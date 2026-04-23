@@ -261,3 +261,125 @@ class TestTimelineBucketing:
         assert isinstance(at, str)
         # SQLite default datetime('now') 格式 "YYYY-MM-DD HH:MM:SS"
         assert len(at) >= 10 and at[4] == "-" and at[7] == "-"
+
+
+# ─── Phase 6 P0: greeting 入口前置检查 active handoff ────────────────
+class TestGreetingPeerCooldownGate:
+    """A 端 send_greeting_after_add_friend 前置检查 check_peer_cooldown_handoff,
+    当 B 对该 peer 在 7 天内发起过活跃/已完成 handoff 时, A 跳过 greeting 避免双打扰。"""
+
+    def _stub_fb(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb._current_device = "D_p0"
+        fb._last_greet_skip_reason = ""
+        fb._current_lead_cid = ""
+        fb._current_lead_persona = ""
+        fb._current_greet_template_id = ""
+        # Stub: _did 取 device_id 或默认, _u2 返回 None(永远不会走到 UI 层)
+        fb._did = lambda dev=None: dev or "D_p0"
+        fb._u2 = lambda did: None
+        return fb
+
+    def test_active_handoff_blocks_greeting(self, tmp_db):
+        """B 机已发 LINE handoff(pending) → A 跳过 greeting, 写 journey。"""
+        from src.host.lead_mesh import (resolve_identity, create_handoff,
+                                          get_journey)
+        cid = resolve_identity(platform="facebook",
+                                account_id="fb:P0Active",
+                                display_name="P0Active")
+        h = create_handoff(canonical_id=cid, source_agent="b",
+                            channel="line", enqueue_webhook=False)
+        assert h
+
+        fb = self._stub_fb()
+        ok = fb.send_greeting_after_add_friend(
+            "P0Active", greeting="hello",
+            device_id="D_p0", persona_key="jp_female_midlife")
+        assert ok is False
+
+        events = get_journey(cid)
+        blocked = [e for e in events if e["action"] == "greeting_blocked"]
+        assert any(e["data"]["reason"] == "peer_already_handed_off"
+                    for e in blocked)
+
+    def test_no_handoff_passes_gate(self, tmp_db):
+        """无 handoff 记录时, 前置检查放行, 不写 greeting_blocked{peer_already_handed_off}。
+        (主流程会因 u2=None 在其他地方失败, 这里只验 gate 未命中。)"""
+        from src.host.lead_mesh import resolve_identity, get_journey
+        cid = resolve_identity(platform="facebook",
+                                account_id="fb:P0Free",
+                                display_name="P0Free")
+
+        fb = self._stub_fb()
+        # 不关心最终返回值(UI 层会因 stub 失败), 只验 journey 没写 peer_already 事件
+        try:
+            fb.send_greeting_after_add_friend(
+                "P0Free", greeting="hello", device_id="D_p0")
+        except Exception:
+            pass
+
+        events = get_journey(cid)
+        peer_blocked = [
+            e for e in events
+            if e["action"] == "greeting_blocked"
+            and e["data"].get("reason") == "peer_already_handed_off"
+        ]
+        assert peer_blocked == []
+
+    def test_rejected_handoff_does_not_block(self, tmp_db):
+        """B 已 reject 的 handoff → A 仍可尝试 greeting (honor_rejected=True 默认放行)。"""
+        from src.host.lead_mesh import (resolve_identity, create_handoff,
+                                          reject_handoff, get_journey)
+        cid = resolve_identity(platform="facebook",
+                                account_id="fb:P0Rejected",
+                                display_name="P0Rejected")
+        h = create_handoff(canonical_id=cid, source_agent="b",
+                            channel="line", enqueue_webhook=False)
+        reject_handoff(h, by="b-reject-test")
+
+        fb = self._stub_fb()
+        try:
+            fb.send_greeting_after_add_friend(
+                "P0Rejected", greeting="hello", device_id="D_p0")
+        except Exception:
+            pass
+
+        events = get_journey(cid)
+        peer_blocked = [
+            e for e in events
+            if e["action"] == "greeting_blocked"
+            and e["data"].get("reason") == "peer_already_handed_off"
+        ]
+        assert peer_blocked == []
+
+    def test_expired_cooldown_does_not_block(self, tmp_db):
+        """>7 天前的 handoff 不阻塞 (cooldown 窗口过期)。"""
+        from src.host.lead_mesh import (resolve_identity, create_handoff,
+                                          get_journey)
+        from src.host.database import _connect
+        cid = resolve_identity(platform="facebook",
+                                account_id="fb:P0Old",
+                                display_name="P0Old")
+        h = create_handoff(canonical_id=cid, source_agent="b",
+                            channel="line", enqueue_webhook=False)
+        # 手工把 created_at 倒退 30 天 → 超出 7 天冷却窗口
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE lead_handoffs SET created_at=datetime('now','-30 days')"
+                " WHERE handoff_id=?", (h,))
+
+        fb = self._stub_fb()
+        try:
+            fb.send_greeting_after_add_friend(
+                "P0Old", greeting="hello", device_id="D_p0")
+        except Exception:
+            pass
+
+        events = get_journey(cid)
+        peer_blocked = [
+            e for e in events
+            if e["action"] == "greeting_blocked"
+            and e["data"].get("reason") == "peer_already_handed_off"
+        ]
+        assert peer_blocked == []

@@ -479,12 +479,13 @@
       { maxWidth: '980px' });
     const body = document.getElementById('lm-cc-body');
     try {
-      const [pending, ack, completed, rejected, dead] = await Promise.all([
+      const [pending, ack, completed, rejected, dead, receivers] = await Promise.all([
         Shell.api.get('/lead-mesh/handoffs?state=pending&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=acknowledged&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=completed&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=rejected&limit=500'),
         Shell.api.get('/lead-mesh/webhooks/dead-letters?limit=100'),
+        Shell.api.get('/lead-mesh/receivers?with_load=true&enabled_only=true'),
       ]);
       const pn = (pending.handoffs || []).length;
       const an = (ack.handoffs || []).length;
@@ -529,12 +530,42 @@
           + '</div>';
       };
 
-      const rvRows = Object.entries(rvLoad).sort(function (a, b) { return b[1] - a[1]; })
-        .map(function (kv) {
-          return '<div style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg-main);border-radius:4px;margin-bottom:4px;font-size:12px">'
-            + '<code>' + _safe(kv[0]) + '</code>'
-            + '<span style="color:#f59e0b">' + kv[1] + ' 待/已确认</span></div>';
-        }).join('');
+      // 接收方负载 — 优先走 receivers API (含 cap/percent), 回退到 rvLoad 计数
+      const rvList = (receivers && receivers.receivers) || [];
+      const atRiskReceivers = [];   // 收集 ≥90% 的, 稍后弹 toast
+      const rvRows = rvList.length > 0
+        ? rvList.map(function (r) {
+            const cap = r.cap || r.daily_cap || 0;
+            const cur = r.current || 0;
+            const pct = cap > 0 ? Math.round(cur * 100 / cap) : 0;
+            const barColor = pct >= 90 ? '#ef4444' : pct >= 60 ? '#f59e0b' : '#22c55e';
+            const atRisk = pct >= 90;
+            if (atRisk) atRiskReceivers.push(r.key + '(' + pct + '%)');
+            const rowStyle = atRisk
+              ? 'border:1px solid #ef4444;background:rgba(239,68,68,.06);animation:lmPulseRed 2s ease-in-out infinite'
+              : 'background:var(--bg-main)';
+            const nameHtml = atRisk
+              ? '<b style="color:#ef4444">⚠ ' + _safe(r.key) + '</b>'
+              : '<code>' + _safe(r.key) + '</code>';
+            return ''
+              + '<div style="padding:6px 10px;border-radius:4px;margin-bottom:4px;font-size:12px;' + rowStyle + '">'
+              + '  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">'
+              + '    <span>' + nameHtml
+              + '      <span style="color:var(--text-dim);font-size:10px;margin-left:4px">' + _safe(r.channel || '') + '</span></span>'
+              + '    <span style="color:' + barColor + ';font-weight:600">' + cur + ' / ' + cap
+              + '    <span style="font-size:10px">(' + pct + '%)</span></span>'
+              + '  </div>'
+              + '  <div style="height:5px;background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden">'
+              + '    <div style="width:' + pct + '%;height:100%;background:' + barColor + '"></div>'
+              + '  </div>'
+              + '</div>';
+          }).join('')
+        : Object.entries(rvLoad).sort(function (a, b) { return b[1] - a[1]; })
+            .map(function (kv) {
+              return '<div style="display:flex;justify-content:space-between;padding:6px 10px;background:var(--bg-main);border-radius:4px;margin-bottom:4px;font-size:12px">'
+                + '<code>' + _safe(kv[0]) + '</code>'
+                + '<span style="color:#f59e0b">' + kv[1] + ' 待/已确认</span></div>';
+            }).join('');
 
       const allChannels = {};
       ['pending', 'ack', 'completed', 'rejected'].forEach(function (s) {
@@ -596,8 +627,13 @@
         + '    </table>'
         + '  </div>'
         + '  <div>'
-        + '    <div style="font-size:13px;color:var(--text-muted);margin-bottom:8px">📬 接收方负载</div>'
-        +      (rvRows || '<div style="color:var(--text-dim);font-size:12px">无待处理交接</div>')
+        + '    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+        + '      <span style="font-size:13px;color:var(--text-muted)">📬 接收方负载</span>'
+        + (atRiskReceivers.length > 0
+            ? '      <span style="font-size:10px;color:#ef4444;font-weight:700">⚠ ' + atRiskReceivers.length + ' 已接近满载</span>'
+            : '')
+        + '    </div>'
+        +      (rvRows || '<div style="color:var(--text-dim);font-size:12px">无接收方或无待处理交接</div>')
         + '  </div>'
         + '  <div>'
         + '    <div style="font-size:13px;color:var(--text-muted);margin-bottom:8px">⚠ Webhook 健康</div>'
@@ -609,10 +645,30 @@
         + '    </div>'
         + '  </div>'
         + '</div>';
+
+      // 注入一次 keyframes — 让 atRisk 行呼吸红光
+      _lmInjectPulseKeyframes();
+
+      // 负载告警 toast — 有 ≥90% 的 receiver 时弹红色警告 (每次打开 dashboard 一次)
+      if (atRiskReceivers.length > 0 && typeof showToast === 'function') {
+        showToast('⚠ 接收方负载告警: ' + atRiskReceivers.join(', ')
+                   + ' 已 ≥90%, 请考虑启用备用或提升 daily_cap',
+                   'error');
+      }
     } catch (e) {
       body.innerHTML = '<div style="color:#ef4444;padding:20px">加载失败: ' + _safe(e.message || e) + '</div>';
     }
   };
+
+  function _lmInjectPulseKeyframes() {
+    if (document.getElementById('lm-pulse-keyframes')) return;
+    const s = document.createElement('style');
+    s.id = 'lm-pulse-keyframes';
+    s.textContent = '@keyframes lmPulseRed {'
+      + ' 0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.4); }'
+      + ' 50% { box-shadow: 0 0 0 4px rgba(239,68,68,.15); } }';
+    document.head.appendChild(s);
+  }
 
   window.lmFlushWebhooks = async function () {
     const Shell = _shell();
@@ -696,6 +752,23 @@
     try {
       const r = await Shell.api.get('/lead-mesh/receivers?with_load=true');
       const list = (r && r.receivers) || [];
+      _lmInjectPulseKeyframes();
+      // 计算负载告警 banner
+      const atRisk = list.filter(function (x) {
+        const cap = x.cap || x.daily_cap || 0;
+        const cur = x.current || 0;
+        const pct = cap > 0 ? Math.round(cur * 100 / cap) : 0;
+        return x.enabled !== false && pct >= 90;
+      });
+      const alertBanner = atRisk.length === 0
+        ? ''
+        : ('<div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.35);'
+            + 'border-left:4px solid #ef4444;padding:8px 12px;margin-bottom:12px;border-radius:4px;'
+            + 'font-size:12px;color:#ef4444">'
+            + '⚠ <b>' + atRisk.length + ' 个接收方负载 ≥ 90%</b>: '
+            + atRisk.map(function (x) { return _safe(x.key); }).join(', ')
+            + ' — 建议启用 backup_key 或上调 daily_cap'
+            + '</div>');
       const rows = list.length === 0
         ? '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-dim)">'
           + '尚无接收方。参考 <code>config/referral_receivers.yaml.example</code> 创建。'
@@ -720,6 +793,7 @@
         + '            style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
         + '  </div>'
         + '</div>'
+        + alertBanner
         + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
         + '  <thead><tr style="color:var(--text-dim);background:rgba(255,255,255,.03)">'
         + '    <th style="text-align:left;padding:8px">Key</th>'
@@ -746,6 +820,14 @@
     const cur = r.current || 0;
     const pct = cap > 0 ? Math.round(cur * 100 / cap) : 0;
     const barColor = pct >= 90 ? '#ef4444' : pct >= 60 ? '#f59e0b' : '#22c55e';
+    // 接近/已满: 红字 + 行脉冲发光, 引导 ops 立即处置
+    const atRisk = enabled && pct >= 90;
+    const rowExtraStyle = atRisk
+      ? ';background:rgba(239,68,68,.06);animation:lmPulseRed 2s ease-in-out infinite'
+      : '';
+    const pctLabel = atRisk
+      ? '<span style="color:#ef4444;font-weight:700">⚠ ' + pct + '%</span>'
+      : '<span style="color:' + barColor + '">' + pct + '%</span>';
     const statusBadge = enabled
       ? '<span style="color:#22c55e;font-weight:600">● 启用</span>'
       : '<span style="color:#94a3b8">○ 禁用</span>';
@@ -757,7 +839,7 @@
     const personaTags = (r.persona_filter || []).slice(0, 2).join(', ') || '所有';
 
     return ''
-      + '<tr style="border-bottom:1px solid var(--border)">'
+      + '<tr style="border-bottom:1px solid var(--border)' + rowExtraStyle + '">'
       + '  <td style="padding:8px;cursor:pointer" onclick="lmOpenEditReceiver(\'' + _safe(r.key) + '\')"'
       + '      title="点击编辑">'
       + '    <b style="color:#60a5fa;text-decoration:underline">' + _safe(r.key) + '</b>'
@@ -769,7 +851,7 @@
       + '  <td style="padding:8px;min-width:140px">'
       + '    <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">'
       + '      <span>' + cur + ' / ' + cap + '</span>'
-      + '      <span style="color:' + barColor + '">' + pct + '%</span>'
+      + '      ' + pctLabel
       + '    </div>'
       + '    <div style="height:6px;background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden">'
       + '      <div style="width:' + pct + '%;height:100%;background:' + barColor + '"></div>'

@@ -1549,6 +1549,32 @@ class FacebookAutomation(BaseAutomation):
         # 默认把归因置空,走到 return True 时再设 "ok"
         self._set_greet_reason("")
 
+        # Phase 6 P0: 前置检查 — B 机若已对该 peer 在 7 天内发起过 handoff（LINE/WA/TG…）,
+        # A 就不再 greeting 插话, 避免双方同时打扰。honor_rejected=True 表示
+        # 若 B 主动 reject(user 拒绝引流) 也视作已有接触记录, 一并冷却。
+        if self._current_lead_cid:
+            try:
+                from src.host.lead_mesh import check_peer_cooldown_handoff
+                active_h = check_peer_cooldown_handoff(
+                    self._current_lead_cid,
+                    cooldown_days=7,
+                    honor_rejected=True,
+                )
+                if active_h:
+                    log.info(
+                        "[send_greeting] peer=%s 已被 handoff "
+                        "(channel=%s state=%s handoff_id=%s), A 跳过 greeting",
+                        self._current_lead_cid,
+                        active_h.get("channel"),
+                        active_h.get("state"),
+                        active_h.get("handoff_id"),
+                    )
+                    self._set_greet_reason("peer_already_handed_off")
+                    return False
+            except Exception as e:
+                # 本检查是额外保护, 失败不应阻塞主流程
+                log.debug("[send_greeting] check_peer_cooldown_handoff 异常(继续): %s", e)
+
         try:
             # Phase + playbook
             eff_phase, sg_cfg = _resolve_phase_and_cfg("send_greeting",
