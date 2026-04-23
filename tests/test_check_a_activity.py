@@ -248,11 +248,57 @@ class TestReviewSummary:
         assert s.ready is False
         assert s.blocked is True
 
-    def test_neither_when_only_commented(self):
+    def test_neither_when_only_commented_without_marker(self):
         from scripts.check_a_activity import ReviewSummary
-        s = ReviewSummary(pr_number=10, latest_review_state="COMMENTED")
+        s = ReviewSummary(pr_number=10, latest_review_state="COMMENTED",
+                           latest_review_is_approve_equivalent=False)
         assert s.ready is False
         assert s.blocked is False
+
+    def test_ready_when_commented_is_approve_equivalent(self):
+        """A 的 approve-equivalent COMMENTED 视同 APPROVED (GitHub 不让自审)。"""
+        from scripts.check_a_activity import ReviewSummary
+        s = ReviewSummary(pr_number=10, latest_review_state="COMMENTED",
+                           latest_review_is_approve_equivalent=True)
+        assert s.ready is True
+        assert s.blocked is False
+
+
+class TestIsApproveEquivalent:
+    def test_approved_state_yes(self):
+        from scripts.check_a_activity import _is_approve_equivalent
+        assert _is_approve_equivalent({"state": "APPROVED"}) is True
+
+    def test_commented_with_long_marker_yes(self):
+        from scripts.check_a_activity import _is_approve_equivalent
+        r = {"state": "COMMENTED",
+             "body": "## ✅ A 侧 review 通过 (approve-equivalent)\n..."}
+        assert _is_approve_equivalent(r) is True
+
+    def test_commented_with_short_marker_yes(self):
+        from scripts.check_a_activity import _is_approve_equivalent
+        r = {"state": "COMMENTED",
+             "body": "see approve-equivalent decision"}
+        assert _is_approve_equivalent(r) is True
+
+    def test_commented_without_marker_no(self):
+        from scripts.check_a_activity import _is_approve_equivalent
+        r = {"state": "COMMENTED",
+             "body": "Some feedback but not approving."}
+        assert _is_approve_equivalent(r) is False
+
+    def test_changes_requested_ignores_marker(self):
+        """CHANGES_REQUESTED 不被 body 里的 marker 覆盖。"""
+        from scripts.check_a_activity import _is_approve_equivalent
+        r = {"state": "CHANGES_REQUESTED",
+             "body": "approve-equivalent jk, needs fix"}
+        assert _is_approve_equivalent(r) is False
+
+    def test_empty_body_no(self):
+        from scripts.check_a_activity import _is_approve_equivalent
+        assert _is_approve_equivalent({"state": "COMMENTED"}) is False
+        assert _is_approve_equivalent(
+            {"state": "COMMENTED", "body": None}) is False
 
 
 class TestLatestReview:
@@ -319,6 +365,22 @@ class TestFetchPrReviewSummary:
                    side_effect=self._call_side_effect(pr_meta, [])):
             s = fetch_pr_review_summary(11, token="fake")
         assert s.state == "merged"
+
+    def test_commented_with_marker_is_ready(self):
+        """A 的 approve-equivalent COMMENTED 被识别, ready=True。"""
+        from scripts.check_a_activity import fetch_pr_review_summary
+        pr_meta = {"title": "t", "state": "open",
+                    "head": {"ref": "feat-b-x"}, "merged_at": None}
+        reviews = [{"state": "COMMENTED",
+                     "submitted_at": "2026-04-23T21:17:24Z",
+                     "user": {"login": "victor2025PH"},
+                     "body": "## ✅ A 侧 review 通过 (approve-equivalent)\n"}]
+        with patch("scripts.check_a_activity.github_api_get",
+                   side_effect=self._call_side_effect(pr_meta, reviews)):
+            s = fetch_pr_review_summary(10, token="fake")
+        assert s.latest_review_state == "COMMENTED"
+        assert s.latest_review_is_approve_equivalent is True
+        assert s.ready is True
 
     def test_no_token_sets_error(self):
         from scripts.check_a_activity import fetch_pr_review_summary

@@ -57,6 +57,27 @@ if os.environ.get("NO_COLOR") or (sys.platform == "win32" and
 REPO = "victor2025PH/mobile-auto0423"
 A_BRANCH_PREFIXES = ("feat-a-",)
 A_USERS = ("victor2025PH",)  # A 账号
+
+# A 在 PR #26 反馈: GitHub 不允许 author 自审 (A/B 共用 victor2025PH token),
+# APPROVE state 走不通; 约定 COMMENTED body 含下列任一 marker 视同 approved。
+# A 承诺每次 approve-equivalent 评论必带 "✅ A 侧 review 通过 (approve-equivalent)"。
+APPROVE_EQUIVALENT_MARKERS = (
+    "✅ A 侧 review 通过",
+    "approve-equivalent",
+)
+
+
+def _is_approve_equivalent(review: Dict[str, Any]) -> bool:
+    """state=APPROVED 或 state=COMMENTED 且 body 含 approve marker。"""
+    state = review.get("state", "")
+    if state == "APPROVED":
+        return True
+    if state == "COMMENTED":
+        body = review.get("body") or ""
+        return any(m in body for m in APPROVE_EQUIVALENT_MARKERS)
+    return False
+
+
 # 重要共享契约文件 (若 A 改动应提醒 B)
 SHARED_FILES_TO_WATCH = [
     "docs/INTEGRATION_CONTRACT.md",
@@ -383,13 +404,20 @@ class ReviewSummary:
     latest_review_state: Optional[str] = None   # APPROVED / CHANGES_REQUESTED / COMMENTED / DISMISSED
     latest_review_user: Optional[str] = None
     latest_review_at: Optional[str] = None
+    latest_review_is_approve_equivalent: bool = False
     review_count: int = 0
     error: str = ""
 
     @property
     def ready(self) -> bool:
         """True = 可直接合,无需额外动作。"""
-        return self.latest_review_state == "APPROVED"
+        if self.latest_review_state == "APPROVED":
+            return True
+        # A 的 approve-equivalent COMMENTED (见 APPROVE_EQUIVALENT_MARKERS)
+        if (self.latest_review_state == "COMMENTED"
+                and self.latest_review_is_approve_equivalent):
+            return True
+        return False
 
     @property
     def blocked(self) -> bool:
@@ -405,6 +433,8 @@ class ReviewSummary:
             "latest_review_state": self.latest_review_state,
             "latest_review_user": self.latest_review_user,
             "latest_review_at": self.latest_review_at,
+            "latest_review_is_approve_equivalent":
+                self.latest_review_is_approve_equivalent,
             "review_count": self.review_count,
             "ready": self.ready,
             "blocked": self.blocked,
@@ -463,6 +493,7 @@ def fetch_pr_review_summary(pr_num: int, token: Optional[str]
         s.latest_review_state = latest.get("state")
         s.latest_review_user = (latest.get("user") or {}).get("login")
         s.latest_review_at = latest.get("submitted_at")
+        s.latest_review_is_approve_equivalent = _is_approve_equivalent(latest)
     return s
 
 
@@ -489,12 +520,14 @@ def render_review_dashboard(summaries: List[ReviewSummary],
             continue
         if s.state == "merged":
             status = f"{GREEN}✅ MERGED{RESET}"
+        elif s.ready and s.latest_review_state == "COMMENTED":
+            status = f"{GREEN}✅ APPROVE≡ (COMMENTED+marker){RESET}"
         elif s.ready:
             status = f"{GREEN}✅ APPROVED{RESET}"
         elif s.blocked:
             status = f"{RED}🔴 CHANGES_REQUESTED{RESET}"
         elif s.latest_review_state == "COMMENTED":
-            status = f"{YELLOW}💬 COMMENTED{RESET}"
+            status = f"{YELLOW}💬 COMMENTED (无 approve marker){RESET}"
         elif s.latest_review_state == "DISMISSED":
             status = f"{YELLOW}⊘ DISMISSED{RESET}"
         elif s.review_count == 0:
@@ -521,8 +554,10 @@ def render_review_dashboard(summaries: List[ReviewSummary],
     # 汇总
     approved = sum(1 for s in summaries if s.ready or s.state == "merged")
     blocked_n = sum(1 for s in summaries if s.blocked)
+    # COMMENTED 但不 approve-equivalent 的才需手读
     commented = sum(1 for s in summaries
-                     if s.latest_review_state == "COMMENTED")
+                     if s.latest_review_state == "COMMENTED"
+                     and not s.latest_review_is_approve_equivalent)
     unreviewed = sum(1 for s in summaries
                       if s.review_count == 0 and not s.error)
     lines.append("")
