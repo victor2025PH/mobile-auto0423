@@ -471,13 +471,35 @@
   // P2 · 运营指挥台
   // ─────────────────────────────────────────────────────────────────
 
+  // Phase 8d: Command Center 过滤器状态 (保留在 window 作用域, 切换时重渲染)
+  window._lmCCFilter = window._lmCCFilter || { days: 7, actor: 'agent_a' };
+
   window.lmOpenCommandCenter = async function () {
     const Shell = _shell();
     if (!Shell) return;
     Shell.modal.open('lm-cc-modal',
       '<div id="lm-cc-body" style="padding:18px">加载中…</div>',
       { maxWidth: '980px' });
+    await _lmRenderCommandCenter();
+  };
+
+  // Phase 8d: 过滤器 change handler (供 select 调用)
+  window.lmCCSetFilter = async function (kind, val) {
+    const f = window._lmCCFilter;
+    if (kind === 'days') f.days = parseInt(val) || 7;
+    else if (kind === 'actor') f.actor = val || '';
     const body = document.getElementById('lm-cc-body');
+    if (body) body.innerHTML = '<div style="padding:18px">加载中…</div>';
+    await _lmRenderCommandCenter();
+  };
+
+  async function _lmRenderCommandCenter() {
+    const Shell = _shell();
+    const body = document.getElementById('lm-cc-body');
+    if (!body) return;
+    const f = window._lmCCFilter;
+    const funnelUrl = '/lead-mesh/funnel?days=' + f.days
+      + (f.actor ? '&actor=' + encodeURIComponent(f.actor) : '');
     try {
       const [pending, ack, completed, rejected, dead, receivers, funnel] = await Promise.all([
         Shell.api.get('/lead-mesh/handoffs?state=pending&limit=500'),
@@ -486,7 +508,7 @@
         Shell.api.get('/lead-mesh/handoffs?state=rejected&limit=500'),
         Shell.api.get('/lead-mesh/webhooks/dead-letters?limit=100'),
         Shell.api.get('/lead-mesh/receivers?with_load=true&enabled_only=true'),
-        Shell.api.get('/lead-mesh/funnel?days=7&actor=agent_a'),
+        Shell.api.get(funnelUrl),
       ]);
       const pn = (pending.handoffs || []).length;
       const an = (ack.handoffs || []).length;
@@ -630,11 +652,53 @@
           + '</div>';
       };
 
+      // Phase 8d 过滤器: days + actor select
+      const ff = window._lmCCFilter;
+      const daysOpts = [1, 3, 7, 14, 30].map(function (v) {
+        return '<option value="' + v + '"'
+          + (v === ff.days ? ' selected' : '') + '>'
+          + (v === 1 ? '24 小时' : v + ' 天') + '</option>';
+      }).join('');
+      const actorOpts = [
+        { v: 'agent_a', label: 'A 端' },
+        { v: 'agent_b', label: 'B 端' },
+        { v: '', label: '全部' },
+      ].map(function (o) {
+        return '<option value="' + o.v + '"'
+          + (o.v === ff.actor ? ' selected' : '') + '>'
+          + o.label + '</option>';
+      }).join('');
+      const filterHtml = ''
+        + '<div style="display:flex;gap:8px;align-items:center;font-size:11px">'
+        + '  <select onchange="lmCCSetFilter(\'days\', this.value)" '
+        + '          style="padding:3px 8px;background:var(--bg-main);color:var(--text);'
+        + '                 border:1px solid var(--border);border-radius:4px;font-size:11px">'
+        +    daysOpts
+        + '  </select>'
+        + '  <select onchange="lmCCSetFilter(\'actor\', this.value)" '
+        + '          style="padding:3px 8px;background:var(--bg-main);color:var(--text);'
+        + '                 border:1px solid var(--border);border-radius:4px;font-size:11px">'
+        +    actorOpts
+        + '  </select>'
+        + '</div>';
+
+      // 瓶颈可点击: 点 code 跳 blocked peer 子 modal
+      const topBlockedHtml = topBlocked
+        ? '    <div><span style="color:var(--text-dim)">瓶颈:</span>'
+          + '      <code style="color:#f59e0b;margin-left:4px;cursor:pointer;'
+          + '                  text-decoration:underline dotted" '
+          + '            onclick="lmOpenBlockedPeers(\'' + _safe(topBlocked) + '\')" '
+          + '            title="点击查看具体被挡的 peer">' + _safe(topBlocked) + '</code></div>'
+        : '    <div style="color:#22c55e">✓ 无主要瓶颈</div>';
+
       const aFunnelCard = ''
         + '<div style="grid-column:1/-1;padding:14px;background:rgba(96,165,250,.06);'
         + '            border:1px solid rgba(96,165,250,.25);border-radius:8px">'
         + '  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
-        + '    <div style="font-size:13px;color:var(--text-muted)">🎯 A 端获客漏斗 (近 7 天)</div>'
+        + '    <div style="display:flex;gap:12px;align-items:center">'
+        + '      <span style="font-size:13px;color:var(--text-muted)">🎯 A 端获客漏斗</span>'
+        +        filterHtml
+        + '    </div>'
         + '    <div style="font-size:11px">'
         + '      转化率: <b style="color:' + fuRateColor + ';font-size:14px">' + fuRate + '%</b>'
         + '      <span style="color:var(--text-dim)"> (greeting/friend_req)</span>'
@@ -659,10 +723,7 @@
             ? '      <span style="color:var(--text-dim);margin-left:8px">unknown=' + fuUnknown + '</span>'
             : '')
         + '    </div>'
-        + (topBlocked
-            ? '    <div><span style="color:var(--text-dim)">瓶颈:</span>'
-              + '      <code style="color:#f59e0b;margin-left:4px">' + _safe(topBlocked) + '</code></div>'
-            : '    <div style="color:#22c55e">✓ 无主要瓶颈</div>')
+        +      topBlockedHtml
         + '  </div>'
         + '  <div style="margin-top:10px;font-size:11px">'
         + '    <span style="color:var(--text-dim)">top persona:</span> ' + personaHtml
@@ -757,6 +818,72 @@
       + ' 50% { box-shadow: 0 0 0 4px rgba(239,68,68,.15); } }';
     document.head.appendChild(s);
   }
+
+  // Phase 8d: 点击漏斗瓶颈看具体被挡 peer 列表
+  window.lmOpenBlockedPeers = async function (reason) {
+    const Shell = _shell();
+    if (!Shell || !reason) return;
+    const f = window._lmCCFilter || { days: 7 };
+    Shell.modal.open('lm-blocked-peers-modal',
+      '<div id="lm-bp-body" style="padding:18px">加载中…</div>',
+      { maxWidth: '720px' });
+    try {
+      const r = await Shell.api.get(
+        '/lead-mesh/funnel/blocked-peers?reason=' + encodeURIComponent(reason)
+        + '&days=' + f.days + '&limit=50');
+      const peers = (r && r.peers) || [];
+      const rows = peers.length === 0
+        ? '<div style="text-align:center;padding:30px;color:var(--text-dim)">✓ 该 reason 下无被挡 peer (时间窗口内)</div>'
+        : peers.map(function (p) {
+            const cid = p.canonical_id || '';
+            const cidShort = cid.substring(0, 8);
+            const at = (p.last_blocked_at || '').substring(0, 19);
+            const persona = p.persona_key || '';
+            return ''
+              + '<div style="padding:10px 14px;background:var(--bg-main);'
+              + '            border-left:3px solid #f59e0b;border-radius:4px;margin-bottom:6px;'
+              + '            display:flex;justify-content:space-between;align-items:center">'
+              + '  <div style="flex:1;min-width:0">'
+              + '    <div style="font-size:12px">'
+              + '      <code style="color:#60a5fa">' + _safe(cidShort) + '…</code>'
+              + '      <span style="margin-left:10px;color:var(--text-dim);font-size:10px">'
+              +          _safe(at) + '</span>'
+              + (persona
+                  ? '      <span style="margin-left:10px;padding:1px 6px;background:rgba(96,165,250,.12);'
+                    + '                   color:#60a5fa;border-radius:8px;font-size:10px">'
+                    + _safe(persona) + '</span>'
+                  : '')
+              + '    </div>'
+              + '    <div style="font-size:10px;color:var(--text-dim);margin-top:2px">'
+              + '      被挡次数: <b style="color:#f59e0b">' + p.n_blocked + '</b>'
+              + '    </div>'
+              + '  </div>'
+              + '  <button onclick="PlatShell.modal.close(\'lm-blocked-peers-modal\');'
+              + '                   lmOpenLeadDossier(\'' + _safe(cid) + '\')" '
+              + '          style="padding:4px 10px;background:rgba(96,165,250,.12);color:#60a5fa;'
+              + '                 border:1px solid rgba(96,165,250,.3);border-radius:4px;'
+              + '                 font-size:11px;cursor:pointer">📖 dossier</button>'
+              + '</div>';
+          }).join('');
+      document.getElementById('lm-bp-body').innerHTML = ''
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
+        + '  <div>'
+        + '    <div style="font-size:16px;font-weight:700">🔍 被挡 peer 列表</div>'
+        + '    <div style="font-size:11px;color:var(--text-muted);margin-top:2px">'
+        + '      reason: <code style="color:#f59e0b">' + _safe(reason) + '</code>'
+        + '      · 近 ' + f.days + ' 天 · 共 ' + peers.length + ' 个唯一 peer'
+        + '    </div>'
+        + '  </div>'
+        + '  <button onclick="PlatShell.modal.close(\'lm-blocked-peers-modal\')" '
+        + '          style="background:none;border:1px solid var(--border);color:var(--text);'
+        + '                 padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
+        + '</div>'
+        + rows;
+    } catch (e) {
+      document.getElementById('lm-bp-body').innerHTML =
+        '<div style="color:#ef4444;padding:20px">加载失败: ' + _safe(e.message || e) + '</div>';
+    }
+  };
 
   window.lmFlushWebhooks = async function () {
     const Shell = _shell();

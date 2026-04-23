@@ -172,6 +172,57 @@ def compute_funnel(days: int = 7,
     return stats
 
 
+def list_blocked_peers(reason: str,
+                         days: int = 7,
+                         limit: int = 50) -> List[Dict[str, Any]]:
+    """返回近 N 天被某 reason 挡住的 peer 列表 (点击 Dashboard top_blocked_reason
+    子 modal 用). 按最近 blocked 时间倒序, 同 peer 只出 1 行 (含总次数).
+
+    Args:
+        reason: 要过滤的 reason (如 "no_message_button")
+        days: 时间窗口
+        limit: 最多返回 N 条 (默认 50)
+
+    Returns:
+        [{"canonical_id", "last_blocked_at", "n_blocked", "persona_key"}]
+    """
+    if not reason:
+        return []
+    since = _iso_since(days)
+    # SQLite JSON 解析 Python 侧做, 避免 json_extract 版本要求
+    sql = ("SELECT canonical_id, data_json, at FROM lead_journey"
+            " WHERE action = 'greeting_blocked' AND at >= ?"
+            " ORDER BY at DESC LIMIT ?")
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, (since, int(limit) * 10)).fetchall()
+    except Exception:
+        return []
+
+    agg: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        cid = row[0] or ""
+        try:
+            data = json.loads(row[1] or "{}")
+        except Exception:
+            data = {}
+        if (data.get("reason") or "") != reason:
+            continue
+        at = row[2] or ""
+        if cid not in agg:
+            agg[cid] = {
+                "canonical_id": cid,
+                "last_blocked_at": at,  # DESC ordering 下第一次命中就是最近
+                "n_blocked": 1,
+                "persona_key": str(data.get("persona_key") or ""),
+            }
+        else:
+            agg[cid]["n_blocked"] += 1
+        if len(agg) >= int(limit):
+            break
+    return list(agg.values())
+
+
 def format_text_report(stats: FunnelStats) -> str:
     """人类友好的控制台输出. 多行 markdown-ish 格式."""
     lines = [
