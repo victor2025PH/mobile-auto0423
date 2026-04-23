@@ -50,6 +50,7 @@ def fb_env():
         "risk_dialog": (False, ""),
         "handle_xspace_dismissed": True,
         "app_start_raises": False,
+        "blocked_popup_text": "",  # F4: 非空时模拟点 Send 后 FB 拒绝
     }
 
     def _smart_tap(name, device_id=None, **kw):
@@ -92,6 +93,8 @@ def fb_env():
                                      side_effect=_detect_risk))
     stack.enter_context(patch.object(fb, "_xspace_select_sheet_visible",
                                      side_effect=_xspace_visible))
+    stack.enter_context(patch.object(fb, "_detect_send_blocked",
+                                     side_effect=lambda _d: knobs["blocked_popup_text"]))
     stack.enter_context(patch.object(fb, "guarded",
                                      return_value=nullcontext()))
     stack.enter_context(patch("src.app_automation.facebook.time.sleep"))
@@ -293,6 +296,32 @@ class TestStrictRaisesWithCode:
             fb.send_message("Alice", "hello", raise_on_error=True)
         assert ei.value.code == "send_button_missing"
 
+    def test_send_blocked_by_content(self, fb_env):
+        """F4: Send 点击成功但 FB 弹拒绝提示 → send_blocked_by_content。"""
+        from src.app_automation.facebook import MessengerError
+        fb, knobs = fb_env
+        knobs["blocked_popup_text"] = "This message can't be sent"
+        with patch("src.host.fb_store.record_risk_event") as m_risk:
+            with pytest.raises(MessengerError) as ei:
+                fb.send_message("Alice", "hi", raise_on_error=True)
+        assert ei.value.code == "send_blocked_by_content"
+        assert "text_hash=" in ei.value.hint
+        # record_risk_event 被调 (record_risk_event 内部会分类,
+        # F4-support commit 在 followup PR 加的 content_blocked 规则生效后
+        # 会归 kind='content_blocked')
+        m_risk.assert_called_once()
+        args, kwargs = m_risk.call_args
+        assert args[0] == "devA"  # device_id
+        assert "can't be sent" in args[1].lower()  # raw_message
+        assert "task_id" in kwargs
+
+    def test_send_blocked_by_content_no_raise_mode(self, fb_env):
+        """raise_on_error=False 时 send_blocked_by_content 返 False 向后兼容。"""
+        fb, knobs = fb_env
+        knobs["blocked_popup_text"] = "message can't be sent"
+        with patch("src.host.fb_store.record_risk_event"):
+            assert fb.send_message("Alice", "hi") is False
+
     def test_messenger_icon_fails_but_app_start_ok_no_raise(self, fb_env):
         """icon 点不开但 app_start 成功 → 不抛 messenger_unavailable,继续流程。"""
         fb, knobs = fb_env
@@ -314,7 +343,7 @@ class TestContractCodes:
         known = {
             "messenger_unavailable", "xspace_blocked", "risk_detected",
             "search_ui_missing", "recipient_not_found", "send_button_missing",
-            "send_fail",
+            "send_blocked_by_content", "send_fail",
         }
         # 遍历所有失败场景收集 code
         scenarios = [
@@ -326,6 +355,7 @@ class TestContractCodes:
             lambda k: k["smart_tap_results"].__setitem__("Search in Messenger", False),
             lambda k: k["smart_tap_results"].__setitem__("First matching contact", False),
             lambda k: k["smart_tap_results"].__setitem__("Send message button", False),
+            lambda k: k.__setitem__("blocked_popup_text", "message can't be sent"),  # F4
         ]
         seen = set()
         for scenario in scenarios:
@@ -336,10 +366,80 @@ class TestContractCodes:
             knobs["risk_dialog"] = (False, "")
             knobs["handle_xspace_dismissed"] = True
             knobs["app_start_raises"] = False
+            knobs["blocked_popup_text"] = ""
             scenario(knobs)
             try:
-                fb.send_message("Alice", "hello", raise_on_error=True)
+                with patch("src.host.fb_store.record_risk_event"):
+                    fb.send_message("Alice", "hello", raise_on_error=True)
             except MessengerError as e:
                 seen.add(e.code)
         assert seen <= known, f"新 code {seen - known} 未写入契约表"
-        assert len(seen) >= 6, f"只观察到 {seen}, 少于预期 6 种失败"
+        assert len(seen) >= 7, f"只观察到 {seen}, 少于预期 7 种失败"
+
+
+# ─── F4: _detect_send_blocked 独立测试 ─────────────────────────────────────
+
+class TestDetectSendBlocked:
+    def test_empty_xml_returns_empty(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(return_value="")
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._detect_send_blocked(d) == ""
+
+    def test_english_popup_detected(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(return_value=(
+            "<node><text>This message can't be sent to this person</text></node>"
+        ))
+        with patch("src.app_automation.facebook.time.sleep"):
+            r = fb._detect_send_blocked(d)
+        assert r != ""
+        assert "can't be sent" in r.lower()
+
+    def test_chinese_popup_detected(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(
+            return_value="<node>发送失败,请重试</node>")
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._detect_send_blocked(d) != ""
+
+    def test_japanese_popup_detected(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(
+            return_value="<node>送信できませんでした</node>")
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._detect_send_blocked(d) != ""
+
+    def test_italian_popup_detected(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(
+            return_value="<node>Messaggio non inviato</node>")
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._detect_send_blocked(d) != ""
+
+    def test_normal_dump_no_false_positive(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(
+            return_value="<node>Hello friend, how are you?</node>")
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._detect_send_blocked(d) == ""
+
+    def test_dump_hierarchy_exception_returns_empty(self):
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        d = MagicMock()
+        d.dump_hierarchy = MagicMock(side_effect=RuntimeError("disconnected"))
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._detect_send_blocked(d) == ""

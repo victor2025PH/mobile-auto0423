@@ -184,13 +184,17 @@ class MessengerError(Exception):
         DM 作二次兜底
 
     Codes (稳定公开契约,改名要先改 INTEGRATION_CONTRACT §二):
-      - messenger_unavailable: Messenger 图标点不开 + app_start 也启动失败
-      - xspace_blocked:        MIUI/HyperOS XSpace 选择框挡路无法 dismiss
-      - risk_detected:         Messenger 撞到封禁/校验对话框
-      - search_ui_missing:     Messenger 搜索按钮点不开 (UI 变更或 cold app)
-      - recipient_not_found:   搜索结果里找不到目标联系人
-      - send_button_missing:   输入后 Send 按钮点不到 (可能被键盘遮住 / 文案含违禁词触发灰出)
-      - send_fail:             其他未分类失败 (保底)
+      - messenger_unavailable:    Messenger 图标点不开 + app_start 也启动失败
+      - xspace_blocked:           MIUI/HyperOS XSpace 选择框挡路无法 dismiss
+      - risk_detected:            Messenger 撞到封禁/校验对话框
+      - search_ui_missing:        Messenger 搜索按钮点不开 (UI 变更或 cold app)
+      - recipient_not_found:      搜索结果里找不到目标联系人
+      - send_button_missing:      Send 按钮未渲染/点不到 (UI 问题)
+      - send_blocked_by_content:  Send 成功但 FB 弹 "message can't be sent"
+                                  (文案违禁/反垃圾规则, F4 来自 A→B Q6);
+                                  同时 record_risk_event(kind='content_blocked')
+                                  入库, hint 带 text_hash 供 A 去重 + 短版本重试
+      - send_fail:                其他未分类失败 (保底)
     """
 
     def __init__(self, code: str, message: str = "", hint: str = ""):
@@ -1109,10 +1113,68 @@ class FacebookAutomation(BaseAutomation):
                     "send_button_missing",
                     "Messenger Send 按钮点不到",
                     hint="可能被键盘遮挡/文案违禁被灰出,A 可降级走 FB 个人页 DM")
+
+            # ── 7. F4: 检测 FB 点 Send 后的"内容违禁"弹窗 ─────────────
+            # A→B review Q6 建议的新 code。UI 出现 "This message can't be
+            # sent / 送信できません / 不能发送此消息 / non inviabile" 类提示
+            # → 记 fb_risk_events{kind='content_blocked'} + raise 细分错误,
+            # A 的 A2 降级可按 text_hash 去重并用更短 greeting 重试
+            blocked_text = self._detect_send_blocked(d)
+            if blocked_text:
+                try:
+                    from src.host.fb_store import record_risk_event
+                    # record_risk_event 用 raw_message 文本经 _RISK_KIND_RULES
+                    # 自动分类到 'content_blocked' (该规则由 F4-support
+                    # commit 在 follow-up PR 里扩展)
+                    record_risk_event(did, blocked_text,
+                                      task_id=f"send_message:{recipient[:20]}")
+                except Exception as e:
+                    log.debug("[send_message] record_risk_event 失败: %s", e)
+                import hashlib as _h
+                text_hash = _h.sha256(
+                    (message or "").encode("utf-8", errors="replace")
+                ).hexdigest()[:12]
+                raise MessengerError(
+                    "send_blocked_by_content",
+                    f"FB 拒绝发送 ({blocked_text[:80]})",
+                    hint=(f"text_hash={text_hash}; A 可用更短/更自然的 "
+                          f"greeting 重试, 或用此 hash 去重防重复触发"))
             return True
         # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
         return False  # pragma: no cover
+
+    # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (ja/zh/en/it 对齐
+    # persona)。要改请同步改 src/host/fb_store.py::_RISK_KIND_RULES 的
+    # content_blocked 分类规则,否则 record_risk_event 会错分类。
+    _SEND_BLOCKED_KEYWORDS = (
+        "can't be sent", "cannot be sent", "couldn't send", "unable to send",
+        "message can't be sent", "message wasn't sent",
+        "不能发送此消息", "发送失败", "无法发送", "訊息無法傳送",
+        "送信できませんでした", "メッセージを送信できません",
+        "non inviabile", "messaggio non inviato",
+    )
+
+    def _detect_send_blocked(self, d) -> str:
+        """F4: 点 Send 按钮后扫屏查 FB 拒绝发送提示 (snackbar/toast/dialog)。
+
+        返回匹配到的文本片段 (非空即代表被拒); 无匹配返回空串。不抛。
+        """
+        try:
+            time.sleep(0.8)  # wait popup render
+            xml = d.dump_hierarchy()
+        except Exception:
+            return ""
+        low = xml.lower() if xml else ""
+        if not low:
+            return ""
+        for kw in self._SEND_BLOCKED_KEYWORDS:
+            k = kw.lower()
+            idx = low.find(k)
+            if idx >= 0:
+                # 截取一段返回,方便日志 + record_risk_event 分类
+                return xml[max(0, idx - 10):idx + len(kw) + 50]
+        return ""
 
     def _xspace_select_sheet_visible(self, d) -> bool:
         """快速探测 MIUI 'Select app' 浅色底 sheet 是否仍在屏(P2 辅助)。"""
