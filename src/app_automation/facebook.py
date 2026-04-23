@@ -802,7 +802,7 @@ class FacebookAutomation(BaseAutomation):
                     pass
             time.sleep(1.5)
 
-        results = self._extract_search_results(d, max_results)
+        results = self._extract_search_results(d, max_results, query_hint=query)
         return results
 
     @_with_fb_foreground
@@ -969,6 +969,11 @@ class FacebookAutomation(BaseAutomation):
                     low = x.lower()
                     if any(s in low for s in ("add friend", "message", "follow")):
                         return True
+                    # 资料页常见 resource-id 片段（不依赖界面语言）
+                    if "profile_actionbar" in low or "profile_header" in low:
+                        return True
+                    if "com.facebook.katana:id/profile_" in low:
+                        return True
                     # 日文界面常见文案
                     return any(
                         s in x
@@ -984,8 +989,21 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     xml_chk = ""
                 if not _xml_has_profile_signals(xml_chk):
-                    # 可能仍停在列表：再点一次列表中部（首条人名卡片常见区域）
-                    log.info("[add_friend_with_note] 未检测到资料页特征，尝试二次点击列表区")
+                    like_name = (results[0].get("name") or "").strip()
+                    if like_name and self._search_result_name_plausible(
+                            like_name, profile_name):
+                        try:
+                            el = d(text=like_name)
+                            if el.exists(timeout=2.0):
+                                el.click()
+                                log.info("[add_friend_with_note] 按提取人名重试进入主页: %r",
+                                         like_name[:80])
+                                time.sleep(random.uniform(3.5, 5.5))
+                                xml_chk = d.dump_hierarchy()
+                        except Exception:
+                            pass
+                if not _xml_has_profile_signals(xml_chk):
+                    log.info("[add_friend_with_note] 未检测到资料页特征，尝试列表区坐标点击")
                     w, _h = d.window_size()
                     self._adb(f"shell input tap {int(w * 0.5)} {int(620)}", device_id=did)
                     time.sleep(random.uniform(3.0, 5.0))
@@ -1176,6 +1194,192 @@ class FacebookAutomation(BaseAutomation):
             pass
         return False
 
+    # ─── 2026-04-23 Phase 5 Post-Review: Messenger fallback 细分归因 + 设备锁 ─
+    # 实施 INTEGRATION_CONTRACT §7.6 (MessengerError 分流矩阵) +
+    # §7.7 (device_section_lock("messenger_active") 双方共用)。
+    #
+    # 依赖关系:
+    #   * B 的 PR #1 (feat-b-chat-p2) 在 send_message 里新增 raise_on_error
+    #     参数 + MessengerError 7 档 code。本方法**向前兼容**: 若 PR 未合并
+    #     (TypeError on raise_on_error kwarg), 自动降级到 bool 返回值。
+    #   * 锁 "messenger_active" 是 A/B 共用契约, B 的 check_message_requests
+    #     入口也会拿同一把锁, 避免抢输入框。
+
+    _MESSENGER_ERROR_CODES = (
+        "risk_detected", "xspace_blocked", "recipient_not_found",
+        "search_ui_missing", "send_button_missing",
+        "send_blocked_by_content", "messenger_unavailable", "send_fail",
+    )
+
+    def _mark_device_messenger_not_ready(self, did: str, ttl_min: int = 30) -> None:
+        """messenger_unavailable 时把 device 标记为临时不可用。
+
+        简易实现: 写 fb_risk_events{kind='messenger_not_ready', ttl_min}
+        供调度器 / 运维面板读取; 未来可扩展到 fb_account_phase。
+        """
+        try:
+            from src.host.fb_store import record_risk_event
+            record_risk_event(did, f"messenger_not_ready ttl_min={ttl_min}",
+                              task_id="send_greeting_fallback")
+        except Exception:
+            pass
+
+    def _mark_content_blocked(self, did: str, text: str) -> str:
+        """违禁词 hash 入库, 返回 hash 短码。供 send_button_missing /
+        send_blocked_by_content 分流使用。"""
+        try:
+            import hashlib
+            h = hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+            from src.host.fb_store import record_risk_event
+            record_risk_event(did, f"content_blocked text_hash={h}",
+                              task_id="send_greeting_fallback")
+            return h
+        except Exception:
+            return ""
+
+    def _apply_messenger_error_policy(self, did: str, code: str,
+                                       greeting: str,
+                                       profile_name: str) -> str:
+        """按 §7.6 分流矩阵应用动作, 返回归因 reason (写入 _set_greet_reason)。"""
+        if code == "risk_detected":
+            # device-level cooldown - on_risk 触发阈值时会自动转到 cooldown phase
+            try:
+                from src.host.fb_account_phase import on_risk
+                on_risk(did)
+            except Exception as e:
+                log.debug("[send_greeting] on_risk 调用失败: %s", e)
+            # 补一条 risk event 供运维看
+            try:
+                from src.host.fb_store import record_risk_event
+                record_risk_event(did, f"messenger_risk peer={profile_name[:16]}",
+                                  task_id="send_greeting_fallback")
+            except Exception:
+                pass
+            return "fallback_risk_detected"
+
+        if code == "xspace_blocked":
+            log.warning("[send_greeting] XSpace 挡路 device=%s peer=%s (不 cooldown, 仅 log)",
+                        did[:8], profile_name[:16])
+            return "fallback_xspace_blocked"
+
+        if code == "recipient_not_found":
+            return "fallback_peer_not_found"
+
+        if code == "search_ui_missing":
+            return "fallback_search_ui_miss"
+
+        if code in ("send_button_missing", "send_blocked_by_content"):
+            h = self._mark_content_blocked(did, greeting)
+            log.info("[send_greeting] content blocked hash=%s peer=%s", h,
+                     profile_name[:16])
+            return (f"fallback_content_blocked:{h}" if h
+                    else "fallback_content_blocked")
+
+        if code == "messenger_unavailable":
+            self._mark_device_messenger_not_ready(did)
+            return "fallback_messenger_unavailable"
+
+        # send_fail 或未知
+        return f"fallback_fail:{code or 'unknown'}"
+
+    def _send_greeting_messenger_fallback(self, *, did: str,
+                                           profile_name: str,
+                                           greeting: str,
+                                           template_id: str,
+                                           persona_key: Optional[str],
+                                           eff_phase: str,
+                                           preset_key: str,
+                                           ai_decision: str) -> bool:
+        """profile 页无 Message 按钮时降级走 Messenger App 路径。
+
+        两件关键事:
+          1) 拿 ``device_section_lock("messenger_active")`` 锁, 避免和 B 机的
+             ``check_message_requests`` 抢输入框 (§7.7)
+          2) 调 ``send_message(raise_on_error=True)`` (PR #1 语义) 细分归因
+             (§7.6); PR #1 未合并时自动降级为 bool 返回
+        """
+        log.info("[send_greeting] profile 无 Message 按钮, 降级 Messenger 路径: %s",
+                 profile_name)
+
+        # §7.7 锁: 阻塞等最多 60s; 拿不到就放弃(让 B 先跑完)
+        from src.host.fb_concurrency import device_section_lock
+
+        def _core() -> bool:
+            fallback_ok = False
+            error_code = ""
+            try:
+                # 优先 raise_on_error=True 拿结构化异常 (B 的 PR #1)
+                try:
+                    fallback_ok = self.send_message(profile_name, greeting,
+                                                      device_id=did,
+                                                      raise_on_error=True)
+                except TypeError:
+                    # PR #1 未合并时 send_message 没有 raise_on_error 参数
+                    fallback_ok = self.send_message(profile_name, greeting,
+                                                      device_id=did)
+            except Exception as e:
+                error_code = (getattr(e, "code", "") or "").strip()
+                if not error_code:
+                    error_code = "send_fail"
+                log.debug("[send_greeting fallback] 异常 code=%s msg=%s",
+                          error_code, str(e)[:120])
+                fallback_ok = False
+
+            if fallback_ok:
+                try:
+                    from src.host.fb_store import record_inbox_message
+                    record_inbox_message(
+                        did, profile_name,
+                        peer_type="friend_request",
+                        message_text=greeting,
+                        direction="outgoing",
+                        ai_decision=ai_decision,
+                        ai_reply_text=greeting,
+                        preset_key=preset_key or "",
+                        template_id=(template_id or "") + "|fallback",
+                    )
+                except Exception:
+                    pass
+                try:
+                    from src.host.fb_store import (record_contact_event,
+                                                    CONTACT_EVT_GREETING_FALLBACK)
+                    record_contact_event(
+                        did, profile_name, CONTACT_EVT_GREETING_FALLBACK,
+                        template_id=template_id or "",
+                        preset_key=preset_key or "",
+                        meta={"persona_key": persona_key or "",
+                              "phase": eff_phase,
+                              "fallback_path": "messenger_app"},
+                    )
+                except Exception:
+                    pass
+                self._set_greet_reason("ok_via_fallback")
+                log.info("[send_greeting] Messenger fallback 成功: %s",
+                         profile_name)
+                return True
+
+            # 失败: 按 §7.6 分流 + 设置 reason
+            if error_code:
+                reason = self._apply_messenger_error_policy(
+                    did, error_code, greeting, profile_name)
+            else:
+                reason = "no_message_button_fallback_miss"
+            self._set_greet_reason(reason)
+            return False
+
+        # fb_concurrency.device_section_lock 的契约:
+        #   * 拿到锁 → yield (无值, 用作 None)
+        #   * 超时 / 拿不到 → raise RuntimeError
+        # 所以只用 try/except 识别"没拿到"即可, 不用 if not got 判断。
+        try:
+            with device_section_lock(did, "messenger_active", timeout=60.0):
+                return _core()
+        except RuntimeError as e:
+            log.info("[send_greeting fallback] 锁等超时(60s), B 可能长时间扫 inbox: %s",
+                     str(e)[:100])
+            self._set_greet_reason("fallback_locked_by_other")
+            return False
+
     def _confirm_message_request_if_any(self, d) -> bool:
         """部分 FB 版本:对非好友首次发消息会弹 "Send Message Request?" 确认框。
 
@@ -1363,49 +1567,11 @@ class FacebookAutomation(BaseAutomation):
             if not self._tap_profile_message_button(d, did):
                 # 可选降级: 走 Messenger App 路径(allow_messenger_fallback=true 时)
                 if bool(sg_cfg.get("allow_messenger_fallback", False)):
-                    log.info("[send_greeting] profile 无 Message 按钮,降级 Messenger 路径: %s",
-                             profile_name)
-                    fallback_ok = False
-                    try:
-                        fallback_ok = self.send_message(profile_name, greeting,
-                                                        device_id=did)
-                    except Exception as e:
-                        log.debug("[send_greeting] Messenger fallback 异常: %s", e)
-                    if fallback_ok:
-                        # 入库标注来源为 fallback,保留统计可区分
-                        try:
-                            from src.host.fb_store import record_inbox_message
-                            record_inbox_message(
-                                did, profile_name,
-                                peer_type="friend_request",
-                                message_text=greeting,
-                                direction="outgoing",
-                                ai_decision=ai_decision,
-                                ai_reply_text=greeting,
-                                preset_key=preset_key or "",
-                                template_id=(template_id or "") + "|fallback",
-                            )
-                        except Exception:
-                            pass
-                        # P3-3: 接触事件(标注为 fallback)
-                        try:
-                            from src.host.fb_store import (record_contact_event,
-                                                            CONTACT_EVT_GREETING_FALLBACK)
-                            record_contact_event(
-                                did, profile_name, CONTACT_EVT_GREETING_FALLBACK,
-                                template_id=template_id or "",
-                                preset_key=preset_key or "",
-                                meta={"persona_key": persona_key or "",
-                                      "phase": eff_phase,
-                                      "fallback_path": "messenger_app"},
-                            )
-                        except Exception:
-                            pass
-                        self._set_greet_reason("ok_via_fallback")
-                        log.info("[send_greeting] Messenger fallback 成功: %s", profile_name)
-                        return True
-                    self._set_greet_reason("no_message_button_fallback_miss")
-                    return False
+                    return self._send_greeting_messenger_fallback(
+                        did=did, profile_name=profile_name, greeting=greeting,
+                        template_id=template_id, persona_key=persona_key,
+                        eff_phase=eff_phase, preset_key=preset_key,
+                        ai_decision=ai_decision)
                 log.info("[send_greeting] 未找到 Message 按钮(profile 可能无此入口): %s",
                          profile_name)
                 self._set_greet_reason("no_message_button")
@@ -3744,7 +3910,8 @@ class FacebookAutomation(BaseAutomation):
                 return True
         return False
 
-    def _extract_search_results(self, d, max_results: int) -> List[Dict[str, str]]:
+    def _extract_search_results(self, d, max_results: int,
+                                query_hint: str = "") -> List[Dict[str, str]]:
         """Extract names from search results (heuristic, uses XML dump).
         
         支持两种 FB 界面：
@@ -3761,6 +3928,16 @@ class FacebookAutomation(BaseAutomation):
             for el in elements:
                 if el.text and len(el.text) > 2 and el.clickable:
                     if el.class_name and "TextView" in el.class_name:
+                        t = el.text.strip()
+                        if t in self._BAD_SEARCH_RESULT_NAMES:
+                            continue
+                        if t in self._SEARCH_FILTER_TAB_TEXTS:
+                            continue
+                        if el.bounds and el.bounds[1] < 280 and len(t) < 36:
+                            continue
+                        if query_hint and not self._search_result_name_plausible(
+                                t, query_hint):
+                            continue
                         results.append({
                             "name": el.text,
                             "username": "",
@@ -3777,6 +3954,9 @@ class FacebookAutomation(BaseAutomation):
                         # content_desc 格式: "人名,地点" 或 "人名"
                         name = cd.split(",")[0].strip() if cd else (el.text or "").strip()
                         if name and len(name) >= 2:
+                            if query_hint and not self._search_result_name_plausible(
+                                    name, query_hint):
+                                continue
                             results.append({
                                 "name": name,
                                 "username": "",
@@ -3794,6 +3974,27 @@ class FacebookAutomation(BaseAutomation):
         "Photos", "Marketplace", "Videos", "Places", "News",
         "全部", "贴文", "用户", "小组", "公共主页", "活动", "影片", "照片",
     })
+    # 易被 TextView 启发式误当成「人名」的列表项 / 功能入口
+    _BAD_SEARCH_RESULT_NAMES = frozenset({
+        "Group chat", "See all", "See more", "Home", "Search", "Marketplace",
+        "Notifications", "Menu", "Settings", "Recent", "Recent searches",
+        "Clear", "Filters", "Meta AI", "New message", "Message",
+    })
+
+    def _search_result_name_plausible(self, name: str, query: str) -> bool:
+        """人名结果应与搜索词有 token 重叠，避免 Group chat 等误报。"""
+        n = (name or "").strip()
+        if len(n) < 2:
+            return False
+        if n in self._BAD_SEARCH_RESULT_NAMES:
+            return False
+        if n in self._SEARCH_FILTER_TAB_TEXTS:
+            return False
+        qtok = [p for p in (query or "").replace("·", " ").split() if len(p) > 1]
+        if not qtok:
+            return True
+        nl = n.lower()
+        return any(t.lower() in nl for t in qtok)
 
     def _first_search_result_element(self, d):
         """返回搜索结果列表里第 1 个可点击的人员卡片元素(用于进入主页)。
