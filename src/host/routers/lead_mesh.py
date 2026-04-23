@@ -373,6 +373,34 @@ def api_retry_dead(dispatch_id: int):
     return {"ok": ok}
 
 
+# ── Phase 8h: Blocklist (运营一键 skip 骚扰保护) ────────────────────
+@router.post("/peers/{canonical_id}/blocklist")
+def api_add_blocklist(canonical_id: str, body: Dict[str, Any] = Body(default={})):
+    """加入 blocklist. body 可传 {reason, note, created_by}."""
+    from src.host.lead_mesh import add_to_blocklist
+    created = add_to_blocklist(
+        canonical_id,
+        reason=str(body.get("reason") or ""),
+        note=str(body.get("note") or ""),
+        created_by=str(body.get("created_by") or "operator"))
+    return {"ok": True, "canonical_id": canonical_id,
+             "created": created, "was_already_blocklisted": not created}
+
+
+@router.delete("/peers/{canonical_id}/blocklist")
+def api_remove_blocklist(canonical_id: str):
+    from src.host.lead_mesh import remove_from_blocklist
+    removed = remove_from_blocklist(canonical_id)
+    return {"ok": True, "canonical_id": canonical_id, "removed": removed}
+
+
+@router.get("/blocklist")
+def api_list_blocklist(limit: int = Query(default=50, ge=1, le=200)):
+    from src.host.lead_mesh import list_blocklist, count_blocklist
+    items = list_blocklist(limit=limit)
+    return {"total": count_blocklist(), "count": len(items), "items": items}
+
+
 # ── Phase 8b: 漏斗报告 (给 Command Center Dashboard 卡片用) ─────────
 @router.get("/funnel")
 def api_funnel_report(days: int = Query(default=7, ge=1, le=90),

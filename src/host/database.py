@@ -597,6 +597,19 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_fb_contact_type ON fb_contact_events(device_id, event_type, at)",
     "CREATE INDEX IF NOT EXISTS idx_fb_contact_template ON fb_contact_events(template_id)",
     "CREATE INDEX IF NOT EXISTS idx_fb_contact_peer_global ON fb_contact_events(peer_name, at)",
+
+    # ── Phase 8h (2026-04-24): Lead Blocklist ──────────────────────────
+    # 跨 device / 跨 agent 的 peer 骚扰保护表. 运营在 Dashboard 一键
+    # 把某个 peer 加黑后, 后续 A 端 add_friend / send_greeting 入口主动
+    # skip + journey 记 peer_blocklisted. 不影响 B 端决策 (B 有自己的冷却).
+    "CREATE TABLE IF NOT EXISTS lead_blocklist ("
+    " canonical_id TEXT PRIMARY KEY,"
+    " reason TEXT NOT NULL DEFAULT '',"  # 用户注解的原因
+    " note TEXT DEFAULT '',"              # 自由备注
+    " created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    " created_by TEXT DEFAULT ''"          # agent_a/operator 等
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_blocklist_created ON lead_blocklist(created_at DESC)",
 ]
 
 

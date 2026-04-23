@@ -1013,6 +1013,33 @@
     document.head.appendChild(s);
   }
 
+  // Phase 8h: 一键加入 blocklist — 从 blocked peer modal 里点"🚫 加黑"触发
+  window.lmAddToBlocklist = async function (cid, reasonHint) {
+    const Shell = _shell();
+    if (!Shell || !cid) return;
+    const note = window.prompt(
+      '加入 blocklist 后, 后续 A 端 add_friend / send_greeting 对该 peer 自动 skip.\n'
+      + '输入可选备注 (原因 / 运营姓名等, 可为空):',
+      reasonHint ? '来自 ' + reasonHint + ' 瓶颈' : '');
+    if (note === null) return;   // 用户 cancel
+    try {
+      await Shell.api.post(
+        '/lead-mesh/peers/' + encodeURIComponent(cid) + '/blocklist',
+        { reason: reasonHint || '', note: note, created_by: 'dashboard' });
+      if (typeof showToast === 'function') {
+        showToast('✓ 已加入 blocklist · ' + cid.substring(0, 8) + '…', 'success');
+      }
+      // 刷新当前 blocked peers modal (让列表视觉上反映变化, 虽然 peer 仍在 journey)
+      if (reasonHint) {
+        lmOpenBlockedPeers(reasonHint);
+      }
+    } catch (e) {
+      if (typeof showToast === 'function') {
+        showToast('加黑失败: ' + (e.message || e), 'error');
+      }
+    }
+  };
+
   // Phase 8d: 点击漏斗瓶颈看具体被挡 peer 列表
   window.lmOpenBlockedPeers = async function (reason) {
     const Shell = _shell();
@@ -1053,11 +1080,18 @@
               + '      被挡次数: <b style="color:#f59e0b">' + p.n_blocked + '</b>'
               + '    </div>'
               + '  </div>'
-              + '  <button onclick="PlatShell.modal.close(\'lm-blocked-peers-modal\');'
-              + '                   lmOpenLeadDossier(\'' + _safe(cid) + '\')" '
-              + '          style="padding:4px 10px;background:rgba(96,165,250,.12);color:#60a5fa;'
-              + '                 border:1px solid rgba(96,165,250,.3);border-radius:4px;'
-              + '                 font-size:11px;cursor:pointer">📖 dossier</button>'
+              + '  <div style="display:flex;gap:4px">'
+              + '    <button onclick="PlatShell.modal.close(\'lm-blocked-peers-modal\');'
+              + '                     lmOpenLeadDossier(\'' + _safe(cid) + '\')" '
+              + '            style="padding:4px 10px;background:rgba(96,165,250,.12);color:#60a5fa;'
+              + '                   border:1px solid rgba(96,165,250,.3);border-radius:4px;'
+              + '                   font-size:11px;cursor:pointer">📖 dossier</button>'
+              + '    <button onclick="lmAddToBlocklist(\'' + _safe(cid) + '\', \'' + _safe(reason) + '\')" '
+              + '            title="加入 blocklist, 后续 A 端 add_friend/greeting 自动 skip"'
+              + '            style="padding:4px 10px;background:rgba(239,68,68,.12);color:#ef4444;'
+              + '                   border:1px solid rgba(239,68,68,.3);border-radius:4px;'
+              + '                   font-size:11px;cursor:pointer">🚫 加黑</button>'
+              + '  </div>'
               + '</div>';
           }).join('');
       document.getElementById('lm-bp-body').innerHTML = ''

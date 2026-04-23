@@ -1383,6 +1383,12 @@ class FacebookAutomation(BaseAutomation):
         did = self._did(device_id)
         d = self._u2(did)
 
+        # Phase 8h (2026-04-24): blocklist 前置检查 — 运营一键加黑的 peer 直接 skip,
+        # 防止反复骚扰. 命中时内部已写 journey event `greeting_blocked{reason=peer_blocklisted}`.
+        if self._check_peer_blocklist(profile_name, did=did, persona_key=persona_key):
+            log.info("[add_friend_with_note] peer=%s 在 blocklist, skip", profile_name)
+            return False
+
         # P0-2: phase + playbook 参数解析
         eff_phase, ab_cfg = _resolve_phase_and_cfg("add_friend",
                                                    device_id=did,
@@ -2168,6 +2174,48 @@ class FacebookAutomation(BaseAutomation):
                 log.debug("[journey] greeting reason 同步失败: %s", e)
 
     # ─── Phase 6.A: Lead Mesh 接入 helpers ─────────────────────────────
+    def _check_peer_blocklist(self, peer_name: str, *,
+                                did: str = "",
+                                persona_key: Optional[str] = None) -> bool:
+        """Phase 8h 前置检查 — peer 在 blocklist 时返回 True (表示应 skip).
+
+        resolve cid + 查 is_blocklisted. 失败 (lead_mesh 不可用等) 保守返回 False
+        (放行, 不 block 主流程).
+
+        命中时主动写一条 ``greeting_blocked{reason=peer_blocklisted}`` journey
+        事件, 让 funnel_report 能看到被 blocklist 挡的量.
+        """
+        try:
+            cid = self._resolve_peer_canonical_safe(
+                peer_name, did=did, persona_key=persona_key,
+                discovered_via="blocklist_check")
+            if not cid:
+                return False
+            from src.host.lead_mesh import is_blocklisted, get_blocklist_entry
+            if not is_blocklisted(cid):
+                return False
+            # 命中 — 记 journey 让 dashboard funnel 可观测
+            entry = get_blocklist_entry(cid) or {}
+            try:
+                from src.host.lead_mesh import append_journey
+                append_journey(
+                    cid, actor="agent_a", actor_device=did or "",
+                    platform="facebook",
+                    action="greeting_blocked",
+                    data={
+                        "reason": "peer_blocklisted",
+                        "blocklist_reason": entry.get("reason") or "",
+                        "blocklisted_at": entry.get("created_at") or "",
+                    })
+            except Exception:
+                pass
+            log.info("[blocklist] peer=%s cid=%s 在 blocklist, skip (reason=%s)",
+                      peer_name, cid, entry.get("reason") or "")
+            return True
+        except Exception as e:
+            log.debug("[blocklist] 检查异常(保守放行): %s", e)
+            return False
+
     def _resolve_peer_canonical_safe(self, peer_name: str, *,
                                       did: str = "",
                                       persona_key: Optional[str] = None,
@@ -2267,6 +2315,17 @@ class FacebookAutomation(BaseAutomation):
 
         # 默认把归因置空,走到 return True 时再设 "ok"
         self._set_greet_reason("")
+
+        # Phase 8h (2026-04-24): blocklist 前置检查 —
+        # 运营手工加黑的 peer 直接 skip greeting, set_greet_reason 同步写 journey
+        # 让 funnel_report 能统计到 peer_blocklisted reason.
+        if (self._current_lead_cid
+                and __import__("src.host.lead_mesh", fromlist=["is_blocklisted"])
+                    .is_blocklisted(self._current_lead_cid)):
+            log.info("[send_greeting] peer cid=%s 在 blocklist, skip",
+                      self._current_lead_cid)
+            self._set_greet_reason("peer_blocklisted")
+            return False
 
         # Phase 6 P0: 前置检查 — B 机若已对该 peer 在 7 天内发起过 handoff（LINE/WA/TG…）,
         # A 就不再 greeting 插话, 避免双方同时打扰。honor_rejected=True 表示

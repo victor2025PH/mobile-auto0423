@@ -41,6 +41,10 @@ from .receivers import (  # noqa
     pick_receiver, receiver_load, all_loads as list_receiver_loads,
     count_today_handoffs, upsert_receiver, delete_receiver,
 )
+from .blocklist import (  # noqa
+    add_to_blocklist, remove_from_blocklist, is_blocklisted,
+    get_blocklist_entry, list_blocklist, count_blocklist,
+)
 
 __all__ = [
     "resolve_identity", "auto_merge_candidates",
