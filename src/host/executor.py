@@ -717,26 +717,30 @@ def _execute_facebook(manager, resolved, task_type, params):
                                              safe_mode=safe_mode,
                                              device_id=resolved,
                                              persona_key=_persona_key or None,
-                                             phase=_phase_override or None)
+                                             phase=_phase_override or None,
+                                             source=params.get("source", "") or params.get("group_name", ""),
+                                             preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")))
             else:
                 ok = fb.add_friend(target, device_id=resolved)
 
-            # Sprint 2 P0: 写入 facebook_friend_requests 表(用于漏斗 + 状态追踪)
-            # Sprint 3 P0: 透传 preset_key,支持按预设切片
-            try:
-                from src.host.fb_store import record_friend_request
-                source = params.get("source", "") or params.get("group_name", "")
-                preset_key = (params.get("_preset_key", "") or
-                              params.get("preset_key", ""))
-                record_friend_request(
-                    resolved, target,
-                    note=note,
-                    source=source,
-                    status="sent" if ok else "risk",
-                    preset_key=preset_key,
-                )
-            except Exception:
-                pass
+            # 2026-04-23 P3-1: add_friend_with_note 内部已在锁内 record,
+            # executor 层不再重复写入。仅失败时补一条 risk 记录供分析,
+            # 因为 automation 失败路径不会 record(它只在 UI 成功时写 sent)。
+            if not ok:
+                try:
+                    from src.host.fb_store import record_friend_request
+                    source = params.get("source", "") or params.get("group_name", "")
+                    preset_key = (params.get("_preset_key", "") or
+                                  params.get("preset_key", ""))
+                    record_friend_request(
+                        resolved, target,
+                        note=note,
+                        source=source,
+                        status="risk",
+                        preset_key=preset_key,
+                    )
+                except Exception:
+                    pass
             return ok, ("" if ok else "添加好友失败"), None
 
         # 2026-04-23: 搜索 → 加好友 → 打招呼(一体化,方案 A2)
@@ -757,6 +761,8 @@ def _execute_facebook(manager, resolved, task_type, params):
                            or params.get("preset_key", ""))
             if not hasattr(fb, "add_friend_and_greet"):
                 return False, "facebook.add_friend_and_greet 尚未实现", None
+            # 把 source / preset_key 下推,automation 层锁内 record 时用
+            _src_val = params.get("source", "") or params.get("group_name", "")
             res = fb.add_friend_and_greet(
                 target,
                 note=note,
@@ -765,21 +771,23 @@ def _execute_facebook(manager, resolved, task_type, params):
                 persona_key=_persona_key or None,
                 phase=_phase_override or None,
                 preset_key=_preset_key,
+                source=_src_val,
                 greet_on_failure=bool(params.get("greet_on_failure", False)),
             ) or {}
-            # add_friend 结果入库（与 facebook_add_friend 路径一致）
-            try:
-                from src.host.fb_store import record_friend_request
-                source = params.get("source", "") or params.get("group_name", "")
-                record_friend_request(
-                    resolved, target,
-                    note=note,
-                    source=source,
-                    status="sent" if res.get("add_friend_ok") else "risk",
-                    preset_key=_preset_key,
-                )
-            except Exception:
-                pass
+            # 2026-04-23 P3-1: automation 层已在锁内 record(ok 时 sent;
+            # 不 ok 时不写)。这里仅补 risk 标记, 便于失败漏斗分析。
+            if not res.get("add_friend_ok"):
+                try:
+                    from src.host.fb_store import record_friend_request
+                    record_friend_request(
+                        resolved, target,
+                        note=note,
+                        source=_src_val,
+                        status="risk",
+                        preset_key=_preset_key,
+                    )
+                except Exception:
+                    pass
             ok = bool(res.get("add_friend_ok"))
             return ok, ("" if ok else "加好友+打招呼失败"), res
 
@@ -1132,6 +1140,14 @@ def _run_facebook_campaign(fb, resolved, params):
                     if not name:
                         continue
                     if greet_inline and hasattr(fb, "add_friend_and_greet"):
+                        # campaign: 把 source 下推到 automation 层 record(锁内)
+                        _camp_src = params.get("source", "") or ""
+                        if not _camp_src:
+                            _tg = params.get("target_groups")
+                            if isinstance(_tg, list) and _tg:
+                                _camp_src = str(_tg[0])
+                            elif isinstance(params.get("group_name"), str):
+                                _camp_src = params.get("group_name") or ""
                         res = fb.add_friend_and_greet(
                             name,
                             note=note,
@@ -1140,6 +1156,7 @@ def _run_facebook_campaign(fb, resolved, params):
                             persona_key=_pk,
                             phase=_ph,
                             preset_key=_pr,
+                            source=_camp_src,
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
                         if ok:
@@ -1153,37 +1170,48 @@ def _run_facebook_campaign(fb, resolved, params):
                             "greet_skipped_reason": res.get("greet_skipped_reason", ""),
                         })
                     elif hasattr(fb, "add_friend_with_note"):
+                        # campaign 场景: source 从 target_groups/group_name 推断
+                        _camp_src = params.get("source", "") or ""
+                        if not _camp_src:
+                            _tg = params.get("target_groups")
+                            if isinstance(_tg, list) and _tg:
+                                _camp_src = str(_tg[0])
+                            elif isinstance(params.get("group_name"), str):
+                                _camp_src = params.get("group_name") or ""
                         ok = fb.add_friend_with_note(name, note=note,
                                                      safe_mode=True,
                                                      device_id=resolved,
                                                      persona_key=_pk,
-                                                     phase=_ph)
+                                                     phase=_ph,
+                                                     source=_camp_src,
+                                                     preset_key=_pr)
                         if ok:
                             sent += 1
                     else:
                         ok = fb.add_friend(name, device_id=resolved)
                         if ok:
                             sent += 1
-                    # 入库 facebook_friend_requests（campaign 层一直依赖 executor.single
-                    # 调用路径 record，这里是 campaign 批量路径，也要入库以驱动 daily_cap）
-                    try:
-                        from src.host.fb_store import record_friend_request
-                        _src = params.get("source", "") or ""
-                        if not _src:
-                            _tg = params.get("target_groups")
-                            if isinstance(_tg, list) and _tg:
-                                _src = str(_tg[0])
-                            elif isinstance(params.get("group_name"), str):
-                                _src = params.get("group_name") or ""
-                        record_friend_request(
-                            resolved, name,
-                            note=note,
-                            source=_src,
-                            status="sent" if ok else "risk",
-                            preset_key=_pr,
-                        )
-                    except Exception:
-                        pass
+                    # 2026-04-23 P3-1: automation 层(add_friend_with_note / add_friend_and_greet)
+                    # 在锁内已 record sent 状态; 这里仅为失败补 risk。
+                    if not ok:
+                        try:
+                            from src.host.fb_store import record_friend_request
+                            _src = params.get("source", "") or ""
+                            if not _src:
+                                _tg = params.get("target_groups")
+                                if isinstance(_tg, list) and _tg:
+                                    _src = str(_tg[0])
+                                elif isinstance(params.get("group_name"), str):
+                                    _src = params.get("group_name") or ""
+                            record_friend_request(
+                                resolved, name,
+                                note=note,
+                                source=_src,
+                                status="risk",
+                                preset_key=_pr,
+                            )
+                        except Exception:
+                            pass
                     time.sleep(_r.uniform(60, 180))
                 result["friend_requests_sent"] += sent
                 if greet_inline:

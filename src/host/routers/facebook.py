@@ -807,6 +807,13 @@ def fb_funnel(device_id: Optional[str] = None,
                 "request_to_inbox": m["rate_request_to_inbox"],
                 "inbox_to_referral": m["rate_inbox_to_referral"],
             },
+            # P3-4 2026-04-23: 把 greeting 维度透传到响应根字段,前端 widget 直接读
+            "stage_friend_request_sent": m.get("stage_friend_request_sent", 0),
+            "stage_friend_accepted": m.get("stage_friend_accepted", 0),
+            "stage_greetings_sent": m.get("stage_greetings_sent", 0),
+            "stage_greetings_fallback": m.get("stage_greetings_fallback", 0),
+            "rate_greet_after_add": m.get("rate_greet_after_add", 0.0),
+            "greeting_template_distribution": m.get("greeting_template_distribution", []),
             "_platform": "facebook",
             "_scope_device": m["scope_device"],
             "_scope_since": m["scope_since"],
@@ -815,6 +822,77 @@ def fb_funnel(device_id: Optional[str] = None,
     except Exception as e:
         logger.exception("fb_funnel failed")
         raise HTTPException(500, f"漏斗数据查询失败: {e}")
+
+
+@router.get("/contact-events")
+def fb_contact_events(device_id: Optional[str] = None,
+                      peer_name: Optional[str] = None,
+                      hours: int = 168,
+                      event_type: Optional[str] = None,
+                      limit: int = 100):
+    """P3-3: 统一接触事件流水查询。
+
+    三个使用场景:
+      1. 查某人全部接触历史: ?device_id=X&peer_name=Y
+      2. 查某类型事件近期总数: ?event_type=greeting_sent&hours=24
+      3. 查 greeting 模板 A/B 回复率: 用 /facebook/greeting-reply-rate
+
+    事件 schema 见 src/host/fb_store.py::VALID_CONTACT_EVENT_TYPES。
+    """
+    try:
+        from src.host.fb_store import (list_contact_events_by_peer,
+                                        count_contact_events)
+
+        out: Dict[str, Any] = {
+            "_platform": "facebook",
+            "_scope_device": device_id or "all",
+            "_scope_hours": hours,
+        }
+
+        if device_id and peer_name:
+            # 场景 1: 查单人完整接触流水
+            out["events"] = list_contact_events_by_peer(
+                device_id=device_id, peer_name=peer_name, limit=limit)
+            out["count"] = len(out["events"])
+        else:
+            # 场景 2: 仅统计计数
+            out["count"] = count_contact_events(
+                device_id=device_id,
+                peer_name=peer_name,
+                event_type=event_type,
+                hours=hours,
+            )
+            out["event_type_filter"] = event_type or "all"
+        return out
+    except Exception as e:
+        logger.exception("fb_contact_events failed")
+        raise HTTPException(500, f"接触事件查询失败: {e}")
+
+
+@router.get("/greeting-reply-rate")
+def fb_greeting_reply_rate(device_id: Optional[str] = None,
+                           hours: int = 168):
+    """P3-3: 按 template_id 分组返回 greeting 回复率, 供 A/B 实验决策。
+
+    依赖机器 B 的 Messenger 自动回复回写 ``greeting_replied`` 事件;
+    在 B 未上线前此端点返回的 ``replied=0 / reply_rate=0``, 但 ``sent`` 数仍可信。
+    """
+    try:
+        from src.host.fb_store import get_greeting_reply_rate_by_template
+        rows = get_greeting_reply_rate_by_template(
+            device_id=device_id, hours=hours)
+        return {
+            "_platform": "facebook",
+            "_scope_device": device_id or "all",
+            "_scope_hours": hours,
+            "templates": rows,
+            "total_templates": len(rows),
+            "total_sent": sum(r["sent"] for r in rows),
+            "total_replied": sum(r["replied"] for r in rows),
+        }
+    except Exception as e:
+        logger.exception("fb_greeting_reply_rate failed")
+        raise HTTPException(500, f"回复率查询失败: {e}")
 
 
 @router.get("/qualified-leads")

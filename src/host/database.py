@@ -427,6 +427,36 @@ _MIGRATIONS = [
     "ALTER TABLE facebook_inbox_messages ADD COLUMN template_id TEXT DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS idx_fb_inbox_sent_at ON facebook_inbox_messages(device_id, direction, sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_fb_inbox_template ON facebook_inbox_messages(template_id)",
+
+    # ─── 2026-04-23 Phase 3 P3-3: 统一接触事件流水表 ──────────────────────
+    # 动机:
+    #   * facebook_friend_requests + facebook_inbox_messages 按"对象"组织,
+    #     但漏斗分析需要按"事件序列"看(某人什么时候被加友/打招呼/回复/拒绝)。
+    #   * B 做 Messenger 自动回复时, 需要回写"对方回复了 greeting"这一事件,
+    #     把它放一张独立流水表最干净 —— 不污染 inbox 的 incoming 原始数据。
+    #   * 后续 "接触配额" 建模(同一人 24h 被接触 N 次就算骚扰)直接查这张表。
+    #
+    # event_type 枚举:
+    #   add_friend_sent / add_friend_risk / add_friend_accepted / add_friend_rejected
+    #   greeting_sent / greeting_fallback / greeting_replied
+    #   message_received (B 写入, 对方主动发起的消息)
+    #   wa_referral_sent (B 写入, 引流话术发出)
+    #
+    # 由 A 和 B 共同写入; meta_json 放各自的扩展字段(JSON 字符串, 不强约束 schema)。
+    """CREATE TABLE IF NOT EXISTS fb_contact_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        peer_name TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        template_id TEXT DEFAULT '',
+        preset_key TEXT DEFAULT '',
+        meta_json TEXT DEFAULT '',
+        at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_fb_contact_peer ON fb_contact_events(device_id, peer_name, at)",
+    "CREATE INDEX IF NOT EXISTS idx_fb_contact_type ON fb_contact_events(device_id, event_type, at)",
+    "CREATE INDEX IF NOT EXISTS idx_fb_contact_template ON fb_contact_events(template_id)",
+    "CREATE INDEX IF NOT EXISTS idx_fb_contact_peer_global ON fb_contact_events(peer_name, at)",
 ]
 
 

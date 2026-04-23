@@ -844,7 +844,9 @@ class FacebookAutomation(BaseAutomation):
                              safe_mode: bool = True,
                              device_id: Optional[str] = None,
                              persona_key: Optional[str] = None,
-                             phase: Optional[str] = None) -> bool:
+                             phase: Optional[str] = None,
+                             source: str = "",
+                             preset_key: str = "") -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -879,8 +881,24 @@ class FacebookAutomation(BaseAutomation):
                      eff_phase, profile_name)
             return False
 
+        # P3-1 2026-04-23: 整段"cap 检查 → 发起请求 → 写库"用 device+section 锁串行化,
+        # 消除多 worker 同时过 gate 造成的竞态超 cap。锁粒度 = 单 device 单 section,
+        # 同 device 的 add_friend 串行, 跨 device / 跨 section(add_friend vs send_greeting)
+        # 完全独立。
+        from src.host.fb_concurrency import device_section_lock
+        with device_section_lock(did, "add_friend", timeout=180.0):
+            return self._add_friend_with_note_locked(
+                profile_name, note, safe_mode, did, d,
+                ab_cfg, daily_cap=int(ab_cfg.get("daily_cap_per_account") or 0),
+                persona_key=persona_key, eff_phase=eff_phase,
+                source=source, preset_key=preset_key)
+
+    def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
+                                     did, d, ab_cfg, daily_cap,
+                                     persona_key, eff_phase,
+                                     source: str = "", preset_key: str = ""):
+        """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
-        daily_cap = int(ab_cfg.get("daily_cap_per_account") or 0)
         if daily_cap > 0:
             try:
                 from src.host.fb_store import count_friend_requests_sent_since
@@ -966,7 +984,54 @@ class FacebookAutomation(BaseAutomation):
 
             log.info("[add_friend_with_note] 好友请求已发送: %s (note=%s)",
                      profile_name, bool(note))
+
+            # P3-1 2026-04-23: 入库移到锁内,消除 record 和下一 worker check cap 之间
+            # 的竞态窗口。调用方(executor) 不再重复 record(仅在 UI 失败时补 risk)。
+            self._record_friend_request_safely(
+                did, profile_name, note=note,
+                persona_key=persona_key,
+                source=source, preset_key=preset_key,
+                status="sent")
             return True
+
+    def _record_friend_request_safely(self, device_id: str, target_name: str,
+                                      *, note: str = "",
+                                      persona_key: Optional[str] = None,
+                                      source: Optional[str] = None,
+                                      preset_key: Optional[str] = None,
+                                      status: str = "sent") -> None:
+        """把 record_friend_request 的调用收敛在 automation 层, 便于锁内一次性完成。
+
+        调用方仍然可以用 record_friend_request 自己写(如需要 lead_id 关联等高级场景),
+        但默认路径由本方法负责, 保证 UI 发送 → 入库原子化。
+
+        P3-3: 同步写一条 fb_contact_events 流水, 供 A/B 和骚扰配额分析。
+        """
+        try:
+            from src.host.fb_store import record_friend_request
+            record_friend_request(
+                device_id, target_name,
+                note=note or "",
+                source=source or "",
+                status=status,
+                preset_key=preset_key or "",
+            )
+        except Exception as e:
+            log.debug("[add_friend] 入库失败(不影响 UI 成功): %s", e)
+        # P3-3: 接触事件流水
+        try:
+            from src.host.fb_store import (record_contact_event,
+                                            CONTACT_EVT_ADD_FRIEND_SENT,
+                                            CONTACT_EVT_ADD_FRIEND_RISK)
+            evt = (CONTACT_EVT_ADD_FRIEND_SENT if status == "sent"
+                   else CONTACT_EVT_ADD_FRIEND_RISK)
+            record_contact_event(
+                device_id, target_name, evt,
+                preset_key=preset_key or "",
+                meta={"source": source or "", "has_note": bool(note)},
+            )
+        except Exception:
+            pass
 
     # ─── 2026-04-23: 加好友后打招呼（方案 A2 — 在 profile 页点 Message）──
     # 设计决策（vs 原方案 A1 "切到 Messenger App 搜名字"）:
@@ -1121,6 +1186,22 @@ class FacebookAutomation(BaseAutomation):
             self._set_greet_reason("phase_blocked")
             return False
 
+        # P3-1 2026-04-23: 和 add_friend 同思路, 把 cap 检查 → UI 操作 → 入库
+        # 整段用 device+section 锁串行化。section="send_greeting",
+        # 与 "add_friend" 锁独立, add_friend_and_greet 场景两把锁先后持有不冲突。
+        from src.host.fb_concurrency import device_section_lock
+        with device_section_lock(did, "send_greeting", timeout=180.0):
+            return self._send_greeting_after_add_friend_locked(
+                profile_name, greeting, did, d,
+                sg_cfg, eff_phase, persona_key,
+                assume_on_profile, preset_key, ai_decision, _r)
+
+    def _send_greeting_after_add_friend_locked(
+            self, profile_name, greeting, did, d,
+            sg_cfg, eff_phase, persona_key,
+            assume_on_profile, preset_key, ai_decision, _r):
+        """锁内主体 — 保证 cap 检查 + UI 发送 + 入库原子化。"""
+
         # 概率闸：支持 A/B 抽样（默认 1.0 必发）
         enabled_p = float(sg_cfg.get("enabled_probability", 1.0) or 0.0)
         if enabled_p <= 0.0 or (enabled_p < 1.0 and _r.random() > enabled_p):
@@ -1229,6 +1310,20 @@ class FacebookAutomation(BaseAutomation):
                             )
                         except Exception:
                             pass
+                        # P3-3: 接触事件(标注为 fallback)
+                        try:
+                            from src.host.fb_store import (record_contact_event,
+                                                            CONTACT_EVT_GREETING_FALLBACK)
+                            record_contact_event(
+                                did, profile_name, CONTACT_EVT_GREETING_FALLBACK,
+                                template_id=template_id or "",
+                                preset_key=preset_key or "",
+                                meta={"persona_key": persona_key or "",
+                                      "phase": eff_phase,
+                                      "fallback_path": "messenger_app"},
+                            )
+                        except Exception:
+                            pass
                         self._set_greet_reason("ok_via_fallback")
                         log.info("[send_greeting] Messenger fallback 成功: %s", profile_name)
                         return True
@@ -1305,6 +1400,19 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception as e:
             log.debug("[send_greeting] 入库失败(不影响主流程): %s", e)
+        # P3-3: 接触事件流水(greeting_sent / greeting_fallback)
+        try:
+            from src.host.fb_store import (record_contact_event,
+                                            CONTACT_EVT_GREETING_SENT)
+            record_contact_event(
+                did, profile_name, CONTACT_EVT_GREETING_SENT,
+                template_id=template_id or "",
+                preset_key=preset_key or "",
+                meta={"persona_key": persona_key or "", "phase": eff_phase,
+                      "msg_len": len(greeting or "")},
+            )
+        except Exception:
+            pass
 
         log.info("[send_greeting] 已向 %s 发送打招呼(len=%d, persona=%s, phase=%s)",
                  profile_name, len(greeting), persona_key or "(default)", eff_phase)
@@ -1327,6 +1435,7 @@ class FacebookAutomation(BaseAutomation):
                              persona_key: Optional[str] = None,
                              phase: Optional[str] = None,
                              preset_key: str = "",
+                             source: str = "",
                              greet_on_failure: bool = False) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
@@ -1366,6 +1475,8 @@ class FacebookAutomation(BaseAutomation):
             device_id=device_id,
             persona_key=persona_key,
             phase=phase,
+            source=source,
+            preset_key=preset_key,
         )
         out["add_friend_ok"] = bool(add_ok)
 

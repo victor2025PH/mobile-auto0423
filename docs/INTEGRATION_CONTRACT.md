@@ -193,15 +193,87 @@ git push -u origin feat-a-optimize-gate
 # GitHub 网页上开 PR → review → merge
 ```
 
-## 七、遗留问题 / 待协商
+## 七、Phase 3 新增接口（A 已实施，待 B 对接）
+
+### 7.1 统一接触事件表 `fb_contact_events`
+
+**双方协同的核心表**。A 已在 schema 迁移里建好,自动写入 `add_friend_*` / `greeting_*` 事件。
+
+**B 需要做的回写**:
+
+| 场景 | 写入 event_type | 用 template_id | meta_json |
+|------|----------------|---------------|-----------|
+| 对方接受好友请求 | `add_friend_accepted` | 留空或传原值 | `{"accepted_at": iso}` |
+| 对方拒绝 | `add_friend_rejected` | 留空 | `{"rejected_at": iso}` |
+| **对方回复了我们的 greeting** | `greeting_replied` | **必须传原 greeting outgoing 行的 template_id** | `{"reply_ms_after": int, "reply_text": str[:50]}` |
+| 对方主动发 DM | `message_received` | 留空 | `{"decision": "reply"\|"wa_referral"\|"skip"}` |
+| 引流话术发出 | `wa_referral_sent` | 可选 | `{"channel": "line"\|"whatsapp"\|...}` |
+
+**最关键的是 `greeting_replied`** —— 它让 A 的 `/facebook/greeting-reply-rate` 能按模板算真实 A/B
+回复率,否则 reply_rate 永远是 0。
+
+B 的实现建议(在 `check_messenger_inbox` / `_ai_reply_and_send` 内):
+```python
+# 检测到对方回复后,查该 peer 最近 7 天的 greeting outgoing 行
+from src.host.fb_store import record_contact_event, CONTACT_EVT_GREETING_REPLIED
+from src.host.database import _connect
+with _connect() as conn:
+    row = conn.execute(
+        "SELECT template_id, sent_at FROM facebook_inbox_messages"
+        " WHERE device_id=? AND peer_name=? AND direction='outgoing'"
+        " AND ai_decision='greeting' AND sent_at > datetime('now', '-7 days')"
+        " ORDER BY sent_at DESC LIMIT 1",
+        (device_id, peer_name)).fetchone()
+if row:
+    tpl_id, sent_at = row
+    # 回写事件
+    record_contact_event(
+        device_id, peer_name, CONTACT_EVT_GREETING_REPLIED,
+        template_id=(tpl_id or "").split("|")[0],  # 去掉 |fallback 后缀
+        meta={"reply_to_sent_at": sent_at, "reply_text": msg[:50]})
+```
+
+### 7.2 Gate 注册表
+
+B 不再需要改 `routers/tasks.py` 加 gate 的 if-elif。
+在自己的 gate 模块末尾调 `register_task_gate()` 即可:
+
+```python
+# src/host/your_gate_module.py (B 新建)
+def check_my_task_gate(device_id, params): ...
+
+# 模块末尾自动注册:
+from src.host.gate_registry import register_task_gate, register_campaign_step_gate
+register_task_gate("facebook_check_inbox", check_my_task_gate)
+register_campaign_step_gate("check_inbox", check_my_task_gate)
+```
+
+### 7.3 并发 Lock（B 写入事件表也建议用）
+
+`fb_contact_events` 表的 INSERT 是原子的不需要锁。
+但 B 如果要做"同 peer 24h 内只接触 N 次"的配额 gate(需要 read + write 两步), 应该用:
+
+```python
+from src.host.fb_concurrency import device_section_lock
+
+with device_section_lock(device_id, "check_inbox", timeout=120.0):
+    # 查 count + 决定是否跳过 + 写入事件
+    ...
+```
+
+section name 自选,但不要用 A 已占用的 `add_friend` / `send_greeting`。
+
+## 八、遗留问题 / 待协商
 
 > 双方遇到不确定归属的事情先写在这里，不要直接动代码。
 
-- [ ] ~~greeting 的 reply_rate 计算：B 在什么时机把对方回复写回 greeting 行？每次 check_inbox 扫一次匹配 `peer_type=friend_request + sent_at 在 7 天内` → 若有新 incoming → 把 greeting 行的 replied_at 设上~~（2026-04-23 A 提议方案，待 B 确认）
-- [ ] `fb_contact_events` 表：要不要新建统一事件表记 `(add_friend, greeting, reply_received)` 三元组，修正 daily_cap 模型？
-- [ ] 共享的 `ai_cost_events` 表，B 跑 LLM 回复也要写入，格式对齐
-- [ ] `facebook_check_inbox` 如果回复的是 greeting 触发的消息，要不要在回复里附上用户的引流 ID？由 B 实现
+- [ ] 接触配额: 同一 peer 24h 内被接触总次数(add+greet+referral 合计)超阈值时, A 和 B 都应该主动跳过 —— 具体阈值由谁定?(建议 3 次)
+- [ ] `ai_cost_events` 表对齐: B 跑 LLM 回复的成本统计格式请和现有 TikTok / A 的 LLM 调用一致
+- [ ] Phase-aware 的"过度接触"冷却: 单一 peer 被接触 3+ 次后进入私人 cooldown, 是否要落到 playbook?
+- [ ] B 完成 Messenger 自动回复后, 真机 smoke 测试由谁跑? 建议 victor2025PH 协调(两台电脑各一个设备)
 
-## 八、历史变更
+## 九、历史变更
 
 - 2026-04-23 首版 — 由 A 起草（v1.1.0 + Phase 1/2 实施完成后）
+- 2026-04-23 Phase 3 更新 — A 追加: fb_contact_events / gate_registry / device_section_lock /
+  /facebook/contact-events / /facebook/greeting-reply-rate / Funnel greeting widget

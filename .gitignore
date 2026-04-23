@@ -65,3 +65,12 @@ mobile-auto-project/
 # 如果要把当前版本入库，删除下面两行即可
 # avcodec-*.dll
 # avformat-*.dll
+
+# 备份文件
+*.bak
+*.orig
+
+# 运行时生成的 JSON 状态（每次启动都会被覆盖，不应入库）
+config/analytics_history.json
+config/routers.json
+.restart-required
