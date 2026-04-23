@@ -1848,25 +1848,231 @@ class FacebookAutomation(BaseAutomation):
 
     # ── Group Operations (Sprint 1 新增 — Facebook 引流核心入口) ──────────
 
-    @_with_fb_foreground
+    # ─── 2026-04-23 P3-bug: 修复 browse_groups 误点发图界面 ──────────────
+    # 根因: data/selectors/com_facebook_katana.yaml 里自学习污染:
+    #   "Groups tab" → "Home, tab 1 of 6"  (首页)
+    #   "Your groups" → "What's on your mind?"  (发帖输入框,点了会进发图界面)
+    # 两个 selector 都已错误命中 15 次。
+    #
+    # 新策略: 不再信任 smart_tap 对这两个 key 的自学习,用硬编码 u2 selector
+    # 精确匹配底部导航的 tab description 规律 "Groups, tab N of M"。
+
+    # 底部导航 Groups tab 常见 description (FB Android 按账号 tab 数区分:
+    # 3 栏版本(无 Marketplace / Watch)=3/5 或 4/5; 完整版=4/6 或 5/6)
+    _FB_GROUPS_TAB_DESCRIPTIONS = (
+        "Groups, tab 4 of 6", "Groups, tab 5 of 6",
+        "Groups, tab 3 of 5", "Groups, tab 4 of 5",
+        "Groups, tab 3 of 6",
+        # 中文版也可能就叫"群组" —— FB Android 国际版通常是英文 description
+        # 但 MIUI/Android system 本地化后可能会有变种
+    )
+
+    # "你的群组" / "Your groups" 的精确 selectors (Groups 主页上方入口)
+    _FB_YOUR_GROUPS_TEXTS = (
+        "Your groups", "Your Groups", "YOUR GROUPS",
+        "我加入的群组", "我的群组", "加入的群组",
+        "マイグループ", "参加しているグループ", "所属グループ",
+    )
+
+    def _tap_groups_bottom_tab(self, d, did: str) -> bool:
+        """精确点击底部导航的 Groups tab, 避免命中 Home / 发帖按钮。
+
+        策略三层:
+          1. 枚举已知的 description 精确值
+          2. 正则 descriptionMatches "Groups, tab \\d+ of \\d+"
+          3. resourceId 兜底 (某些版本用 id 而非 description)
+        """
+        import re as _re
+        # 1) 精确 description
+        for desc in self._FB_GROUPS_TAB_DESCRIPTIONS:
+            try:
+                el = d(description=desc)
+                if el.exists(timeout=0.8):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[browse_groups] tap Groups bottom tab by desc='%s'", desc)
+                    return True
+            except Exception:
+                continue
+        # 2) 正则匹配 "Groups, tab N of M"
+        try:
+            el = d(descriptionMatches=r"Groups, tab \d+ of \d+")
+            if el.exists(timeout=0.8):
+                self.hb.tap(d, *self._el_center(el))
+                time.sleep(0.4)
+                log.info("[browse_groups] tap Groups bottom tab by regex")
+                return True
+        except Exception:
+            pass
+        # 3) resourceId 兜底(少数版本)
+        for rid in ("com.facebook.katana:id/tab_groups",
+                    "com.facebook.katana:id/bottom_bar_groups"):
+            try:
+                el = d(resourceId=rid)
+                if el.exists(timeout=0.5):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[browse_groups] tap Groups bottom tab by resourceId")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _tap_your_groups_entry(self, d, did: str) -> bool:
+        """点击 Groups 主页的 "Your groups" 入口 (顶部 tab 或 section 标题)。
+
+        必须避免命中 "What's on your mind?" 发帖输入框 —— 用 text 精确匹配
+        + clickable 过滤即可排除非按钮元素。
+        """
+        for txt in self._FB_YOUR_GROUPS_TEXTS:
+            try:
+                # 同时 text = 精确值 AND clickable=True; TextView 的发帖提示
+                # 不是 clickable 的(父 view 才是), 所以不会误命中
+                el = d(text=txt, clickable=True)
+                if el.exists(timeout=0.6):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[browse_groups] tap Your groups by text='%s'", txt)
+                    return True
+                # 退一步: clickable 属性可能在父 layout, 用 descContains
+                el = d(descriptionContains=txt)
+                if el.exists(timeout=0.4):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[browse_groups] tap Your groups by descContains='%s'", txt)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    # 群内 "Members" tab 的精确匹配(避免被"Suggested group"推荐卡片污染)
+    _FB_GROUP_MEMBERS_TAB_TEXTS = (
+        "Members", "MEMBERS",
+        "メンバー",
+        "Membri",
+        "成员", "成員",
+    )
+
+    def _tap_group_members_tab(self, d, did: str) -> bool:
+        """点击群内 Members tab 的精确路径。
+
+        - text 精确匹配 + clickable 过滤,避免命中推荐群卡片 description
+        - fallback 到 resourceId (部分 FB 版本)
+        """
+        for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
+            try:
+                el = d(text=txt, clickable=True)
+                if el.exists(timeout=0.8):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.5)
+                    log.info("[extract_members] tap Members tab by text='%s'", txt)
+                    return True
+            except Exception:
+                continue
+        # resourceId 兜底
+        for rid in ("com.facebook.katana:id/members_tab",
+                    "com.facebook.katana:id/group_members_tab"):
+            try:
+                el = d(resourceId=rid)
+                if el.exists(timeout=0.4):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.5)
+                    log.info("[extract_members] tap Members tab by resourceId")
+                    return True
+            except Exception:
+                continue
+        # descriptionMatches: 不命中 "Suggested group" 前缀的 Members 标签
+        try:
+            el = d(descriptionMatches=r"^Members(?:, tab)?\b.*")
+            if el.exists(timeout=0.5):
+                self.hb.tap(d, *self._el_center(el))
+                time.sleep(0.5)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _assert_on_groups_page(self, d) -> bool:
+        """点击 Groups tab 后验证: 当前页面看起来像 Groups 主页 / 群组列表。
+
+        判据: 页面 dump 含 "groups" / "Your groups" / 已加入群名等关键词,
+        且**不含** "What's on your mind?" / "Photo" / "Album" 等发帖元素。
+        """
+        try:
+            xml = d.dump_hierarchy()
+            low = xml.lower()
+            # 明显是发帖界面 -> 已误入
+            bad_markers = ("what's on your mind", "add to your post",
+                            "what are you thinking", "photo/video",
+                            "你在想什么")
+            for m in bad_markers:
+                if m in low:
+                    log.warning("[browse_groups] 检测到发帖界面标志 '%s',未进 Groups", m)
+                    return False
+            # 正确标志
+            good_markers = ("groups", "your groups", "joined", "my groups",
+                             "グループ", "群组")
+            return any(m in low for m in good_markers)
+        except Exception:
+            return True  # dump 失败不强判
+
     def browse_groups(self, max_groups: int = 5,
                       device_id: Optional[str] = None) -> Dict[str, Any]:
         """浏览"我加入的群组"列表,顺序进每个群浏览 1 屏内容。
 
-        作用:养号信号,让 FB 知道这些群是用户的兴趣所在,推送相关内容。
+        2026-04-23 bug fix: 原实现用 ``smart_tap("Groups tab")`` +
+        ``smart_tap("Your groups")`` 依赖自学习 selector, 但 AutoSelector
+        把 "Groups tab" 学成了 Home 按钮, "Your groups" 学成了"你在想什么"
+        发帖输入框 — 每次运行都进发图界面。
+
+        新实现:
+          1. **硬编码 u2 selector** 精确点底部 Groups tab (description =
+             "Groups, tab N of M" 规律)
+          2. 点击后立刻做 **页面自检**(_assert_on_groups_page), 发现误入
+             发帖界面就 BACK 一次撤销
+          3. 再点"Your groups" (text 精确匹配 + clickable 过滤, 避免
+             命中 TextView 提示语)
         """
         did = self._did(device_id)
         d = self._u2(did)
-        stats = {"groups_visited": 0, "scrolls_total": 0, "groups_failed": 0}
+        stats = {"groups_visited": 0, "scrolls_total": 0, "groups_failed": 0,
+                 "nav_fallback_used": False}
 
         with self.guarded("browse_groups", device_id=did, weight=0.5):
-            # 找 Groups Tab — Facebook Android 通常在底部菜单或左侧抽屉
-            # 真机修复 (P3): cache key 必须短而稳定,使用 "Groups tab" 命中
-            # data/selectors/com_facebook_katana.yaml:Groups tab
-            self.smart_tap("Groups tab", device_id=did)
-            time.sleep(2)
-            # 也可能跳到 Groups 总览页,需点 "Your groups" / "我加入的"
-            self.smart_tap("Your groups", device_id=did)
+            # Step 1: 点底部导航 Groups tab
+            if not self._tap_groups_bottom_tab(d, did):
+                # 兜底: 尝试 smart_tap (虽然可能被污染 selector 命中,
+                # 但有 _assert_on_groups_page 二次校验兜底)
+                log.info("[browse_groups] 硬定位 Groups tab 未命中,降级 smart_tap")
+                self.smart_tap("Groups tab", device_id=did)
+                stats["nav_fallback_used"] = True
+            time.sleep(2.0)
+
+            # Step 2: 自检是否真在 Groups 相关页面
+            if not self._assert_on_groups_page(d):
+                # 误入发帖界面 → BACK 一次撤销
+                log.warning("[browse_groups] 未进 Groups 页, BACK 撤销误操作")
+                try:
+                    d.press("back")
+                    time.sleep(1.0)
+                    # 二次尝试 (只信任硬定位)
+                    if not self._tap_groups_bottom_tab(d, did):
+                        stats["fatal"] = "groups_tab_miss_after_fallback"
+                        log.error("[browse_groups] 二次硬定位仍失败,放弃任务")
+                        return stats
+                    time.sleep(2.0)
+                    if not self._assert_on_groups_page(d):
+                        stats["fatal"] = "not_on_groups_page"
+                        log.error("[browse_groups] 二次点击后仍不在 Groups 页")
+                        return stats
+                except Exception as e:
+                    log.warning("[browse_groups] BACK 兜底异常: %s", e)
+                    stats["fatal"] = "back_recovery_failed"
+                    return stats
+
+            # Step 3: 点 "Your groups" 入口进入已加入群列表
+            # (有些 FB 版本点 Groups tab 后直接就是 joined list, 不用再点)
+            self._tap_your_groups_entry(d, did)
             time.sleep(1.5)
 
             for i in range(max_groups):
@@ -2076,14 +2282,16 @@ class FacebookAutomation(BaseAutomation):
             return members
 
         with self.guarded("extract_members", device_id=did, weight=0.6):
-            # 找 Members Tab — 通常在群顶部菜单(About/Discussion/Members/Media)
-            if not self.smart_tap("Members tab in the group header",
-                                  device_id=did):
+            # 2026-04-23 bug fix: "Members tab in the group header" 的 AutoSelector
+            # 学习被污染为 "Suggested group: 50代以上..." 的 bounds(推荐群卡片),
+            # 会误点进推荐群。改用硬定位:text/desc 精确匹配 "Members"/"メンバー"。
+            hit = self._tap_group_members_tab(d, did)
+            if not hit:
                 # 退而求其次:点群头部进群信息页再点 Members
                 self.smart_tap("Group name or icon at top to open info",
                                device_id=did)
                 time.sleep(1.5)
-                self.smart_tap("Members section", device_id=did)
+                self._tap_group_members_tab(d, did)
             time.sleep(2.0)
 
             seen_names = set()
