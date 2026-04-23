@@ -103,6 +103,45 @@ class TestFunnelApi:
         assert body["blocked_reasons"]["no_message_button"] == 3
 
 
+class TestDateFilterApi:
+    """Phase 8g: date 参数 API 层."""
+
+    def test_funnel_api_with_date(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        import datetime as dt
+
+        cid = resolve_identity(platform="facebook", account_id="fb:DA1",
+                                 display_name="DA1")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={})
+
+        today = dt.datetime.utcnow().date().isoformat()
+        r = api_client.get("/lead-mesh/funnel?date=" + today)
+        body = r.json()
+        assert body["window_days"] == 1
+        assert body["total_friend_requested"] == 1
+
+        other = (dt.datetime.utcnow() - dt.timedelta(days=10)).date().isoformat()
+        r = api_client.get("/lead-mesh/funnel?date=" + other)
+        assert r.json()["total_friend_requested"] == 0
+
+    def test_blocked_peers_api_with_date(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        import datetime as dt
+
+        cid = resolve_identity(platform="facebook", account_id="fb:DA2",
+                                 display_name="DA2")
+        append_journey(cid, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "cap_hit"})
+
+        today = dt.datetime.utcnow().date().isoformat()
+        r = api_client.get(
+            "/lead-mesh/funnel/blocked-peers?reason=cap_hit&date=" + today)
+        body = r.json()
+        assert body["date"] == today
+        assert body["count"] == 1
+
+
 class TestTimeseriesApi:
     """Phase 8e: GET /lead-mesh/funnel/timeseries."""
 

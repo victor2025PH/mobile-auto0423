@@ -110,18 +110,48 @@ def _iso_since(days: int) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _validate_date(s: str) -> str:
+    """校验 YYYY-MM-DD 格式, 不合法返回空字符串 (caller 降级到 days)."""
+    if not s:
+        return ""
+    try:
+        d = _dt.datetime.strptime(s.strip(), "%Y-%m-%d")
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def compute_funnel(days: int = 7,
-                    actor: Optional[str] = None) -> FunnelStats:
-    """从 lead_journey 表汇总近 N 天的漏斗. actor 过滤 agent_a/agent_b, 空则不限.
+                    actor: Optional[str] = None,
+                    date: Optional[str] = None) -> FunnelStats:
+    """从 lead_journey 表汇总漏斗. actor 过滤 agent_a/agent_b, 空则不限.
+
+    Args:
+        days: 近 N 天窗口 (date 未提供时生效)
+        actor: actor 过滤
+        date: YYYY-MM-DD 单日过滤 (Phase 8g Dashboard 下钻用, 优先于 days).
+              非法格式降级到 days 窗口.
 
     所有 A 端关心的事件 1 次 SQL 全部拿完, 再在 Python 分桶. 原则: 扫表只 1 次,
     其他都是内存聚合. 表规模小 (<10k rows) 时远比多次 SQL 快.
     """
-    stats = FunnelStats(window_days=int(days), since_iso=_iso_since(days))
+    # date 优先, 降级 days
+    valid_date = _validate_date(date) if date else ""
+    if valid_date:
+        since_iso = valid_date + " 00:00:00"
+        until_iso = valid_date + " 23:59:59"
+        stats = FunnelStats(window_days=1, since_iso=since_iso)
+    else:
+        stats = FunnelStats(window_days=int(days),
+                              since_iso=_iso_since(days))
+        until_iso = ""
 
     sql = ("SELECT actor, action, data_json FROM lead_journey"
             " WHERE at >= ?")
     params: list = [stats.since_iso]
+    if until_iso:
+        sql += " AND at <= ?"
+        params.append(until_iso)
     if actor:
         sql += " AND actor = ?"
         params.append(actor)
@@ -232,28 +262,41 @@ def compute_funnel_timeseries(days: int = 7,
 
 def list_blocked_peers(reason: str,
                          days: int = 7,
-                         limit: int = 50) -> List[Dict[str, Any]]:
-    """返回近 N 天被某 reason 挡住的 peer 列表 (点击 Dashboard top_blocked_reason
+                         limit: int = 50,
+                         date: Optional[str] = None) -> List[Dict[str, Any]]:
+    """返回被某 reason 挡住的 peer 列表 (点击 Dashboard top_blocked_reason
     子 modal 用). 按最近 blocked 时间倒序, 同 peer 只出 1 行 (含总次数).
 
     Args:
         reason: 要过滤的 reason (如 "no_message_button")
-        days: 时间窗口
+        days: 时间窗口 (date 未提供时生效)
         limit: 最多返回 N 条 (默认 50)
+        date: YYYY-MM-DD 单日过滤 (Phase 8g 下钻用, 优先于 days)
 
     Returns:
         [{"canonical_id", "last_blocked_at", "n_blocked", "persona_key"}]
     """
     if not reason:
         return []
-    since = _iso_since(days)
+    valid_date = _validate_date(date) if date else ""
+    if valid_date:
+        since = valid_date + " 00:00:00"
+        until = valid_date + " 23:59:59"
+    else:
+        since = _iso_since(days)
+        until = ""
     # SQLite JSON 解析 Python 侧做, 避免 json_extract 版本要求
     sql = ("SELECT canonical_id, data_json, at FROM lead_journey"
-            " WHERE action = 'greeting_blocked' AND at >= ?"
-            " ORDER BY at DESC LIMIT ?")
+            " WHERE action = 'greeting_blocked' AND at >= ?")
+    params: list = [since]
+    if until:
+        sql += " AND at <= ?"
+        params.append(until)
+    sql += " ORDER BY at DESC LIMIT ?"
+    params.append(int(limit) * 10)
     try:
         with _connect() as conn:
-            rows = conn.execute(sql, (since, int(limit) * 10)).fetchall()
+            rows = conn.execute(sql, params).fetchall()
     except Exception:
         return []
 
