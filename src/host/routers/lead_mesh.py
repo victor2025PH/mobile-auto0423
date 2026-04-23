@@ -388,6 +388,16 @@ def api_funnel_report(days: int = Query(default=7, ge=1, le=90),
     return stats.to_dict()
 
 
+# ── Phase 8e: 近 N 天按日时序 (Dashboard sparkline 用) ──────────────
+@router.get("/funnel/timeseries")
+def api_funnel_timeseries(days: int = Query(default=7, ge=1, le=90),
+                            actor: str = Query(default="")):
+    """近 N 天按日分桶的漏斗时序. 缺失日填 0 避免 sparkline 断线."""
+    from src.host.lead_mesh.funnel_report import compute_funnel_timeseries
+    series = compute_funnel_timeseries(days=days, actor=actor or None)
+    return {"days": days, "actor": actor or "", "series": series}
+
+
 # ── Phase 8d: 点击某 blocked reason 看具体 peer 列表 ────────────────
 @router.get("/funnel/blocked-peers")
 def api_blocked_peers(reason: str = Query(...),

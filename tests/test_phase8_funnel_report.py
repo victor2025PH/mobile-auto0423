@@ -208,6 +208,82 @@ class TestBlockedPeers:
         assert list_blocked_peers("", days=7) == []
 
 
+class TestTimeseries:
+    """Phase 8e: 近 N 天按日分桶的漏斗时序."""
+
+    def test_empty_db_returns_zeros_all_days(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import compute_funnel_timeseries
+        series = compute_funnel_timeseries(days=7)
+        assert len(series) == 7
+        for p in series:
+            assert p["friend_req"] == 0
+            assert p["greeting_sent"] == 0
+            assert p["blocked"] == 0
+            # date 格式 YYYY-MM-DD
+            assert len(p["date"]) == 10 and p["date"][4] == "-"
+
+    def test_dates_are_consecutive_ascending(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import compute_funnel_timeseries
+        import datetime as dt
+        series = compute_funnel_timeseries(days=5)
+        assert len(series) == 5
+        # 升序连续, 最后一天是 today (UTC)
+        today = dt.datetime.utcnow().date().isoformat()
+        assert series[-1]["date"] == today
+        # 相邻差 1 天
+        for i in range(1, len(series)):
+            a = dt.date.fromisoformat(series[i - 1]["date"])
+            b = dt.date.fromisoformat(series[i]["date"])
+            assert (b - a).days == 1
+
+    def test_counts_bucket_today(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel_timeseries
+
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:TS", display_name="TS")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp"})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message"})
+        append_journey(cid, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "no_message_button"})
+
+        series = compute_funnel_timeseries(days=3)
+        # 今天的 bucket 应有 1/1/1
+        today_pt = series[-1]
+        assert today_pt["friend_req"] == 1
+        assert today_pt["greeting_sent"] == 1
+        assert today_pt["blocked"] == 1
+        # 前几天都是 0
+        for p in series[:-1]:
+            assert p["friend_req"] == 0
+            assert p["greeting_sent"] == 0
+            assert p["blocked"] == 0
+
+    def test_actor_filter(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel_timeseries
+
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:AF", display_name="AF")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={})
+        append_journey(cid, actor="agent_b", action="friend_requested",
+                         data={})
+
+        s_all = compute_funnel_timeseries(days=1)
+        s_a = compute_funnel_timeseries(days=1, actor="agent_a")
+        assert s_all[0]["friend_req"] == 2
+        assert s_a[0]["friend_req"] == 1
+
+    def test_days_clamped(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import compute_funnel_timeseries
+        # days=0 → 1 天; days=1000 → 90 天
+        assert len(compute_funnel_timeseries(days=0)) == 1
+        assert len(compute_funnel_timeseries(days=1000)) == 90
+
+
 class TestTextReport:
     def test_format_text_empty(self, tmp_db):
         from src.host.lead_mesh.funnel_report import (compute_funnel,
