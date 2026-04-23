@@ -90,6 +90,35 @@ class FbWarmupError(Exception):
         self.hint = hint or ""
 
 
+def _emit_contact_event_safe(device_id: str, peer_name: str,
+                             event_type: str, **kwargs) -> None:
+    """P7 (INTEGRATION_CONTRACT §7.1 B 机回写契约) fb_contact_events 写入
+    wrapper (feature-detect)。
+
+    B 应写入的 5 类事件 (A 的 fb_store.CONTACT_EVT_* 常量,字符串稳定契约):
+      * add_friend_accepted     好友请求被对方接受 (check_friend_requests_inbox)
+      * greeting_replied        对方回复 greeting (间接: mark_greeting_replied_back)
+      * message_received        对方主动发 DM (check_messenger_inbox/requests loop)
+      * wa_referral_sent        B 发出引流话术 (_ai_reply_and_send 成功后)
+      * (add_friend_rejected    B 暂不主动写, 待观察"对方未接受"的实际信号)
+
+    Phase 5 (A 的 record_contact_event + fb_contact_events 表) 未 merge 时
+    静默 skip, 让 B 代码可独立 merge。Phase 5 merge 后自动激活无需改代码。
+
+    改 event_type 字符串需先改 INTEGRATION_CONTRACT §七 再改代码。
+    """
+    if not device_id or not peer_name or not event_type:
+        return
+    try:
+        from src.host.fb_store import record_contact_event
+    except ImportError:
+        return  # Phase 5 未 merge
+    try:
+        record_contact_event(device_id, peer_name, event_type, **kwargs)
+    except Exception as e:
+        log.debug("[contact_event] %s 写入失败: %s", event_type, e)
+
+
 def _messenger_active_lock(device_id: str, timeout: float = 30.0):
     """F3 (A→B review Q10): ``device_section_lock("messenger_active")`` 的
     feature-detect wrapper。
@@ -2798,6 +2827,8 @@ class FacebookAutomation(BaseAutomation):
                             stats["unread_processed"] += 1
                             stats["messages"].append(detail)
 
+                            # P7 §7.1 message_received: 默认"只读",触发 reply 后覆写
+                            msg_decision = "read_only"
                             if auto_reply and detail.get("incoming_text"):
                                 reply, decision = self._ai_reply_and_send(
                                     d, did,
@@ -2811,6 +2842,14 @@ class FacebookAutomation(BaseAutomation):
                                     stats["replied"] += 1
                                     if decision == "wa_referral":
                                         stats["wa_referrals"] += 1
+                                msg_decision = decision  # reply/wa_referral/skip
+                            # P7 §7.1: 只要拿到 incoming 就写 message_received 事件
+                            # (不管 B 是否 reply; auto_reply=False 写 'read_only')
+                            if detail.get("incoming_text"):
+                                _emit_contact_event_safe(
+                                    did, c["name"], "message_received",
+                                    preset_key=preset_key,
+                                    meta={"decision": msg_decision})
 
                         d.press("back")
                         time.sleep(random.uniform(1.0, 1.8))
@@ -2917,6 +2956,8 @@ class FacebookAutomation(BaseAutomation):
                         if detail and detail.get("incoming_text"):
                             stats["messages_collected"] += 1
 
+                            # P7 §7.1 message_received: stranger 场景默认 read_only
+                            msg_decision = "read_only"
                             # P6: 陌生人场景自动回复 (peer_type='stranger' 触发
                             # referral_gate 保守配置)
                             if auto_reply and not detail.get("risk"):
@@ -2935,6 +2976,13 @@ class FacebookAutomation(BaseAutomation):
                                         stats["wa_referrals"] += 1
                                 else:
                                     stats["reply_skipped"] += 1
+                                msg_decision = decision
+                            # P7 §7.1: message_received 带 peer_type=stranger 区分
+                            _emit_contact_event_safe(
+                                did, c["name"], "message_received",
+                                preset_key=preset_key,
+                                meta={"decision": msg_decision,
+                                      "peer_type": "stranger"})
 
                         d.press("back")
                         time.sleep(random.uniform(0.8, 1.5))
@@ -3111,6 +3159,22 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             log.debug("[inbox] 写库失败", exc_info=True)
+
+        # P7 §7.1 greeting_replied: 对方一 incoming 就尝试标记最近 7 天未回
+        # 的 greeting 行 (P0 的 mark_greeting_replied_back 幂等, 已标则跳过)。
+        # 这覆盖 auto_reply=False 场景 — 只要对方回了 greeting 就算关系建立,
+        # 即使 B 没 reply 也记到 fb_contact_events。
+        #
+        # Feature-detect: P0 未 merge 时 mark_greeting_replied_back 不存在,
+        # 静默 skip; 合入后自动激活, F1 内部会同步写 greeting_replied event。
+        if incoming_text:
+            try:
+                from src.host.fb_store import mark_greeting_replied_back
+                mark_greeting_replied_back(did, conv["name"], window_days=7)
+            except ImportError:
+                pass  # P0 未 merge
+            except Exception as e:
+                log.debug("[P7 greeting_replied] skip: %s", e)
         return {"peer_name": conv["name"], "incoming_text": incoming_text}
 
     def _extract_latest_incoming_message(self, d) -> str:
@@ -3373,6 +3437,19 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             pass
+
+        # P7 §7.1 wa_referral_sent: 引流话术发出时记事件,让 A 的 Lead Mesh
+        # Dashboard 可按 channel 切片引流漏斗 (Phase 5 未 merge 时 no-op)
+        if decision == "wa_referral":
+            _emit_contact_event_safe(
+                did, peer_name, "wa_referral_sent",
+                preset_key=preset_key,
+                meta={
+                    "channel": _r_channel or "unknown",
+                    "peer_type": peer_type,
+                    "intent": intent_tag,  # P4 意图信号
+                },
+            )
         return reply, decision
 
     def _open_message_requests_fallback(self, d) -> bool:
