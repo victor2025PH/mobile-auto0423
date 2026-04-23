@@ -358,13 +358,19 @@ def intent_source_coverage(device_id: Optional[str] = None, *,
             params_dev + params_since + [int(sample_limit)],
         ).fetchall()
 
+    # 传 stub 非空 history 防止每条都被判 opening (离线分析不重建真实 history)
+    stub_history = [
+        {"direction": "outgoing", "message_text": "(prev greeting)"},
+        {"direction": "incoming", "message_text": "(prev incoming)"},
+    ]
     by_source: Dict[str, int] = {}
     for row in rows:
         msg = row[0] or ""
         if not msg.strip():
             continue
         try:
-            r = classify_intent(msg, use_llm_fallback=False)
+            r = classify_intent(msg, history=stub_history,
+                                use_llm_fallback=False)
             by_source[r.source] = by_source.get(r.source, 0) + 1
         except Exception:
             continue
@@ -375,6 +381,77 @@ def intent_source_coverage(device_id: Optional[str] = None, *,
         "total_sampled": total,
         "by_source": by_source,
         "rates": rates,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4b. intent_health_report (P9 — 基于 intent_source_coverage 做阈值告警)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def intent_health_report(device_id: Optional[str] = None, *,
+                         since_iso: Optional[str] = None,
+                         sample_limit: int = 500,
+                         rule_threshold_healthy: float = 0.60,
+                         rule_threshold_degraded: float = 0.40
+                         ) -> Dict[str, Any]:
+    """P9 轻量健康报告 — 根据 rule_source 比例分档给出建议。
+
+    档位:
+      * ``healthy``      rule >= rule_threshold_healthy (默认 60%)
+      * ``needs_rules``  rule_threshold_degraded <= rule < rule_threshold_healthy
+      * ``degraded``     rule < rule_threshold_degraded (默认 40%)
+
+    设计思路: **不做 LLM 硬限流**(太粗暴), 而是用 rule coverage 作为反馈
+    信号——coverage 低说明 chat_intent 规则漏覆盖, 应该扩 `_REFERRAL_RE` /
+    `_BUYING_RE` 多语言规则, 而不是限制 LLM 调用。
+
+    输出:
+        {
+          "health": "healthy" | "needs_rules" | "degraded" | "no_data",
+          "rule_coverage": float (0-1),
+          "llm_coverage": float,
+          "fallback_coverage": float,
+          "recommendation": str (人类可读的行动建议),
+          "sample": {...}  # 同 intent_source_coverage 输出, 供深入调试
+        }
+    """
+    sample = intent_source_coverage(
+        device_id=device_id, since_iso=since_iso, sample_limit=sample_limit)
+    total = sample.get("total_sampled", 0)
+    rates = sample.get("rates", {})
+    rule_cov = float(rates.get("rule", 0.0))
+    llm_cov = float(rates.get("llm", 0.0))
+    fallback_cov = float(rates.get("fallback", 0.0))
+
+    if total == 0:
+        health = "no_data"
+        rec = "样本不足,需累积 incoming 消息后再评估"
+    elif rule_cov >= rule_threshold_healthy:
+        health = "healthy"
+        rec = (f"rule 命中率 {rule_cov:.0%} ≥ {rule_threshold_healthy:.0%},"
+               f" chat_intent 规则覆盖健康")
+    elif rule_cov >= rule_threshold_degraded:
+        health = "needs_rules"
+        # 判断哪类意图最多 fallback → 推 LLM 的方向反推
+        low_intents = [k for k, v in sample.get("by_source", {}).items()
+                       if k in ("fallback", "llm")]
+        rec = (f"rule 命中率 {rule_cov:.0%} 偏低, 建议扩 chat_intent 的"
+               f" 多语言正则规则 (ja/zh/en/it). fallback+llm={llm_cov + fallback_cov:.0%}"
+               f" 里大概率有可 rule 化的模式")
+    else:
+        health = "degraded"
+        rec = (f"rule 命中率 {rule_cov:.0%} < {rule_threshold_degraded:.0%},"
+               f" chat_intent 可能退化 — 审计 _REFERRAL_RE / _BUYING_RE /"
+               f" _CLOSING_RE / _COLD_TOKENS 覆盖范围; 或者最近对话文化变迁"
+               f" (新表情/新术语) 需要人工扩词表")
+
+    return {
+        "health": health,
+        "rule_coverage": rule_cov,
+        "llm_coverage": llm_cov,
+        "fallback_coverage": fallback_cov,
+        "recommendation": rec,
+        "sample": sample,
     }
 
 
@@ -459,6 +536,8 @@ def get_funnel_metrics_extended(device_id: Optional[str] = None, *,
 
     if include_intent_coverage:
         out["intent_source_coverage"] = intent_source_coverage(
+            device_id=device_id, since_iso=since_iso)
+        out["intent_health"] = intent_health_report(
             device_id=device_id, since_iso=since_iso)
 
     if include_greeting_template:
