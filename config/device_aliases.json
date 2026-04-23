@@ -203,16 +203,6 @@
     "alias": "11号",
     "display_name": ""
   },
-  "CACAVKLNU8SGO74D": {
-    "display_name": "CACAVKLN",
-    "slot": 4,
-    "host_scope": "coordinator",
-    "host_name": "主控",
-    "host_label_short": "主控",
-    "display_label": "主控-04",
-    "alias": "主控-04",
-    "number": 4
-  },
   "emulator-5554": {
     "number": 5,
     "alias": "05号",

@@ -378,6 +378,10 @@ class AdbFallbackDevice:
             except Exception:
                 pass
 
+    def window_size(self):
+        """与 uiautomator2.Device 对齐，供 scroll / 点击相对坐标使用。"""
+        return self._w, self._h
+
     def _adb(self, cmd: str, timeout: int = 15) -> str:
         ok, out = self._dm.execute_adb_command(cmd, self._did)
         return out if ok else ""

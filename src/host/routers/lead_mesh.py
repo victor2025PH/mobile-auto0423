@@ -44,14 +44,8 @@ router = APIRouter(prefix="/lead-mesh", tags=["lead-mesh"])
 
 # ─── Leads / Dossier ─────────────────────────────────────────────────
 
-@router.get("/leads/{canonical_id}")
-def api_get_dossier(canonical_id: str, journey_limit: int = 100):
-    d = lm.get_dossier(canonical_id, journey_limit=journey_limit)
-    if not d:
-        raise HTTPException(404, "lead not found")
-    return d
-
-
+# ⚠ 路由顺序: 静态路径(/leads/search, /leads/resolve, /leads/merge*) 必须
+# 声明在 /leads/{canonical_id} 之前, 否则静态片段会被当成 path param 吃掉。
 @router.get("/leads/search")
 def api_search_leads(name_like: str = "",
                        platform: str = "",
@@ -60,16 +54,6 @@ def api_search_leads(name_like: str = "",
     return {"results": lm.search_leads(
         name_like=name_like, platform=platform,
         account_id_like=account_id_like, limit=limit)}
-
-
-@router.get("/leads/{canonical_id}/journey")
-def api_get_journey(canonical_id: str,
-                     limit: int = Query(default=100, ge=1, le=1000),
-                     action_prefix: str = "",
-                     since_iso: str = ""):
-    return {"journey": lm.get_journey(canonical_id, limit=limit,
-                                        action_prefix=action_prefix,
-                                        since_iso=since_iso)}
 
 
 @router.post("/leads/resolve")
@@ -99,13 +83,6 @@ def api_resolve_identity(body: Dict[str, Any] = Body(...)):
         raise HTTPException(500, f"resolve 失败: {e}")
 
 
-@router.get("/leads/{canonical_id}/merge-candidates")
-def api_merge_candidates(canonical_id: str,
-                          min_confidence: float = 0.70):
-    return {"candidates": lm.auto_merge_candidates(canonical_id,
-                                                      min_confidence=min_confidence)}
-
-
 @router.post("/leads/merge")
 def api_merge_manually(body: Dict[str, Any] = Body(...)):
     """手动合并 {source_canonical_id, target_canonical_id, merged_by, reason}。"""
@@ -127,6 +104,32 @@ def api_revert_merge(merge_id: int, body: Dict[str, Any] = Body(default={})):
                        reverted_by=body.get("reverted_by") or "human",
                        reason=body.get("reason") or "")
     return {"ok": ok, "merge_id": merge_id}
+
+
+# 动态路径(path param) 必须在所有同前缀静态路径之后
+@router.get("/leads/{canonical_id}")
+def api_get_dossier(canonical_id: str, journey_limit: int = 100):
+    d = lm.get_dossier(canonical_id, journey_limit=journey_limit)
+    if not d:
+        raise HTTPException(404, "lead not found")
+    return d
+
+
+@router.get("/leads/{canonical_id}/journey")
+def api_get_journey(canonical_id: str,
+                     limit: int = Query(default=100, ge=1, le=1000),
+                     action_prefix: str = "",
+                     since_iso: str = ""):
+    return {"journey": lm.get_journey(canonical_id, limit=limit,
+                                        action_prefix=action_prefix,
+                                        since_iso=since_iso)}
+
+
+@router.get("/leads/{canonical_id}/merge-candidates")
+def api_merge_candidates(canonical_id: str,
+                          min_confidence: float = 0.70):
+    return {"candidates": lm.auto_merge_candidates(canonical_id,
+                                                      min_confidence=min_confidence)}
 
 
 # ─── Handoffs ────────────────────────────────────────────────────────

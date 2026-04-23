@@ -405,6 +405,37 @@ def start_job_scheduler():
                     logger.info("话术权重优化完成: %s", result)
                 except Exception as e:
                     logger.debug("话术权重优化失败: %s", e)
+
+            # Phase 5.5 新增: Lead Mesh 定时任务 ────────────────────
+            # 每 tick (30s) 刷新 pending webhook, 有到期的就发
+            try:
+                from src.host.lead_mesh.webhook_dispatcher import flush_pending_webhooks
+                stats = flush_pending_webhooks(max_batch=50)
+                if stats.get("delivered", 0) > 0 or stats.get("dead_letter", 0) > 0:
+                    logger.info("[lead_mesh/webhooks] flush stats=%s", stats)
+            except Exception as e:
+                logger.debug("[lead_mesh/webhooks] flush 失败: %s", e)
+
+            # 每 720 次 tick (=6 小时) 过期 72h 未 ack 的 handoffs
+            if _analytics_tick[0] % 720 == 0 and _analytics_tick[0] > 0:
+                try:
+                    from src.host.lead_mesh.handoff import expire_pending_handoffs
+                    n = expire_pending_handoffs(expire_hours=72)
+                    if n > 0:
+                        logger.info("[lead_mesh/handoffs] 自动过期 %s 个 pending", n)
+                except Exception as e:
+                    logger.debug("[lead_mesh/handoffs] 过期任务失败: %s", e)
+
+            # 每 2880 次 tick (=24 小时) 清理旧 agent_messages (已 ack/failed 超 30 天)
+            if _analytics_tick[0] % 2880 == 0 and _analytics_tick[0] > 0:
+                try:
+                    from src.host.lead_mesh.agent_mesh import cleanup_old_messages
+                    n = cleanup_old_messages(older_than_days=30)
+                    if n > 0:
+                        logger.info("[lead_mesh/mesh] 清理旧消息 %s 条", n)
+                except Exception as e:
+                    logger.debug("[lead_mesh/mesh] cleanup 失败: %s", e)
+
             time.sleep(30)
 
     t = threading.Thread(target=_loop, daemon=True, name="job-scheduler")

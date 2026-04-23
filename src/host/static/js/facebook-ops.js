@@ -193,6 +193,19 @@
         <button class="qa-btn" onclick="fbOpenReferralModal()" style="padding:6px 10px;font-size:12px">
           🔗 引流账号
         </button>
+
+        ${groupDivider}
+
+        <!-- ④ Lead Mesh 交接 / 档案 / 指挥台 (Phase 5.5 新增, 跨 Agent 协同) -->
+        <button class="qa-btn" onclick="lmOpenHandoffInbox()" style="padding:6px 10px;font-size:12px;background:rgba(245,158,11,.15);color:#f59e0b">
+          🤝 接收方工作台
+        </button>
+        <button class="qa-btn" onclick="lmOpenLeadSearch()" style="padding:6px 10px;font-size:12px;background:rgba(14,165,233,.15);color:#0ea5e9">
+          🔍 Lead 档案
+        </button>
+        <button class="qa-btn" onclick="lmOpenCommandCenter()" style="padding:6px 10px;font-size:12px;background:rgba(168,85,247,.15);color:#a855f7">
+          📊 运营指挥台
+        </button>
       </div>
     `;
   }

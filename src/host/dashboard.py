@@ -2769,6 +2769,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script src="/static/js/platform-shell.js?v=20260420c"></script>
 <script src="/static/js/tiktok-ops.js?v=20260417i"></script>
 <script src="/static/js/facebook-ops.js?v=20260420d"></script>
+<script src="/static/js/lead-mesh-ui.js?v=20260423a"></script>
 <script src="/static/js/platform-grid.js?v=20260417a"></script>
 <script src="/static/js/studio.js?v=20260411f"></script>
 <script>

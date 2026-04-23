@@ -963,6 +963,33 @@ class FacebookAutomation(BaseAutomation):
                 self.hb.tap(d, *self._el_center(first))
                 time.sleep(random.uniform(4.5, 7.0))
 
+                def _xml_has_profile_signals(x: str) -> bool:
+                    if not x:
+                        return False
+                    low = x.lower()
+                    if any(s in low for s in ("add friend", "message", "follow")):
+                        return True
+                    # 日文界面常见文案
+                    return any(
+                        s in x
+                        for s in (
+                            "\u53cb\u9054\u3092\u8ffd\u52a0",  # 友達を追加
+                            "\u30e1\u30c3\u30bb\u30fc\u30b8",  # メッセージ
+                            "\u30d5\u30a9\u30ed\u30fc",  # フォロー
+                        )
+                    )
+
+                try:
+                    xml_chk = d.dump_hierarchy()
+                except Exception:
+                    xml_chk = ""
+                if not _xml_has_profile_signals(xml_chk):
+                    # 可能仍停在列表：再点一次列表中部（首条人名卡片常见区域）
+                    log.info("[add_friend_with_note] 未检测到资料页特征，尝试二次点击列表区")
+                    w, _h = d.window_size()
+                    self._adb(f"shell input tap {int(w * 0.5)} {int(620)}", device_id=did)
+                    time.sleep(random.uniform(3.0, 5.0))
+
                 # 检测风控
                 is_risk, msg = self._detect_risk_dialog(d)
                 if is_risk:
@@ -989,11 +1016,15 @@ class FacebookAutomation(BaseAutomation):
                 if not tapped:
                     tapped = self.smart_tap("Add Friend button", device_id=did)
                 if not tapped:
+                    # 日文 FB 常用：友達を追加 / 友達になる（用 Unicode 避免源文件编码问题）
                     for sel in (
                         {"resourceId": "com.facebook.katana:id/profile_actionbar_addfriend_button"},
                         {"descriptionContains": "Add friend"},
                         {"textContains": "友達"},
                         {"descriptionContains": "友達"},
+                        {"textContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},  # 友達を追加
+                        {"textContains": "\u53cb\u9054\u306b\u306a\u308b"},  # 友達になる
+                        {"descriptionContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},
                     ):
                         try:
                             el = d(**sel)

@@ -12,14 +12,6 @@
   },
   "history": [
     {
-      "ts": "2026-04-14 13:29:18",
-      "type": "device.disconnected",
-      "title": "device.disconnected",
-      "message": "设备: 192.168.0.150:5555",
-      "level": "warning",
-      "sent": false
-    },
-    {
       "ts": "2026-04-14 13:29:19",
       "type": "device.disconnected",
       "title": "device.disconnected",
@@ -1640,6 +1632,14 @@
       "type": "device.disconnected",
       "title": "device.disconnected",
       "message": "设备: 8DWOF6CYY5R8YHX8",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-23 16:03:39",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: CACAVKLNU8SGO74D",
       "level": "warning",
       "sent": false
     }
