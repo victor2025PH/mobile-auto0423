@@ -1,0 +1,6 @@
+version: 1
+defaults:
+  daily_cap: 15
+  cap_reset_tz: +00:00
+  rotation_mode: least_loaded
+receivers: {}
