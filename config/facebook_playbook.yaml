@@ -92,10 +92,12 @@ defaults:
     # 文案为空时是否强制走 persona 本地化模板（关闭则跳过发送，防发错语言）
     require_persona_template: true
     # 2026-04-23: profile 页无 Message 按钮时,是否降级 Messenger App 路径
-    #   - false(默认): 直接放弃,记录 reason=no_message_button
-    #   - true: 调 send_message() 切 Messenger + 搜名字 + 发消息
-    # 开启前请评估: 切 app 会触发 MIUI XSpace 弹窗,且刚加的人很可能搜不到
-    allow_messenger_fallback: false
+    #   - false: 直接放弃,记录 reason=no_message_button
+    #   - true(Phase 7 起默认): 调 send_message() 切 Messenger + 搜名字 + 发消息
+    # 2026-04-24 启用: 真机验证 AdbFallbackDevice unicode 修复后链路已通,
+    # 剩下风险 (Messenger 搜不到 / XSpace 弹窗) 会被生产代码的 §7.6 MessengerError
+    # 分流矩阵 + device_section_lock("messenger_active") 容错
+    allow_messenger_fallback: true
 
   # ── 收件箱 / Messenger 回复 ─────────────────────────────────────────
   check_inbox:

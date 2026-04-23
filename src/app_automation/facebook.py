@@ -1266,6 +1266,41 @@ class FacebookAutomation(BaseAutomation):
         "发送", "发送请求",
     )
 
+    # ── Messenger app 安装状态 (带缓存, 避免每次 greeting 查 pm list) ──
+    _messenger_installed_cache: Dict[str, Tuple[bool, float]] = {}
+
+    def _is_messenger_installed(self, did: str) -> bool:
+        """检查目标设备是否装了 Messenger (com.facebook.orca).
+
+        缓存 5 分钟避免频繁 shell pm list. 缓存 miss/过期时用 adb 查.
+        """
+        import time as _t
+        now = _t.time()
+        cached = self._messenger_installed_cache.get(did)
+        if cached and (now - cached[1]) < 300:
+            return cached[0]
+        installed = False
+        try:
+            # u2.Device 和 AdbFallbackDevice 都支持 shell
+            d = self._u2(did)
+            out = d.shell(f"pm list packages {MESSENGER_PACKAGE}")
+            # u2.Device.shell 返回 ShellResponse (output + exit_code);
+            # AdbFallbackDevice 没 shell, 用 _adb
+            if hasattr(out, "output"):
+                txt = out.output
+            elif isinstance(out, tuple):
+                txt = out[0]
+            else:
+                txt = str(out)
+            installed = MESSENGER_PACKAGE in txt
+        except Exception as e:
+            log.debug("[_is_messenger_installed] 查询失败 (默认 True 不拦): %s", e)
+            # 查询失败时倾向 true (让 fallback 尝试), 而不是 false 直接拒绝
+            installed = True
+        self._messenger_installed_cache[did] = (installed, now)
+        log.info("[messenger] app installed=%s on %s", installed, did[:12])
+        return installed
+
     def _tap_profile_message_button(self, d, did: str) -> bool:
         """在当前 profile 页上点击 Message 按钮进入内联对话。
 
@@ -1797,6 +1832,14 @@ class FacebookAutomation(BaseAutomation):
             if not self._tap_profile_message_button(d, did):
                 # 可选降级: 走 Messenger App 路径(allow_messenger_fallback=true 时)
                 if bool(sg_cfg.get("allow_messenger_fallback", False)):
+                    # Phase 7a 2026-04-24: 先验证 Messenger app 已装, 没装直接走
+                    # 精准 reason "messenger_not_installed", 别让下游 send_message
+                    # 在 app 不存在时各种 UI 查找全失败, reason 成 "send_fail" 没信息.
+                    if not self._is_messenger_installed(did):
+                        log.info("[send_greeting] Messenger app 未装, 无法 fallback: %s",
+                                  profile_name)
+                        self._set_greet_reason("messenger_not_installed")
+                        return False
                     return self._send_greeting_messenger_fallback(
                         did=did, profile_name=profile_name, greeting=greeting,
                         template_id=template_id, persona_key=persona_key,
