@@ -101,3 +101,41 @@ class TestFunnelApi:
         assert body["total_greeting_blocked"] == 4
         assert body["top_blocked_reason"] == "no_message_button"
         assert body["blocked_reasons"]["no_message_button"] == 3
+
+
+class TestBlockedPeersApi:
+    """Phase 8d: GET /lead-mesh/funnel/blocked-peers."""
+
+    def test_api_requires_reason(self, api_client, tmp_db):
+        # reason 是 required query param
+        r = api_client.get("/lead-mesh/funnel/blocked-peers")
+        assert r.status_code == 422
+
+    def test_api_empty_returns_empty_list(self, api_client, tmp_db):
+        r = api_client.get("/lead-mesh/funnel/blocked-peers?reason=no_message_button")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["reason"] == "no_message_button"
+        assert body["count"] == 0
+        assert body["peers"] == []
+
+    def test_api_returns_peers_with_reason(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        cid = resolve_identity(platform="facebook", account_id="fb:BP1",
+                                 display_name="BP1")
+        for _ in range(2):
+            append_journey(cid, actor="agent_a", action="greeting_blocked",
+                             data={"reason": "no_message_button",
+                                   "persona_key": "jp_female_midlife"})
+
+        r = api_client.get("/lead-mesh/funnel/blocked-peers?reason=no_message_button")
+        body = r.json()
+        assert body["count"] == 1  # 1 个唯一 peer
+        assert body["peers"][0]["canonical_id"] == cid
+        assert body["peers"][0]["n_blocked"] == 2
+        assert body["peers"][0]["persona_key"] == "jp_female_midlife"
+
+    def test_api_limit_enforced(self, api_client, tmp_db):
+        r = api_client.get(
+            "/lead-mesh/funnel/blocked-peers?reason=x&limit=500")
+        assert r.status_code == 422   # le=200
