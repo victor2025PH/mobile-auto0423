@@ -95,7 +95,9 @@ class TestTaskEndpoints:
         data = r.json()
         assert "task_id" in data
         assert data["type"] == "telegram_send_message"
-        assert data["status"] == "pending"
+        # run_on_host=True (默认) 使 create_task_endpoint 立即 dispatch_after_create,
+        # task 会从 pending 瞬时转 running。断言只验证"尚未进入终态", 不锁初始时机。
+        assert data["status"] in ("pending", "running")
 
     def test_get_nonexistent_task(self, client):
         r = client.get("/tasks/nonexistent-id")
