@@ -4077,13 +4077,15 @@ class FacebookAutomation(BaseAutomation):
                            referral_contact: str = "",
                            preset_key: str = "",
                            persona_key: Optional[str] = None) -> Tuple[Optional[str], str]:
-        """调 ChatBrain 生成回复并发出；P1 接入 persona 语言 + 引流话术。
+        """调 ChatBrain 生成回复并发出;P1 接入 persona 语言 + 引流话术;P3 接入长久记忆。
 
-        * ``target_language`` 来自 ``fb_target_personas.get_persona_display``，
-          日本客群强制 ``ja``，避免英文破冰。
-        * 引流阶段（referral_score>0.5）且配置了 contact 时，**出站消息**
-          以 ``fb_content_assets.get_referral_snippet`` 为主渠道话术为准，
-          避免 LLM 生成英文 WhatsApp 句而 persona 要求 LINE 日文。
+        * ``target_language`` 来自 ``fb_target_personas.get_persona_display``,
+          日本客群强制 ``ja``,避免英文破冰。
+        * 引流阶段(referral_score>0.5)且配置了 contact 时,**出站消息**
+          以 ``fb_content_assets.get_referral_snippet`` 为主渠道话术为准。
+        * **P3 长久记忆**: 同 peer 历史消息 + 派生画像通过 ``chat_memory.build_context_block``
+          实时拼进 ``ab_style_hint``,让 LLM 看得到前 5 轮对话 + 对方语言偏好 + 引流历史;
+          若上一轮引流对方未回,本轮强制降级为 reply (不再重复引流)。
         """
         reply = None
         decision = "skip"
@@ -4109,7 +4111,25 @@ class FacebookAutomation(BaseAutomation):
         except Exception as e:
             log.debug("[ai_reply] persona 元数据失败(继续): %s", e)
 
-        # 空 incoming：破冰时叠一条 greeting 参考（约束 LLM 不要写英文 hello）
+        # P3: 注入长久记忆 — 历史对话 + peer 派生画像
+        memory_ctx: Dict[str, Any] = {
+            "hint_text": "",
+            "should_block_referral": False,
+            "history": [],
+            "profile": {},
+        }
+        try:
+            from src.ai.chat_memory import build_context_block
+            memory_ctx = build_context_block(did, peer_name, history_limit=5)
+            if memory_ctx.get("hint_text"):
+                if ab_style_hint:
+                    ab_style_hint = ab_style_hint + "\n\n" + memory_ctx["hint_text"]
+                else:
+                    ab_style_hint = memory_ctx["hint_text"]
+        except Exception as e:
+            log.debug("[ai_reply] chat_memory 构建失败(降级): %s", e)
+
+        # 空 incoming:破冰时叠一条 greeting 参考(约束 LLM 不要写英文 hello)
         try:
             if not (incoming_text or "").strip():
                 from .fb_content_assets import get_greeting_message
@@ -4156,6 +4176,13 @@ class FacebookAutomation(BaseAutomation):
                 ref_score = float(getattr(result, "referral_score", 0.0) or 0.0)
                 has_contact = bool(_rc_raw) or bool(_rch_map)
                 decision = "wa_referral" if (has_contact and ref_score > 0.5) else "reply"
+                # P3: 上次引流对方未回 → 本轮强制降级 reply,避免 spam 式重复引流
+                if decision == "wa_referral" and memory_ctx.get("should_block_referral"):
+                    log.info(
+                        "[ai_reply] peer=%s 上次引流后未回复,本轮降级为 reply",
+                        peer_name,
+                    )
+                    decision = "reply"
                 # P1-1 + P1-5: 引流出站用 **首推渠道 + 对应 ID** 的本地化模板
                 if decision == "wa_referral" and _r_val:
                     try:
