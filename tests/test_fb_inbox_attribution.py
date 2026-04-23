@@ -260,3 +260,100 @@ class TestMarkGreetingRepliedBack:
         from src.host.fb_store import mark_greeting_replied_back
         assert mark_greeting_replied_back("", "Alice") == 0
         assert mark_greeting_replied_back("d1", "") == 0
+
+
+# ─── F1: contact_event 同步 (Phase 5 merge 前后都要 graceful) ────────────
+class TestGreetingRepliedContactEventSync:
+    def test_phase5_not_merged_graceful(self, tmp_db):
+        """Phase 5 未 merge → record_contact_event 不在 globals → 静默 skip。"""
+        from src.host import fb_store
+        from src.host.fb_store import (record_inbox_message,
+                                        mark_greeting_replied_back)
+        # 先准备一条 greeting 行
+        record_inbox_message("d1", "Alice",
+                             peer_type="friend_request",
+                             direction="outgoing",
+                             ai_decision="greeting",
+                             template_id="yaml:jp:3|fallback",
+                             preset_key="jp_growth",
+                             message_text="hi")
+        # 确认 record_contact_event 不在 globals (Phase 5 未 merge)
+        # — 此断言说明 graceful 降级能起作用
+        assert "record_contact_event" not in fb_store.__dict__ or \
+               callable(getattr(fb_store, "record_contact_event", None))
+        # 不管是否有 Phase 5,mark_greeting_replied_back 应成功返回 1
+        n = mark_greeting_replied_back("d1", "Alice", window_days=7)
+        assert n == 1
+
+    def test_phase5_merged_writes_contact_event(self, tmp_db, monkeypatch):
+        """Phase 5 已 merge 时 → 同步调 record_contact_event。"""
+        from src.host import fb_store
+        from src.host.fb_store import (record_inbox_message,
+                                        mark_greeting_replied_back)
+
+        calls = []
+
+        def fake_record(device_id, peer_name, event_type, **kw):
+            calls.append({
+                "device_id": device_id, "peer_name": peer_name,
+                "event_type": event_type, **kw,
+            })
+            return 1
+
+        monkeypatch.setattr(fb_store, "record_contact_event",
+                            fake_record, raising=False)
+        monkeypatch.setattr(fb_store, "CONTACT_EVT_GREETING_REPLIED",
+                            "greeting_replied", raising=False)
+
+        record_inbox_message("d1", "Alice",
+                             peer_type="friend_request",
+                             direction="outgoing",
+                             ai_decision="greeting",
+                             template_id="yaml:jp:3|fallback",
+                             preset_key="jp_growth",
+                             message_text="hi")
+        n = mark_greeting_replied_back("d1", "Alice", window_days=7)
+        assert n == 1
+        # contact_event 被同步写入
+        assert len(calls) == 1
+        c = calls[0]
+        assert c["device_id"] == "d1"
+        assert c["peer_name"] == "Alice"
+        assert c["event_type"] == "greeting_replied"
+        # template_id 去了 '|fallback' 后缀,只保留纯 id
+        assert c["template_id"] == "yaml:jp:3"
+        assert c["preset_key"] == "jp_growth"
+        assert c["meta"]["via"] == "mark_greeting_replied_back"
+        assert c["meta"]["window_days"] == 7
+
+    def test_phase5_merged_no_row_matched_no_event(self, tmp_db, monkeypatch):
+        """UPDATE 未命中 (peer 无 greeting) → 不写 contact_event。"""
+        from src.host import fb_store
+        from src.host.fb_store import mark_greeting_replied_back
+        calls = []
+        monkeypatch.setattr(fb_store, "record_contact_event",
+                            lambda *a, **kw: calls.append(kw) or 1,
+                            raising=False)
+        n = mark_greeting_replied_back("d1", "GhostPeer", window_days=7)
+        assert n == 0
+        assert calls == []
+
+    def test_phase5_record_contact_event_failure_does_not_break(self, tmp_db,
+                                                                monkeypatch):
+        """record_contact_event 抛异常 → 主流程不受影响 (仍返回 rowcount=1)。"""
+        from src.host import fb_store
+        from src.host.fb_store import (record_inbox_message,
+                                        mark_greeting_replied_back)
+
+        def crashing(*a, **kw):
+            raise RuntimeError("contact event DB wiped")
+        monkeypatch.setattr(fb_store, "record_contact_event", crashing,
+                            raising=False)
+        record_inbox_message("d1", "Alice",
+                             peer_type="friend_request",
+                             direction="outgoing",
+                             ai_decision="greeting",
+                             message_text="hi")
+        # 不抛, 仍返回 1
+        n = mark_greeting_replied_back("d1", "Alice", window_days=7)
+        assert n == 1

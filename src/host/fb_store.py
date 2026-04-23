@@ -381,10 +381,54 @@ def mark_greeting_replied_back(device_id: str, peer_name: str, *,
     try:
         with _connect() as conn:
             cur = conn.execute(sql, (ts, device_id, peer_name, cutoff))
-            return cur.rowcount or 0
+            rc = cur.rowcount or 0
+            # F1 (A→B review Q1): 命中时同步写一条 fb_contact_events
+            # (Phase 5 事件表, /facebook/greeting-reply-rate 的权威数据源).
+            # Phase 5 未 merge 时 record_contact_event 不在 globals → 静默 skip
+            # 让老 replied_at 一路继续, 新 contact_events 在 merge 后自动激活。
+            if rc > 0:
+                _sync_greeting_replied_contact_event(
+                    conn, device_id, peer_name, ts, window_days)
+            return rc
     except Exception as e:
         logger.debug("mark_greeting_replied_back 失败: %s", e)
         return 0
+
+
+def _sync_greeting_replied_contact_event(conn, device_id: str, peer_name: str,
+                                         ts: str, window_days: int) -> None:
+    """F1 辅助: 把 greeting_replied 事件同步到 fb_contact_events。
+
+    Phase 5 (A 的 fb_contact_events + record_contact_event) 未 merge 时
+    ``record_contact_event`` 不在模块 globals 里, 静默 skip 不抛。Phase 5
+    merge 后自动工作, 不需要二次改动。
+    """
+    if "record_contact_event" not in globals():
+        return
+    try:
+        row = conn.execute(
+            "SELECT template_id, preset_key FROM facebook_inbox_messages"
+            " WHERE device_id=? AND peer_name=? AND direction='outgoing'"
+            " AND ai_decision='greeting' AND replied_at=?"
+            " ORDER BY id DESC LIMIT 1",
+            (device_id, peer_name, ts),
+        ).fetchone()
+        if not row:
+            return
+        tid = (row[0] or "").split("|")[0]  # 去 '|fallback' 后缀,对齐 A 建议
+        pkey = row[1] or ""
+        evt_const = globals().get(
+            "CONTACT_EVT_GREETING_REPLIED", "greeting_replied")
+        globals()["record_contact_event"](
+            device_id, peer_name, evt_const,
+            template_id=tid,
+            preset_key=pkey,
+            meta={"via": "mark_greeting_replied_back",
+                  "window_days": window_days},
+        )
+    except Exception as e:
+        logger.debug(
+            "[mark_greeting_replied_back] contact_event 同步失败: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────
