@@ -162,14 +162,23 @@ def _fuzzy_match_lead_by_name(store, name: str) -> Optional[int]:
     except Exception as e:
         log.debug("[_fuzzy_match_lead_by_name] DB 查询失败: %s", e)
         return None
+    hits: List[int] = []
     for row in rows:
         cand = row[1] or ""
         if cand == n_name:
             # 硬匹配本应在 find_match 命中; 这里兜底处理
             return int(row[0])
         if _levenshtein_le1(n_name, cand):
-            return int(row[0])
-    return None
+            hits.append(int(row[0]))
+    if not hits:
+        return None
+    if len(hits) > 1:
+        # M3.1 (A Round 3 review): 多命中便于排查误归属; 返回 id DESC 最大者
+        log.warning(
+            "[_fuzzy_match_lead_by_name] %d candidates within dist<=1 "
+            "for %r: %s; picked %d",
+            len(hits), n_name, hits[:5], hits[0])
+    return hits[0]
 
 
 class MessengerError(Exception):
@@ -1144,7 +1153,7 @@ class FacebookAutomation(BaseAutomation):
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
         return False  # pragma: no cover
 
-    # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (ja/zh/en/it 对齐
+    # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (en/zh/ja/it/es 对齐
     # persona)。要改请同步改 src/host/fb_store.py::_RISK_KIND_RULES 的
     # content_blocked 分类规则,否则 record_risk_event 会错分类。
     _SEND_BLOCKED_KEYWORDS = (
@@ -1153,28 +1162,36 @@ class FacebookAutomation(BaseAutomation):
         "不能发送此消息", "发送失败", "无法发送", "訊息無法傳送",
         "送信できませんでした", "メッセージを送信できません",
         "non inviabile", "messaggio non inviato",
+        # M5.1 (A Round 3 review): fb_target_personas.yaml 含 ES 客群
+        "no se puede enviar", "mensaje no enviado", "no se pudo enviar",
     )
 
-    def _detect_send_blocked(self, d) -> str:
+    def _detect_send_blocked(self, d, *, max_wait_s: float = 1.5,
+                             initial_wait_s: float = 0.3,
+                             poll_interval_s: float = 0.15) -> str:
         """F4: 点 Send 按钮后扫屏查 FB 拒绝发送提示 (snackbar/toast/dialog)。
 
-        返回匹配到的文本片段 (非空即代表被拒); 无匹配返回空串。不抛。
+        M5.2 (A Round 3 review): time.sleep(0.8) 固定等 → bounded polling。
+        initial_wait_s 让 popup 初始渲染, 之后每 poll_interval_s dump 一次直到
+        命中或 max_wait_s 到期。慢设备赶得上, 快设备早退。无匹配返回空串, 不抛。
         """
-        try:
-            time.sleep(0.8)  # wait popup render
-            xml = d.dump_hierarchy()
-        except Exception:
-            return ""
-        low = xml.lower() if xml else ""
-        if not low:
-            return ""
-        for kw in self._SEND_BLOCKED_KEYWORDS:
-            k = kw.lower()
-            idx = low.find(k)
-            if idx >= 0:
-                # 截取一段返回,方便日志 + record_risk_event 分类
-                return xml[max(0, idx - 10):idx + len(kw) + 50]
-        return ""
+        time.sleep(initial_wait_s)
+        deadline = time.time() + max_wait_s - initial_wait_s
+        while True:
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if xml:
+                low = xml.lower()
+                for kw in self._SEND_BLOCKED_KEYWORDS:
+                    idx = low.find(kw.lower())
+                    if idx >= 0:
+                        # 截取一段返回,方便日志 + record_risk_event 分类
+                        return xml[max(0, idx - 10):idx + len(kw) + 50]
+            if time.time() >= deadline:
+                return ""
+            time.sleep(poll_interval_s)
 
     def _xspace_select_sheet_visible(self, d) -> bool:
         """快速探测 MIUI 'Select app' 浅色底 sheet 是否仍在屏(P2 辅助)。"""
