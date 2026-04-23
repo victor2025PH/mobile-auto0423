@@ -216,6 +216,53 @@ class TestIntentSourceCoverage:
         assert r["total_sampled"] <= 5
 
 
+# ─── P9 intent_health_report ─────────────────────────────────────────────────
+
+class TestIntentHealthReport:
+    def test_no_data_returns_no_data_health(self, tmp_db):
+        from src.analytics.chat_funnel import intent_health_report
+        r = intent_health_report()
+        assert r["health"] == "no_data"
+        assert r["rule_coverage"] == 0.0
+
+    def test_healthy_when_rules_dominate(self, tmp_db):
+        from src.host.fb_store import record_inbox_message
+        from src.analytics.chat_funnel import intent_health_report
+        for m in ["how much", "LINE できますか",
+                  "再见", "ok", "hello friend how are you"]:
+            record_inbox_message("d1", "p", direction="incoming",
+                                 peer_type="friend", message_text=m)
+        r = intent_health_report(device_id="d1")
+        # 大部分可 rule 命中 → healthy
+        assert r["health"] in ("healthy", "needs_rules")
+        assert r["rule_coverage"] > 0.5
+        assert "rule" in r["recommendation"] or "健康" in r["recommendation"]
+
+    def test_degraded_when_mostly_fallback(self, tmp_db):
+        from src.host.fb_store import record_inbox_message
+        from src.analytics.chat_funnel import intent_health_report
+        # 故意用模糊消息让 rule 不命中 → LLM 关 → fallback
+        for i in range(5):
+            record_inbox_message("d1", f"p{i}", direction="incoming",
+                                 peer_type="friend",
+                                 message_text="这是一个比较含糊的表达消息")
+        r = intent_health_report(device_id="d1")
+        # 大部分 fallback (rule 不中 + LLM 关) → degraded 或 needs_rules
+        assert r["health"] in ("degraded", "needs_rules")
+        assert "扩" in r["recommendation"] or "审计" in r["recommendation"]
+
+    def test_thresholds_customizable(self, tmp_db):
+        from src.host.fb_store import record_inbox_message
+        from src.analytics.chat_funnel import intent_health_report
+        record_inbox_message("d1", "p", direction="incoming",
+                             peer_type="friend", message_text="how much?")
+        # 把 healthy 门调到 99%, 必然 degraded/needs_rules
+        r = intent_health_report(device_id="d1",
+                                  rule_threshold_healthy=0.99,
+                                  rule_threshold_degraded=0.99)
+        assert r["health"] in ("needs_rules", "degraded", "healthy")
+
+
 # ─── a_greeting_reply_rate (A Phase 5 消费) ──────────────────────────────────
 
 class TestAGreetingReplyRate:
