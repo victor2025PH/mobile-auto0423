@@ -70,13 +70,13 @@ if os.environ.get("NO_COLOR") or (sys.platform == "win32" and
 @dataclass
 class LiveStep:
     name: str
-    status: str = "NOT_RUN"  # PASS / FAIL / SKIP / NOT_RUN
+    status: str = "NOT_RUN"  # PASS / WARN / FAIL / SKIP / NOT_RUN
     reason: str = ""
     data: Dict[str, Any] = field(default_factory=dict)
     elapsed_ms: int = 0
 
     def render(self) -> str:
-        color = {"PASS": GREEN, "SKIP": YELLOW,
+        color = {"PASS": GREEN, "WARN": YELLOW, "SKIP": YELLOW,
                  "FAIL": RED, "NOT_RUN": ""}.get(self.status, "")
         tag = f"{color}[{self.status:6}]{RESET}"
         detail = f" ({self.reason})" if self.reason else ""
@@ -102,6 +102,66 @@ PRESET_KEY = "live_smoke"
 # ─────────────────────────────────────────────────────────────────────────────
 # 各步骤 (只读)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def step_init_db(device_id: str) -> LiveStep:
+    """确保生产 DB 的 FB schema 存在 (逐语句 IF NOT EXISTS, 幂等)。
+
+    真机验证发现两个真实问题:
+      1. 新仓库/首次 smoke 时 data/openclaw.db 可能空, 需 init 建 FB 表
+      2. 历史遗留 audit_logs 表 schema 版本不一致 (老版有 ts 列, 新版
+         代码 CREATE INDEX ON audit_logs(timestamp) 会 FAIL), 导致整个
+         init_db() executescript 中途崩溃, FB 表根本建不起来
+
+    修复策略: 不调 init_db() 整体 script, 改为解析 _SCHEMA + _MIGRATIONS
+    逐条执行, 每条独立 try/except skip — 老表 schema 不一致的索引失败
+    不影响后续 FB 表建立。之后 verify FB 关键表存在。
+    """
+    s = LiveStep("init_db")
+    t0 = time.time()
+    try:
+        from src.host.database import _SCHEMA, _MIGRATIONS, _connect, DB_PATH
+        # _SCHEMA 是一整条 executescript, 按分号拆分 (简化 — 忽略嵌套)
+        schema_stmts = [st.strip() for st in _SCHEMA.split(";") if st.strip()]
+        all_stmts = schema_stmts + list(_MIGRATIONS)
+        ok = fail = 0
+        failures_sample: List[str] = []
+        with _connect() as conn:
+            for stmt in all_stmts:
+                try:
+                    conn.execute(stmt)
+                    ok += 1
+                except Exception as e:
+                    fail += 1
+                    if len(failures_sample) < 3:
+                        failures_sample.append(f"{str(e)[:50]}")
+            conn.commit()
+        s.data["db_path"] = str(DB_PATH)
+        s.data["stmts_ok"] = ok
+        s.data["stmts_fail"] = fail
+        # 验证 FB 关键表存在
+        critical = ["facebook_friend_requests", "facebook_inbox_messages",
+                    "facebook_groups", "fb_risk_events"]
+        with _connect() as conn:
+            for t in critical:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (t,)).fetchone()
+                if not row:
+                    s.status = "FAIL"
+                    s.reason = f"关键表 {t} 未建"
+                    return s
+        if fail > 0:
+            s.status = "WARN"
+            s.reason = (f"{fail} 条历史/非关键 SQL 失败 (忽略), "
+                        f"FB 表已齐")
+        else:
+            s.status = "PASS"
+    except Exception as e:
+        s.status = "FAIL"
+        s.reason = str(e)[:120]
+    s.elapsed_ms = int((time.time() - t0) * 1000)
+    return s
+
 
 def step_device_reachable(device_id: str) -> LiveStep:
     """验 adb 能连设备。不动设备状态。"""
@@ -148,17 +208,49 @@ def step_fb_automation_init(device_id: str) -> LiveStep:
 
 
 def step_list_messenger_conversations(device_id: str) -> LiveStep:
-    """调 _list_messenger_conversations 读取可见对话 (不进入)。"""
+    """调 _list_messenger_conversations 读取可见对话 (不进入)。
+
+    会检查 app_current 是否在 Messenger/FB, 若不在加 WARN 提示用户手动
+    导航到 Messenger chat 列表。还会对抓到的 first_names 做语义检查,
+    全是 UI 元素关键词 (非人名) 时也 WARN。
+    """
     s = LiveStep("list_messenger_conversations")
     t0 = time.time()
+    # UI 元素噪声关键词 — 命中说明抓到的不是真实对话人名
+    ui_noise_markers = (
+        "查看主页", "详细了解", "输入消息", "搜索", "Search", "Chats",
+        "Stories", "People", "Calls", "Home", "Profile",
+        "見る", "送信", "メッセージ", "検索",
+        # 2026-04-24 真机 smoke 扩充: Messenger 顶部/导航元素
+        "Meta AI", "已验证", "对话详情", "问问", "立即还原",
+        "Back", "返回",
+    )
     try:
-        from src.app_automation.facebook import FacebookAutomation
+        from src.app_automation.facebook import FacebookAutomation, MESSENGER_PACKAGE, PACKAGE
         fb = FacebookAutomation()
         d = fb._u2(device_id)
+
+        # 前置检查: 当前屏幕是否在 Messenger/FB
+        try:
+            cur_pkg = (d.app_current() or {}).get("package", "")
+        except Exception:
+            cur_pkg = ""
+        s.data["app_current"] = cur_pkg
+
         convs = fb._list_messenger_conversations(d, max_n=5)
+        names = [c.get("name", "") for c in convs[:5]]
         s.data["found"] = len(convs)
-        s.data["first_names"] = [c.get("name", "") for c in convs[:3]]
-        s.status = "PASS"
+        s.data["first_names"] = names[:3]
+
+        # 语义判断
+        if cur_pkg not in (MESSENGER_PACKAGE, PACKAGE):
+            s.status = "WARN"
+            s.reason = f"当前 app={cur_pkg or '空'}, 非 Messenger/FB, 结果可能是 UI 噪声"
+        elif names and all(any(m in n for m in ui_noise_markers) for n in names):
+            s.status = "WARN"
+            s.reason = "抓到的 names 全是 UI 元素关键词, 屏幕可能不在 chat 列表"
+        else:
+            s.status = "PASS"
     except Exception as e:
         s.status = "FAIL"
         s.reason = str(e)[:120]
@@ -188,6 +280,10 @@ def step_list_friend_requests(device_id: str) -> LiveStep:
         if stats.get("accepted", 0) > 0:
             s.status = "FAIL"
             s.reason = "意外接受了好友请求,安全约束失效"
+        elif not stats.get("opened", False):
+            # 入口未找到是常见场景 (当前 app 不在 FB 主页), 标 WARN 提示用户
+            s.status = "WARN"
+            s.reason = stats.get("error", "Friends 入口未找到,请导航到 FB > Friends")
         else:
             s.status = "PASS"
     except Exception as e:
@@ -246,8 +342,13 @@ def step_funnel_metrics_snapshot(device_id: str) -> LiveStep:
                   and isinstance(v, (int, float))}
         s.status = "PASS"
     except Exception as e:
-        s.status = "FAIL"
-        s.reason = str(e)[:120]
+        err = str(e)
+        if "no such table" in err:
+            s.status = "SKIP"
+            s.reason = f"{err[:60]} — 请先跑 init_db step 或启动 server.py"
+        else:
+            s.status = "FAIL"
+            s.reason = err[:120]
     s.elapsed_ms = int((time.time() - t0) * 1000)
     return s
 
@@ -272,8 +373,13 @@ def step_extended_funnel(device_id: str) -> LiveStep:
         s.data["rule_coverage"] = health.get("rule_coverage", 0.0)
         s.status = "PASS"
     except Exception as e:
-        s.status = "FAIL"
-        s.reason = str(e)[:120]
+        err = str(e)
+        if "no such table" in err:
+            s.status = "SKIP"
+            s.reason = f"{err[:60]} — 请先跑 init_db step"
+        else:
+            s.status = "FAIL"
+            s.reason = err[:120]
     s.elapsed_ms = int((time.time() - t0) * 1000)
     return s
 
@@ -283,6 +389,7 @@ def step_extended_funnel(device_id: str) -> LiveStep:
 # ─────────────────────────────────────────────────────────────────────────────
 
 STEPS: List[Callable[[str], LiveStep]] = [
+    step_init_db,
     step_device_reachable,
     step_fb_automation_init,
     step_list_messenger_conversations,
@@ -293,6 +400,7 @@ STEPS: List[Callable[[str], LiveStep]] = [
 ]
 
 STEP_BY_KEY = {
+    "init_db": step_init_db,
     "adb": step_device_reachable,
     "init": step_fb_automation_init,
     "conversations": step_list_messenger_conversations,
@@ -383,11 +491,11 @@ def main() -> int:
         by_status[r.status] = by_status.get(r.status, 0) + 1
 
     print(f"\n{BOLD}=== Summary ==={RESET}")
-    for status in ("PASS", "SKIP", "FAIL", "NOT_RUN"):
+    for status in ("PASS", "WARN", "SKIP", "FAIL", "NOT_RUN"):
         n = by_status.get(status, 0)
         if n == 0:
             continue
-        color = {"PASS": GREEN, "SKIP": YELLOW,
+        color = {"PASS": GREEN, "WARN": YELLOW, "SKIP": YELLOW,
                  "FAIL": RED}.get(status, "")
         print(f"  {color}{status}{RESET}: {n}")
 
