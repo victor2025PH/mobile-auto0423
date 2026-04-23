@@ -610,6 +610,13 @@ _RISK_KIND_RULES = [
     (("disabled", "account is locked", "account has been"), "account_review"),
     (("suspicious", "unusual login"), "identity_verify"),
     (("can't use this feature", "cannot use this feature"), "policy_warning"),
+    # F4 (来自 A→B review Q6): Messenger 发送文案被 FB 拒绝
+    # (多语言,ja/zh/en/it 对齐 persona)
+    (("can't be sent", "cannot be sent", "couldn't send", "unable to send",
+      "message can't be sent", "message wasn't sent",
+      "不能发送此消息", "发送失败", "无法发送", "訊息無法傳送",
+      "送信できませんでした", "メッセージを送信できません",
+      "non inviabile", "messaggio non inviato"), "content_blocked"),
 ]
 
 
