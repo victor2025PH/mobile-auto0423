@@ -358,6 +358,62 @@ B 给出"需要这个渠道"的需求在遗留问题里列, A 实现后 B 直接
 
 ---
 
+## 七点六、MessengerError 分流契约（2026-04-23 B PR #1 + A review 确认）
+
+**source**: `src/app_automation/facebook.py::MessengerError` (7 档 code)
+
+A 机的 Messenger 降级路径 (`send_greeting_after_add_friend` 的 A2 fallback)
+catch 下列 code 后按此分流:
+
+| code | A 机分流动作 | 归因副作用 |
+|------|-------------|------------|
+| `risk_detected` | `fb_account_phase.set_phase(did, "cooldown")` — **设备级** | journey `risk_detected` + 30 min 硬停 |
+| `xspace_blocked` | 只 log warning, retry 1 次; 仍失败 → 降级 FB 主 app 个人页 DM | **不** cooldown (系统弹窗, 不是 FB 风控) |
+| `recipient_not_found` | 重试 2 次 × 间隔 5-15s; 仍失败 → 跳该 peer | journey `referral_blocked{reason=peer_not_in_messenger}` |
+| `search_ui_missing` | 等 8s retry 1 次; 仍失败 → 降级 FB 主 app | 可能是 cold start |
+| `send_button_missing` | 记 `fb_risk_events{kind=content_blocked, text_hash=...}` → 降级主 app | 文案可能违禁 |
+| `send_blocked_by_content` *(建议 B 后续加一档)* | 同上 + 用更短版本重试一次 | FB 主动拒发 |
+| `messenger_unavailable` | 跳该 peer + **device-level 标记** `messenger_not_ready` (临时过期 30 min) | 调度器应避开 |
+| `send_fail` | cooldown 3 min + retry 1 次 | 保底 |
+
+**不改码契约**: 新增 code 要双方同意, 加到本表。删 code 不允许。
+
+---
+
+## 七点七、共享 `device_section_lock` section 命名约定（2026-04-23）
+
+`src/host/fb_concurrency.device_section_lock(device_id, section)` 的
+section 字符串是**全局键名空间**, 双方共用:
+
+| section | 持有者 | 含义 |
+|---------|--------|------|
+| `add_friend` | A 独占 | 加好友 UI 操作 |
+| `send_greeting` | A 独占 | profile 页 Message 内嵌对话 |
+| `messenger_active` | **A+B 共用** | Messenger App 前台占用 (避免 A 的 fallback 和 B 的 check_message_requests 抢输入框) |
+| `chatting_<canonical_id>` | 未来扩展 | 跨 agent 持有同一 lead 的对话权 |
+
+**铁律**: B 的 `check_message_requests` / `check_messenger_inbox` 进入 Messenger
+App 操作时必须先拿 `messenger_active` 锁; A 的 `send_message` fallback 路径同样。
+
+---
+
+## 七点八、greeting 回复归因双写（2026-04-23 A 机 PR #6 review 补充）
+
+为让 Phase 5 的 `/facebook/greeting-reply-rate` 能按 template_id 算 A/B 回复率,
+B 在 `mark_greeting_replied_back` 成功后需要同步写 `fb_contact_events`:
+
+```python
+record_contact_event(
+    device_id, peer_name, CONTACT_EVT_GREETING_REPLIED,
+    template_id=greeting_row.template_id.split("|")[0],  # 去 |fallback 后缀
+    preset_key=greeting_row.preset_key or "",
+    meta={"via": "mark_greeting_replied_back", "window_days": 7})
+```
+
+详见 `docs/A_TO_B_REPLY_REVIEW.md` Q1。
+
+---
+
 ## 八、遗留问题 / 待协商
 
 > 双方遇到不确定归属的事情先写在这里，不要直接动代码。
@@ -372,3 +428,9 @@ B 给出"需要这个渠道"的需求在遗留问题里列, A 实现后 B 直接
 - 2026-04-23 首版 — 由 A 起草（v1.1.0 + Phase 1/2 实施完成后）
 - 2026-04-23 Phase 3 更新 — A 追加: fb_contact_events / gate_registry / device_section_lock /
   /facebook/contact-events / /facebook/greeting-reply-rate / Funnel greeting widget
+- 2026-04-23 Phase 4+5 — A 追加: 多渠道 ReferralChannel (§7.5) + Lead Mesh (§7+) —
+  Dossier / Handoff / Agent Mesh / Webhook
+- 2026-04-23 B PR #1-#7 — B 追加: `mark_greeting_replied_back` + lang_detect +
+  MessengerError + chat_memory + chat_intent + referral_gate + stranger auto-reply
+- 2026-04-23 A review 回复 — A 新增契约: MessengerError 分流矩阵 (§7.6) +
+  device_section_lock section 命名 (§7.7) + greeting 归因双写 (§7.8)
