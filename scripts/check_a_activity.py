@@ -101,7 +101,7 @@ def git_recent_commits_on_branch(branch: str, hours: int,
     多分支重复报同一 commit (例如 feat-a-phase3 的 commits 也在
     feat-a-phase5-mesh 和 feat-a-reply-to-b 里)。
     """
-    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
     since_iso = since.strftime("%Y-%m-%dT%H:%M:%S+0000")
     try:
         r = subprocess.run(
@@ -136,7 +136,7 @@ def git_file_changed_recently(path: str, hours: int,
 
     返回 [{sha, when, subject}, ...], 空列表表示无实际变化。
     """
-    since = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+    since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
     since_iso = since.strftime("%Y-%m-%dT%H:%M:%S+0000")
     try:
         r = subprocess.run(
@@ -280,7 +280,7 @@ def collect_activity(hours: int, token: Optional[str],
             ))
             prs = []
 
-        cutoff = _dt.datetime.utcnow() - _dt.timedelta(hours=hours)
+        cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)
         for p in prs:
             head_ref = (p.get("head") or {}).get("ref", "")
             if not head_ref.startswith("feat-b-"):
@@ -301,7 +301,9 @@ def collect_activity(hours: int, token: Optional[str],
                 if not sub:
                     continue
                 try:
-                    ts = _dt.datetime.strptime(sub, "%Y-%m-%dT%H:%M:%SZ")
+                    ts = _dt.datetime.strptime(
+                        sub, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=_dt.timezone.utc)
                 except ValueError:
                     continue
                 if ts < cutoff:
@@ -326,7 +328,9 @@ def collect_activity(hours: int, token: Optional[str],
                 if not created:
                     continue
                 try:
-                    ts = _dt.datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ")
+                    ts = _dt.datetime.strptime(
+                        created, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=_dt.timezone.utc)
                 except ValueError:
                     continue
                 if ts < cutoff:
@@ -343,8 +347,9 @@ def collect_activity(hours: int, token: Optional[str],
             # merged state
             if p.get("merged_at"):
                 try:
-                    merged = _dt.datetime.strptime(p["merged_at"],
-                                                     "%Y-%m-%dT%H:%M:%SZ")
+                    merged = _dt.datetime.strptime(
+                        p["merged_at"], "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=_dt.timezone.utc)
                 except ValueError:
                     merged = None
                 if merged and merged >= cutoff:

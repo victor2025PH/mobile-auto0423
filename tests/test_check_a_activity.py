@@ -129,7 +129,7 @@ class TestCollectActivity:
     def test_mocked_api_pr_merged_detected(self):
         from scripts.check_a_activity import collect_activity
         import datetime as _dt
-        now = _dt.datetime.utcnow()
+        now = _dt.datetime.now(_dt.timezone.utc)
         merged_iso = (now - _dt.timedelta(hours=2)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
         fake_pr = {
@@ -157,7 +157,7 @@ class TestCollectActivity:
     def test_watch_pr_filter(self):
         from scripts.check_a_activity import collect_activity
         import datetime as _dt
-        now = _dt.datetime.utcnow()
+        now = _dt.datetime.now(_dt.timezone.utc)
         merged_iso = (now - _dt.timedelta(hours=1)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
         fake_prs = [
@@ -185,7 +185,8 @@ class TestCollectActivity:
         """head.ref 不以 feat-b- 开头的 PR 不应进入 GitHub API 部分。"""
         from scripts.check_a_activity import collect_activity
         import datetime as _dt
-        merged_iso = (_dt.datetime.utcnow() - _dt.timedelta(hours=1)
+        merged_iso = (_dt.datetime.now(_dt.timezone.utc)
+                       - _dt.timedelta(hours=1)
                       ).strftime("%Y-%m-%dT%H:%M:%SZ")
         fake_prs = [
             {"number": 10, "title": "A PR",
