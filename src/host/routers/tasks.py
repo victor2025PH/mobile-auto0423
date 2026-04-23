@@ -80,50 +80,32 @@ def create_task_endpoint(body: TaskCreate):
         params = {**params, "_created_via": str(cv).strip()}
     elif isinstance(params, dict) and "_created_via" not in params:
         params = {**params, "_created_via": "api"}
-    # P1-5: 创建任务前与 executor 同源闸，避免 facebook_add_friend 堆积 pending
-    # 2026-04-23: 把 facebook_add_friend_and_greet 也纳入同源闸
-    if task_type in ("facebook_add_friend",
-                     "facebook_add_friend_and_greet") and body.device_id:
-        from src.host.fb_add_friend_gate import check_add_friend_gate
-
-        _gerr, _gmeta = check_add_friend_gate(str(body.device_id), params)
+    # P3-2 2026-04-23: 统一用 gate_registry 查 gate,避免 if-elif 膨胀。
+    # A 已注册 facebook_add_friend / facebook_add_friend_and_greet /
+    # facebook_send_greeting 三个 task_type 的 gate;
+    # B 只需在自己的 gate 模块末尾调 register_task_gate(...) 即可加入, 无需改本文件。
+    if body.device_id:
+        from src.host.gate_registry import check_gate_for_task
+        _gerr, _gmeta = check_gate_for_task(task_type, str(body.device_id), params)
         if _gerr:
             raise HTTPException(
                 status_code=400,
                 detail={"error": _gerr, "meta": _gmeta, "task_type": task_type},
             )
-    # 2026-04-23: 独立打招呼任务也需前置闸(phase / greeting daily_cap)
-    if task_type == "facebook_send_greeting" and body.device_id:
-        from src.host.fb_add_friend_gate import check_send_greeting_gate
-
-        _gerr_g, _gmeta_g = check_send_greeting_gate(str(body.device_id), params)
-        if _gerr_g:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": _gerr_g, "meta": _gmeta_g, "task_type": task_type},
-            )
-    # P1-6: campaign 含 add_friends 时同源闸（避免整单入队后首步加好友才失败）
-    # 2026-04-23: campaign 含 send_greeting step 时同样需要闸,防止绕过 greeting cap
+    # campaign 含 gated step(add_friends / send_greeting / 未来 B 加的 reply_flood 等)时,
+    # 前置闸统一走 check_gates_for_campaign_steps, 任何 step gate 失败整单拒绝入队。
     if task_type == "facebook_campaign_run" and body.device_id:
-        from src.host.fb_add_friend_gate import (campaign_step_names,
-                                                  check_add_friend_gate,
-                                                  check_send_greeting_gate)
+        from src.host.fb_add_friend_gate import campaign_step_names
+        from src.host.gate_registry import check_gates_for_campaign_steps
 
         _step_names = campaign_step_names(params)
-        if "add_friends" in _step_names:
-            _g2, _m2 = check_add_friend_gate(str(body.device_id), params)
-            if _g2:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": _g2, "meta": _m2, "task_type": task_type},
-                )
-        if "send_greeting" in _step_names:
-            _g3, _m3 = check_send_greeting_gate(str(body.device_id), params)
-            if _g3:
-                raise HTTPException(
-                    status_code=400,
-                    detail={"error": _g3, "meta": _m3, "task_type": task_type},
-                )
+        _gerr_c, _gmeta_c = check_gates_for_campaign_steps(
+            _step_names, str(body.device_id), params)
+        if _gerr_c:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": _gerr_c, "meta": _gmeta_c, "task_type": task_type},
+            )
     task_id = task_store.create_task(
         task_type=task_type,
         device_id=body.device_id,

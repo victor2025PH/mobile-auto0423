@@ -24,9 +24,8 @@ websockets>=12.0              # 集群 WebSocket 实时流代理
 
 # ── 聊天控制 (AI 意图解析) ──
 # openai>=1.0.0            # 可选：如需 openai SDK
-# httpx>=0.24.0             # 可选：异步 HTTP 客户端
+httpx>=0.24.0               # 异步 HTTP 客户端 — src/ai/llm_client / openclaw_agent / vision/backends 必需，且 fastapi.testclient 也依赖
 
 # ── 开发/测试（可选） ──
 # pytest>=7.0.0
-# httpx>=0.24.0
 # requests>=2.28.0

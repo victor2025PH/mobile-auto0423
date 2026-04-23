@@ -193,6 +193,22 @@
         <button class="qa-btn" onclick="fbOpenReferralModal()" style="padding:6px 10px;font-size:12px">
           🔗 引流账号
         </button>
+
+        ${groupDivider}
+
+        <!-- ④ Lead Mesh 交接 / 档案 / 指挥台 (Phase 5.5 新增, 跨 Agent 协同) -->
+        <button class="qa-btn" onclick="lmOpenHandoffInbox()" style="padding:6px 10px;font-size:12px;background:rgba(245,158,11,.15);color:#f59e0b">
+          🤝 接收方工作台
+        </button>
+        <button class="qa-btn" onclick="lmOpenLeadSearch()" style="padding:6px 10px;font-size:12px;background:rgba(14,165,233,.15);color:#0ea5e9">
+          🔍 Lead 档案
+        </button>
+        <button class="qa-btn" onclick="lmOpenCommandCenter()" style="padding:6px 10px;font-size:12px;background:rgba(168,85,247,.15);color:#a855f7">
+          📊 运营指挥台
+        </button>
+        <button class="qa-btn" onclick="lmOpenReceiversConfig()" style="padding:6px 10px;font-size:12px;background:rgba(34,197,94,.15);color:#22c55e">
+          📬 接收方管理
+        </button>
       </div>
     `;
   }
@@ -909,23 +925,83 @@
     const Shell = window.PlatShell;
     if (!Shell) { showToast('PlatShell 未加载', 'error'); return; }
     Shell.modal.open('fb-funnel-modal',
-      '<div id="fb-funnel-body">加载中…</div>', { maxWidth: '720px' });
+      '<div id="fb-funnel-body">加载中…</div>', { maxWidth: '860px' });
     try {
       const r = await Shell.api.get('/facebook/funnel?since_hours=168');
       const steps = r.steps || [];
+      // P3-4: greeting 维度专属数据(取自 /facebook/funnel 响应根字段)
+      const greetSent = r.stage_greetings_sent || 0;
+      const greetFallback = r.stage_greetings_fallback || 0;
+      const frSent = r.stage_friend_request_sent || 0;
+      const rateGreetAfterAdd = r.rate_greet_after_add || 0;
+      const templateDist = r.greeting_template_distribution || [];
+
+      // 模板分布 top 5 的水平柱状
+      const maxCnt = Math.max(1, ...templateDist.map(function (kv) { return kv[1] || 0; }));
+      const tplBars = templateDist.length
+        ? templateDist.map(function (kv) {
+            const tid = kv[0] || '-';
+            const cnt = kv[1] || 0;
+            const w = Math.round(cnt * 100 / maxCnt);
+            return ''
+              + '<div style="display:flex;align-items:center;gap:8px;font-size:11px;margin-bottom:4px">'
+              +   '<code style="min-width:110px;color:var(--text-muted)">' + tid + '</code>'
+              +   '<div style="flex:1;background:rgba(96,165,250,.12);border-radius:4px;overflow:hidden;height:14px">'
+              +     '<div style="width:' + w + '%;height:100%;background:linear-gradient(90deg,#60a5fa,#22d3ee)"></div>'
+              +   '</div>'
+              +   '<span style="min-width:32px;text-align:right;font-weight:600">' + cnt + '</span>'
+              + '</div>';
+          }).join('')
+        : '<div style="color:var(--text-dim);font-size:11px">暂无 greeting 模板命中数据</div>';
+
+      const fallbackPct = greetSent > 0 ? Math.round(greetFallback * 100 / greetSent) : 0;
+      const fbPctColor = fallbackPct > 30 ? '#ef4444'
+                       : fallbackPct > 10 ? '#f59e0b' : '#22c55e';
+
       const html = ''
         + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
         + '<h3 style="margin:0">📊 Facebook 引流漏斗 (近 7 天)</h3>'
         + '<button onclick="PlatShell.modal.close(\'fb-funnel-modal\')" style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
         + '</div>'
-        + '<div style="display:grid;gap:10px">'
-        + steps.map(function (s) {
-          const rate = s.rate != null ? ' (' + (s.rate * 100).toFixed(0) + '%)' : '';
-          return '<div style="display:flex;justify-content:space-between;padding:10px 14px;background:var(--bg-main);border-radius:8px;border-left:3px solid #1877f2">'
-            + '<span style="font-size:13px">' + s.label + '</span>'
-            + '<span style="font-weight:700;color:#60a5fa">' + s.value + rate + '</span>'
-            + '</div>';
-        }).join('')
+        + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">'
+        //  ── 左列: 传统漏斗 (已有)
+        + '<div>'
+        +   '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">🔻 主链路</div>'
+        +   '<div style="display:grid;gap:8px">'
+        +     steps.map(function (s) {
+            const rate = s.rate != null ? ' (' + (s.rate * 100).toFixed(0) + '%)' : '';
+            return '<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-main);border-radius:6px;border-left:3px solid #1877f2">'
+              + '<span style="font-size:12px">' + s.label + '</span>'
+              + '<span style="font-weight:700;color:#60a5fa;font-size:13px">' + s.value + rate + '</span>'
+              + '</div>';
+          }).join('')
+        +   '</div>'
+        + '</div>'
+        //  ── 右列: greeting 专项 (新增)
+        + '<div>'
+        +   '<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">💬 打招呼 (P3)</div>'
+        +   '<div style="display:grid;gap:8px;margin-bottom:12px">'
+        +     '<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-main);border-radius:6px;border-left:3px solid #0ea5e9">'
+        +       '<span style="font-size:12px">Greeting 总数</span>'
+        +       '<span style="font-weight:700;color:#0ea5e9;font-size:13px">' + greetSent + '</span>'
+        +     '</div>'
+        +     '<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-main);border-radius:6px;border-left:3px solid ' + fbPctColor + '">'
+        +       '<span style="font-size:12px">Fallback 路径</span>'
+        +       '<span style="font-weight:700;color:' + fbPctColor + ';font-size:13px">' + greetFallback + ' (' + fallbackPct + '%)</span>'
+        +     '</div>'
+        +     '<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-main);border-radius:6px;border-left:3px solid #a855f7">'
+        +       '<span style="font-size:12px">加友后打招呼率</span>'
+        +       '<span style="font-weight:700;color:#a855f7;font-size:13px">' + (rateGreetAfterAdd * 100).toFixed(1) + '% (' + greetSent + '/' + frSent + ')</span>'
+        +     '</div>'
+        +   '</div>'
+        +   '<div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">模板命中 Top 5 (A/B 样本)</div>'
+        +   '<div style="background:var(--bg-main);border-radius:6px;padding:10px">'
+        +     tplBars
+        +   '</div>'
+        +   '<div style="margin-top:6px;font-size:10px;color:var(--text-dim)">'
+        +     '回复率 A/B 需机器 B 的 Messenger 自动回复就位后查看 <code>/facebook/greeting-reply-rate</code>'
+        +   '</div>'
+        + '</div>'
         + '</div>'
         + '<div style="margin-top:14px;font-size:11px;color:var(--text-muted)">'
         + '设备范围: ' + (r._scope_device || 'all') + ' | 起始: ' + (r._scope_since || '?')

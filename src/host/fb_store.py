@@ -467,6 +467,185 @@ def record_risk_event(device_id: str, raw_message: str, *,
         return 0
 
 
+# ─────────────────────────────────────────────────────────────────────
+# 2026-04-23 Phase 3 P3-3: fb_contact_events —— 统一接触事件流水
+# ─────────────────────────────────────────────────────────────────────
+
+# event_type 枚举，供调用方和测试共用
+CONTACT_EVT_ADD_FRIEND_SENT = "add_friend_sent"
+CONTACT_EVT_ADD_FRIEND_RISK = "add_friend_risk"
+CONTACT_EVT_ADD_FRIEND_ACCEPTED = "add_friend_accepted"    # B 写
+CONTACT_EVT_ADD_FRIEND_REJECTED = "add_friend_rejected"    # B 写
+CONTACT_EVT_GREETING_SENT = "greeting_sent"
+CONTACT_EVT_GREETING_FALLBACK = "greeting_fallback"
+CONTACT_EVT_GREETING_REPLIED = "greeting_replied"          # B 写,对方回了我们的 greeting
+CONTACT_EVT_MESSAGE_RECEIVED = "message_received"          # B 写,对方主动 DM
+CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写
+
+VALID_CONTACT_EVENT_TYPES = frozenset({
+    CONTACT_EVT_ADD_FRIEND_SENT,
+    CONTACT_EVT_ADD_FRIEND_RISK,
+    CONTACT_EVT_ADD_FRIEND_ACCEPTED,
+    CONTACT_EVT_ADD_FRIEND_REJECTED,
+    CONTACT_EVT_GREETING_SENT,
+    CONTACT_EVT_GREETING_FALLBACK,
+    CONTACT_EVT_GREETING_REPLIED,
+    CONTACT_EVT_MESSAGE_RECEIVED,
+    CONTACT_EVT_WA_REFERRAL_SENT,
+})
+
+
+def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
+                         template_id: str = "",
+                         preset_key: str = "",
+                         meta: Optional[Dict[str, Any]] = None) -> int:
+    """记录一条接触事件。
+
+    ``event_type`` 不在 ``VALID_CONTACT_EVENT_TYPES`` 时会记 warn log 但仍然写入
+    (允许 B 扩展新类型,但提醒可能拼写错误)。
+
+    ``meta`` 会被 JSON 序列化为 meta_json; 不强约束 schema, 允许放:
+      * ``reply_to_template_id`` (B 写 greeting_replied 时放)
+      * ``reply_ms_after`` (B 写 greeting_replied 时放, 对方回复距 greeting 发出的毫秒数)
+      * ``decision`` / ``lang_detected`` 等任意辅助字段
+    """
+    if not device_id or not peer_name or not event_type:
+        return 0
+    if event_type not in VALID_CONTACT_EVENT_TYPES:
+        logger.warning("[fb_contact_events] 未知 event_type=%s, 仍写入但请检查拼写", event_type)
+    meta_str = ""
+    if meta:
+        try:
+            import json as _j
+            meta_str = _j.dumps(meta, ensure_ascii=False)
+        except Exception as e:
+            logger.debug("[fb_contact_events] meta 序列化失败: %s", e)
+            meta_str = ""
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO fb_contact_events"
+                " (device_id, peer_name, event_type, template_id, preset_key, meta_json)"
+                " VALUES (?,?,?,?,?,?)",
+                (device_id, peer_name, event_type, template_id or "",
+                 preset_key or "", meta_str),
+            )
+            return cur.lastrowid or 0
+    except Exception as e:
+        logger.debug("[fb_contact_events] 写入失败: %s", e)
+        return 0
+
+
+def count_contact_events(device_id: Optional[str] = None, *,
+                         peer_name: Optional[str] = None,
+                         event_type: Optional[str] = None,
+                         hours: int = 24) -> int:
+    """按 (device_id, peer_name, event_type) 组合计数 rolling 窗口内事件数。
+
+    用途举例:
+      * 同一对方在 24h 内被多次接触(发好友+打招呼+引流) → 骚扰配额
+      * 某 device 24h 内 greeting_sent 总数 → 日限预警
+    """
+    if hours <= 0:
+        return 0
+    import datetime as _dt
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    sql = "SELECT COUNT(*) FROM fb_contact_events WHERE at >= ?"
+    params: list = [cutoff]
+    if device_id:
+        sql += " AND device_id=?"
+        params.append(device_id)
+    if peer_name:
+        sql += " AND peer_name=?"
+        params.append(peer_name)
+    if event_type:
+        sql += " AND event_type=?"
+        params.append(event_type)
+    try:
+        with _connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def list_contact_events_by_peer(device_id: str, peer_name: str,
+                                limit: int = 50) -> List[Dict[str, Any]]:
+    """返回某 device 对某人的所有接触事件,按时间正序。
+
+    用途: 诊断"为什么给 X 发了 5 次消息还没回" —— 看事件序列。
+    """
+    if not device_id or not peer_name:
+        return []
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            rows = conn.execute(
+                "SELECT id, device_id, peer_name, event_type, template_id,"
+                " preset_key, meta_json, at FROM fb_contact_events"
+                " WHERE device_id=? AND peer_name=?"
+                " ORDER BY at ASC LIMIT ?",
+                (device_id, peer_name, int(limit)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_greeting_reply_rate_by_template(device_id: Optional[str] = None,
+                                        hours: int = 168) -> List[Dict[str, Any]]:
+    """按 template_id 分组, 计算 reply_rate = greeting_replied / greeting_sent。
+
+    这是 A/B 实验的核心指标 —— 哪条打招呼模板通过率高。
+    默认 168h (7 天) 窗口。B 的 Messenger 自动回复合并后这个数据才真正有效。
+    """
+    if hours <= 0:
+        return []
+    import datetime as _dt
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+    # 先查各模板的 sent / replied 数
+    where_dev = ""
+    params: list = [cutoff]
+    if device_id:
+        where_dev = " AND device_id=?"
+        params.append(device_id)
+    sql = (
+        "SELECT template_id, event_type, COUNT(*) FROM fb_contact_events"
+        " WHERE at >= ?"
+        + where_dev +
+        " AND event_type IN ('greeting_sent','greeting_replied')"
+        " AND template_id != ''"
+        " GROUP BY template_id, event_type"
+    )
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception:
+        return []
+    bucket: Dict[str, Dict[str, int]] = {}
+    for tid, evt, n in rows:
+        b = bucket.setdefault(tid, {"sent": 0, "replied": 0})
+        if evt == "greeting_sent":
+            b["sent"] = int(n)
+        elif evt == "greeting_replied":
+            b["replied"] = int(n)
+    out = []
+    for tid, d in bucket.items():
+        sent = d["sent"]
+        replied = d["replied"]
+        out.append({
+            "template_id": tid,
+            "sent": sent,
+            "replied": replied,
+            "reply_rate": round(replied / sent, 3) if sent else 0.0,
+        })
+    out.sort(key=lambda x: (-x["reply_rate"], -x["sent"]))
+    return out
+
+
 def count_risk_events_recent(device_id: str, hours: int = 24) -> int:
     """最近 N 小时内该设备风控事件总数，供 Gate 冷却判断。"""
     if not device_id:

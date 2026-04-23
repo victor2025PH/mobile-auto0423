@@ -193,15 +193,244 @@ git push -u origin feat-a-optimize-gate
 # GitHub 网页上开 PR → review → merge
 ```
 
-## 七、遗留问题 / 待协商
+## 七、Phase 3 新增接口（A 已实施，待 B 对接）
+
+### 7.1 统一接触事件表 `fb_contact_events`
+
+**双方协同的核心表**。A 已在 schema 迁移里建好,自动写入 `add_friend_*` / `greeting_*` 事件。
+
+**B 需要做的回写**:
+
+| 场景 | 写入 event_type | 用 template_id | meta_json |
+|------|----------------|---------------|-----------|
+| 对方接受好友请求 | `add_friend_accepted` | 留空或传原值 | `{"accepted_at": iso}` |
+| 对方拒绝 | `add_friend_rejected` | 留空 | `{"rejected_at": iso}` |
+| **对方回复了我们的 greeting** | `greeting_replied` | **必须传原 greeting outgoing 行的 template_id** | `{"reply_ms_after": int, "reply_text": str[:50]}` |
+| 对方主动发 DM | `message_received` | 留空 | `{"decision": "reply"\|"wa_referral"\|"skip"}` |
+| 引流话术发出 | `wa_referral_sent` | 可选 | `{"channel": "line"\|"whatsapp"\|...}` |
+
+**最关键的是 `greeting_replied`** —— 它让 A 的 `/facebook/greeting-reply-rate` 能按模板算真实 A/B
+回复率,否则 reply_rate 永远是 0。
+
+B 的实现建议(在 `check_messenger_inbox` / `_ai_reply_and_send` 内):
+```python
+# 检测到对方回复后,查该 peer 最近 7 天的 greeting outgoing 行
+from src.host.fb_store import record_contact_event, CONTACT_EVT_GREETING_REPLIED
+from src.host.database import _connect
+with _connect() as conn:
+    row = conn.execute(
+        "SELECT template_id, sent_at FROM facebook_inbox_messages"
+        " WHERE device_id=? AND peer_name=? AND direction='outgoing'"
+        " AND ai_decision='greeting' AND sent_at > datetime('now', '-7 days')"
+        " ORDER BY sent_at DESC LIMIT 1",
+        (device_id, peer_name)).fetchone()
+if row:
+    tpl_id, sent_at = row
+    # 回写事件
+    record_contact_event(
+        device_id, peer_name, CONTACT_EVT_GREETING_REPLIED,
+        template_id=(tpl_id or "").split("|")[0],  # 去掉 |fallback 后缀
+        meta={"reply_to_sent_at": sent_at, "reply_text": msg[:50]})
+```
+
+### 7.2 Gate 注册表
+
+B 不再需要改 `routers/tasks.py` 加 gate 的 if-elif。
+在自己的 gate 模块末尾调 `register_task_gate()` 即可:
+
+```python
+# src/host/your_gate_module.py (B 新建)
+def check_my_task_gate(device_id, params): ...
+
+# 模块末尾自动注册:
+from src.host.gate_registry import register_task_gate, register_campaign_step_gate
+register_task_gate("facebook_check_inbox", check_my_task_gate)
+register_campaign_step_gate("check_inbox", check_my_task_gate)
+```
+
+### 7.3 并发 Lock（B 写入事件表也建议用）
+
+`fb_contact_events` 表的 INSERT 是原子的不需要锁。
+但 B 如果要做"同 peer 24h 内只接触 N 次"的配额 gate(需要 read + write 两步), 应该用:
+
+```python
+from src.host.fb_concurrency import device_section_lock
+
+with device_section_lock(device_id, "check_inbox", timeout=120.0):
+    # 查 count + 决定是否跳过 + 写入事件
+    ...
+```
+
+section name 自选,但不要用 A 已占用的 `add_friend` / `send_greeting`。
+
+## 七点五、多渠道引流接口（A 机 Phase 4 新建,2026-04-23）
+
+### 7.5.1 `src/app_automation/referral_channels.py`
+
+A 机建立了统一的多渠道引流抽象层。**B 的 `_ai_reply_and_send` 可选迁移**到
+新接口,零破坏现有流程(旧的 `parse_referral_channels` / `pick_referral_for_persona`
+仍然保留)。
+
+**核心概念**:
+* `ReferralChannel` — 每个渠道一个子类
+  - `LineChannel` / `WhatsAppChannel` / `TelegramChannel` / `MessengerChannel` / `InstagramChannel`
+  - 每类自带 `validate_account` / `build_deep_link` / `detect_intent` / `format_snippet` / `mask`
+* `REFERRAL_REGISTRY` — 中央注册表;第三方渠道(如 KakaoTalk) 运行时注册
+* `pick_channel_smart()` — 三段式智能选渠道:
+  1. **意图感知**: 对方消息里问"LINE 有吗?" → 直接回 LINE(不管 persona 优先级)
+  2. **persona 优先级**: 无意图时按 `referral_priority` 排序
+  3. **兜底**: 任意可用渠道
+
+**B 迁移建议**(可选, 不迁移不破坏):
+
+```python
+# 旧代码 (fb_store 的 _ai_reply_and_send 里, B 的 P0 分支保留即可):
+from src.host.fb_referral_contact import (
+    parse_referral_channels, pick_referral_for_persona)
+_rch_map = parse_referral_channels(referral_contact)
+_r_val, _r_channel = pick_referral_for_persona(_rch_map, persona_key)
+# 仍然工作, 但不做意图识别
+
+# 新推荐 (B 未来迁移):
+from src.app_automation.referral_channels import pick_channel_smart
+from src.host.fb_referral_contact import parse_referral_channels
+channel_obj, value = pick_channel_smart(
+    incoming_text=incoming_text,
+    persona_key=persona_key,
+    available_accounts=parse_referral_channels(referral_contact),
+)
+if channel_obj and value:
+    snippet = channel_obj.format_snippet(value, persona_key=persona_key, name=peer_name)
+    # deep link 自动按渠道策略拼接(WA/TG 有,LINE 故意无)
+```
+
+### 7.5.2 LINE 特化
+
+**重要**: LINE 渠道刻意不发 `line.me/...` deep link。
+- FB 风控对 line.me 屏蔽严, 多次触发会把账号判为 spam
+- 改用**纯文本 @ID**: `LINE: @myid` + 提示对方搜索
+- 如果运营要用 QR 落地页, 直接在账号 value 里填 `https://xxx.example.com/mypage.png`,
+  `validate_account` 会识别 URL 形式并原样保留
+
+### 7.5.3 数据层扩展
+
+`fb_contact_events` 事件枚举**保持不变**(无破坏性迁移), 新增 `meta_json` 字段约定:
+
+| event_type | meta 字段 |
+|-----------|-----------|
+| `wa_referral_sent` (legacy,保留) | `{"channel": "whatsapp", "account_masked": "+8*******"}` |
+| `wa_referral_sent` | B 也可以用这个 event_type 记其他渠道(通过 meta.channel 区分) |
+
+**新建议**: B 用 `ReferralChannel.event_meta(value)` 直接返回 meta dict:
+
+```python
+from src.app_automation.referral_channels import pick_channel_smart
+from src.host.fb_store import record_contact_event, CONTACT_EVT_WA_REFERRAL_SENT
+
+channel_obj, value = pick_channel_smart(...)
+if channel_obj:
+    # 发消息...
+    record_contact_event(
+        device_id, peer_name, CONTACT_EVT_WA_REFERRAL_SENT,
+        meta=channel_obj.event_meta(value),  # 自动含 channel + masked
+    )
+```
+
+这样 A 的 `/facebook/contact-events?event_type=wa_referral_sent` 能按
+`meta.channel` 聚合出 LINE / WA / TG 各自的转化数据。
+
+### 7.5.4 新渠道扩展流程
+
+双方任意一方想加新渠道(如 KakaoTalk / Viber / WeChat):
+
+1. 在 `src/app_automation/referral_channels.py` 新建 `KakaoChannel(ReferralChannel)` 子类
+2. 在 `REFERRAL_REGISTRY["kakao"] = KakaoChannel()` 注册
+3. 在 `config/fb_target_personas.yaml` 的某 persona 的 `referral_priority` 里可选加 `kakao`
+4. 在 `config/chat_messages.yaml` 的 `countries[cc].referral_kakao` 加本地化文案
+5. 不改 B 的 `_ai_reply_and_send` 也不改 A 的 greeting 代码 —— 注册表自动生效
+
+**决策权**: 添加新渠道**A 主导** (因为属于共享基础设施),
+B 给出"需要这个渠道"的需求在遗留问题里列, A 实现后 B 直接 import 用。
+
+### 7.5.5 测试
+
+覆盖 47 个 test case: `tests/test_referral_channels.py`。
+
+---
+
+## 七点六、MessengerError 分流契约（2026-04-23 B PR #1 + A review 确认）
+
+**source**: `src/app_automation/facebook.py::MessengerError` (7 档 code)
+
+A 机的 Messenger 降级路径 (`send_greeting_after_add_friend` 的 A2 fallback)
+catch 下列 code 后按此分流:
+
+| code | A 机分流动作 | 归因副作用 |
+|------|-------------|------------|
+| `risk_detected` | `fb_account_phase.set_phase(did, "cooldown")` — **设备级** | journey `risk_detected` + 30 min 硬停 |
+| `xspace_blocked` | 只 log warning, retry 1 次; 仍失败 → 降级 FB 主 app 个人页 DM | **不** cooldown (系统弹窗, 不是 FB 风控) |
+| `recipient_not_found` | 重试 2 次 × 间隔 5-15s; 仍失败 → 跳该 peer | journey `referral_blocked{reason=peer_not_in_messenger}` |
+| `search_ui_missing` | 等 8s retry 1 次; 仍失败 → 降级 FB 主 app | 可能是 cold start |
+| `send_button_missing` | 记 `fb_risk_events{kind=content_blocked, text_hash=...}` → 降级主 app | 文案可能违禁 |
+| `send_blocked_by_content` *(建议 B 后续加一档)* | 同上 + 用更短版本重试一次 | FB 主动拒发 |
+| `messenger_unavailable` | 跳该 peer + **device-level 标记** `messenger_not_ready` (临时过期 30 min) | 调度器应避开 |
+| `send_fail` | cooldown 3 min + retry 1 次 | 保底 |
+
+**不改码契约**: 新增 code 要双方同意, 加到本表。删 code 不允许。
+
+---
+
+## 七点七、共享 `device_section_lock` section 命名约定（2026-04-23）
+
+`src/host/fb_concurrency.device_section_lock(device_id, section)` 的
+section 字符串是**全局键名空间**, 双方共用:
+
+| section | 持有者 | 含义 |
+|---------|--------|------|
+| `add_friend` | A 独占 | 加好友 UI 操作 |
+| `send_greeting` | A 独占 | profile 页 Message 内嵌对话 |
+| `messenger_active` | **A+B 共用** | Messenger App 前台占用 (避免 A 的 fallback 和 B 的 check_message_requests 抢输入框) |
+| `chatting_<canonical_id>` | 未来扩展 | 跨 agent 持有同一 lead 的对话权 |
+
+**铁律**: B 的 `check_message_requests` / `check_messenger_inbox` 进入 Messenger
+App 操作时必须先拿 `messenger_active` 锁; A 的 `send_message` fallback 路径同样。
+
+---
+
+## 七点八、greeting 回复归因双写（2026-04-23 A 机 PR #6 review 补充）
+
+为让 Phase 5 的 `/facebook/greeting-reply-rate` 能按 template_id 算 A/B 回复率,
+B 在 `mark_greeting_replied_back` 成功后需要同步写 `fb_contact_events`:
+
+```python
+record_contact_event(
+    device_id, peer_name, CONTACT_EVT_GREETING_REPLIED,
+    template_id=greeting_row.template_id.split("|")[0],  # 去 |fallback 后缀
+    preset_key=greeting_row.preset_key or "",
+    meta={"via": "mark_greeting_replied_back", "window_days": 7})
+```
+
+详见 `docs/A_TO_B_REPLY_REVIEW.md` Q1。
+
+---
+
+## 八、遗留问题 / 待协商
 
 > 双方遇到不确定归属的事情先写在这里，不要直接动代码。
 
-- [ ] ~~greeting 的 reply_rate 计算：B 在什么时机把对方回复写回 greeting 行？每次 check_inbox 扫一次匹配 `peer_type=friend_request + sent_at 在 7 天内` → 若有新 incoming → 把 greeting 行的 replied_at 设上~~（2026-04-23 A 提议方案，待 B 确认）
-- [ ] `fb_contact_events` 表：要不要新建统一事件表记 `(add_friend, greeting, reply_received)` 三元组，修正 daily_cap 模型？
-- [ ] 共享的 `ai_cost_events` 表，B 跑 LLM 回复也要写入，格式对齐
-- [ ] `facebook_check_inbox` 如果回复的是 greeting 触发的消息，要不要在回复里附上用户的引流 ID？由 B 实现
+- [ ] 接触配额: 同一 peer 24h 内被接触总次数(add+greet+referral 合计)超阈值时, A 和 B 都应该主动跳过 —— 具体阈值由谁定?(建议 3 次)
+- [ ] `ai_cost_events` 表对齐: B 跑 LLM 回复的成本统计格式请和现有 TikTok / A 的 LLM 调用一致
+- [ ] Phase-aware 的"过度接触"冷却: 单一 peer 被接触 3+ 次后进入私人 cooldown, 是否要落到 playbook?
+- [ ] B 完成 Messenger 自动回复后, 真机 smoke 测试由谁跑? 建议 victor2025PH 协调(两台电脑各一个设备)
 
-## 八、历史变更
+## 九、历史变更
 
 - 2026-04-23 首版 — 由 A 起草（v1.1.0 + Phase 1/2 实施完成后）
+- 2026-04-23 Phase 3 更新 — A 追加: fb_contact_events / gate_registry / device_section_lock /
+  /facebook/contact-events / /facebook/greeting-reply-rate / Funnel greeting widget
+- 2026-04-23 Phase 4+5 — A 追加: 多渠道 ReferralChannel (§7.5) + Lead Mesh (§7+) —
+  Dossier / Handoff / Agent Mesh / Webhook
+- 2026-04-23 B PR #1-#7 — B 追加: `mark_greeting_replied_back` + lang_detect +
+  MessengerError + chat_memory + chat_intent + referral_gate + stranger auto-reply
+- 2026-04-23 A review 回复 — A 新增契约: MessengerError 分流矩阵 (§7.6) +
+  device_section_lock section 命名 (§7.7) + greeting 归因双写 (§7.8)

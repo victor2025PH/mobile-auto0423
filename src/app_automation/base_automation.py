@@ -282,16 +282,42 @@ class _AdbUiObject:
         return self._text_cache or ""
 
     def set_text(self, text):
-        if self._find():
-            self._dev.click(*self._bounds)
-            import time
-            time.sleep(0.3)
-            # 清空已有文本
-            self._dev._adb("shell input keyevent 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67")  # 20个 DEL
-            time.sleep(0.1)
-            # 使用 ADB input text（需要 URL 编码空格）
-            safe = text.replace(" ", "%s").replace("'", "\\'").replace('"', '\\"')
-            self._dev._adb(f'shell input text "{safe}"')
+        if not self._find():
+            return
+        self._dev.click(*self._bounds)
+        import time
+        time.sleep(0.3)
+        # 清空已有文本
+        self._dev._adb("shell input keyevent 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67 67")
+        time.sleep(0.1)
+
+        # 2026-04-24 关键修复: unicode (中/日/韩) 文本走原生 u2.Device.set_text
+        # 因为 `adb shell input text` 只支持 ASCII, 非 ASCII 会被吞或乱码.
+        # 借 dm.get_u2 拿原生 Device, 用同样 selector 找 element 后 setText
+        # (u2 的 setText 走 AccessibilityNodeInfo ACTION_SET_TEXT, 支持任意 unicode).
+        is_ascii = all(ord(c) < 128 for c in text)
+        if not is_ascii:
+            try:
+                dm = getattr(self._dev, "_dm", None)
+                did = getattr(self._dev, "_did", None)
+                if dm is not None and did:
+                    u2_d = dm.get_u2(did)
+                    if u2_d is not None:
+                        # 用同一 selector 在原生 u2 找 element
+                        u2_el = u2_d(**self._sel)
+                        if u2_el.exists(timeout=1.5):
+                            u2_el.set_text(text)
+                            self._dev.invalidate_dump_cache()
+                            return
+            except Exception as e:
+                import logging as _lg
+                _lg.getLogger("src.app_automation._AdbUiObject").debug(
+                    "[set_text] u2 原生路径失败, 回退 adb input text: %s", e)
+
+        # ASCII 或 u2 兜底失败: adb input text
+        safe = text.replace(" ", "%s").replace("'", "\\'").replace('"', '\\"')
+        self._dev._adb(f'shell input text "{safe}"')
+        self._dev.invalidate_dump_cache()
 
     def clear_text(self):
         if self._find():
@@ -377,6 +403,10 @@ class AdbFallbackDevice:
                 self._w, self._h = int(parts[0]), int(parts[1])
             except Exception:
                 pass
+
+    def window_size(self):
+        """与 uiautomator2.Device 对齐，供 scroll / 点击相对坐标使用。"""
+        return self._w, self._h
 
     def _adb(self, cmd: str, timeout: int = 15) -> str:
         ok, out = self._dm.execute_adb_command(cmd, self._did)
@@ -480,6 +510,20 @@ class AdbFallbackDevice:
             time.sleep(0.05)
             self._adb("shell input keyevent 67")  # KEYCODE_DEL
             time.sleep(0.1)
+
+        # 2026-04-24 关键修复: unicode 文本借原生 u2.Device.send_keys (走 IME/AdbKeyboard),
+        # `adb shell input text` 只支持 ASCII. 中日文字符会被吞掉.
+        is_ascii = all(ord(c) < 128 for c in text)
+        if not is_ascii:
+            try:
+                u2_d = self._dm.get_u2(self._did) if self._dm else None
+                if u2_d is not None:
+                    u2_d.send_keys(text, clear=False)  # clear 已处理过
+                    self.invalidate_dump_cache()
+                    return
+            except Exception as e:
+                self._log.debug("[send_keys] u2 原生路径失败, 回退 adb input text: %s", e)
+
         # ADB input text:空格 %s,转义 \ " '
         safe = text.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
         safe_adb = safe.replace(" ", "%s")

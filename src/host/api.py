@@ -480,6 +480,7 @@ from .routers.ai import router as _ai_router
 from .routers.leads import router as _leads_router
 from .routers.campaigns import router as campaigns_router
 from .routers.crm_sync import router as _crm_sync_router
+from .routers.lead_mesh import router as _lead_mesh_router  # 2026-04-23 Phase 5
 
 app.include_router(_notif_router, dependencies=[Depends(verify_api_key)])
 app.include_router(_notify_center_router, dependencies=[Depends(verify_api_key)])
@@ -502,6 +503,7 @@ app.include_router(_ai_router, dependencies=[Depends(verify_api_key)])
 app.include_router(_leads_router, dependencies=[Depends(verify_api_key)])
 app.include_router(campaigns_router)
 app.include_router(_crm_sync_router)
+app.include_router(_lead_mesh_router, dependencies=[Depends(verify_api_key)])
 
 # ---------------------------------------------------------------------------
 # Router registration — new routers (extracted from api.py)

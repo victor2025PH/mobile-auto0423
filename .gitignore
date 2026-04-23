@@ -65,3 +65,19 @@ mobile-auto-project/
 # 如果要把当前版本入库，删除下面两行即可
 # avcodec-*.dll
 # avformat-*.dll
+
+# 备份文件
+*.bak
+*.orig
+
+# 运行时生成的 JSON 状态（每次启动都会被覆盖，不应入库）
+config/analytics_history.json
+config/routers.json
+.restart-required
+
+# 接收方账号配置(含真实运营账号, 不同部署不同, 不入库)
+# 模板见 config/referral_receivers.yaml.example
+config/referral_receivers.yaml
+
+# 本地真机调试产物 (截图 + hierarchy dump)
+debug/
