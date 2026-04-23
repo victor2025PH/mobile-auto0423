@@ -296,6 +296,141 @@ def list_inbox_messages(device_id: Optional[str] = None,
     return [dict(r) for r in rows]
 
 
+def mark_incoming_replied(device_id: str, peer_name: str, *,
+                          replied_at: Optional[str] = None,
+                          peer_type: Optional[str] = None) -> int:
+    """给该 peer 最近一条尚未标记的 incoming 行写 replied_at。
+
+    触发时机: ``_ai_reply_and_send`` 成功发出回复后同步调用。
+    幂等: 若该 peer 最近的 incoming 行已有 ``replied_at``, 不更新。
+
+    Args:
+        device_id: 设备 ID
+        peer_name: 对方姓名 (与 incoming 行的 peer_name 完全相等)
+        replied_at: 可选,覆盖默认 now; 便于测试注入固定时间
+        peer_type: 可选过滤 (friend/stranger/...);默认不过滤
+
+    Returns:
+        实际更新的行数 (0 或 1)。
+    """
+    if not device_id or not peer_name:
+        return 0
+    ts = replied_at or _now_iso()
+    sql = (
+        "UPDATE facebook_inbox_messages SET replied_at=? "
+        "WHERE id = ("
+        " SELECT id FROM facebook_inbox_messages"
+        " WHERE device_id=? AND peer_name=? AND direction='incoming'"
+        " AND (replied_at IS NULL OR replied_at='')"
+    )
+    params: list = [ts, device_id, peer_name]
+    if peer_type:
+        sql += " AND peer_type=?"
+        params.append(peer_type)
+    sql += " ORDER BY id DESC LIMIT 1)"
+    try:
+        with _connect() as conn:
+            cur = conn.execute(sql, params)
+            return cur.rowcount or 0
+    except Exception as e:
+        logger.debug("mark_incoming_replied 失败: %s", e)
+        return 0
+
+
+def mark_greeting_replied_back(device_id: str, peer_name: str, *,
+                               window_days: int = 7,
+                               replied_at: Optional[str] = None) -> int:
+    """跨 bot 归因:对方回复了 A 写入的 greeting 行 → 回写 ``replied_at``。
+
+    对应 INTEGRATION_CONTRACT §三 "B 允许回写 A 写入的 greeting 行的 replied_at"。
+    扫描条件:
+      * ``direction='outgoing'`` + ``ai_decision='greeting'``
+      * ``peer_type='friend_request'`` (A 的 greeting 路径写入的 peer_type)
+      * ``COALESCE(sent_at, seen_at) >= utcnow() - window_days``
+      * ``replied_at IS NULL`` (幂等,已标记过则跳过)
+
+    命中最新一条 greeting 行写入 ``replied_at``,让 A 端的
+    ``reply_rate_by_template`` / A/B 模板效果统计能跑。
+
+    Args:
+        device_id: 设备 ID
+        peer_name: 对方姓名 (与 greeting 行的 peer_name 完全相等)
+        window_days: 回溯窗口,默认 7 天;超出窗口的 greeting 视为"机缘已过"
+        replied_at: 可选,覆盖默认 now
+
+    Returns:
+        实际更新的行数 (0 或 1)。
+    """
+    if not device_id or not peer_name or window_days <= 0:
+        return 0
+    import datetime as _dt
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=window_days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    ts = replied_at or _now_iso()
+    sql = (
+        "UPDATE facebook_inbox_messages SET replied_at=? "
+        "WHERE id = ("
+        " SELECT id FROM facebook_inbox_messages"
+        " WHERE device_id=? AND peer_name=?"
+        " AND direction='outgoing' AND ai_decision='greeting'"
+        " AND peer_type='friend_request'"
+        " AND COALESCE(sent_at, seen_at) >= ?"
+        " AND (replied_at IS NULL OR replied_at='')"
+        " ORDER BY id DESC LIMIT 1)"
+    )
+    try:
+        with _connect() as conn:
+            cur = conn.execute(sql, (ts, device_id, peer_name, cutoff))
+            rc = cur.rowcount or 0
+            # F1 (A→B review Q1): 命中时同步写一条 fb_contact_events
+            # (Phase 5 事件表, /facebook/greeting-reply-rate 的权威数据源).
+            # Phase 5 未 merge 时 record_contact_event 不在 globals → 静默 skip
+            # 让老 replied_at 一路继续, 新 contact_events 在 merge 后自动激活。
+            if rc > 0:
+                _sync_greeting_replied_contact_event(
+                    conn, device_id, peer_name, ts, window_days)
+            return rc
+    except Exception as e:
+        logger.debug("mark_greeting_replied_back 失败: %s", e)
+        return 0
+
+
+def _sync_greeting_replied_contact_event(conn, device_id: str, peer_name: str,
+                                         ts: str, window_days: int) -> None:
+    """F1 辅助: 把 greeting_replied 事件同步到 fb_contact_events。
+
+    Phase 5 (A 的 fb_contact_events + record_contact_event) 未 merge 时
+    ``record_contact_event`` 不在模块 globals 里, 静默 skip 不抛。Phase 5
+    merge 后自动工作, 不需要二次改动。
+    """
+    if "record_contact_event" not in globals():
+        return
+    try:
+        row = conn.execute(
+            "SELECT template_id, preset_key FROM facebook_inbox_messages"
+            " WHERE device_id=? AND peer_name=? AND direction='outgoing'"
+            " AND ai_decision='greeting' AND replied_at=?"
+            " ORDER BY id DESC LIMIT 1",
+            (device_id, peer_name, ts),
+        ).fetchone()
+        if not row:
+            return
+        tid = (row[0] or "").split("|")[0]  # 去 '|fallback' 后缀,对齐 A 建议
+        pkey = row[1] or ""
+        evt_const = globals().get(
+            "CONTACT_EVT_GREETING_REPLIED", "greeting_replied")
+        globals()["record_contact_event"](
+            device_id, peer_name, evt_const,
+            template_id=tid,
+            preset_key=pkey,
+            meta={"via": "mark_greeting_replied_back",
+                  "window_days": window_days},
+        )
+    except Exception as e:
+        logger.debug(
+            "[mark_greeting_replied_back] contact_event 同步失败: %s", e)
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 漏斗聚合 — /facebook/funnel 数据源
 # ─────────────────────────────────────────────────────────────────────

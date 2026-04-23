@@ -4224,6 +4224,12 @@ class FacebookAutomation(BaseAutomation):
             return {"peer_name": conv["name"], "risk": msg}
 
         incoming_text = self._extract_latest_incoming_message(d)
+        lang = ""
+        try:
+            from src.ai.lang_detect import detect_language
+            lang = detect_language(incoming_text or "")
+        except Exception:
+            pass
         try:
             from src.host.fb_store import record_inbox_message
             record_inbox_message(
@@ -4231,11 +4237,13 @@ class FacebookAutomation(BaseAutomation):
                 peer_type=peer_type,
                 message_text=incoming_text or "",
                 direction="incoming",
+                language_detected=lang,
                 preset_key=preset_key,
             )
         except Exception:
             log.debug("[inbox] 写库失败", exc_info=True)
-        return {"peer_name": conv["name"], "incoming_text": incoming_text}
+        return {"peer_name": conv["name"], "incoming_text": incoming_text,
+                "language_detected": lang}
 
     def _extract_latest_incoming_message(self, d) -> str:
         """从对话页面 dump 中提取最新一条对方消息(简单启发:取屏幕中靠左的最长 TextView)。"""
@@ -4287,6 +4295,15 @@ class FacebookAutomation(BaseAutomation):
         decision = "skip"
         target_lang = ""
         ab_style_hint = ""
+        # P0 2026-04-23: incoming 侧语言检测,用于:
+        #   (a) persona 未声明目标语言时降级填充 target_lang
+        #   (b) 写入 facebook_inbox_messages.language_detected (both incoming & outgoing)
+        detected_incoming_lang = ""
+        try:
+            from src.ai.lang_detect import detect_language
+            detected_incoming_lang = detect_language(incoming_text or "")
+        except Exception:
+            pass
         try:
             from src.host.fb_target_personas import get_persona_display
             disp = get_persona_display(persona_key)
@@ -4306,6 +4323,21 @@ class FacebookAutomation(BaseAutomation):
                 )
         except Exception as e:
             log.debug("[ai_reply] persona 元数据失败(继续): %s", e)
+
+        # P0 2026-04-23: persona 未设 target_lang 时用 incoming 检测结果降级,
+        # 避免 LLM 默认英文回复日/意客群
+        if not target_lang and detected_incoming_lang:
+            target_lang = detected_incoming_lang
+            if target_lang == "ja":
+                ab_style_hint = (
+                    "【言語・トーン必須】日本語のみ。丁寧語ベース、"
+                    "押しが強くない・スパム感ゼロ。絵文字は1個まで。"
+                )
+            elif target_lang:
+                ab_style_hint = (
+                    f"Reply ONLY in language code '{target_lang}'. "
+                    "Warm, not pushy, max 1 emoji."
+                )
 
         # 空 incoming：破冰时叠一条 greeting 参考（约束 LLM 不要写英文 hello）
         try:
@@ -4396,10 +4428,25 @@ class FacebookAutomation(BaseAutomation):
                 direction="outgoing",
                 ai_decision=decision,
                 ai_reply_text=reply,
+                language_detected=target_lang or detected_incoming_lang,
                 preset_key=preset_key,
             )
         except Exception:
             pass
+
+        # P0 2026-04-23: 跨 bot 归因 — 回写 replied_at
+        #   1) 被 B 刚回复的最近一条 incoming 行
+        #   2) 如果近 7 天内 A 对该 peer 写过 greeting (peer_type=friend_request),
+        #      也把那条 greeting 行的 replied_at 设上 —— A 的模板效果 A/B 统计依赖这个
+        try:
+            from src.host.fb_store import (
+                mark_greeting_replied_back,
+                mark_incoming_replied,
+            )
+            mark_incoming_replied(did, peer_name)
+            mark_greeting_replied_back(did, peer_name, window_days=7)
+        except Exception as e:
+            log.debug("[ai_reply] replied_at 回写失败: %s", e)
         return reply, decision
 
     def _open_message_requests_fallback(self, d) -> bool:
