@@ -501,7 +501,9 @@
     const funnelUrl = '/lead-mesh/funnel?days=' + f.days
       + (f.actor ? '&actor=' + encodeURIComponent(f.actor) : '');
     try {
-      const [pending, ack, completed, rejected, dead, receivers, funnel] = await Promise.all([
+      const tsUrl = '/lead-mesh/funnel/timeseries?days=' + f.days
+        + (f.actor ? '&actor=' + encodeURIComponent(f.actor) : '');
+      const [pending, ack, completed, rejected, dead, receivers, funnel, timeseries] = await Promise.all([
         Shell.api.get('/lead-mesh/handoffs?state=pending&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=acknowledged&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=completed&limit=500'),
@@ -509,6 +511,7 @@
         Shell.api.get('/lead-mesh/webhooks/dead-letters?limit=100'),
         Shell.api.get('/lead-mesh/receivers?with_load=true&enabled_only=true'),
         Shell.api.get(funnelUrl),
+        Shell.api.get(tsUrl),
       ]);
       const pn = (pending.handoffs || []).length;
       const an = (ack.handoffs || []).length;
@@ -691,6 +694,10 @@
           + '            title="点击查看具体被挡的 peer">' + _safe(topBlocked) + '</code></div>'
         : '    <div style="color:#22c55e">✓ 无主要瓶颈</div>';
 
+      // Phase 8e: sparkline SVG — 纯 SVG 零依赖
+      const series = (timeseries && timeseries.series) || [];
+      const sparkHtml = _lmBuildSparkline(series, f.days);
+
       const aFunnelCard = ''
         + '<div style="grid-column:1/-1;padding:14px;background:rgba(96,165,250,.06);'
         + '            border:1px solid rgba(96,165,250,.25);border-radius:8px">'
@@ -728,6 +735,7 @@
         + '  <div style="margin-top:10px;font-size:11px">'
         + '    <span style="color:var(--text-dim)">top persona:</span> ' + personaHtml
         + '  </div>'
+        +    sparkHtml
         + '</div>';
 
       body.innerHTML = ''
@@ -808,6 +816,78 @@
       body.innerHTML = '<div style="color:#ef4444;padding:20px">加载失败: ' + _safe(e.message || e) + '</div>';
     }
   };
+
+  // Phase 8e: sparkline — 3 条线 (friend_req/greeting/blocked) 纯 SVG 零依赖.
+  //   series: [{date: "YYYY-MM-DD", friend_req, greeting_sent, blocked}]
+  //   days: 时间窗口 (<= 1 时 return ''; 单点无 sparkline 意义)
+  function _lmBuildSparkline(series, days) {
+    if (!Array.isArray(series) || series.length <= 1 || days <= 1) return '';
+    const W = 600, H = 64;
+    const PAD_X = 6, PAD_Y = 6;
+    const plotW = W - 2 * PAD_X;
+    const plotH = H - 2 * PAD_Y;
+    const n = series.length;
+    const stepX = n > 1 ? plotW / (n - 1) : 0;
+    // y 范围: max 向上取整到 5 的倍数 (留 20% 头部空间)
+    let ymax = 0;
+    series.forEach(function (p) {
+      ymax = Math.max(ymax,
+        (p.friend_req || 0),
+        (p.greeting_sent || 0),
+        (p.blocked || 0));
+    });
+    ymax = Math.max(5, Math.ceil(ymax * 1.2 / 5) * 5);
+
+    const yToPx = function (v) {
+      return PAD_Y + plotH - (v / ymax) * plotH;
+    };
+    const makeLine = function (key, color) {
+      const pts = series.map(function (p, i) {
+        return (PAD_X + i * stepX).toFixed(1) + ',' + yToPx(p[key] || 0).toFixed(1);
+      }).join(' ');
+      const circles = series.map(function (p, i) {
+        const cx = (PAD_X + i * stepX).toFixed(1);
+        const cy = yToPx(p[key] || 0).toFixed(1);
+        const v = p[key] || 0;
+        return '<circle cx="' + cx + '" cy="' + cy + '" r="2.5" fill="' + color + '">'
+          + '<title>' + p.date + ' ' + key + '=' + v + '</title></circle>';
+      }).join('');
+      return '<polyline fill="none" stroke="' + color
+        + '" stroke-width="1.5" points="' + pts + '"/>' + circles;
+    };
+
+    const legendItem = function (color, label) {
+      return '<span style="display:inline-flex;align-items:center;margin-right:10px">'
+        + '  <span style="display:inline-block;width:10px;height:2px;background:' + color
+        + ';margin-right:4px"></span>' + label + '</span>';
+    };
+    return '<div style="margin-top:14px;padding-top:10px;'
+      + '              border-top:1px dashed rgba(255,255,255,.08)">'
+      + '  <div style="display:flex;justify-content:space-between;align-items:center;'
+      + '              margin-bottom:4px;font-size:10px;color:var(--text-dim)">'
+      + '    <span>📈 近 ' + days + ' 天每日</span>'
+      + '    <span>'
+      + legendItem('#60a5fa', 'friend_req')
+      + legendItem('#22c55e', 'greeting')
+      + legendItem('#f59e0b', 'blocked')
+      + '    </span>'
+      + '  </div>'
+      + '  <svg width="100%" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" '
+      + '       preserveAspectRatio="none" style="display:block">'
+      + '    <line x1="' + PAD_X + '" y1="' + yToPx(0)
+      + '" x2="' + (W - PAD_X) + '" y2="' + yToPx(0)
+      + '" stroke="rgba(255,255,255,.06)" stroke-width="1"/>'
+      +      makeLine('friend_req', '#60a5fa')
+      +      makeLine('greeting_sent', '#22c55e')
+      +      makeLine('blocked', '#f59e0b')
+      + '  </svg>'
+      + '  <div style="display:flex;justify-content:space-between;font-size:10px;'
+      + '              color:var(--text-dim);margin-top:2px">'
+      + '    <span>' + _safe(series[0].date.substring(5)) + '</span>'
+      + '    <span>' + _safe(series[series.length - 1].date.substring(5)) + '</span>'
+      + '  </div>'
+      + '</div>';
+  }
 
   function _lmInjectPulseKeyframes() {
     if (document.getElementById('lm-pulse-keyframes')) return;
