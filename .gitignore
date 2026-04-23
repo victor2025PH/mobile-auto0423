@@ -1,0 +1,67 @@
+# 环境变量（包含敏感信息）
+.env
+.env.local
+.env.*.local
+
+# 不要忽略模板文件
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright / pytest-playwright 产物（trace、截图等）
+test-results/
+playwright-report/
+
+# 数据和日志
+data/
+logs/
+*.log
+*.db
+
+# TLS 证书私钥
+config/certs/*.key
+config/certs/*.pem
+
+# VPN 配置池（含代理账号密码，勿提交）
+src/config/vpn_pool.json
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 运行时缓存 / 临时文件（2026-04-23 补）
+.pytest_cache/
+temp/
+*.tmp
+*.pid
+
+# APK 二进制仓库（32M+，写 README 说明如何获取或走 Release 单独下载）
+apk_repo/
+
+# 学习型选择器运行时产物（data/ 已忽略，兜底）
+data/selectors/*.yaml.bak
+
+# 项目内的独立子文档目录（避免与主 docs/ 混淆）
+mobile-auto-project/
+
+# FFmpeg / scrcpy 大二进制（若对方手动获取 portable 包会更新版本）
+# 如果要把当前版本入库，删除下面两行即可
+# avcodec-*.dll
+# avformat-*.dll

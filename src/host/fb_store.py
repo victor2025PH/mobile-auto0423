@@ -1,0 +1,504 @@
+# -*- coding: utf-8 -*-
+"""Facebook 业务数据 store(Sprint 2 P0)。
+
+3 张表的 CRUD + 漏斗聚合查询封装。
+所有写入函数都是幂等/upsert 模式,可被 automation 层重复调用。
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from .database import _connect
+
+
+def _now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# facebook_groups
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_group(device_id: str, group_name: str, *,
+                 group_url: str = "", member_count: int = 0,
+                 language: str = "", country: str = "",
+                 status: str = "joined",
+                 preset_key: str = "") -> int:
+    """新加入或更新群信息。返回 row id。"""
+    if not device_id or not group_name:
+        return 0
+    now = _now_iso()
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM facebook_groups WHERE device_id=? AND group_name=?",
+            (device_id, group_name),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE facebook_groups SET group_url=COALESCE(NULLIF(?,''), group_url),"
+                " member_count=CASE WHEN ?>0 THEN ? ELSE member_count END,"
+                " language=COALESCE(NULLIF(?,''), language),"
+                " country=COALESCE(NULLIF(?,''), country),"
+                " status=?,"
+                " preset_key=COALESCE(NULLIF(?,''), preset_key)"
+                " WHERE id=?",
+                (group_url, member_count, member_count, language, country,
+                 status, preset_key, row[0]),
+            )
+            return row[0]
+        cur = conn.execute(
+            "INSERT INTO facebook_groups"
+            " (device_id, group_name, group_url, member_count, language, country,"
+            "  status, joined_at, preset_key)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (device_id, group_name, group_url, member_count, language, country,
+             status, now, preset_key),
+        )
+        return cur.lastrowid
+
+
+def mark_group_visit(device_id: str, group_name: str,
+                     extracted_count: int = 0):
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE facebook_groups SET last_visited_at=?, visit_count=visit_count+1,"
+            " extracted_member_count=extracted_member_count+? "
+            "WHERE device_id=? AND group_name=?",
+            (_now_iso(), int(extracted_count or 0), device_id, group_name),
+        )
+
+
+def list_groups(device_id: Optional[str] = None,
+                status: str = "joined",
+                limit: int = 200) -> List[Dict]:
+    sql = "SELECT * FROM facebook_groups WHERE 1=1"
+    params: list = []
+    if device_id:
+        sql += " AND device_id=?"
+        params.append(device_id)
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    sql += " ORDER BY joined_at DESC LIMIT ?"
+    params.append(limit)
+    with _connect() as conn:
+        conn.row_factory = __import__("sqlite3").Row
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# facebook_friend_requests
+# ─────────────────────────────────────────────────────────────────────
+
+def record_friend_request(device_id: str, target_name: str, *,
+                          note: str = "", source: str = "",
+                          target_profile_url: str = "",
+                          status: str = "sent",
+                          lead_id: Optional[int] = None,
+                          preset_key: str = "") -> int:
+    if not device_id or not target_name:
+        return 0
+    now = _now_iso()
+    with _connect() as conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO facebook_friend_requests"
+                " (device_id, target_name, target_profile_url, note, source,"
+                "  status, sent_at, lead_id, preset_key)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (device_id, target_name, target_profile_url, note, source,
+                 status, now, lead_id, preset_key),
+            )
+            return cur.lastrowid
+        except Exception as e:
+            logger.debug("record_friend_request 失败: %s", e)
+            return 0
+
+
+def update_friend_request_status(device_id: str, target_name: str,
+                                 new_status: str):
+    with _connect() as conn:
+        if new_status == "accepted":
+            conn.execute(
+                "UPDATE facebook_friend_requests SET status=?, accepted_at=? "
+                "WHERE device_id=? AND target_name=? "
+                "AND status='sent'",
+                (new_status, _now_iso(), device_id, target_name),
+            )
+        else:
+            conn.execute(
+                "UPDATE facebook_friend_requests SET status=? "
+                "WHERE device_id=? AND target_name=? AND status='sent'",
+                (new_status, device_id, target_name),
+            )
+
+
+def get_friend_request_stats(device_id: Optional[str] = None,
+                             since_iso: Optional[str] = None,
+                             preset_key: Optional[str] = None) -> Dict[str, int]:
+    sql = ("SELECT status, COUNT(*) FROM facebook_friend_requests WHERE 1=1")
+    params: list = []
+    if device_id:
+        sql += " AND device_id=?"
+        params.append(device_id)
+    if since_iso:
+        sql += " AND sent_at >= ?"
+        params.append(since_iso)
+    if preset_key:
+        sql += " AND preset_key=?"
+        params.append(preset_key)
+    sql += " GROUP BY status"
+    with _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    stats = {"sent": 0, "accepted": 0, "rejected": 0,
+             "cancelled": 0, "risk": 0, "pending": 0}
+    for s, c in rows:
+        stats[s] = stats.get(s, 0) + c
+    sent = stats["sent"]
+    accepted = stats["accepted"]
+    # 修正:旧逻辑 sent 不含 accepted 时分母漏算,现在 sent_total = sent + accepted
+    sent_total = sent + accepted
+    stats["sent_total"] = sent_total
+    stats["accept_rate"] = round(accepted / sent_total, 3) if sent_total else 0.0
+    return stats
+
+
+def count_friend_requests_sent_since(device_id: str, hours: int = 24) -> int:
+    """统计 rolling 窗口内发出的好友请求条数（按 ``sent_at`` 过滤）。
+
+    用于 ``facebook_playbook.add_friend.daily_cap_per_account`` 硬闸：
+    同一 device 在 24h 内尝试次数 ≥ cap 则拒绝新请求。
+
+    计数包含所有 ``sent_at`` 落在窗口内的行（含后来 accepted / rejected 的），
+    因为每一次尝试都消耗风控预算。
+    """
+    if not device_id or hours <= 0:
+        return 0
+    import datetime as _dt
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM facebook_friend_requests"
+            " WHERE device_id=? AND sent_at>=?",
+            (device_id, cutoff),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# facebook_inbox_messages
+# ─────────────────────────────────────────────────────────────────────
+
+def record_inbox_message(device_id: str, peer_name: str, *,
+                         peer_type: str = "friend",
+                         message_text: str = "",
+                         direction: str = "incoming",
+                         ai_decision: str = "",
+                         ai_reply_text: str = "",
+                         language_detected: str = "",
+                         lead_id: Optional[int] = None,
+                         replied_at: Optional[str] = None,
+                         preset_key: str = "",
+                         template_id: str = "") -> int:
+    """记录一条 Messenger 消息(incoming/outgoing 皆可)。
+
+    2026-04-23 新增:
+      * direction=outgoing 时自动填 ``sent_at`` 列(与 ``seen_at`` 同值);
+        下游 count_outgoing_messages_since 优先读 sent_at,避免 seen_at 对
+        outgoing 语义不清。老行 sent_at=NULL 会回退到 seen_at 兜底。
+      * template_id: 打招呼文案来自哪个模板(格式 '<country>:<idx>'),
+        供 A/B 分析;其他场景写空串。
+    """
+    if not device_id or not peer_name:
+        return 0
+    now = _now_iso()
+    # direction=outgoing 时同步把 sent_at 写上(incoming 留 NULL)
+    sent_at = now if direction == "outgoing" else None
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO facebook_inbox_messages"
+            " (device_id, peer_name, peer_type, message_text, direction,"
+            "  ai_decision, ai_reply_text, language_detected,"
+            "  seen_at, sent_at, replied_at, lead_id, preset_key, template_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (device_id, peer_name, peer_type, message_text, direction,
+             ai_decision, ai_reply_text, language_detected,
+             now, sent_at, replied_at, lead_id, preset_key, template_id),
+        )
+        return cur.lastrowid
+
+
+def count_outgoing_messages_since(device_id: str,
+                                  hours: int = 24,
+                                  ai_decision: Optional[str] = None) -> int:
+    """统计 rolling 窗口内本机发出的消息条数。
+
+    用于 ``facebook_playbook.send_greeting.daily_cap_per_account`` 硬闸：
+    同一 device 在 24h 内主动外发消息次数 ≥ cap 则拒绝新的打招呼。
+
+    2026-04-23 修复: 优先读 ``sent_at`` 列(outgoing 专用),回落到 ``seen_at``
+    保证历史行(sent_at=NULL)仍被计入,避免 daily_cap 漏算。
+
+    Args:
+        device_id: 设备 ID
+        hours: 窗口长度（小时）
+        ai_decision: 可选过滤 ai_decision 字段（如 ``'greeting'`` 只统计
+            "加好友后打招呼"这一类），为空则统计所有方向=outgoing 的消息
+    """
+    if not device_id or hours <= 0:
+        return 0
+    import datetime as _dt
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    # COALESCE(sent_at, seen_at) 让新旧行都能正确比较
+    sql = ("SELECT COUNT(*) FROM facebook_inbox_messages"
+           " WHERE device_id=? AND direction='outgoing'"
+           " AND COALESCE(sent_at, seen_at) >= ?")
+    params: list = [device_id, cutoff]
+    if ai_decision:
+        sql += " AND ai_decision=?"
+        params.append(ai_decision)
+    try:
+        with _connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.debug("count_outgoing_messages_since 失败: %s", e)
+        return 0
+
+
+def list_inbox_messages(device_id: Optional[str] = None,
+                        since_iso: Optional[str] = None,
+                        limit: int = 200,
+                        preset_key: Optional[str] = None) -> List[Dict]:
+    sql = "SELECT * FROM facebook_inbox_messages WHERE 1=1"
+    params: list = []
+    if device_id:
+        sql += " AND device_id=?"
+        params.append(device_id)
+    if since_iso:
+        sql += " AND seen_at >= ?"
+        params.append(since_iso)
+    if preset_key:
+        sql += " AND preset_key=?"
+        params.append(preset_key)
+    sql += " ORDER BY seen_at DESC LIMIT ?"
+    params.append(limit)
+    with _connect() as conn:
+        conn.row_factory = __import__("sqlite3").Row
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 漏斗聚合 — /facebook/funnel 数据源
+# ─────────────────────────────────────────────────────────────────────
+
+def get_funnel_metrics(device_id: Optional[str] = None,
+                       since_iso: Optional[str] = None,
+                       preset_key: Optional[str] = None) -> Dict[str, Any]:
+    """计算完整漏斗:浏览群 → 提取成员 → 加好友 → 通过 → 私信 → 转化。
+
+    Sprint 3: 支持 preset_key 切片。
+    2026-04-23: 新增 greeting 专项维度
+        * stage_greetings_sent      主动打招呼总数(ai_decision=greeting + outgoing)
+        * stage_greetings_fallback  其中走 Messenger fallback 的数量
+        * rate_greet_after_add      打招呼数 / 好友请求数 (覆盖率指标)
+        * greeting_template_distribution 前 N 个最常用模板 + 命中数
+    """
+    fr_stats = get_friend_request_stats(device_id, since_iso, preset_key)
+    inbox_msgs = list_inbox_messages(device_id, since_iso, limit=10000,
+                                     preset_key=preset_key)
+    incoming = [m for m in inbox_msgs if m.get("direction") == "incoming"]
+    outgoing = [m for m in inbox_msgs if m.get("direction") == "outgoing"]
+    wa_referrals = [m for m in outgoing if m.get("ai_decision") == "wa_referral"]
+    greetings = [m for m in outgoing if m.get("ai_decision") == "greeting"]
+    greetings_fallback = [
+        m for m in greetings
+        if isinstance(m.get("template_id"), str) and m.get("template_id", "").endswith("|fallback")
+    ]
+    # 模板分布 (top 5)
+    template_counter: Dict[str, int] = {}
+    for m in greetings:
+        tid = (m.get("template_id") or "").split("|")[0]
+        if tid:
+            template_counter[tid] = template_counter.get(tid, 0) + 1
+    template_dist = sorted(template_counter.items(), key=lambda kv: kv[1],
+                           reverse=True)[:5]
+
+    extracted_total = 0
+    extra_filters = []
+    extra_params: list = []
+    if device_id:
+        extra_filters.append("device_id=?")
+        extra_params.append(device_id)
+    if preset_key:
+        extra_filters.append("preset_key=?")
+        extra_params.append(preset_key)
+    where = (" WHERE " + " AND ".join(extra_filters)) if extra_filters else ""
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT COALESCE(SUM(extracted_member_count), 0) "
+            f"FROM facebook_groups{where}",
+            extra_params,
+        ).fetchone()
+        extracted_total = row[0] or 0
+
+    sent_total = fr_stats.get("sent_total", 0)
+    accepted = fr_stats.get("accepted", 0)
+    greet_count = len(greetings)
+    return {
+        "stage_extracted_members": int(extracted_total),
+        "stage_friend_request_sent": int(sent_total),
+        "stage_friend_accepted": int(accepted),
+        "stage_greetings_sent": greet_count,
+        "stage_greetings_fallback": len(greetings_fallback),
+        "stage_inbox_incoming": len(incoming),
+        "stage_outgoing_replies": len(outgoing),
+        "stage_wa_referrals": len(wa_referrals),
+        "rate_accept": fr_stats.get("accept_rate", 0.0),
+        "rate_extract_to_request": round(sent_total / extracted_total, 3)
+            if extracted_total else 0.0,
+        "rate_request_to_inbox": round(len(incoming) / sent_total, 3)
+            if sent_total else 0.0,
+        "rate_inbox_to_referral": round(len(wa_referrals) / max(len(incoming), 1), 3),
+        # 覆盖率: 每发 N 个好友请求, 有多少个实际打了招呼
+        "rate_greet_after_add": round(greet_count / sent_total, 3) if sent_total else 0.0,
+        # 模板 A/B: [["yaml:jp:3", 12], ["yaml:jp:1", 7], ...]
+        "greeting_template_distribution": template_dist,
+        "scope_device": device_id or "all",
+        "scope_since": since_iso or "all_time",
+        "scope_preset": preset_key or "all",
+    }
+
+
+def get_funnel_metrics_by_preset(device_id: Optional[str] = None,
+                                 since_iso: Optional[str] = None
+                                 ) -> List[Dict[str, Any]]:
+    """按预设切片返回漏斗。Sprint 3 P1 — /facebook/funnel?group_by=preset_key。
+
+    返回 [{preset_key, ..metrics..}, ...],按 sent_total 降序。
+    """
+    with _connect() as conn:
+        sql = ("SELECT DISTINCT COALESCE(NULLIF(preset_key, ''), '_no_preset') "
+               "FROM facebook_friend_requests WHERE 1=1")
+        params: list = []
+        if device_id:
+            sql += " AND device_id=?"
+            params.append(device_id)
+        if since_iso:
+            sql += " AND sent_at >= ?"
+            params.append(since_iso)
+        rows = conn.execute(sql, params).fetchall()
+    presets = [r[0] for r in rows]
+    out: List[Dict[str, Any]] = []
+    for pk in presets:
+        actual_pk = None if pk == "_no_preset" else pk
+        m = get_funnel_metrics(device_id=device_id, since_iso=since_iso,
+                               preset_key=actual_pk)
+        m["preset_key"] = pk
+        out.append(m)
+    out.sort(key=lambda x: x.get("stage_friend_request_sent", 0), reverse=True)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+# fb_risk_events — 风控事件（驱动 Gate 自动冷却红旗）
+# ─────────────────────────────────────────────────────────────────────
+
+_RISK_KIND_RULES = [
+    # 关键词 → 归一化 kind，顺序匹配（先到先得）
+    (("identity", "confirm it's you", "confirm it is you", "verify"), "identity_verify"),
+    (("captcha", "robot", "are you a human"), "captcha"),
+    (("checkpoint", "temporarily blocked", "temporarily restricted"), "checkpoint"),
+    (("disabled", "account is locked", "account has been"), "account_review"),
+    (("suspicious", "unusual login"), "identity_verify"),
+    (("can't use this feature", "cannot use this feature"), "policy_warning"),
+]
+
+
+def _classify_risk_kind(raw_message: str) -> str:
+    s = (raw_message or "").lower()
+    for kws, kind in _RISK_KIND_RULES:
+        for kw in kws:
+            if kw in s:
+                return kind
+    return "other"
+
+
+def record_risk_event(device_id: str, raw_message: str, *,
+                      task_id: str = "",
+                      debounce_seconds: int = 60) -> int:
+    """记录一条风控事件。
+
+    debounce_seconds:
+        同 device_id + 同 kind 在最近 N 秒内已落过库，则**去重不写**，
+        避免 browse_feed 循环里每屏检测刷出几十条。返回 0 表示被去重。
+    """
+    if not device_id:
+        return 0
+    kind = _classify_risk_kind(raw_message)
+    try:
+        with _connect() as conn:
+            if debounce_seconds > 0:
+                row = conn.execute(
+                    "SELECT id FROM fb_risk_events "
+                    "WHERE device_id=? AND kind=? "
+                    "AND detected_at > datetime('now', ?) "
+                    "ORDER BY id DESC LIMIT 1",
+                    (device_id, kind, f"-{int(debounce_seconds)} seconds"),
+                ).fetchone()
+                if row:
+                    return 0
+            cur = conn.execute(
+                "INSERT INTO fb_risk_events (device_id, task_id, kind, raw_message)"
+                " VALUES (?,?,?,?)",
+                (device_id, task_id or "", kind, (raw_message or "")[:500]),
+            )
+            return cur.lastrowid or 0
+    except Exception as e:
+        logger.warning("[fb_risk] 写入失败 device=%s: %s", device_id[:12], e)
+        return 0
+
+
+def count_risk_events_recent(device_id: str, hours: int = 24) -> int:
+    """最近 N 小时内该设备风控事件总数，供 Gate 冷却判断。"""
+    if not device_id:
+        return 0
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM fb_risk_events "
+                "WHERE device_id=? AND detected_at > datetime('now', ?)",
+                (device_id, f"-{int(hours)} hours"),
+            ).fetchone()
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+def list_recent_risk_events(device_id: Optional[str] = None,
+                            hours: int = 24,
+                            limit: int = 50) -> List[Dict[str, Any]]:
+    """设备面板红旗下拉 / 调试用。"""
+    sql = ("SELECT id, device_id, task_id, kind, raw_message, detected_at "
+           "FROM fb_risk_events WHERE detected_at > datetime('now', ?)")
+    params: list = [f"-{int(hours)} hours"]
+    if device_id:
+        sql += " AND device_id=?"
+        params.append(device_id)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []

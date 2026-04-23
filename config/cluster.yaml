@@ -1,0 +1,28 @@
+# OpenClaw 集群配置
+# role: coordinator (主控) | worker (工作节点) | standalone (单机，默认)
+role: coordinator
+
+# Worker 模式: 主控节点地址 (coordinator 和 standalone 模式忽略)
+coordinator_url: ""
+
+# 本机 API 端口
+local_port: 18080
+
+# 集群通信密钥 (所有节点必须一致)
+shared_secret: "80dc965edbdebc5d56a5b06ec541f677"
+
+# 心跳间隔 (秒) — 200台设备场景建议 10 秒
+heartbeat_interval: 10
+
+# 主机离线超时 (秒) — 3 倍心跳，30 秒无心跳判定离线
+host_timeout: 30
+
+# 启动时自动加入集群 (worker 模式有效)
+auto_join: true
+
+# 主机显示名称 (空则使用系统主机名)
+host_name: "主控"
+
+# 主机唯一标识 (空则自动由 主机名+MAC 生成；手动填写可保证跨重启不变)
+# 建议每台 Worker 填一个固定值，如 "worker-01"
+host_id: "coordinator"

@@ -1,0 +1,1647 @@
+{
+  "webhook_url": "",
+  "webhook_type": "generic",
+  "enabled_events": [
+    "device.disconnected",
+    "task.failed",
+    "watchdog.captcha_detected"
+  ],
+  "quiet_hours": {
+    "start": "23:00",
+    "end": "07:00"
+  },
+  "history": [
+    {
+      "ts": "2026-04-14 13:29:18",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.150:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 13:29:19",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.121:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 13:29:19",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 13:39:50",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.121:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 13:42:02",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 13:48:17",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 13:48:31",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.150:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:03:50",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:03:50",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:32:33",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:44:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:44:27",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:48:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 14:48:27",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 15:20:16",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 15:24:28",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 16:08:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 16:08:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 16:44:55",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 16:44:59",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 17:02:18",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 17:02:22",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 17:48:28",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 17:56:18",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 17:56:18",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 19:06:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 19:06:27",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 19:41:48",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 19:41:48",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 20:28:36",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 20:39:32",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 21:29:22",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-14 21:29:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 00:42:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 00:42:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 01:07:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 01:07:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 03:48:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 03:48:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 04:18:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 04:18:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 04:28:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 04:28:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 04:29:39",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 04:41:54",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-15 07:24:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 07:24:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 07:24:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 07:50:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 07:50:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 07:50:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 09:36:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 09:36:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 09:36:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 10:30:12",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 10:30:13",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 10:30:16",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 11:05:15",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 11:09:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 11:09:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 11:09:29",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 13:52:56",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 14:23:15",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 15:42:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 15:42:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 16:54:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 16:54:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 16:59:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 17:14:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 17:14:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:01:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:01:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:01:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:03:49",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:03:49",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:03:53",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:34:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:34:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:34:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:50:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:50:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 21:50:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 22:20:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 22:20:22",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-15 22:20:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 01:11:34",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-17 14:02:07",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 14:02:08",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 14:02:10",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 14:02:11",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 14:02:32",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 14:02:35",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 15:17:15",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 15:17:19",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-17 15:17:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: QSVSMRXOXWCYFIX4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-18 02:48:09",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 02:48:09",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 02:49:44",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 04:15:42",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.150:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 04:20:20",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: AIUKQ8WSKZBUQK4X",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 04:24:02",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: AIUKQ8WSKZBUQK4X",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:21:05",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:21:44",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:21:51",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:29:21",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 7X8LJRIRHA4LT8VG",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:30:41",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 7X8LJRIRHA4LT8VG",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:31:43",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 7X8LJRIRHA4LT8VG",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:32:45",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 127.0.0.1:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:32:47",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: emulator-5554",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:33:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 127.0.0.1:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:33:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: emulator-5554",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 05:34:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-18 09:09:39",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.150:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-18 12:11:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.101:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-18 15:32:53",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-18 15:52:08",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-18 15:53:46",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-18 18:07:55",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.150:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 08:51:17",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 08:51:18",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 09:14:38",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 89NZVGKFD6BYUO5P",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 09:36:19",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: AIUKQ8WSKZBUQK4X",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:09:16",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 9PUOYLVK4XIRGMBY",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:20:46",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:22:48",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: KBXO6L6HS8Q4GQWG",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:24:23",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: ON9HSC7LA6LV8HNN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:24:27",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: WO9XKBFMV8ZD5H7L",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:26:37",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: WO9XKBFMV8ZD5H7L",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:45:46",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:45:50",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:50:41",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: MNQ8QCMZXCTWONBI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:51:08",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:51:11",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: MNQ8QCMZXCTWONBI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:51:15",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: VSM76PXKH6CMEQQ4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:51:35",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:51:42",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: VSM76PXKH6CMEQQ4",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 12:53:31",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 9PUOYLVK4XIRGMBY",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:06:02",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:06:03",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:11:10",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8D7DWWUKQGJRNN79",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:11:13",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: BIIVOZFQZTXGVOBU",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:12:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8D7DWWUKQGJRNN79",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:12:29",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: BIIVOZFQZTXGVOBU",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:32:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.124:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:32:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.124:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:50:41",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:50:41",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:59:01",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8D7DWWUKQGJRNN79",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:59:05",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 9PUOYLVK4XIRGMBY",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:59:08",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: GAAMIVLNAQMR4DD6",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:59:12",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: HIXOOB7DEIQ4RCDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 13:59:16",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JFIJYPR86TUW9TAM",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:02:07",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: L7EYZDQOOZ8LDAKN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:03:02",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: L7EYZDQOOZ8LDAKN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:06:44",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.160:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:07:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.134:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:07:28",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.160:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:27:44",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:28:49",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:30:32",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8D7DWWUKQGJRNN79",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:30:36",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8D7DWWUKQGJRNN79",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 14:31:00",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: BIIVOZFQZTXGVOBU",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:31:37",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:32:13",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:38:30",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: GAAMIVLNAQMR4DD6",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:38:33",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: HIXOOB7DEIQ4RCDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:38:39",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: ON9HSC7LA6LV8HNN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:38:43",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: MNQ8QCMZXCTWONBI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:47:14",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.168:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-19 17:47:15",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.168:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-20 10:23:31",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-20 10:23:43",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-20 10:31:41",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-20 13:44:55",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.124:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 04:31:35",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.124:5555",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-21 06:19:02",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 7X8LJRIRHA4LT8VG",
+      "level": "warning",
+      "sent": false,
+      "skipped": "quiet hours"
+    },
+    {
+      "ts": "2026-04-21 07:17:43",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8D7DWWUKQGJRNN79",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 12:47:34",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HDEWKFMJVUCTO6T",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 12:47:37",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 13:15:39",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8DWOF6CYY5R8YHX8",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 13:15:44",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: CACAVKLNU8SGO74D",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 15:09:40",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: emulator-5554",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 15:14:02",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HUSIB4TBQC69TJZ",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 15:14:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 15:26:32",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 16:30:29",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HUSIB4TBQC69TJZ",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 16:30:32",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 16:36:34",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HUSIB4TBQC69TJZ",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 16:39:24",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 16:41:01",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HUSIB4TBQC69TJZ",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 16:46:17",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 17:22:00",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HUSIB4TBQC69TJZ",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 17:40:25",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-21 18:47:56",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 4HUSIB4TBQC69TJZ",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-22 11:48:53",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-22 16:13:37",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-22 16:16:50",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: JZBIGUKZS4NBAYDI",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-22 16:31:28",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 192.168.0.113:5555",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-22 18:24:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: LVHIOZSWDAYLCELN",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-22 19:42:51",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8DWOF6CYY5R8YHX8",
+      "level": "warning",
+      "sent": false
+    }
+  ]
+}

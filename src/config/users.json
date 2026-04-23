@@ -1,0 +1,8 @@
+[
+  {
+    "username": "admin",
+    "password": "pbkdf2:a86d7c6cf27d3b0d6d30d141fc9ba17b:d09cb4ed087bfcda97be7e23e57a65148038faab3dd12cfad388aee619532ca3",
+    "role": "admin",
+    "display": "管理员"
+  }
+]

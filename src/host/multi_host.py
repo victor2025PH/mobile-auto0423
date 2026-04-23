@@ -1,0 +1,876 @@
+# -*- coding: utf-8 -*-
+"""
+分布式多主机管理 — 多 PC 统一汇聚控制。
+
+架构:
+  - 每台 PC 运行 OpenClaw 实例 (Worker)
+  - 其中一台可选作"中心节点" (Coordinator)
+  - Worker 定期向 Coordinator 发送心跳 + 设备/任务状态
+  - Coordinator 聚合所有 Worker 的数据，提供统一 Dashboard 视图
+  - 支持跨主机任务路由
+
+数据流:
+  Worker → POST /cluster/heartbeat → Coordinator (聚合)
+  Dashboard → GET /cluster/overview → Coordinator (统一视图)
+  Dashboard → POST /cluster/dispatch → Coordinator → Worker (路由任务)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import platform
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from src.openclaw_env import DEFAULT_OPENCLAW_PORT
+from src.host.device_registry import DEFAULT_DEVICES_YAML, config_file
+
+log = logging.getLogger(__name__)
+
+_HEARTBEAT_INTERVAL = 15
+_HOST_TIMEOUT = 45
+
+
+@dataclass
+class HostInfo:
+    """Information about a connected host."""
+    host_id: str
+    host_name: str = ""
+    host_ip: str = ""
+    port: int = DEFAULT_OPENCLAW_PORT
+    devices: List[dict] = field(default_factory=list)
+    tasks_active: int = 0
+    tasks_completed: int = 0
+    cpu_usage: float = 0.0
+    memory_usage: float = 0.0
+    ips: List[str] = field(default_factory=list)
+    last_heartbeat: float = 0.0
+    online: bool = True
+    version: str = ""
+
+
+class ClusterCoordinator:
+    """
+    Aggregates state from multiple OpenClaw workers.
+    Runs on one designated PC; others send heartbeats to it.
+    """
+
+    _PERSIST_PATH = "config/cluster_state.json"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hosts: Dict[str, HostInfo] = {}
+        cfg = load_cluster_config()
+        self._secret = cfg.get("shared_secret", "")
+        self._load_persisted_state()
+
+    def receive_heartbeat(self, data: dict) -> dict:
+        """Process heartbeat from a worker host."""
+        host_id = data.get("host_id", "")
+        if not host_id:
+            return {"error": "host_id required"}
+
+        _drop_data = None
+        with self._lock:
+            if host_id not in self._hosts:
+                self._hosts[host_id] = HostInfo(host_id=host_id)
+                log.info("[Cluster] 新主机上线: %s (%s)",
+                         data.get("host_name", host_id[:8]),
+                         data.get("host_ip", "?"))
+
+            host = self._hosts[host_id]
+            was_offline = not host.online
+            old_online = sum(
+                1 for d in (host.devices or []) if d.get("status") == "connected"
+            )
+            old_total = len(host.devices or [])
+            host.host_name = data.get("host_name", host.host_name)
+            host.host_ip = data.get("host_ip", host.host_ip)
+            host.port = data.get("port", host.port)
+            host.devices = data.get("devices", [])
+            host.tasks_active = data.get("tasks_active", 0)
+            host.tasks_completed = data.get("tasks_completed", 0)
+            host.cpu_usage = data.get("cpu_usage", 0)
+            host.memory_usage = data.get("memory_usage", 0)
+            host.last_heartbeat = time.time()
+            host.ips = data.get("ips", [])
+            host.online = True
+            host.version = data.get("version", "")
+            if was_offline:
+                log.info("[Cluster] 主机恢复在线: %s", host_id)
+                try:
+                    from .event_stream import push_event
+                    push_event("worker.online", {
+                        "host_id": host_id,
+                        "host_name": host.host_name,
+                        "host_ip": host.host_ip,
+                    })
+                except Exception:
+                    pass
+
+            new_online = sum(
+                1 for d in (host.devices or []) if d.get("status") == "connected"
+            )
+            new_total = len(host.devices or [])
+            if (
+                not was_offline
+                and old_online > 0
+                and new_online < old_online
+            ):
+                _drop_data = (host.host_name or host_id, old_online, new_online, old_total, new_total)
+
+        self._persist_state()
+
+        if _drop_data:
+            try:
+                _cfg_role = str(load_cluster_config().get("role", "standalone")).lower()
+                if _cfg_role == "coordinator":
+                    from src.host.alert_notifier import AlertNotifier
+                    _an = AlertNotifier.get()
+                    if _an.worker_online_drop_telegram_enabled():
+                        _hn, _o, _n, _ot, _nt = _drop_data
+                        _an.notify_event(
+                            "cluster.worker_online_drop",
+                            "",
+                            "",
+                            "warning",
+                            alert_code="CLUSTER_WORKER_ONLINE_DROP",
+                            params={
+                                "host": _hn,
+                                "adb_o": str(_o),
+                                "adb_n": str(_n),
+                                "reg_o": str(_ot),
+                                "reg_n": str(_nt),
+                            },
+                        )
+            except Exception as e:
+                log.debug("[Cluster] Worker 在线数下降 Telegram 跳过: %s", e)
+
+        return {"status": "ok", "host_id": host_id}
+
+    def get_overview(self) -> dict:
+        """Return aggregated cluster overview."""
+        self._refresh_online_status()
+        with self._lock:
+            hosts = []
+            total_devices = 0
+            total_online = 0
+            total_tasks = 0
+
+            for h in self._hosts.values():
+                device_count = len(h.devices)
+                online_count = sum(1 for d in h.devices
+                                   if d.get("status") == "connected")
+                hosts.append({
+                    "host_id": h.host_id,
+                    "host_name": h.host_name,
+                    "host_ip": h.host_ip,
+                    "port": h.port,
+                    "online": h.online,
+                    "devices": device_count,
+                    "devices_online": online_count,
+                    "tasks_active": h.tasks_active,
+                    "tasks_completed": h.tasks_completed,
+                    "cpu_usage": round(h.cpu_usage, 1),
+                    "memory_usage": round(h.memory_usage, 1),
+                    "last_heartbeat": h.last_heartbeat,
+                    "version": h.version,
+                })
+                total_devices += device_count
+                total_online += online_count
+                total_tasks += h.tasks_active
+
+            # 主控本机 USB 不会出现在 Worker 心跳里；合并计数避免「只显示 W03 的 26 台」
+            coord_usb_n = 0
+            coord_usb_on = 0
+            try:
+                import yaml as _yaml
+                _cy = config_file("cluster.yaml")
+                if _cy.exists():
+                    with open(_cy, encoding="utf-8") as f:
+                        _cc = _yaml.safe_load(f) or {}
+                    if str(_cc.get("role", "")).lower() == "coordinator":
+                        from src.device_control.device_manager import get_device_manager
+                        _dm = get_device_manager(DEFAULT_DEVICES_YAML)
+                        _dm.discover_devices(force=True)
+                        _cds = _dm.get_connected_devices() or []
+                        coord_usb_n = len(_cds)
+                        coord_usb_on = coord_usb_n
+            except Exception:
+                pass
+
+            return {
+                "hosts": hosts,
+                "total_hosts": len(self._hosts),
+                "hosts_online": sum(1 for h in self._hosts.values() if h.online),
+                "total_devices": total_devices + coord_usb_n,
+                "total_devices_online": total_online + coord_usb_on,
+                "total_tasks_active": total_tasks,
+                "worker_devices_total": total_devices,
+                "coordinator_usb_devices": coord_usb_n,
+                "count_legend": (
+                    "Worker: devices_online=发心跳前经 adb 校准后的在线台数, "
+                    "devices=心跳中的设备条数(含已断条); "
+                    "本机USB=主控 discover 在线台数"
+                ),
+            }
+
+    def refresh_all_devices(self) -> int:
+        """主动查询所有在线 Worker 的设备列表，更新内存中的设备数据。
+
+        Returns:
+            int: 从所有 Worker 获取的设备总数
+        """
+        import urllib.request
+        total = 0
+        with self._lock:
+            hosts = [(h.host_id, h.host_ip, h.port, h.online) for h in self._hosts.values()]
+
+        for host_id, host_ip, port, online in hosts:
+            if not online:
+                continue
+            # 尝试多个可能的 URL（包括所有已知 IP）
+            urls_to_try = []
+            with self._lock:
+                h = self._hosts.get(host_id)
+                if h and h.ips:
+                    for ip in h.ips:
+                        urls_to_try.append(f"http://{ip}:{port}")
+            if host_ip:
+                url = f"http://{host_ip}:{port}"
+                if url not in urls_to_try:
+                    urls_to_try.insert(0, url)
+            if not urls_to_try:
+                continue
+
+            for base_url in urls_to_try:
+                try:
+                    url = f"{base_url}/devices"
+                    req = urllib.request.Request(url, method="GET")
+                    # 添加集群密钥认证
+                    if self._secret:
+                        req.add_header("X-Cluster-Secret", self._secret)
+                    req.add_header("Connection", "close")
+                    resp = urllib.request.urlopen(req, timeout=10)
+                    data = json.loads(resp.read().decode())
+                    resp.close()
+                    # Worker /devices 可能返回数组或 {"devices": [...]}
+                    devices = data if isinstance(data, list) else data.get("devices", [])
+                    if isinstance(devices, list) and devices:
+                        # 标准化设备数据
+                        normalized = []
+                        for d in devices:
+                            if isinstance(d, dict):
+                                normalized.append(d)
+                            elif isinstance(d, str):
+                                normalized.append({"device_id": d, "status": "unknown"})
+
+                        with self._lock:
+                            if host_id in self._hosts:
+                                self._hosts[host_id].devices = normalized
+                        total += len(normalized)
+                        log.info("[Cluster] 从 %s 刷新了 %d 个设备", host_id, len(normalized))
+                    break  # 成功就不再尝试其他 URL
+                except Exception as e:
+                    log.debug("[Cluster] 从 %s (%s) 查询设备失败: %s", host_id, base_url, e)
+
+        return total
+
+    def get_all_devices(self) -> List[dict]:
+        """Return unified device list across all hosts."""
+        self._refresh_online_status()
+        devices = []
+        with self._lock:
+            for h in self._hosts.values():
+                if not h.online:
+                    continue
+                for d in h.devices:
+                    d_copy = dict(d)
+                    d_copy["host_id"] = h.host_id
+                    d_copy["host_name"] = h.host_name
+                    d_copy["host_ip"] = h.host_ip
+                    d_copy["host_port"] = h.port
+                    devices.append(d_copy)
+
+        # 备选: 如果设备列表为空且有在线 Worker，主动刷新
+        if not devices:
+            online_count = sum(1 for h in self._hosts.values() if h.online)
+            if online_count > 0:
+                log.info("[Cluster] 设备列表为空但有 %d 个在线 Worker，尝试主动刷新...", online_count)
+                self.refresh_all_devices()
+                # 重新收集
+                with self._lock:
+                    for h in self._hosts.values():
+                        if not h.online:
+                            continue
+                        for d in h.devices:
+                            d_copy = dict(d) if isinstance(d, dict) else {"device_id": str(d)}
+                            d_copy["host_id"] = h.host_id
+                            d_copy["host_name"] = h.host_name
+                            d_copy["host_ip"] = h.host_ip
+                            d_copy["host_port"] = h.port
+                            devices.append(d_copy)
+
+        return devices
+
+    def select_host_for_task(self, task_type: str = "",
+                             preferred_device: str = "",
+                             platform: str = "") -> Optional[dict]:
+        """
+        Multi-factor host selection:
+        1. Device affinity: route to host that owns preferred_device
+        2. Platform affinity: for platform-specific tasks, prefer hosts with
+           devices running that platform's app
+        3. Load balancing: health score - active tasks penalty
+        4. CPU/memory headroom bonus
+        """
+        self._refresh_online_status()
+        with self._lock:
+            online_hosts = [h for h in self._hosts.values() if h.online]
+            if not online_hosts:
+                return None
+
+            if preferred_device:
+                for h in online_hosts:
+                    for d in h.devices:
+                        if d.get("device_id") == preferred_device:
+                            return self._host_result(h)
+
+            if not platform and task_type:
+                for prefix in ("tiktok_", "telegram_", "whatsapp_", "facebook_"):
+                    if task_type.startswith(prefix):
+                        platform = prefix.rstrip("_")
+                        break
+
+            def _host_score(h):
+                load_penalty = h.tasks_active * 10
+                avg_health = 50
+                connected = [d for d in h.devices
+                             if d.get("status") == "connected"]
+                if connected:
+                    scores = [d.get("health_score", 50) for d in connected]
+                    avg_health = sum(scores) / len(scores)
+
+                cpu_bonus = max(0, (100 - h.cpu_usage) * 0.1)
+                mem_bonus = max(0, (100 - h.memory_usage) * 0.05)
+                device_count_bonus = len(connected) * 2
+
+                return avg_health - load_penalty + cpu_bonus + mem_bonus + device_count_bonus
+
+            best = max(online_hosts, key=_host_score)
+            return self._host_result(best)
+
+    @staticmethod
+    def _host_result(h: HostInfo) -> dict:
+        return {
+            "host_id": h.host_id,
+            "host_name": h.host_name,
+            "host_ip": h.host_ip,
+            "port": h.port,
+            "url": f"http://{h.host_ip}:{h.port}",
+        }
+
+    def remove_host(self, host_id: str):
+        with self._lock:
+            self._hosts.pop(host_id, None)
+        self._persist_state()
+
+    def _persist_state(self):
+        """Save minimal host info to disk for fast recovery after restart."""
+        try:
+            import json
+            from pathlib import Path
+            data = {}
+            with self._lock:
+                for hid, h in self._hosts.items():
+                    data[hid] = {
+                        "host_name": h.host_name,
+                        "host_ip": h.host_ip,
+                        "port": h.port,
+                        "last_heartbeat": h.last_heartbeat,
+                    }
+            p = Path(self._PERSIST_PATH)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            log.debug("[Cluster] 持久化失败: %s", e)
+
+    def _load_persisted_state(self):
+        """Load previously known hosts so Coordinator knows about workers
+        immediately after restart, before they send new heartbeats."""
+        try:
+            import json
+            from pathlib import Path
+            p = Path(self._PERSIST_PATH)
+            if not p.exists():
+                return
+            data = json.loads(p.read_text(encoding="utf-8"))
+            for hid, info in data.items():
+                h = HostInfo(host_id=hid)
+                h.host_name = info.get("host_name", "")
+                h.host_ip = info.get("host_ip", "")
+                h.port = info.get("port", DEFAULT_OPENCLAW_PORT)
+                h.last_heartbeat = info.get("last_heartbeat", 0)
+                h.online = False
+                self._hosts[hid] = h
+            if data:
+                log.info("[Cluster] 从缓存恢复 %d 个已知主机（等待心跳上线）",
+                         len(data))
+        except Exception as e:
+            log.debug("[Cluster] 加载持久化状态失败: %s", e)
+
+    def _refresh_online_status(self):
+        now = time.time()
+        with self._lock:
+            for h in self._hosts.values():
+                if now - h.last_heartbeat > _HOST_TIMEOUT:
+                    if h.online:
+                        log.warning("[Cluster] 主机离线: %s (%s)",
+                                    h.host_name, h.host_id[:8])
+                    h.online = False
+                    try:
+                        from .event_stream import push_event
+                        push_event("worker.offline", {
+                            "host_id": h.host_id,
+                            "host_name": h.host_name,
+                            "host_ip": h.host_ip,
+                            "last_heartbeat": h.last_heartbeat,
+                        })
+                    except Exception:
+                        pass
+
+
+class HeartbeatSender:
+    """
+    Runs on worker hosts. Periodically sends heartbeat to coordinator.
+    """
+
+    _consecutive_failures: int = 0
+    _standalone_mode: bool = False
+    _last_collected_data: Optional[dict] = None
+    _collect_timeout: float = 5.0
+
+    def __init__(self, coordinator_url: str, local_port: int = DEFAULT_OPENCLAW_PORT,
+                 interval: int = _HEARTBEAT_INTERVAL):
+        self._coordinator_url = coordinator_url.rstrip("/")
+        self._local_port = local_port
+        self._interval = interval
+        self._host_id = self._generate_host_id()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._consecutive_failures = 0
+        self._standalone_mode = False
+        self._last_collected_data = None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="heartbeat-sender")
+        self._thread.start()
+        log.info("[Cluster] 心跳发送已启动 → %s", self._coordinator_url)
+
+    def stop(self):
+        self._stop.set()
+
+    def is_standalone_mode(self) -> bool:
+        """Returns True if this worker has lost contact with coordinator (degraded mode)."""
+        return self._standalone_mode
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                self._send_heartbeat()
+                self._consecutive_failures = 0
+                if self._standalone_mode:
+                    log.info("[Cluster] 心跳已恢复，退出降级模式")
+                    self._standalone_mode = False
+            except Exception as e:
+                self._consecutive_failures += 1
+                if self._standalone_mode:
+                    log.debug("[Cluster] 心跳发送失败 (降级模式): %s", e)
+                else:
+                    log.warning("[Cluster] 心跳发送失败: %s", e)
+                if self._consecutive_failures >= 3 and not self._standalone_mode:
+                    log.warning("[Cluster] 连续 %d 次心跳失败，进入降级独立模式",
+                                self._consecutive_failures)
+                    self._standalone_mode = True
+            self._stop.wait(self._interval)
+
+    def _send_heartbeat(self):
+        import urllib.request
+        import json
+        import hmac as _hmac
+        import hashlib as _hashlib
+        import time as _time
+        import concurrent.futures as _cf
+
+        # Collect with timeout to avoid blocking heartbeat
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(self._collect_status)
+            try:
+                data = fut.result(timeout=self._collect_timeout)
+                self._last_collected_data = data
+            except _cf.TimeoutError:
+                log.warning("[Cluster] Status collection timed out, using last known data")
+                data = self._last_collected_data or self._minimal_status()
+
+        # Add HMAC-SHA256 signing to payload
+        secret = data.pop("secret", "")  # remove plain secret if present
+        if not secret:
+            cfg = load_cluster_config()
+            secret = cfg.get("shared_secret", "")
+        if secret:
+            host_id = data.get("host_id", "")
+            ts = str(_time.time())
+            sig = _hmac.new(
+                secret.encode(),
+                f"{host_id}:{ts}".encode(),
+                _hashlib.sha256
+            ).hexdigest()
+            data["_sig"] = sig
+            data["_ts"] = ts
+
+        payload = json.dumps(data).encode()
+        req = urllib.request.Request(
+            f"{self._coordinator_url}/cluster/heartbeat",
+            data=payload,
+            headers={"Content-Type": "application/json", "Connection": "close"},
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            resp.read()
+            resp.close()
+        except Exception as e:
+            log.warning("[Cluster] Heartbeat HTTP failed: %s", e)
+
+    def _collect_status(self) -> dict:
+        """Collect local status for heartbeat."""
+        import socket
+
+        devices = []
+        tasks_active = 0
+        tasks_completed = 0
+
+        try:
+            from src.host.health_monitor import metrics
+            for did, status in metrics.device_status.items():
+                dev_info = {
+                    "device_id": did,
+                    "display_name": status.get("display_name", ""),
+                    "status": status.get("status", "unknown"),
+                }
+                try:
+                    score = metrics.device_health_score(did)
+                    dev_info["health_score"] = score.get("total", 0)
+                except Exception:
+                    pass
+                try:
+                    from src.host.health_monitor import _monitor
+                    if _monitor and hasattr(_monitor, '_wifi_backup'):
+                        wifi = _monitor._wifi_backup.get(did)
+                        dev_info["wifi_backup"] = wifi or ""
+                except Exception:
+                    pass
+                devices.append(dev_info)
+            tasks_completed = metrics.tasks_total
+        except Exception:
+            pass
+
+        # 用当前 adb 在线集合校准 status（metrics 由 HealthMonitor 周期更新，默认约 60s 才变；心跳约 10s 一发，避免「已掉线仍显示 26 在线」）
+        try:
+            from pathlib import Path as _Path
+            from src.device_control.device_manager import get_device_manager
+
+            _mgr = get_device_manager(DEFAULT_DEVICES_YAML)
+            _mgr.discover_devices(force=True)
+            _live = {d.device_id for d in (_mgr.get_connected_devices() or [])}
+            _by_id = {d["device_id"]: d for d in devices}
+            for _d in devices:
+                _id = _d.get("device_id", "")
+                if not _id:
+                    continue
+                if _id in _live:
+                    _d["status"] = "connected"
+                else:
+                    if (_d.get("status") or "") == "connected":
+                        _d["status"] = "disconnected"
+            for _id in _live:
+                if _id not in _by_id:
+                    devices.append(
+                        {
+                            "device_id": _id,
+                            "display_name": _id[:8],
+                            "status": "connected",
+                        }
+                    )
+        except Exception:
+            pass
+
+        try:
+            from src.host.worker_pool import get_worker_pool
+            pool = get_worker_pool()
+            st = pool.get_status()
+            tasks_active = st.get("active_count", 0)
+        except Exception:
+            pass
+
+        cpu = 0.0
+        mem = 0.0
+        try:
+            import psutil
+            cpu = psutil.cpu_percent(interval=0)
+            mem = psutil.virtual_memory().percent
+        except ImportError:
+            pass
+
+        cfg = load_cluster_config()
+        host_name = getattr(self, "_host_name_override", "") or cfg.get("host_name", "") or platform.node()
+        result = {
+            "host_id": self._host_id,
+            "host_name": host_name,
+            "host_ip": cfg.get("advertise_ip", "") or self._get_local_ip(),
+            "ips": self._get_all_ips(),
+            "port": self._local_port,
+            "devices": devices,
+            "tasks_active": tasks_active,
+            "tasks_completed": tasks_completed,
+            "cpu_usage": cpu,
+            "memory_usage": mem,
+            "version": "1.0.0",
+        }
+        # 恢复状态信息
+        recovery_info = {}
+        try:
+            from src.host.health_monitor import _monitor
+            if _monitor:
+                recovery_state = getattr(_monitor, '_recovery_state', {})
+                disconnected = getattr(_monitor, '_disconnected_devices', set())
+                recovery_info = {
+                    "disconnected_count": len(disconnected),
+                    "recovering_devices": list(disconnected)[:10],
+                }
+        except Exception:
+            pass
+        result["recovery"] = recovery_info
+
+        secret = cfg.get("shared_secret", "")
+        if secret:
+            result["secret"] = secret
+        return result
+
+    def _minimal_status(self) -> dict:
+        """Return bare-minimum status payload when full collection times out."""
+        cfg = load_cluster_config()
+        return {
+            "host_id": self._host_id,
+            "host_name": cfg.get("host_name", ""),
+            "host_ip": self._get_local_ip(),
+            "port": self._local_port,
+            "devices": [],
+            "tasks_active": 0,
+            "tasks_completed": 0,
+        }
+
+    @staticmethod
+    def _get_local_ip() -> str:
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    @staticmethod
+    def _get_all_ips() -> list:
+        """获取所有网卡的 IPv4 地址。"""
+        import socket
+        ips = []
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if ip and not ip.startswith('127.'):
+                    if ip not in ips:
+                        ips.append(ip)
+        except Exception:
+            pass
+        # 也尝试获取默认路由 IP
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            default_ip = s.getsockname()[0]
+            s.close()
+            if default_ip not in ips:
+                ips.insert(0, default_ip)
+        except Exception:
+            pass
+        return ips
+
+    @staticmethod
+    def _generate_host_id() -> str:
+        cfg = load_cluster_config()
+        custom_id = cfg.get("host_id", "")
+        if custom_id:
+            return custom_id
+        raw = f"{platform.node()}-{platform.machine()}"
+        try:
+            import uuid as _uuid
+            raw += f"-{_uuid.getnode()}"
+        except Exception:
+            pass
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+_coordinator: Optional[ClusterCoordinator] = None
+_coord_lock = threading.Lock()
+_sender: Optional[HeartbeatSender] = None
+_sender_lock = threading.Lock()
+_cluster_config: Optional[Dict[str, Any]] = None
+
+
+def load_cluster_config() -> Dict[str, Any]:
+    """Load cluster config from config/cluster.yaml."""
+    global _cluster_config
+    if _cluster_config is not None:
+        return _cluster_config
+    cfg_path = config_file("cluster.yaml")
+    default = {
+        "role": "standalone",
+        "coordinator_url": "",
+        "local_port": DEFAULT_OPENCLAW_PORT,
+        "shared_secret": "",
+        "heartbeat_interval": 10,
+        "host_timeout": 30,
+        "auto_join": True,
+        "host_name": "",
+        "host_id": "",
+        "advertise_ip": "",
+    }
+    if cfg_path.exists():
+        try:
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                loaded = yaml.safe_load(f) or {}
+            default.update(loaded)
+        except ImportError:
+            try:
+                text = cfg_path.read_text(encoding="utf-8")
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        k = k.strip()
+                        v = v.strip().strip('"').strip("'")
+                        if k in default:
+                            if isinstance(default[k], bool):
+                                default[k] = v.lower() in ("true", "yes", "1")
+                            elif isinstance(default[k], int):
+                                try:
+                                    default[k] = int(v)
+                                except ValueError:
+                                    pass
+                            else:
+                                default[k] = v
+            except Exception as e:
+                log.debug("Failed to parse cluster config: %s", e)
+    # 环境变量回退: shared_secret
+    if not default.get("shared_secret"):
+        env_secret = os.environ.get("OPENCLAW_CLUSTER_SECRET", "")
+        if env_secret:
+            default["shared_secret"] = env_secret
+        else:
+            # 自动生成随机密钥
+            import secrets
+            generated = secrets.token_hex(16)
+            default["shared_secret"] = generated
+            log.info("[Cluster] shared_secret 为空，已自动生成随机密钥")
+
+    _cluster_config = default
+    return _cluster_config
+
+
+def save_cluster_config(config: Dict[str, Any]):
+    """Save cluster config back to YAML."""
+    global _cluster_config
+    cfg_path = config_file("cluster.yaml")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# OpenClaw 集群配置",
+        f"role: {config.get('role', 'standalone')}",
+        f"coordinator_url: \"{config.get('coordinator_url', '')}\"",
+        f"local_port: {config.get('local_port', DEFAULT_OPENCLAW_PORT)}",
+        f"shared_secret: \"{config.get('shared_secret', '')}\"",
+        f"heartbeat_interval: {config.get('heartbeat_interval', 10)}",
+        f"host_timeout: {config.get('host_timeout', 30)}",
+        f"auto_join: {'true' if config.get('auto_join') else 'false'}",
+        f"host_name: \"{config.get('host_name', '')}\"",
+        f"host_id: \"{config.get('host_id', '')}\"",
+    ]
+    cfg_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _cluster_config = config
+
+
+def get_cluster_coordinator() -> ClusterCoordinator:
+    global _coordinator
+    if _coordinator is None:
+        with _coord_lock:
+            if _coordinator is None:
+                cfg = load_cluster_config()
+                _coordinator = ClusterCoordinator()
+                if cfg.get("host_timeout"):
+                    global _HOST_TIMEOUT
+                    _HOST_TIMEOUT = cfg["host_timeout"]
+    return _coordinator
+
+
+def start_heartbeat_sender(coordinator_url: str,
+                           local_port: int = DEFAULT_OPENCLAW_PORT) -> HeartbeatSender:
+    global _sender
+    with _sender_lock:
+        if _sender:
+            _sender.stop()
+        cfg = load_cluster_config()
+        interval = cfg.get("heartbeat_interval", _HEARTBEAT_INTERVAL)
+        host_name = cfg.get("host_name", "")
+        _sender = HeartbeatSender(coordinator_url, local_port, interval=interval)
+        if host_name:
+            _sender._host_name_override = host_name
+        _sender.start()
+    return _sender
+
+
+def auto_start_cluster():
+    """Called at startup — auto-join cluster if configured."""
+    cfg = load_cluster_config()
+    role = cfg.get("role", "standalone")
+    if role == "worker" and cfg.get("auto_join") and cfg.get("coordinator_url"):
+        log.info("[Cluster] Auto-joining as worker → %s",
+                 cfg["coordinator_url"])
+        start_heartbeat_sender(cfg["coordinator_url"],
+                               cfg.get("local_port", DEFAULT_OPENCLAW_PORT))
+    elif role == "coordinator":
+        log.info("[Cluster] Starting as coordinator")
+        get_cluster_coordinator()
+    else:
+        log.info("[Cluster] Standalone mode")
+
+
+def is_worker_standalone() -> bool:
+    """Returns True if this worker has lost contact with coordinator (degraded mode)."""
+    global _sender
+    sender = _sender
+    if sender is None:
+        return False
+    return getattr(sender, '_standalone_mode', False)

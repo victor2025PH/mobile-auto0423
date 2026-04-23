@@ -1,0 +1,236 @@
+{
+  "NZROIVNFMJE69DVW": {
+    "number": 12,
+    "alias": "12号",
+    "display_name": "",
+    "wallpaper_error": "deploy_failed"
+  },
+  "CIVWFQGAUOCU45U8": {
+    "number": 19,
+    "alias": "19号",
+    "display_name": "23106RN0DA",
+    "wallpaper_error": "deploy_failed"
+  },
+  "IJDMAUJFZH6XG6RS": {
+    "number": 11,
+    "alias": "11号",
+    "display_name": "23106RN0DA",
+    "wallpaper_error": "deploy_failed"
+  },
+  "BMNJCMH69HVGAUMN": {
+    "number": 5,
+    "alias": "05号",
+    "display_name": "23106RN0DA",
+    "wallpaper_error": "deploy_failed"
+  },
+  "192.168.0.109:5555": {
+    "number": 9,
+    "alias": "JRIZ6DIB-09",
+    "display_name": "JRIZ6DIB",
+    "host_scope": "unknown",
+    "slot": 9,
+    "host_label_short": "JRIZ6DIB",
+    "display_label": "JRIZ6DIB-09",
+    "wallpaper_error": "deploy_failed"
+  },
+  "5PHIFQQ8IFYPUOQC": {
+    "number": 28,
+    "alias": "28号",
+    "display_name": "",
+    "wallpaper_error": "deploy_failed"
+  },
+  "RCBYPZJZ656LR8NB": {
+    "number": 15,
+    "alias": "15号",
+    "display_name": "",
+    "wallpaper_error": "deploy_failed"
+  },
+  "192.168.0.128:5555": {
+    "number": 38,
+    "alias": "38号",
+    "display_name": "",
+    "wallpaper_error": "deploy_failed"
+  },
+  "QSVSMRXOXWCYFIX4": {
+    "number": 2,
+    "alias": "02号",
+    "display_name": "23106RN0DA",
+    "wallpaper_error": "deploy_failed"
+  },
+  "192.168.0.195:5555": {
+    "number": 31,
+    "alias": "31号",
+    "display_name": "",
+    "wallpaper_error": "deploy_failed"
+  },
+  "127.0.0.1:5555": {
+    "number": 2,
+    "alias": "02号",
+    "display_name": "SM-S908E"
+  },
+  "KBXO6L6HS8Q4GQWG": {
+    "number": 12,
+    "alias": "12号",
+    "display_name": "23106RN0DA"
+  },
+  "8XINBU4HNF9TSOXW": {
+    "number": 3,
+    "alias": "03号",
+    "display_name": "23108RN04Y"
+  },
+  "OZMZKRDMGIOJGEKF": {
+    "number": 10,
+    "alias": "10号",
+    "display_name": "23106RN0DA"
+  },
+  "AIUKQ8WSKZBUQK4X": {
+    "number": 3,
+    "alias": "03号",
+    "display_name": "23106RN0DA"
+  },
+  "89NZVGKFD6BYUO5P": {
+    "number": 1,
+    "alias": "01号",
+    "display_name": "23106RN0DA"
+  },
+  "E6FYKRHYS48HZLAM": {
+    "number": 4,
+    "alias": "04号",
+    "display_name": ""
+  },
+  "J7Z5TGTCDA9H7DMF": {
+    "number": 7,
+    "alias": "07号",
+    "display_name": ""
+  },
+  "YX5HMVUGDY6X4P79": {
+    "number": 18,
+    "alias": "18号",
+    "display_name": ""
+  },
+  "192.168.0.150:5555": {
+    "number": 35,
+    "alias": "35号",
+    "display_name": ""
+  },
+  "KRNJKVT88LQSDA95": {
+    "number": 39,
+    "alias": "39号",
+    "display_name": ""
+  },
+  "X8PF75ZHPVDIFA5X": {
+    "number": 39,
+    "alias": "39号",
+    "display_name": ""
+  },
+  "8DQKW8RWVSWO4PKB": {
+    "number": 41,
+    "alias": "41号",
+    "display_name": ""
+  },
+  "JV9XXCW495KRDYWS": {
+    "number": 43,
+    "alias": "43号",
+    "display_name": ""
+  },
+  "WO9XKBFMV8ZD5H7L": {
+    "number": 17,
+    "alias": "17号",
+    "display_name": ""
+  },
+  "VSM76PXKH6CMEQQ4": {
+    "number": 16,
+    "alias": "16号",
+    "display_name": ""
+  },
+  "JFIJYPR86TUW9TAM": {
+    "number": 7,
+    "alias": "07号",
+    "display_name": "23106RN0DA"
+  },
+  "9PUOYLVK4XIRGMBY": {
+    "number": 4,
+    "alias": "04号",
+    "display_name": "23106RN0DA"
+  },
+  "L7EYZDQOOZ8LDAKN": {
+    "number": 8,
+    "alias": "08号",
+    "display_name": "23106RN0DA"
+  },
+  "192.168.0.134:5555": {
+    "number": 3,
+    "alias": "03号",
+    "display_name": ""
+  },
+  "192.168.0.167:5555": {
+    "number": 1,
+    "alias": "01号",
+    "display_name": "23106RN0DA"
+  },
+  "192.168.0.160:5555": {
+    "display_name": "192.168.",
+    "slot": 6,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-06",
+    "alias": "主控-06",
+    "number": 6
+  },
+  "8D7DWWUKQGJRNN79": {
+    "number": 2,
+    "alias": "02号",
+    "display_name": "23106RN0DA"
+  },
+  "HIXOOB7DEIQ4RCDI": {
+    "number": 6,
+    "alias": "06号",
+    "display_name": "23106RN0DA"
+  },
+  "192.168.0.168:5555": {
+    "number": 9,
+    "alias": "09号",
+    "display_name": "23106RN0DA"
+  },
+  "GAAMIVLNAQMR4DD6": {
+    "number": 5,
+    "alias": "05号",
+    "display_name": ""
+  },
+  "MNQ8QCMZXCTWONBI": {
+    "number": 11,
+    "alias": "11号",
+    "display_name": ""
+  },
+  "CACAVKLNU8SGO74D": {
+    "display_name": "CACAVKLN",
+    "slot": 4,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-04",
+    "alias": "主控-04",
+    "number": 4
+  },
+  "emulator-5554": {
+    "number": 5,
+    "alias": "05号",
+    "display_name": "SM-S908E"
+  },
+  "4HUSIB4TBQC69TJZ": {
+    "number": 2,
+    "alias": "02号",
+    "display_name": "23106RN0DA"
+  },
+  "192.168.0.113:5555": {
+    "display_name": "192.168.",
+    "slot": 1,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-01",
+    "alias": "主控-01",
+    "number": 1
+  }
+}

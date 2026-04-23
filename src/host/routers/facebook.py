@@ -1,0 +1,1574 @@
+# -*- coding: utf-8 -*-
+"""Facebook 平台路由 — 与 routers/tiktok.py 同构,提供:
+
+  * 设备级一键启动 (POST /facebook/device/{id}/launch)
+  * 5 套执行方案预设查询 (GET /facebook/presets)
+  * 引流账号配置 (GET/POST /facebook/referral-config) — 默认 WA 优先
+  * 设备网格聚合数据 (GET /facebook/device-grid)
+  * 漏斗统计 (GET /facebook/funnel)
+
+Sprint 1 实现 launch + presets + referral-config 骨架;
+Sprint 2 补 device-grid + funnel + qualified-leads。
+"""
+from __future__ import annotations
+
+import json as _json
+import logging
+import os
+import urllib.request as _ur
+from pathlib import Path
+import copy as _copy
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+
+from .auth import verify_api_key
+from src.openclaw_env import local_api_base
+from src.host.device_registry import (
+    DEFAULT_DEVICES_YAML,
+    config_file,
+    is_device_in_local_registry,
+)
+# P2-UI Sprint 新增：persona 展示层 & 引流优先级
+# 把原先写在 /referral-config 里的 priority_order 硬编码迁到 persona 节点，
+# 实现"改客群即自动切换引流渠道顺序"的单一事实源。
+from src.host.fb_target_personas import (
+    clear_active_persona_override,
+    get_default_persona_key,
+    get_persona_display,
+    get_referral_priority,
+    get_yaml_default_persona_key,
+    list_persona_displays,
+    read_active_persona_override,
+    set_active_persona_override,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/facebook", tags=["facebook"],
+                   dependencies=[Depends(verify_api_key)])
+
+# 设为 1/true：POST /active-persona 仅接受 X-API-Key==OPENCLAW_API_KEY（不接受仅浏览器会话），用于公网暴露面收缩。
+_STRICT_FB_ACTIVE_PERSONA_POST = os.environ.get(
+    "OPENCLAW_FB_ACTIVE_PERSONA_REQUIRE_KEY", ""
+).strip().lower() in ("1", "true", "yes")
+
+_W03_BASE = "http://192.168.0.103:8000"
+_DEVICES_YAML = Path(DEFAULT_DEVICES_YAML)
+_CHAT_MSG_YAML = config_file("chat_messages.yaml")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 工具
+# ─────────────────────────────────────────────────────────────────────────
+
+def _is_local_device(device_id: str) -> bool:
+    """判断设备是否在本地 device manager 中。"""
+    return is_device_in_local_registry(device_id, devices_yaml=str(_DEVICES_YAML))
+
+
+class FacebookTaskEnqueueError(RuntimeError):
+    """子节点 ``POST /tasks`` 失败（含 400 gate / 校验错误），携带 HTTP 状态与 FastAPI detail。"""
+
+    __slots__ = ("status", "detail")
+
+    def __init__(self, message: str, *, status: int = 0, detail: Any = None):
+        super().__init__(message)
+        self.status = int(status or 0)
+        self.detail = detail
+
+
+def _probe_worker_health_capabilities(base: str, timeout: float = 3.0) -> Tuple[Dict[str, Any], bool]:
+    """对远端 ``GET {base}/health`` 轻量探测；返回 ``(capabilities 字典, 是否成功拿到 HTTP 响应体)``。"""
+    b = (base or "").rstrip("/")
+    if not b:
+        return {}, False
+    try:
+        req = _ur.Request(f"{b}/health", method="GET")
+        resp = _ur.urlopen(req, timeout=timeout)
+        try:
+            raw = resp.read().decode("utf-8", errors="replace")
+            data = _json.loads(raw) if raw.strip().startswith("{") else {}
+            return dict((data or {}).get("capabilities") or {}), True
+        finally:
+            resp.close()
+    except Exception:
+        return {}, False
+
+
+def _remote_worker_capabilities_warning(
+    *,
+    is_local: bool,
+    worker_caps: Dict[str, Any],
+    probe_ok: bool = True,
+) -> Optional[str]:
+    """非本机入队时，若无法确认 Worker 与主控一致的预检门能力，则给出运维可读告警文案。"""
+    if is_local:
+        return None
+    if (worker_caps or {}).get("facebook_task_precreate_gate") is True:
+        return None
+    core = (
+        "无法确认远程 Worker 与主控一致的加好友预检门（facebook_task_precreate_gate）；"
+        "加好友类 POST /tasks 可能与主控不一致，请将 Worker 升级到与主控同版本。"
+    )
+    if not probe_ok:
+        return core + "（GET /health 探测失败：请检查网络、防火墙与 Worker 是否在线。）"
+    return core + "（GET /health 已连通但未声明该能力，常见于旧版 Worker。）"
+
+
+def _post_create_task(base: str, payload: dict, timeout: int = 10) -> dict:
+    import urllib.error as _ue
+
+    rb = _json.dumps(payload).encode()
+    req = _ur.Request(f"{base.rstrip('/')}/tasks", data=rb,
+                      headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        resp = _ur.urlopen(req, timeout=timeout)
+        try:
+            return _json.loads(resp.read())
+        finally:
+            resp.close()
+    except _ue.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+        detail: Any = None
+        msg = ""
+        try:
+            if body.strip().startswith("{"):
+                j = _json.loads(body)
+                detail = j.get("detail")
+                if isinstance(detail, dict):
+                    msg = str(detail.get("error") or detail.get("message") or "").strip()
+                elif isinstance(detail, str):
+                    msg = detail.strip()
+        except Exception:
+            pass
+        if not msg:
+            msg = f"HTTP {e.code}: {body[:400]}"
+        raise FacebookTaskEnqueueError(msg, status=e.code, detail=detail) from e
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 5 套执行方案预设(服务端权威定义,前端拉取后渲染卡片)
+# ─────────────────────────────────────────────────────────────────────────
+#
+# 设计原则:
+#   - 与 TikTok 的 _TT_FLOW_PRESETS 同构,但步骤适配 FB 业务
+#   - "激进"风控档默认值:每号每日 30 加好友 / 60 DM 上限
+#   - steps 里的 type 必须与 executor.py 中 facebook_* 任务类型对齐
+# ─────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────
+# 预设参数设计笔记（P2-UI Sprint · 日本 37-60 女性客群）
+# ─────────────────────────────────────────────────────────────────────────
+# 以下 5 套预设的"显性参数"（像 like_probability、max_friends_per_run、
+# max_members）来自 3 个维度的综合权衡：
+#   1) 日本 FB 中年女性行为常模（本地敬语文化 + 举报阈值更低 → 克制）
+#   2) 风控相位（cold_start/growth/mature/cooldown，由 fb_playbook.yaml 热加载）
+#   3) 引流产出 KPI（日本 LINE 渗透更高 → 侧重深聊而非广撒网）
+#
+# 主要调整（相比旧版通用激进档）：
+#   * like_probability ↑  0.18 → 0.35（日本女性点赞文化活跃，低了反不自然）
+#   * comment_probability ↓ 0.25 → 0.15（日本社区评论克制，广告态度会被秒投诉）
+#   * max_friends_per_run ↓ 8 → 5（日本女性号被秒举报即永封）
+#   * group_hunter.max_members ↓ 30 → 20（一次提取太多 → 后续 add_friend 必超限）
+#   * full_funnel.max_friends ↓ 5 → 4（保守档下每日 16-20 好友，月稳定累计）
+#
+# 所有 step 默认 persona_key=jp_female_midlife；launch 阶段如未传入
+# target_country/language 会由 fb_device_launch 自动从 persona 补齐。
+# ─────────────────────────────────────────────────────────────────────────
+
+# 客群硬编码值：从 fb_target_personas.yaml 读出默认 persona 的 key。
+# 放在 module 级常量是为了让 FB_FLOW_PRESETS 在模块载入时就能固化，
+# 切换客群时只需改 YAML 的 default_persona 字段并调 /facebook/presets/reload。
+_DEFAULT_PERSONA = "jp_female_midlife"
+
+FB_FLOW_PRESETS: List[dict] = [
+    {
+        "key": "warmup",
+        "name": "🌱 账号培育",
+        "color": "#22c55e",
+        "label": "养号机",
+        "desc": "Feed 浏览 + 兴趣点赞,降低风控权重",
+        "detail": "适合新号或被限号恢复期(日本中年女性号安全档)",
+        "estimated_minutes": 30,
+        "estimated_output": "0 线索(基础养号)",
+        "steps": [
+            {"type": "facebook_browse_feed_by_interest",
+             "params": {"duration": 10, "persona_key": _DEFAULT_PERSONA,
+                        "interest_hours": 168, "max_topics": 4, "like_boost": 0.12}},
+            {"type": "facebook_browse_feed",
+             "params": {"scroll_count": 20, "like_probability": 0.35, "duration": 15,
+                        "persona_key": _DEFAULT_PERSONA}},
+        ],
+    },
+    {
+        "key": "group_hunter",
+        "name": "🎯 圈层拓客",
+        "color": "#f59e0b",
+        "label": "猎客机",
+        "desc": "进群浏览 + 评论曝光 + 提取群成员",
+        "detail": "FB 引流核心入口,日采 30-50 精准女性成员",
+        "estimated_minutes": 60,
+        "estimated_output": "20-40 潜在线索",
+        "steps": [
+            {"type": "facebook_browse_groups",
+             "params": {"max_groups": 2, "persona_key": _DEFAULT_PERSONA}},
+            {"type": "facebook_group_engage",
+             "params": {"max_posts": 5, "comment_probability": 0.15,
+                        "like_probability": 0.40, "persona_key": _DEFAULT_PERSONA}},
+            {"type": "facebook_extract_members",
+             "params": {"max_members": 20, "persona_key": _DEFAULT_PERSONA}},
+        ],
+    },
+    {
+        "key": "friend_growth",
+        "name": "👥 好友拓展",
+        "color": "#60a5fa",
+        "label": "拓展机",
+        "desc": "群成员 → 进主页 → 带验证语好友请求 → 打招呼 DM",
+        "detail": "通过率 25-35%;日本女性保守档每号每日 15 请求 + 上限 8 条打招呼;"
+                  "打招呼走 profile 页 Message 按钮（方案 A2，全程不换 app）",
+        "estimated_minutes": 75,
+        "estimated_output": "4-6 通过好友 + 3-5 条打招呼曝光",
+        "steps": [
+            {"type": "facebook_extract_members",
+             "params": {"max_members": 20, "persona_key": _DEFAULT_PERSONA}},
+            {"type": "facebook_campaign_run",
+             "params": {"steps": ["add_friends"], "max_friends_per_run": 5,
+                        "verification_note": "",
+                        "greeting": "",
+                        "send_greeting_inline": True,
+                        "require_verification_note": True,
+                        "persona_key": _DEFAULT_PERSONA}},
+        ],
+    },
+    {
+        "key": "name_hunter",
+        "name": "🔎 点名添加",
+        "color": "#0ea5e9",
+        "label": "点名机",
+        "desc": "名字列表 → 搜索 → 看资料 → 加好友 → 打招呼 DM",
+        "detail": "适合已有高质量名字线索(Excel 导入 / 运营手动列)。"
+                  "phase=cold_start / cooldown 会自动跳过,"
+                  "每号每日硬上限由 playbook 控制。",
+        "estimated_minutes": 45,
+        "estimated_output": "3-5 个好友 + 同数量打招呼",
+        "needs_input": ["add_friend_targets"],   # 前端必须提供名字列表
+        "steps": [
+            {"type": "facebook_campaign_run",
+             "params": {"steps": ["add_friends"],
+                        "max_friends_per_run": 5,
+                        "verification_note": "",
+                        "greeting": "",
+                        "send_greeting_inline": True,
+                        "require_verification_note": True,
+                        "add_friend_targets": [],   # 运行时由前端填充: [{"name": "山田花子"}, ...]
+                        "persona_key": _DEFAULT_PERSONA}},
+        ],
+    },
+    {
+        "key": "inbox_pro",
+        "name": "💬 沟通管家",
+        "color": "#a78bfa",
+        "label": "管家机",
+        "desc": "Messenger + Message Requests + Friend Requests 三件套",
+        "detail": "AI 按敬语文化自动回复,LINE 优先引流",
+        "estimated_minutes": 40,
+        "estimated_output": "处理 20-40 条对话",
+        "steps": [
+            {"type": "facebook_check_inbox",
+             "params": {"auto_reply": True, "max_conversations": 15,
+                        "persona_key": _DEFAULT_PERSONA}},
+            {"type": "facebook_check_message_requests",
+             "params": {"max_requests": 10, "persona_key": _DEFAULT_PERSONA}},
+            {"type": "facebook_check_friend_requests",
+             "params": {"accept_all": False, "max_requests": 15,
+                        "persona_key": _DEFAULT_PERSONA}},
+        ],
+    },
+    {
+        "key": "full_funnel",
+        "name": "⚡ 全链路获客",
+        "color": "#ef4444",
+        "label": "全程机",
+        "desc": "养号 → 进群 → 提取 → 加好友 → 收件,完整闭环",
+        "detail": "日常首选,日本女性保守档每号每日 3-6 个 LINE 引流",
+        "estimated_minutes": 150,
+        "estimated_output": "3-6 个 LINE 引流",
+        "steps": [
+            {"type": "facebook_campaign_run",
+             "params": {
+                 "steps": ["warmup", "group_engage", "extract_members",
+                           "add_friends", "check_inbox"],
+                 "warmup_scrolls": 20,
+                 "group_max_posts": 4,
+                 "extract_max_members": 20,
+                 "max_friends_per_run": 4,
+                 "max_conversations": 12,
+                 "auto_reply": True,
+                 "require_verification_note": True,
+                 "persona_key": _DEFAULT_PERSONA,
+             }},
+        ],
+    },
+]
+
+
+@router.get("/presets")
+def get_facebook_presets():
+    """返回 5 套执行方案预设(供前端流程模态渲染)。
+
+    各 step 的 ``params.persona_key`` 按当前**生效**默认客群重写（含运行时 override），
+    与 GET ``/active-persona`` 的 ``default_key`` 一致。
+    """
+    eff = get_default_persona_key()
+    out = _copy.deepcopy(FB_FLOW_PRESETS)
+    for p in out:
+        for st in p.get("steps") or []:
+            if not isinstance(st, dict):
+                continue
+            prm = dict(st.get("params") or {})
+            if "persona_key" in prm:
+                prm["persona_key"] = eff
+                st["params"] = prm
+    return {"presets": out}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 引流账号配置 — 与 TikTok 同结构,但默认排序 WA 优先
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.get("/referral-config")
+def get_facebook_referral_config(persona_key: Optional[str] = None):
+    """获取所有设备的 Facebook 引流账号配置。
+
+    数据源与 TikTok 共用 chat_messages.yaml.device_referrals。
+    ``priority_order`` 不再硬编码 WA 优先——P2-UI Sprint 起改为按 persona
+    节点读取(来源 fb_target_personas.yaml 的 ``referral_priority`` 字段)，
+    实现"改目标客群即自动切换引流渠道顺序"的单一事实源。
+
+    查询参数 ``persona_key`` 可显式覆盖(用于前端预览非默认客群的排序)；
+    不传则用默认客群(jp_female_midlife → LINE/IG/WA/TG)。
+    """
+    data = {}
+    if _CHAT_MSG_YAML.exists():
+        with open(_CHAT_MSG_YAML, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    persona = get_persona_display(persona_key)
+    return {
+        "referrals": data.get("device_referrals", {}),
+        "priority_order": persona["referral_priority"],
+        "persona": persona,  # 前端用它拿 display_label/display_flag 生成文案
+        "_platform": "facebook",
+    }
+
+
+@router.get("/active-persona")
+def get_active_persona(persona_key: Optional[str] = None):
+    """返回当前目标客群的展示包 + 可选客群列表(供前端下拉渲染)。
+
+    * ``active`` = 当前 persona(默认或 query 指定)的完整 display 字段
+    * ``available`` = 全部 active=True 的 persona 的精简卡片列表
+    * ``default_key`` = 当前**生效**默认（含 ``data/fb_active_persona_override.json``）
+    * ``yaml_default_key`` = YAML 文件内 ``default_persona``（不含 override）
+    * ``override_key`` = 仅当存在 override 文件时返回
+    前端在 ⚡ 配置执行流程 和 🔗 引流账号 两个弹窗里统一调这一个接口。
+    """
+    return {
+        "active": get_persona_display(persona_key),
+        "available": list_persona_displays(),
+        "default_key": get_default_persona_key(),
+        "yaml_default_key": get_yaml_default_persona_key(),
+        "override_key": read_active_persona_override(),
+    }
+
+
+@router.post("/active-persona")
+def post_active_persona(request: Request, body: dict = Body(default={})):
+    """切换运行时默认目标客群（不写 YAML；持久化到 ``data/fb_active_persona_override.json``）。
+
+    Body:
+      * ``{"persona_key": "jp_female_midlife"}`` — 设为默认
+      * ``{"clear": true}`` — 删除 override，恢复仅 YAML ``default_persona``
+
+    可选环境变量 ``OPENCLAW_FB_ACTIVE_PERSONA_REQUIRE_KEY=1``：此 POST 仅接受 ``X-API-Key`` 与
+    ``OPENCLAW_API_KEY`` 完全一致（不接受仅登录会话），用于公网主控缩小写盘攻击面。
+    """
+    if _STRICT_FB_ACTIVE_PERSONA_POST:
+        expected = (os.environ.get("OPENCLAW_API_KEY") or "").strip()
+        if not expected:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "已启用 OPENCLAW_FB_ACTIVE_PERSONA_REQUIRE_KEY 但未配置 OPENCLAW_API_KEY",
+                    "hint": "设置 OPENCLAW_API_KEY，或将该开关置 0。",
+                },
+            )
+        key = (request.headers.get("X-API-Key") or "").strip()
+        if key != expected:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": "active-persona 严格模式：须携带与 OPENCLAW_API_KEY 一致的 X-API-Key",
+                    "hint": "浏览器仅会话无效；关闭 OPENCLAW_FB_ACTIVE_PERSONA_REQUIRE_KEY 可恢复与会话共用鉴权。",
+                },
+            )
+    if body.get("clear"):
+        clear_active_persona_override()
+        return {"ok": True, "cleared": True, **get_active_persona()}
+    pk = (body.get("persona_key") or body.get("key") or "").strip()
+    if not pk:
+        raise HTTPException(400, "persona_key 必填，或传 clear=true")
+    try:
+        set_active_persona_override(pk)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, "persona_key": pk, **get_active_persona()}
+
+
+@router.post("/referral-config")
+def set_facebook_referral_config(body: dict = Body(default={})):
+    """配置某设备(或全部设备)的引流账号。
+
+    Body:
+      {"device_id": "...", "whatsapp": "+39...", "telegram": "@u"}
+      {"all": true, "whatsapp": "+39..."}  # 全部设备
+    """
+    data = {}
+    if _CHAT_MSG_YAML.exists():
+        with open(_CHAT_MSG_YAML, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    data.setdefault("device_referrals", {})
+
+    _RESERVED = {"device_id", "all"}
+    contacts = {k: v for k, v in body.items()
+                if k not in _RESERVED and not k.startswith("_")}
+
+    if body.get("all"):
+        from src.device_control.device_manager import get_device_manager
+        mgr = get_device_manager(str(_DEVICES_YAML))
+        devices = [d.device_id for d in mgr.get_all_devices()]
+        for did in devices:
+            ref = data["device_referrals"].get(did, {})
+            for app, val in contacts.items():
+                if val:
+                    ref[app] = val
+                elif app in ref:
+                    del ref[app]
+            data["device_referrals"][did] = ref
+        updated = len(devices)
+    else:
+        device_id = body.get("device_id", "")
+        if not device_id:
+            raise HTTPException(400, "device_id 必填(或 all=true)")
+        ref = data["device_referrals"].get(device_id, {})
+        for app, val in contacts.items():
+            if val:
+                ref[app] = val
+            elif app in ref:
+                del ref[app]
+        data["device_referrals"][device_id] = ref
+        updated = 1
+
+    with open(_CHAT_MSG_YAML, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    return {"ok": True, "updated": updated, "_platform": "facebook"}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 设备级一键启动 — 与 TikTok device/{id}/launch 同构
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.post("/device/{device_id}/launch")
+def fb_device_launch(device_id: str, body: dict = Body(default={})):
+    """为指定设备启动 Facebook 工作流。
+
+    支持两种模式:
+      A. flow_steps=[{type, params}, ...]  自定义步骤序列(前端流程配置器传入)
+      B. preset_key="full_funnel"          直接运行预设
+    """
+    flow_steps = body.get("flow_steps")
+    preset_key = body.get("preset_key")
+
+    # B 模式: 用预设展开为步骤
+    if preset_key and not flow_steps:
+        preset = next((p for p in FB_FLOW_PRESETS if p["key"] == preset_key), None)
+        if not preset:
+            raise HTTPException(404, f"未知预设 key: {preset_key}")
+        flow_steps = preset["steps"]
+
+    if not flow_steps or not isinstance(flow_steps, list):
+        raise HTTPException(400, "需要传入 flow_steps[] 或 preset_key")
+
+    # 从 body 注入 GEO/语言/人群预设/目标群组 到每个 step
+    geo_country = body.get("target_country") or ""
+    geo_lang = body.get("language") or ""
+    audience_preset = body.get("audience_preset") or ""
+    target_groups = body.get("target_groups") or []
+    if isinstance(target_groups, str):
+        target_groups = [g.strip() for g in target_groups.split(",") if g.strip()]
+    verification_note = body.get("verification_note") or ""
+    # 2026-04-23: 点名添加 (name_hunter 预设) 的名字列表入口
+    # body.add_friend_targets 支持三种形式:
+    #   * List[Dict] : [{"name": "山田花子"}, ...]
+    #   * List[str]  : ["山田花子", "佐藤美咲"]
+    #   * str        : "山田花子\n佐藤美咲" / "山田花子, 佐藤美咲"
+    raw_targets = body.get("add_friend_targets") or []
+    add_friend_targets: List[dict] = []
+    if isinstance(raw_targets, str):
+        import re as _re
+        for line in _re.split(r"[,\n;]+", raw_targets):
+            nm = line.strip()
+            if nm:
+                add_friend_targets.append({"name": nm})
+    elif isinstance(raw_targets, list):
+        for item in raw_targets:
+            if isinstance(item, str) and item.strip():
+                add_friend_targets.append({"name": item.strip()})
+            elif isinstance(item, dict) and item.get("name"):
+                add_friend_targets.append({"name": str(item["name"]).strip()})
+    # body.greeting 允许用户覆盖 persona 默认打招呼文案（name_hunter 常用）
+    greeting_override = body.get("greeting") or ""
+
+    # P2-UI Sprint：persona 自动补齐安全网
+    # 前端可以在 body 里指定 persona_key 明确客群；否则回退默认（当前=日本中年女性）。
+    # 如果前端忘了传 GEO/lang，从 persona 的 country_code/language 自动补齐，
+    # 避免出现"target_country='' + persona=JP"这种错配送到 automation 层。
+    persona_key_in = body.get("persona_key") or get_default_persona_key()
+    persona_ctx = get_persona_display(persona_key_in)
+    if not geo_country:
+        geo_country = persona_ctx.get("country_code") or ""
+    if not geo_lang:
+        geo_lang = persona_ctx.get("language") or ""
+    if not target_groups and persona_ctx.get("seed_group_keywords"):
+        # 没显式指定群组时，用 persona 的默认种子词（日本女性 = ママ友等）
+        target_groups = list(persona_ctx["seed_group_keywords"])[:2]
+
+    is_local = _is_local_device(device_id)
+    base = local_api_base() if is_local else _W03_BASE
+    worker_caps: Dict[str, Any] = {}
+    worker_probe_ok = True
+    if not is_local:
+        worker_caps, worker_probe_ok = _probe_worker_health_capabilities(base)
+
+    results = []
+    for step in flow_steps:
+        s_type = step.get("type", "")
+        s_params = dict(step.get("params") or {})
+        if geo_country and "target_country" not in s_params:
+            s_params["target_country"] = geo_country
+        if geo_lang and "language" not in s_params:
+            s_params["language"] = geo_lang
+        if audience_preset and "audience_preset" not in s_params:
+            s_params["audience_preset"] = audience_preset
+        # 群组类步骤注入目标群名(取首个,或全部传入)
+        if target_groups:
+            if s_type in ("facebook_group_engage", "facebook_extract_members") \
+                    and "group_name" not in s_params:
+                s_params["group_name"] = target_groups[0]
+            if s_type == "facebook_campaign_run" and "target_groups" not in s_params:
+                s_params["target_groups"] = target_groups
+        if verification_note and s_type in ("facebook_add_friend", "facebook_campaign_run"):
+            s_params.setdefault("verification_note", verification_note)
+            s_params.setdefault("note", verification_note)
+
+        # 2026-04-23: name_hunter 预设 — 注入名字列表 + 覆盖打招呼文案
+        # 注意: 不能用 setdefault, 因为 name_hunter 预设里预填了 add_friend_targets=[],
+        # 空列表虽然 falsy 但 key 已存在,setdefault 不会覆盖 → body 的名字会被吞掉
+        if add_friend_targets and s_type in (
+                "facebook_campaign_run",
+                "facebook_add_friend",
+                "facebook_add_friend_and_greet",
+                "facebook_send_greeting"):
+            if not s_params.get("add_friend_targets"):
+                s_params["add_friend_targets"] = add_friend_targets
+        if greeting_override and s_type in (
+                "facebook_campaign_run",
+                "facebook_add_friend_and_greet",
+                "facebook_send_greeting"):
+            if not s_params.get("greeting"):
+                s_params["greeting"] = greeting_override
+
+        # Sprint 3 P0: 自动透传 preset_key,让漏斗能按预设切片
+        if preset_key:
+            s_params.setdefault("_preset_key", preset_key)
+
+        # P2-UI Sprint：persona_key 兜底注入(preset 里可能漏填的 step 也会带上)
+        s_params.setdefault("persona_key", persona_key_in)
+
+        try:
+            r = _post_create_task(base, {
+                "type": s_type,
+                "device_id": device_id,
+                "params": s_params,
+            })
+            results.append({"type": s_type, "task_id": r.get("task_id", ""), "ok": True})
+        except FacebookTaskEnqueueError as e:
+            row: Dict[str, Any] = {
+                "type": s_type,
+                "ok": False,
+                "error": str(e),
+                "http_status": e.status,
+            }
+            if e.detail is not None:
+                row["detail"] = e.detail
+            results.append(row)
+        except Exception as e:
+            results.append({"type": s_type, "ok": False, "error": str(e)})
+
+    ok_n = sum(1 for r in results if r.get("ok"))
+    out: Dict[str, Any] = {
+        "ok": ok_n > 0,
+        "device_id": device_id,
+        "preset_key": preset_key,
+        "flow_tasks": results,
+        "task_count": ok_n,
+        "message": f"已创建 {ok_n}/{len(flow_steps)} 个 Facebook 步骤任务",
+        "task_enqueue_base": base,
+        "is_local_enqueue": is_local,
+        "worker_capabilities_probe_ok": bool(is_local or worker_probe_ok),
+    }
+    if is_local:
+        out["worker_capabilities"] = {"facebook_task_precreate_gate": True, "_source": "local"}
+    else:
+        out["worker_capabilities"] = dict(worker_caps)
+    warn_msg = _remote_worker_capabilities_warning(
+        is_local=is_local, worker_caps=worker_caps, probe_ok=worker_probe_ok
+    )
+    if warn_msg:
+        out["worker_capabilities_warning"] = warn_msg
+    fail_n = sum(1 for r in results if not r.get("ok"))
+    try:
+        from src.host.health_monitor import metrics as _fb_launch_metrics
+
+        _fb_launch_metrics.record_fb_device_launch(
+            is_local_enqueue=is_local,
+            worker_capabilities_probe_ok=bool(out.get("worker_capabilities_probe_ok")),
+            had_worker_capabilities_warning=bool(warn_msg),
+            steps_ok=ok_n,
+            steps_failed=fail_n,
+        )
+    except Exception:
+        logger.debug("record_fb_device_launch skipped", exc_info=True)
+    if warn_msg or fail_n > 0:
+        logger.warning(
+            "[fb_device_launch] device_id=%s steps_ok=%s steps_failed=%s worker_warn=%s probe_ok=%s base=%s",
+            device_id,
+            ok_n,
+            fail_n,
+            bool(warn_msg),
+            out.get("worker_capabilities_probe_ok"),
+            base,
+        )
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 设备网格聚合数据(Sprint 2 完善)
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.get("/device-grid")
+def fb_device_grid():
+    """返回 FB 面板设备网格的聚合数据(Sprint 1 骨架,Sprint 2 补全)。
+
+    与 /tiktok/device-grid 输出结构尽量对齐,便于公共组件复用。
+    """
+    devices_payload = []
+    summary = {
+        "online": 0,
+        "logged_in": 0,
+        "with_referral": 0,
+        "total_friends_today": 0,
+        "total_pending_replies": 0,
+    }
+
+    try:
+        from src.device_control.device_manager import get_device_manager, DeviceStatus
+        mgr = get_device_manager(str(_DEVICES_YAML))
+        all_devs = mgr.get_all_devices()
+
+        # 引流配置存量
+        referrals = {}
+        if _CHAT_MSG_YAML.exists():
+            with open(_CHAT_MSG_YAML, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            referrals = (data.get("device_referrals") or {})
+
+        for dev in all_devs:
+            online = dev.status in (DeviceStatus.CONNECTED, DeviceStatus.BUSY)
+            ref = referrals.get(dev.device_id, {})
+            has_ref = bool(ref.get("whatsapp") or ref.get("telegram"))
+
+            if online:
+                summary["online"] += 1
+            if has_ref:
+                summary["with_referral"] += 1
+
+            devices_payload.append({
+                "device_id": dev.device_id,
+                "alias": getattr(dev, "alias", "") or "",
+                "online": online,
+                "logged_in": online,  # Sprint 2: 增加 FB 真实登录态检测
+                "friends_today": 0,    # Sprint 2: 从 facebook_friend_requests 表聚合
+                "groups_count": 0,     # Sprint 2: 从 facebook_groups 表聚合
+                "pending_replies": 0,  # Sprint 2: 从 inbox 状态聚合
+                "referral": {
+                    "whatsapp": ref.get("whatsapp", ""),
+                    "telegram": ref.get("telegram", ""),
+                },
+                "risk_status": "green",  # Sprint 2: green/yellow/red
+            })
+    except Exception as e:
+        logger.warning("[fb_device_grid] 聚合失败: %s", e)
+
+    return {
+        "devices": devices_payload,
+        "summary": summary,
+        "_platform": "facebook",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 漏斗统计(Sprint 2 完整实现)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _funnel_steps_from_metrics(m: dict, groups_count: int) -> list:
+    """把 fb_store 漏斗 metrics 渲染成前端 steps 数组(可复用)。"""
+    return [
+        {"key": "groups_joined", "label": "已加入群组",
+         "value": groups_count},
+        {"key": "members_extracted", "label": "群成员提取",
+         "value": m["stage_extracted_members"]},
+        {"key": "friend_requests_sent", "label": "好友请求发送",
+         "value": m["stage_friend_request_sent"]},
+        {"key": "friends_accepted", "label": "好友通过",
+         "value": m["stage_friend_accepted"],
+         "rate": m["rate_accept"]},
+        {"key": "dm_conversations", "label": "DM 对话",
+         "value": m["stage_inbox_incoming"],
+         "rate": m["rate_request_to_inbox"]},
+        {"key": "wa_referrals", "label": "WA 引流成功",
+         "value": m["stage_wa_referrals"],
+         "rate": m["rate_inbox_to_referral"]},
+    ]
+
+
+@router.get("/funnel")
+def fb_funnel(device_id: Optional[str] = None,
+              since_hours: int = 168,
+              preset_key: Optional[str] = None,
+              group_by: Optional[str] = None):
+    """FB 引流漏斗:进群 → 提取 → 加好友 → 通过 → DM → WA 引流。
+
+    Sprint 3 P1: 支持 group_by=preset_key 切片对比 + preset_key 过滤。
+
+    Args:
+        device_id: 单设备过滤,空=全量
+        since_hours: 时间窗(小时),默认 7 天
+        preset_key: 单预设过滤(常规模式)
+        group_by: 'preset_key' → 返回每预设一行的对比数组
+    """
+    try:
+        import datetime as _dt
+        since_iso = (
+            _dt.datetime.utcnow() - _dt.timedelta(hours=max(1, since_hours))
+        ).strftime("%Y-%m-%dT%H:%M:%SZ") if since_hours > 0 else None
+
+        from src.host.fb_store import (
+            get_funnel_metrics, list_groups,
+            get_funnel_metrics_by_preset,
+        )
+
+        if group_by == "preset_key":
+            slices = get_funnel_metrics_by_preset(device_id=device_id,
+                                                  since_iso=since_iso)
+            # 每个预设也需要 steps 数组,方便前端直接渲染
+            for s in slices:
+                # group_by 切片:groups 按 preset_key 过滤(简化为 0,主要看好友/DM)
+                s["steps"] = _funnel_steps_from_metrics(s, 0)
+            return {
+                "_platform": "facebook",
+                "_group_by": "preset_key",
+                "_scope_device": device_id or "all",
+                "_scope_since": since_iso or "all_time",
+                "slices": slices,
+                "slice_count": len(slices),
+            }
+
+        m = get_funnel_metrics(device_id=device_id, since_iso=since_iso,
+                               preset_key=preset_key)
+        groups = list_groups(device_id=device_id, status="joined", limit=500)
+        steps = _funnel_steps_from_metrics(m, len(groups))
+        return {
+            "steps": steps,
+            "rates": {
+                "accept": m["rate_accept"],
+                "extract_to_request": m["rate_extract_to_request"],
+                "request_to_inbox": m["rate_request_to_inbox"],
+                "inbox_to_referral": m["rate_inbox_to_referral"],
+            },
+            "_platform": "facebook",
+            "_scope_device": m["scope_device"],
+            "_scope_since": m["scope_since"],
+            "_scope_preset": m.get("scope_preset", "all"),
+        }
+    except Exception as e:
+        logger.exception("fb_funnel failed")
+        raise HTTPException(500, f"漏斗数据查询失败: {e}")
+
+
+@router.get("/qualified-leads")
+def fb_qualified_leads(limit: int = 20, min_score: int = 60):
+    """高分线索列表(Sprint 3 P1 — 支持 min_score 参数,集成 leadList 公共组件)。
+
+    返回字段:name / score / tier(S/A/B/C/D) / tags / reasons
+    """
+    from src.ai.fb_lead_scorer import _tier_for_score
+    leads = []
+    try:
+        from src.leads.store import get_leads_store
+        store = get_leads_store()
+        if hasattr(store, "search_leads"):
+            raw = store.search_leads(source_platform="facebook",
+                                     min_score=min_score, limit=limit)
+            for l in (raw or []):
+                score = int(l.get("score", 0) or 0)
+                # 解析 notes 中的 reasons(scorer 写入的格式 "r1;r2;r3")
+                notes = l.get("notes") or ""
+                reasons = [r.strip() for r in notes.split(";") if r.strip()]
+                leads.append({
+                    "name": l.get("name"),
+                    "score": score,
+                    "tier": _tier_for_score(score),
+                    "tags": l.get("tags", []),
+                    "reasons": reasons[:5],
+                    "lead_id": l.get("lead_id") or l.get("id"),
+                })
+        leads.sort(key=lambda x: -x.get("score", 0))
+    except Exception as e:
+        logger.debug("[fb_qualified_leads] %s", e)
+    return {"leads": leads, "count": len(leads),
+            "min_score": min_score,
+            "_status": "Sprint 3 P1 leadList"}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 风控自愈相关接口(Sprint 2 P0)
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.get("/risk/status")
+def fb_risk_status():
+    """全局风控状态:每台设备的当前 cooldown / 历史风控次数 / 最近事件。"""
+    try:
+        from src.host.fb_risk_listener import get_healer
+        healer = get_healer()
+        all_hist = healer.get_all_histories()
+        result = []
+        for did, hist in all_hist.items():
+            cd = healer.get_cooldown_status(did) or 0
+            result.append({
+                "device_id": did,
+                "risk_count": len(hist),
+                "cooldown_remaining": int(cd),
+                "last_event": hist[-1] if hist else None,
+            })
+        return {"devices": result, "config": healer._cfg}
+    except Exception as e:
+        return {"devices": [], "error": str(e)}
+
+
+@router.get("/risk/history/{device_id}")
+def fb_risk_history(device_id: str):
+    """单台设备的完整风控自愈历史。"""
+    try:
+        from src.host.fb_risk_listener import get_healer
+        return {"device_id": device_id,
+                "history": get_healer().get_history(device_id)}
+    except Exception as e:
+        return {"device_id": device_id, "history": [], "error": str(e)}
+
+
+@router.post("/risk/reload")
+def fb_risk_reload():
+    """重新加载 config/facebook_risk.yaml(无需重启服务)。"""
+    try:
+        from src.host.fb_risk_listener import get_healer
+        get_healer().reload_config()
+        return {"ok": True, "config": get_healer()._cfg}
+    except Exception as e:
+        raise HTTPException(500, f"重载失败: {e}")
+
+
+@router.get("/selectors/health")
+def fb_selectors_health():
+    """Facebook + Messenger 学习库 selector 健康度(Sprint 3 P0)。
+
+    返回:
+      packages: [{name, total_selectors, healthy, stale, stale_details}]
+      facebook_total / messenger_total / overall_health_pct
+    """
+    try:
+        from src.vision.auto_selector import SelectorStore
+        store = SelectorStore()
+        packages = ["com.facebook.katana", "com.facebook.orca"]
+        out = []
+        total, healthy = 0, 0
+        for pkg in packages:
+            entries = store.load(pkg)
+            pkg_total = len(entries)
+            pkg_healthy = sum(1 for e in entries.values()
+                              if not (e.confidence < 0.4 and e.misses >= 3))
+            pkg_stale = pkg_total - pkg_healthy
+            stale_detail = [
+                {"target": t, "confidence": round(e.confidence, 2),
+                 "hits": e.hits, "misses": e.misses}
+                for t, e in entries.items()
+                if e.confidence < 0.4 and e.misses >= 3
+            ]
+            out.append({
+                "package": pkg,
+                "label": "Facebook" if pkg.endswith("katana") else "Messenger",
+                "total_selectors": pkg_total,
+                "healthy": pkg_healthy,
+                "stale": pkg_stale,
+                "stale_details": stale_detail,
+                "all_targets": [
+                    {"target": t, "confidence": round(e.confidence, 2),
+                     "hits": e.hits, "misses": e.misses,
+                     "alts_count": len(e.alts)}
+                    for t, e in entries.items()
+                ],
+            })
+            total += pkg_total
+            healthy += pkg_healthy
+        return {
+            "packages": out,
+            "overall_total": total,
+            "overall_healthy": healthy,
+            "overall_health_pct": round(healthy / total * 100, 1) if total else 100.0,
+        }
+    except Exception as e:
+        logger.exception("fb_selectors_health failed")
+        raise HTTPException(500, str(e))
+
+
+@router.post("/daily-brief/generate")
+def fb_daily_brief_generate(device_id: Optional[str] = None,
+                            hours: int = 24,
+                            persist: bool = True):
+    """生成 1 份新日报。"""
+    try:
+        from src.ai.fb_daily_brief import generate_brief
+        brief = generate_brief(device_id=device_id, hours=hours, persist=persist)
+        return brief
+    except Exception as e:
+        logger.exception("fb_daily_brief_generate failed")
+        raise HTTPException(500, f"生成失败: {e}")
+
+
+@router.get("/daily-brief/latest")
+def fb_daily_brief_latest(device_id: Optional[str] = None, limit: int = 1):
+    """取最近 N 份日报(默认 1)。"""
+    from src.ai.fb_daily_brief import get_latest_brief
+    return {"briefs": get_latest_brief(device_id=device_id, limit=limit)}
+
+
+@router.post("/risk/clear/{device_id}")
+def fb_risk_clear(device_id: str):
+    """清除指定设备的 risk_status / cooldown(人工恢复设备)。"""
+    try:
+        from src.host.fb_risk_listener import get_healer
+        from src.host.device_state import DeviceStateStore
+        healer = get_healer()
+        with healer._lock:
+            healer._cooldown_until.pop(device_id, None)
+        try:
+            ds = DeviceStateStore(platform="facebook")
+            ds.set(device_id, "risk_status", "green")
+        except Exception:
+            pass
+        return {"ok": True, "device_id": device_id}
+    except Exception as e:
+        raise HTTPException(500, f"清除失败: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# P1-1 / P1-2 / P1-3: 养号运营面板 + playbook 热加载 + phase 管理
+# ─────────────────────────────────────────────────────────────────────
+
+
+@router.get("/playbook")
+def fb_get_playbook():
+    """当前生效的 facebook_playbook.yaml（含 mtime 供前端展示）。"""
+    try:
+        from src.host.fb_playbook import load_playbook, playbook_mtime
+        import datetime as _dt
+        data = load_playbook()
+        mt = playbook_mtime()
+        return {
+            "ok": True,
+            "data": data,
+            "mtime": mt,
+            "mtime_iso": (_dt.datetime.fromtimestamp(mt).strftime("%Y-%m-%dT%H:%M:%S")
+                          if mt else ""),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"load playbook failed: {e}")
+
+
+@router.post("/playbook/reload")
+def fb_reload_playbook():
+    """强制重读 playbook（一般不必调；mtime 自动热加载）。"""
+    try:
+        from src.host.fb_playbook import reload_playbook
+        data = reload_playbook()
+        return {"ok": True, "reloaded": True,
+                "phases": list((data.get("phases") or {}).keys())}
+    except Exception as e:
+        raise HTTPException(500, f"reload failed: {e}")
+
+
+@router.get("/phase/{device_id}")
+def fb_get_device_phase(device_id: str):
+    """查单个设备当前 phase / 累计刷量 / 最近一次风控 / 距迁移差距。"""
+    try:
+        from src.host.fb_account_phase import get_phase, evaluate_transition
+        from src.host.fb_store import count_risk_events_recent
+        p = get_phase(device_id) or {}
+        p["risk_count_24h"] = count_risk_events_recent(device_id, hours=24)
+        # 顺手跑一次评估（不强制迁移，只是为了给前端展示最新 phase）
+        snap = evaluate_transition(device_id) or {}
+        p["last_evaluation"] = snap
+        return {"ok": True, "device_id": device_id, "phase": p}
+    except Exception as e:
+        raise HTTPException(500, f"get phase failed: {e}")
+
+
+@router.get("/phase")
+def fb_list_phases(phase: Optional[str] = None):
+    """面板: 所有设备当前 phase 清单。"""
+    try:
+        from src.host.fb_account_phase import list_phases
+        rows = list_phases(phase=phase)
+        return {"ok": True, "total": len(rows), "rows": rows}
+    except Exception as e:
+        raise HTTPException(500, f"list phases failed: {e}")
+
+
+@router.get("/campaign-runs")
+def fb_list_campaign_runs(device_id: Optional[str] = None,
+                          state: Optional[str] = None,
+                          limit: int = 50):
+    """campaign_run 运行史（支持断点续跑 UI 的数据源）。"""
+    try:
+        from src.host.fb_campaign_store import list_runs
+        rows = list_runs(device_id=device_id, state=state, limit=limit)
+        return {"ok": True, "total": len(rows), "rows": rows}
+    except Exception as e:
+        raise HTTPException(500, f"list campaign runs failed: {e}")
+
+
+@router.get("/dashboard/ops")
+def fb_dashboard_ops(hours: int = 24):
+    """养号运营面板 —— 一次返回市场/运营需要的核心指标（P1-3b 最小版）。
+
+    返回字段设计得贴齐市场经理关心的口径：
+      * phases.counts     — 各档位账号分布
+      * risks.*           — 风控触发频次 / 影响设备
+      * campaign_runs.*   — 过去 N 小时的运行/成功率/断点
+      * funnel            — 好友请求/入群/回复的漏斗聚合（复用 fb_store.get_funnel_metrics）
+      * top_devices_risk  — 最近风控最多的 5 台设备（重点盯防）
+    """
+    try:
+        import datetime as _dt
+        from src.host.fb_account_phase import list_phases
+        from src.host.fb_store import (list_recent_risk_events,
+                                        get_funnel_metrics)
+        from src.host.fb_campaign_store import list_runs
+
+        since_iso = (_dt.datetime.utcnow()
+                     - _dt.timedelta(hours=int(hours))
+                     ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # 1. phases 分档
+        all_phases = list_phases()
+        phase_counts = {"cold_start": 0, "growth": 0, "mature": 0, "cooldown": 0}
+        for row in all_phases:
+            k = row.get("phase") or "cold_start"
+            phase_counts[k] = phase_counts.get(k, 0) + 1
+
+        # 2. 风控事件
+        risks = list_recent_risk_events(hours=hours, limit=500)
+        risk_by_device: dict[str, int] = {}
+        risk_by_kind: dict[str, int] = {}
+        for r in risks:
+            did = r.get("device_id") or ""
+            kd = r.get("kind") or "other"
+            if did:
+                risk_by_device[did] = risk_by_device.get(did, 0) + 1
+            risk_by_kind[kd] = risk_by_kind.get(kd, 0) + 1
+        top_devices_risk = sorted(
+            [{"device_id": k, "count": v} for k, v in risk_by_device.items()],
+            key=lambda x: -x["count"])[:5]
+
+        # 3. campaign_runs
+        runs = list_runs(limit=500)
+        runs_recent = [r for r in runs if (r.get("started_at") or "") >= since_iso]
+        cstate: dict[str, int] = {}
+        for r in runs_recent:
+            s = r.get("state") or "unknown"
+            cstate[s] = cstate.get(s, 0) + 1
+        total_recent = len(runs_recent) or 1
+        completed_recent = cstate.get("completed", 0)
+
+        # 4. 漏斗聚合
+        funnel = get_funnel_metrics(since_iso=since_iso)
+
+        return {
+            "ok": True,
+            "window_hours": int(hours),
+            "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "phases": {
+                "counts": phase_counts,
+                "total_devices": len(all_phases),
+            },
+            "risks": {
+                "events_total": len(risks),
+                "affected_devices": len(risk_by_device),
+                "by_kind": risk_by_kind,
+            },
+            "campaign_runs": {
+                "total_recent": len(runs_recent),
+                "by_state": cstate,
+                "success_rate": round(completed_recent / total_recent, 3),
+            },
+            "funnel": funnel,
+            "top_devices_risk": top_devices_risk,
+        }
+    except Exception as e:
+        logger.exception("[dashboard/ops]")
+        raise HTTPException(500, f"dashboard ops failed: {e}")
+
+
+@router.post("/risk/inject")
+def fb_risk_inject(body: dict):
+    """测试用:手工注入一次 risk_detected 事件,验证跨平台联动降级。
+
+    Body:
+      { "device_id": "...", "message": "simulated", "platform": "facebook" }
+    """
+    did = (body.get("device_id") or "").strip()
+    if not did:
+        raise HTTPException(400, "device_id required")
+    msg = body.get("message", "manual inject test")
+    platform = body.get("platform", "facebook")
+    try:
+        from src.host.event_stream import push_event
+        push_event(f"{platform}.risk_detected", {
+            "device_id": did,
+            "message": msg,
+            "manual_inject": True,
+        }, did)
+        return {"ok": True, "pushed": f"{platform}.risk_detected",
+                "device_id": did}
+    except Exception as e:
+        raise HTTPException(500, f"注入失败: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# P2-4 Sprint A: 目标画像 / VLM 识别 API
+# ─────────────────────────────────────────────────────────────────────
+
+@router.get("/target-personas")
+def fb_list_target_personas(only_active: bool = True):
+    """返回所有启用中的目标画像（UI 下拉使用）。"""
+    from src.host import fb_target_personas
+    try:
+        items = fb_target_personas.list_personas(only_active=only_active)
+        cfg = fb_target_personas.load_config()
+        return {
+            "ok": True,
+            "personas": items,
+            "default_persona": cfg.get("default_persona"),
+            "quotas": cfg.get("quotas"),
+            "vlm": {k: v for k, v in (cfg.get("vlm") or {}).items() if k != "endpoint"},
+            "mtime": fb_target_personas.config_mtime(),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"load personas failed: {e}")
+
+
+@router.post("/target-personas/reload")
+def fb_reload_target_personas():
+    """热加载 config/fb_target_personas.yaml。"""
+    from src.host import fb_target_personas
+    try:
+        cfg = fb_target_personas.reload_config()
+        return {"ok": True, "default_persona": cfg.get("default_persona"),
+                "personas": list((cfg.get("personas") or {}).keys()),
+                "mtime": fb_target_personas.config_mtime()}
+    except Exception as e:
+        raise HTTPException(500, f"reload failed: {e}")
+
+
+@router.get("/vlm/health")
+def fb_vlm_health():
+    """Ollama 在线 + 目标模型可用性探测。"""
+    from src.host import ollama_vlm
+    return ollama_vlm.check_health()
+
+
+@router.post("/classify/single")
+def fb_classify_single(body: dict = Body(default={})):
+    """单样本分类接口（给前端/脚本调用）。
+
+    Body::
+        {
+          "device_id": "...",      # required，做配额 & 审计
+          "task_id": "",
+          "persona_key": "jp_female_midlife",  # 可选，空则默认
+          "target_key": "https://facebook.com/xxx",  # required，唯一标识用于去重
+          "display_name": "山田花子",
+          "bio": "...", "username": "...", "locale": "ja-JP",
+          "image_paths": ["/abs/path/1.jpg", ...],
+          "do_l2": true,
+          "dry_run": false
+        }
+    """
+    did = (body.get("device_id") or "").strip()
+    target = (body.get("target_key") or "").strip()
+    if not did or not target:
+        raise HTTPException(400, "device_id 和 target_key 必填")
+    try:
+        from src.host.fb_profile_classifier import classify
+        result = classify(
+            device_id=did,
+            task_id=body.get("task_id", ""),
+            persona_key=body.get("persona_key"),
+            target_key=target,
+            display_name=body.get("display_name", ""),
+            bio=body.get("bio", ""),
+            username=body.get("username", ""),
+            locale=body.get("locale", ""),
+            image_paths=body.get("image_paths") or [],
+            l2_image_paths=body.get("l2_image_paths") or body.get("image_paths") or [],
+            do_l2=bool(body.get("do_l2", True)),
+            dry_run=bool(body.get("dry_run", False)),
+        )
+        return {"ok": True, **result}
+    except Exception as e:
+        logger.exception("classify_single failed")
+        raise HTTPException(500, f"classify failed: {e}")
+
+
+@router.get("/insights")
+def fb_list_insights(device_id: Optional[str] = None,
+                     persona_key: Optional[str] = None,
+                     stage: Optional[str] = None,
+                     match: Optional[int] = None,
+                     hours: int = 24,
+                     limit: int = 100):
+    """查询 fb_profile_insights。用于前端"今天命中了谁"看板。"""
+    from src.host.database import get_conn
+    clauses = ["classified_at >= datetime('now', ?)"]
+    params: list = [f"-{max(1, int(hours))} hours"]
+    if device_id:
+        clauses.append("device_id = ?"); params.append(device_id)
+    if persona_key:
+        clauses.append("persona_key = ?"); params.append(persona_key)
+    if stage:
+        clauses.append("stage = ?"); params.append(stage)
+    if match is not None:
+        clauses.append("match = ?"); params.append(int(match))
+    sql = ("SELECT id, device_id, task_id, persona_key, target_key, display_name, "
+           "stage, match, score, confidence, insights_json, vlm_model, latency_ms, "
+           "classified_at FROM fb_profile_insights "
+           f"WHERE {' AND '.join(clauses)} ORDER BY id DESC LIMIT ?")
+    params.append(max(1, min(int(limit), 500)))
+    out = []
+    try:
+        with get_conn() as conn:
+            for row in conn.execute(sql, params).fetchall():
+                out.append({
+                    "id": row[0], "device_id": row[1], "task_id": row[2],
+                    "persona_key": row[3], "target_key": row[4],
+                    "display_name": row[5], "stage": row[6],
+                    "match": bool(row[7]), "score": float(row[8] or 0),
+                    "confidence": float(row[9] or 0),
+                    "insights": _json.loads(row[10] or "{}"),
+                    "vlm_model": row[11] or "",
+                    "latency_ms": int(row[12] or 0),
+                    "classified_at": row[13],
+                })
+        return {"ok": True, "items": out, "total": len(out)}
+    except Exception as e:
+        raise HTTPException(500, f"query failed: {e}")
+
+
+@router.get("/insights/stats")
+def fb_insights_stats(hours: int = 24):
+    """画像识别指标汇总（Dashboard 用）。"""
+    from src.host.database import get_conn
+    with get_conn() as conn:
+        def _q(sql, params):
+            return conn.execute(sql, params).fetchone()
+
+        since = f"-{max(1, int(hours))} hours"
+        l1_total = _q("SELECT COUNT(*) FROM fb_profile_insights "
+                      "WHERE stage='L1' AND classified_at >= datetime('now', ?)", (since,))[0]
+        l2_total = _q("SELECT COUNT(*) FROM fb_profile_insights "
+                      "WHERE stage='L2' AND classified_at >= datetime('now', ?)", (since,))[0]
+        match_count = _q("SELECT COUNT(*) FROM fb_profile_insights "
+                         "WHERE match=1 AND classified_at >= datetime('now', ?)", (since,))[0]
+        avg_l2_ms = _q("SELECT AVG(latency_ms) FROM fb_profile_insights "
+                       "WHERE stage='L2' AND classified_at >= datetime('now', ?)", (since,))[0] or 0
+
+        persona_rows = conn.execute(
+            """SELECT persona_key,
+                      SUM(CASE WHEN stage='L1' THEN 1 ELSE 0 END) AS l1_n,
+                      SUM(CASE WHEN stage='L2' THEN 1 ELSE 0 END) AS l2_n,
+                      SUM(CASE WHEN match=1 THEN 1 ELSE 0 END) AS match_n
+               FROM fb_profile_insights
+               WHERE classified_at >= datetime('now', ?)
+               GROUP BY persona_key""", (since,)).fetchall()
+
+        device_rows = conn.execute(
+            """SELECT device_id,
+                      SUM(CASE WHEN stage='L1' THEN 1 ELSE 0 END) AS l1_n,
+                      SUM(CASE WHEN stage='L2' THEN 1 ELSE 0 END) AS l2_n,
+                      SUM(CASE WHEN match=1 THEN 1 ELSE 0 END) AS match_n
+               FROM fb_profile_insights
+               WHERE classified_at >= datetime('now', ?)
+               GROUP BY device_id ORDER BY l2_n DESC LIMIT 20""", (since,)).fetchall()
+
+        # Sprint C-1: 新列 queue_wait_ms / device_id 可能在老库上缺失，加 try/except fallback
+        try:
+            cost_rows = conn.execute(
+                """SELECT provider, model, scene, COUNT(*) AS n,
+                          AVG(latency_ms) AS avg_ms, SUM(cost_usd) AS usd,
+                          AVG(COALESCE(queue_wait_ms,0)) AS avg_wait,
+                          MAX(COALESCE(queue_wait_ms,0)) AS peak_wait
+                   FROM ai_cost_events
+                   WHERE at >= datetime('now', ?) GROUP BY provider, model, scene""",
+                (since,)).fetchall()
+            has_wait_col = True
+        except Exception:
+            cost_rows = conn.execute(
+                """SELECT provider, model, scene, COUNT(*) AS n,
+                          AVG(latency_ms) AS avg_ms, SUM(cost_usd) AS usd
+                   FROM ai_cost_events
+                   WHERE at >= datetime('now', ?) GROUP BY provider, model, scene""",
+                (since,)).fetchall()
+            has_wait_col = False
+
+    conv = l2_total / l1_total if l1_total else 0.0
+    match_rate = match_count / l2_total if l2_total else 0.0
+
+    # Sprint C-1: 进程级 VLM 并发指标（当前活跃统计，不受时间窗口限制）
+    try:
+        from src.host.ollama_vlm import get_concurrency_stats, get_warmup_state
+        concurrency = get_concurrency_stats()
+        warmup_st = get_warmup_state()
+    except Exception:
+        concurrency = {"peak_wait_ms": 0, "total_calls": 0, "total_wait_ms": 0}
+        warmup_st = {"fresh": False, "age_sec": None, "last_error": "", "in_progress": False}
+
+    ai_cost_list = []
+    for r in cost_rows:
+        item = {"provider": r[0], "model": r[1], "scene": r[2],
+                "count": int(r[3]), "avg_latency_ms": int(r[4] or 0),
+                "total_usd": float(r[5] or 0)}
+        if has_wait_col and len(r) >= 8:
+            item["avg_queue_wait_ms"] = int(r[6] or 0)
+            item["peak_queue_wait_ms"] = int(r[7] or 0)
+        ai_cost_list.append(item)
+
+    return {
+        "ok": True,
+        "hours": hours,
+        "totals": {
+            "l1": int(l1_total), "l2": int(l2_total), "matched": int(match_count),
+            "l1_to_l2_rate": round(conv, 3),
+            "l2_match_rate": round(match_rate, 3),
+            "avg_l2_latency_ms": int(avg_l2_ms),
+        },
+        "by_persona": [
+            {"persona_key": r[0], "l1": int(r[1] or 0), "l2": int(r[2] or 0),
+             "matched": int(r[3] or 0)} for r in persona_rows
+        ],
+        "top_devices": [
+            {"device_id": r[0], "l1": int(r[1] or 0), "l2": int(r[2] or 0),
+             "matched": int(r[3] or 0)} for r in device_rows
+        ],
+        "ai_cost": ai_cost_list,
+        "vlm_concurrency": concurrency,  # Sprint C-1: {peak_wait_ms, total_calls, total_wait_ms}
+        "vlm_warmup": warmup_st,         # Sprint E-0.1: {fresh, age_sec, last_error, in_progress}
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sprint D-1: L1 规则真阳性分析（只读报表，不自动改 yaml）
+# ───────────────────────────────────────────────────────────────────────
+# 目标：对历史 fb_profile_insights 里的每条 L1 reason 统计其 precision：
+#     precision(reason) = (该 reason 命中 & 最终 L2 match=1 的 target 数)
+#                         / (该 reason 命中的 target 总数)
+# 用途：人类据此 tuning yaml 里的 weight 或增删 rule，不做自动写回。
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get("/l1-rule-analytics")
+def fb_l1_rule_analytics(hours: int = 168, persona_key: Optional[str] = None):
+    """统计近 N 小时内，每条 L1 reason 的命中数 / 最终 L2 match 数 / precision。
+
+    依赖 fb_profile_insights.insights_json.l1_reasons（写入时已带）。
+    """
+    try:
+        from src.host.database import get_conn
+    except Exception:
+        raise HTTPException(500, "db unavailable")
+    hours = max(1, min(int(hours or 168), 24 * 90))
+    since = f"-{hours} hours"
+
+    # 聚合到 target_key 级别：一个 user 在窗口期有多次 L1/L2 记录时只看最新
+    # 简化：直接扫所有 insights，若同 target 有 L2=match=1 则视为"此 target 是真阳性"。
+    sql = """SELECT target_key, stage, match, insights_json
+             FROM fb_profile_insights
+             WHERE classified_at >= datetime('now', ?)"""
+    params: list = [since]
+    if persona_key:
+        sql += " AND persona_key = ?"
+        params.append(persona_key)
+
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        raise HTTPException(500, f"query failed: {e}")
+
+    # per-target: reasons 集合 + 是否最终 L2 匹配
+    per_target: dict = {}
+    for r in rows:
+        tk = r[0]
+        stage = r[1]
+        match = int(r[2] or 0)
+        try:
+            ij = _json.loads(r[3] or "{}")
+        except Exception:
+            ij = {}
+        d = per_target.setdefault(tk, {"reasons": set(), "l2_matched": False, "n_records": 0})
+        d["n_records"] += 1
+        for rz in (ij.get("l1_reasons") or []):
+            d["reasons"].add(str(rz))
+        if stage == "L2" and match == 1:
+            d["l2_matched"] = True
+
+    # reason 级聚合
+    reason_agg: dict = {}
+    for tk, info in per_target.items():
+        for rz in info["reasons"]:
+            a = reason_agg.setdefault(rz, {"hits": 0, "l2_match": 0})
+            a["hits"] += 1
+            if info["l2_matched"]:
+                a["l2_match"] += 1
+
+    rows_out = []
+    for rz, a in reason_agg.items():
+        precision = (a["l2_match"] / a["hits"]) if a["hits"] else 0
+        rows_out.append({
+            "reason": rz,
+            "hits": a["hits"],
+            "l2_match": a["l2_match"],
+            "precision": round(precision, 3),
+        })
+    rows_out.sort(key=lambda x: (-x["hits"], -x["precision"]))
+
+    # 整体 overview
+    total_targets = len(per_target)
+    total_l2_match = sum(1 for d in per_target.values() if d["l2_matched"])
+    return {
+        "ok": True,
+        "hours": hours,
+        "persona_key": persona_key,
+        "total_targets": total_targets,
+        "total_l2_matched": total_l2_match,
+        "overall_l2_match_rate": round(total_l2_match / total_targets, 3) if total_targets else 0,
+        "rules": rows_out,
+        "recommendations": _derive_l1_recommendations(rows_out),
+    }
+
+
+def _derive_l1_recommendations(rows: list) -> list:
+    """纯启发式建议，供人类决策，不自动改配置。"""
+    out = []
+    for r in rows:
+        # 需要至少 5 次命中才给建议，否则样本太小
+        if r["hits"] < 5:
+            continue
+        p = r["precision"]
+        if p >= 0.75:
+            out.append({"reason": r["reason"], "action": "boost_weight",
+                        "hint": f"precision={p} (>=0.75)，可考虑提升该 rule 权重"})
+        elif p <= 0.15:
+            out.append({"reason": r["reason"], "action": "demote_or_remove",
+                        "hint": f"precision={p} (<=0.15)，建议降权/移除，避免误通过"})
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sprint E-0.1: VLM warmup API（供 Dashboard/SysTray 按钮触发）
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.post("/vlm/warmup", operation_id="facebook_vlm_warmup")
+def fb_vlm_warmup(force: bool = False, block: bool = False):
+    """预热 qwen2.5vl:7b 到 GPU 显存，消掉首张 profile_hunt 的 ~56s 冷启动。
+
+    block=False (默认)：fire-and-forget，立即返回
+    block=True        ：等待 warmup 完成再返回
+    force=True        ：忽略 10min TTL，强制重跑
+    """
+    from src.host import ollama_vlm
+    if block:
+        r = ollama_vlm.warmup(force=force)
+        return {"ok": bool(r.get("ok")), "blocking": True, **r,
+                "state": ollama_vlm.get_warmup_state()}
+    queued = ollama_vlm.warmup_async(force=force)
+    return {"ok": True, "blocking": False, "queued": queued,
+            "state": ollama_vlm.get_warmup_state()}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sprint D-2: content_exposure 的兴趣热榜（用于后续"相似帖点赞"）
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get("/content-exposure/top-interests")
+def fb_content_top_interests(hours: int = 168, persona_key: Optional[str] = None, limit: int = 30):
+    """返回最近 N 小时命中用户的兴趣 topic 热榜，后续 feed_browse 可据此筛帖。"""
+    try:
+        from src.host.database import get_conn
+    except Exception:
+        raise HTTPException(500, "db unavailable")
+    hours = max(1, min(int(hours or 168), 24 * 90))
+    since = f"-{hours} hours"
+
+    # meta_json 里存 persona_key；用 LIKE 过滤（避免全量解析 JSON）
+    sql = """SELECT topic, COUNT(*) AS n, COUNT(DISTINCT device_id) AS devs
+             FROM fb_content_exposure
+             WHERE seen_at >= datetime('now', ?)"""
+    params: list = [since]
+    if persona_key:
+        sql += " AND meta_json LIKE ?"
+        params.append(f'%"persona_key": "{persona_key}"%')
+    sql += " GROUP BY topic ORDER BY n DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 30), 200)))
+
+    try:
+        with get_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception as e:
+        raise HTTPException(500, f"query failed: {e}")
+
+    return {
+        "ok": True,
+        "hours": hours,
+        "persona_key": persona_key,
+        "topics": [{"topic": r[0], "count": int(r[1]), "devices": int(r[2])} for r in rows],
+    }
