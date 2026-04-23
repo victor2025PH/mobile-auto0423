@@ -232,5 +232,25 @@
     "display_label": "主控-01",
     "alias": "主控-01",
     "number": 1
+  },
+  "8DWOF6CYY5R8YHX8": {
+    "display_name": "8DWOF6CY",
+    "slot": 2,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-02",
+    "alias": "主控-02",
+    "number": 2
+  },
+  "LVHIOZSWDAYLCELN": {
+    "display_name": "LVHIOZSW",
+    "slot": 3,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-03",
+    "alias": "主控-03",
+    "number": 3
   }
 }

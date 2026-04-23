@@ -1877,12 +1877,16 @@ class FacebookAutomation(BaseAutomation):
     def _tap_groups_bottom_tab(self, d, did: str) -> bool:
         """精确点击底部导航的 Groups tab, 避免命中 Home / 发帖按钮。
 
-        策略三层:
+        2026-04-23 修订: 原 regex fallback(descriptionMatches) 在 AdbFallbackDevice
+        的实现里匹配了几乎所有元素(217 of 218 candidates), 会 tap 错目标。
+        改用 descriptionContains + clickable 过滤的精确流程。
+
+        策略四层:
           1. 枚举已知的 description 精确值
-          2. 正则 descriptionMatches "Groups, tab \\d+ of \\d+"
-          3. resourceId 兜底 (某些版本用 id 而非 description)
+          2. descriptionContains "Groups, tab" + clickable=True
+          3. resourceId 兜底
+          4. 最后才走 smart_tap (通过 _assert_on_groups_page 兜底)
         """
-        import re as _re
         # 1) 精确 description
         for desc in self._FB_GROUPS_TAB_DESCRIPTIONS:
             try:
@@ -1894,16 +1898,25 @@ class FacebookAutomation(BaseAutomation):
                     return True
             except Exception:
                 continue
-        # 2) 正则匹配 "Groups, tab N of M"
-        try:
-            el = d(descriptionMatches=r"Groups, tab \d+ of \d+")
-            if el.exists(timeout=0.8):
-                self.hb.tap(d, *self._el_center(el))
-                time.sleep(0.4)
-                log.info("[browse_groups] tap Groups bottom tab by regex")
-                return True
-        except Exception:
-            pass
+        # 2) descriptionContains "Groups, tab" + clickable 过滤
+        # (比 regex 稳, 因为 AdbFallbackDevice 的 descriptionMatches 语义宽松)
+        for desc_prefix in ("Groups, tab", "Groups,"):
+            try:
+                el = d(descriptionContains=desc_prefix, clickable=True)
+                if el.exists(timeout=0.8):
+                    # 读实际 description 记日志,便于长期观察 FB tab 版本分布
+                    actual_desc = ""
+                    try:
+                        actual_desc = (el.info or {}).get("contentDescription", "") or ""
+                    except Exception:
+                        pass
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[browse_groups] tap Groups bottom tab by descContains='%s' (actual=%r)",
+                             desc_prefix, actual_desc)
+                    return True
+            except Exception:
+                continue
         # 3) resourceId 兜底(少数版本)
         for rid in ("com.facebook.katana:id/tab_groups",
                     "com.facebook.katana:id/bottom_bar_groups"):
