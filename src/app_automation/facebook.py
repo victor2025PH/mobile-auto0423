@@ -767,8 +767,8 @@ class FacebookAutomation(BaseAutomation):
         d = self._u2(did)
 
         with self.guarded("search", device_id=did):
-            if not self.smart_tap("Search bar or search icon", device_id=did):
-                self._fallback_search_tap(d)
+            if not self._tap_search_bar_preferred(d, did):
+                log.warning("[search_people] 无法打开搜索栏")
 
             time.sleep(0.8)
             self.hb.type_text(d, query)
@@ -794,12 +794,7 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     pass
             if not people_tapped:
-                # ADB 固定坐标回退（基于 w0 实测：People tab 约在 y=204）
-                log.info("[search_people] People tab: using fallback ADB tap (332, 204)")
-                try:
-                    self._adb("shell input tap 332 204", device_id=did)
-                except Exception:
-                    pass
+                self._people_tab_fallback_adb(d, did)
             time.sleep(1.5)
 
         results = self._extract_search_results(d, max_results, query_hint=query)
@@ -1127,6 +1122,17 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             pass
+        # Phase 6.A: Lead Mesh journey 同步写
+        action = ("friend_requested" if status == "sent"
+                  else "friend_request_risk")
+        self._append_journey_for_action(
+            target_name, action, did=device_id,
+            persona_key=persona_key,
+            discovered_via=("friend_request"
+                             if status == "sent" else "friend_request_failed"),
+            data={"note_len": len(note or ""),
+                   "source": source or "",
+                   "preset_key": preset_key or ""})
 
     # ─── 2026-04-23: 加好友后打招呼（方案 A2 — 在 profile 页点 Message）──
     # 设计决策（vs 原方案 A1 "切到 Messenger App 搜名字"）:
@@ -1417,8 +1423,85 @@ class FacebookAutomation(BaseAutomation):
     #   / first_tap_miss / risk_before_msg / no_message_button / input_miss
     #   / send_miss / ok
     # 每次 send_greeting_after_add_friend 结束都会刷新 _last_greet_skip_reason。
+    # 2026-04-23 Phase 6.A: 同步写入 Lead Mesh journey (如 _current_lead_cid 存在)。
     def _set_greet_reason(self, reason: str) -> None:
         self._last_greet_skip_reason = reason
+        # Lead Mesh journey 同步写 — cid 由外层 send_greeting_after_add_friend 注入
+        cid = getattr(self, "_current_lead_cid", "")
+        if cid and reason:
+            try:
+                from src.host.lead_mesh import append_journey
+                # ok → greeting_sent; ok_via_fallback → greeting_sent{via=fallback};
+                # 其他 reason → greeting_blocked{reason=...}
+                if reason == "ok":
+                    action = "greeting_sent"
+                    data = {"via": "inline_profile_message"}
+                elif reason == "ok_via_fallback":
+                    action = "greeting_sent"
+                    data = {"via": "messenger_fallback"}
+                else:
+                    action = "greeting_blocked"
+                    data = {"reason": reason}
+                # 附 template_id / persona 等元信息(如果 caller 注入了)
+                tpl = getattr(self, "_current_greet_template_id", "") or ""
+                if tpl:
+                    data["template_id"] = tpl
+                persona = getattr(self, "_current_lead_persona", "") or ""
+                if persona:
+                    data["persona_key"] = persona
+                append_journey(
+                    cid, actor="agent_a",
+                    actor_device=getattr(self, "_current_device", "") or "",
+                    platform="facebook",
+                    action=action, data=data)
+            except Exception as e:
+                log.debug("[journey] greeting reason 同步失败: %s", e)
+
+    # ─── Phase 6.A: Lead Mesh 接入 helpers ─────────────────────────────
+    def _resolve_peer_canonical_safe(self, peer_name: str, *,
+                                      did: str = "",
+                                      persona_key: Optional[str] = None,
+                                      platform: str = "facebook",
+                                      discovered_via: str = "") -> str:
+        """Graceful 解析 canonical_id; lead_mesh 不可用或任何异常 → 返回空串,
+        业务主流程不受影响(退回原 peer_name-only 的旧行为)。"""
+        if not peer_name:
+            return ""
+        try:
+            from src.host.lead_mesh import resolve_identity
+            # account_id 优先用 "fb:<name>" 作伪 id (未来抓到 profile_url 再迁移)
+            acct = f"fb:{peer_name.strip()}"
+            return resolve_identity(
+                platform=platform, account_id=acct,
+                display_name=peer_name, persona_key=persona_key or "",
+                discovered_via=discovered_via or "",
+                discovered_by_device=did or "",
+                auto_merge=True,
+            ) or ""
+        except Exception as e:
+            log.debug("[journey] resolve_peer_canonical 失败: %s", e)
+            return ""
+
+    def _append_journey_for_action(self, peer_name: str, action: str, *,
+                                    did: str = "",
+                                    persona_key: Optional[str] = None,
+                                    platform: str = "facebook",
+                                    data: Optional[Dict[str, Any]] = None,
+                                    discovered_via: str = "") -> None:
+        """一步完成 resolve + append, 供 add_friend_with_note 等不走
+        _current_lead_cid 上下文的路径一次性写入。"""
+        cid = self._resolve_peer_canonical_safe(
+            peer_name, did=did, persona_key=persona_key,
+            platform=platform, discovered_via=discovered_via)
+        if not cid:
+            return
+        try:
+            from src.host.lead_mesh import append_journey
+            append_journey(cid, actor="agent_a", actor_device=did or "",
+                           platform=platform, action=action,
+                           data=data or {})
+        except Exception as e:
+            log.debug("[journey] append %s 失败: %s", action, e)
 
     @_with_fb_foreground
     def send_greeting_after_add_friend(self,
@@ -1453,29 +1536,45 @@ class FacebookAutomation(BaseAutomation):
         import random as _r
         did = self._did(device_id)
         d = self._u2(did)
+
+        # Phase 6.A: 入口 resolve canonical_id 一次, 挂到 instance 变量供
+        # _set_greet_reason 同步写 lead_journey 用。失败 graceful 返回空。
+        self._current_lead_cid = self._resolve_peer_canonical_safe(
+            profile_name, did=did, persona_key=persona_key,
+            discovered_via="greeting_entry")
+        self._current_lead_persona = persona_key or ""
+        # template_id 在 _locked 里抽卡后才知道, 先置空
+        self._current_greet_template_id = ""
+
         # 默认把归因置空,走到 return True 时再设 "ok"
         self._set_greet_reason("")
 
-        # Phase + playbook
-        eff_phase, sg_cfg = _resolve_phase_and_cfg("send_greeting",
-                                                   device_id=did,
-                                                   phase_override=phase)
-        # 冷启/冷却 phase 直接拒绝（YAML 写 max_greetings_per_run=0）
-        if int(sg_cfg.get("max_greetings_per_run", 0)) <= 0:
-            log.info("[send_greeting] phase=%s 禁止打招呼, skip: %s",
-                     eff_phase, profile_name)
-            self._set_greet_reason("phase_blocked")
-            return False
+        try:
+            # Phase + playbook
+            eff_phase, sg_cfg = _resolve_phase_and_cfg("send_greeting",
+                                                       device_id=did,
+                                                       phase_override=phase)
+            # 冷启/冷却 phase 直接拒绝（YAML 写 max_greetings_per_run=0）
+            if int(sg_cfg.get("max_greetings_per_run", 0)) <= 0:
+                log.info("[send_greeting] phase=%s 禁止打招呼, skip: %s",
+                         eff_phase, profile_name)
+                self._set_greet_reason("phase_blocked")
+                return False
 
-        # P3-1 2026-04-23: 和 add_friend 同思路, 把 cap 检查 → UI 操作 → 入库
-        # 整段用 device+section 锁串行化。section="send_greeting",
-        # 与 "add_friend" 锁独立, add_friend_and_greet 场景两把锁先后持有不冲突。
-        from src.host.fb_concurrency import device_section_lock
-        with device_section_lock(did, "send_greeting", timeout=180.0):
-            return self._send_greeting_after_add_friend_locked(
-                profile_name, greeting, did, d,
-                sg_cfg, eff_phase, persona_key,
-                assume_on_profile, preset_key, ai_decision, _r)
+            # P3-1 2026-04-23: 和 add_friend 同思路, 把 cap 检查 → UI 操作 → 入库
+            # 整段用 device+section 锁串行化。section="send_greeting",
+            # 与 "add_friend" 锁独立, add_friend_and_greet 场景两把锁先后持有不冲突。
+            from src.host.fb_concurrency import device_section_lock
+            with device_section_lock(did, "send_greeting", timeout=180.0):
+                return self._send_greeting_after_add_friend_locked(
+                    profile_name, greeting, did, d,
+                    sg_cfg, eff_phase, persona_key,
+                    assume_on_profile, preset_key, ai_decision, _r)
+        finally:
+            # 清空 instance 变量, 避免下次调用串线
+            self._current_lead_cid = ""
+            self._current_lead_persona = ""
+            self._current_greet_template_id = ""
 
     def _send_greeting_after_add_friend_locked(
             self, profile_name, greeting, did, d,
@@ -1529,6 +1628,8 @@ class FacebookAutomation(BaseAutomation):
             # 统计。本质上这条"不该被发出"(persona 无本地化模板),只是作为硬兜底,
             # 不纳入 A/B 样本。
             template_id = ""
+        # Phase 6.A: 把 template_id 挂到 instance, _set_greet_reason 会用
+        self._current_greet_template_id = template_id or ""
 
         # 非 assume_on_profile: 先重新搜索 + 进 profile（独立使用场景）
         if not assume_on_profile:
@@ -3853,6 +3954,42 @@ class FacebookAutomation(BaseAutomation):
         return lead_ids
 
     # ── Internal Helpers ──────────────────────────────────────────────────
+
+    def _tap_search_bar_preferred(self, d, device_id: Optional[str] = None) -> bool:
+        """优先用 resourceId 点搜索框，避免 AutoSelector 把 Feed 顶栏缓存成错误坐标。"""
+        did = self._did(device_id)
+        for sel in (
+            {"resourceId": "com.facebook.katana:id/search_query_text_view"},
+            {"resourceId": "com.facebook.katana:id/search_bar_text_view"},
+            {"resourceId": "com.facebook.katana:id/search_bar"},
+            {"resourceId": "com.facebook.katana:id/search_button"},
+            {"className": "android.widget.EditText", "description": "Search Facebook"},
+        ):
+            try:
+                el = d(**sel)
+                if el.exists(timeout=1.8):
+                    self.hb.tap(d, *self._el_center(el))
+                    log.info("[search] opened search via selector %s", sel)
+                    return True
+            except Exception:
+                continue
+        if self.smart_tap("Search bar or search icon", device_id=did):
+            return True
+        return bool(self._fallback_search_tap(d))
+
+    def _people_tab_fallback_adb(self, d, device_id: str) -> None:
+        """People 筛选：按屏幕分辨率缩放 w0 基准坐标 (332,204)@720x1600。"""
+        try:
+            w, h = d.window_size()
+            x = max(40, min(int(332 * (w / 720.0)), w - 40))
+            y = max(120, min(int(204 * (h / 1600.0)), h - 120))
+        except Exception:
+            x, y = 332, 204
+        try:
+            self._adb(f"shell input tap {x} {y}", device_id=device_id)
+            log.info("[search_people] People tab: scaled ADB tap (%s, %s)", x, y)
+        except Exception:
+            pass
 
     def _fallback_search_tap(self, d):
         """Fallback: try common search button selectors."""

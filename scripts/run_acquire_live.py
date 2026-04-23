@@ -4,8 +4,17 @@
 - 设备：8DWOF6CYY5R8YHX8
 - 搜索关键词：5 个新的日本女性名字
 - 最多加好友：2 人（保守测试）
+
+压测：默认开启 MOBILE_AUTO_FB_COMPLIANCE_RELAXED（跳过 FB 搜索/加好友等
+ComplianceGuard 限额检查，仍写入 action_log）。生产跑法请先设：
+  set MOBILE_AUTO_FB_COMPLIANCE_RELAXED=0
 """
+import os
 import sys, io, logging, json
+
+# 须在 import src.* 之前设置，ComplianceGuard 才会按测试模式跳过 FB 限额
+os.environ.setdefault("MOBILE_AUTO_FB_COMPLIANCE_RELAXED", "1")
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.path.insert(0, '.')
 

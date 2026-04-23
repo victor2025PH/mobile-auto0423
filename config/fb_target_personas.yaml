@@ -25,14 +25,24 @@ quotas:
 dedup_window_hours: 168          # 7 天
 
 # VLM 配置
+# ---------------------------------------------------------------------------
+# 当前默认识别：Ollama + qwen2.5vl:7b（省显存、速度快）。
+# 提高 L2 精准度：① 设 model_l2 为更大视觉模型；② 或环境变量 FB_VLM_MODEL_L2
+#   例：model_l2: qwen2.5vl:32b  （需 ollama pull，显存约 24GB 级）
+#   OCR 可与 L2 分工：model 保持 7b，model_l2 用 32b；model_ocr 不设则同 model。
+# ---------------------------------------------------------------------------
 vlm:
   provider: ollama
-  model: qwen2.5vl:7b            # 本地部署，0 成本
+  model: qwen2.5vl:7b            # 默认 / OCR / warmup 主模型
+  # model_l2: qwen2.5vl:32b      # 取消注释启用高端 L2（未 pull 时请保持注释）
+  # model_ocr: qwen2.5vl:7b      # 可选：专用于 fb_profile_ocr；不设则沿用 model
   endpoint: http://127.0.0.1:11434
   # Sprint E: 冷启动 + 3 张图多模态推理实测需要 15-25s，留一倍余量。
   # warmup 机制能让大多数 classify 在热路径下 3-8s 完成，此 timeout 只在
   # 未 warmup 就直跑 VLM 的边缘场景生效。
   timeout_sec: 60
+  # timeout_sec_l2: 120         # 大模型 L2 建议更长超时（与 model_l2 同时启用）
+  # timeout_sec_ocr: 45         # 可选：仅 OCR 场景超时
   max_retries: 2
   temperature: 0.2               # 判定类任务要稳，低温
   # 每次 L2 最多喂几张图（主页头像/封面/下滑截图）

@@ -701,4 +701,202 @@
     }
   };
 
+
+  // ─────────────────────────────────────────────────────────────────
+  // P1 · 接收方账号管理 (Phase 6.B, 2026-04-23)
+  // ─────────────────────────────────────────────────────────────────
+
+  window.lmOpenReceiversConfig = async function () {
+    const Shell = _shell();
+    if (!Shell) return;
+    Shell.modal.open('lm-receivers-modal',
+      '<div id="lm-receivers-body" style="padding:18px">加载中…</div>',
+      { maxWidth: '1000px' });
+    await _lmRenderReceivers();
+  };
+
+  async function _lmRenderReceivers() {
+    const Shell = _shell();
+    const body = document.getElementById('lm-receivers-body');
+    if (!body) return;
+    try {
+      const r = await Shell.api.get('/lead-mesh/receivers?with_load=true');
+      const list = (r && r.receivers) || [];
+      const rows = list.length === 0
+        ? '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-dim)">'
+          + '尚无接收方。参考 <code>config/referral_receivers.yaml.example</code> 创建。'
+          + '</td></tr>'
+        : list.map(_lmReceiverRowHtml).join('');
+      body.innerHTML = ''
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
+        + '  <div>'
+        + '    <div style="font-size:18px;font-weight:700">📬 接收方账号管理</div>'
+        + '    <div style="font-size:11px;color:var(--text-muted);margin-top:2px">'
+        + '      每个 receiver 是一个接收引流的账号(LINE/WA/TG/IG/Messenger),'
+        + ' handoff 自动按 channel + persona + 剩余 cap 路由</div>'
+        + '  </div>'
+        + '  <div style="display:flex;gap:8px">'
+        + '    <button onclick="lmOpenNewReceiverDialog()" '
+        + '            style="padding:6px 14px;background:#22c55e;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer">'
+        + '      ➕ 新增接收方</button>'
+        + '    <button onclick="_lmRenderReceivers()" '
+        + '            style="padding:6px 12px;background:rgba(96,165,250,.15);color:#60a5fa;border:1px solid rgba(96,165,250,.4);border-radius:6px;font-size:11px;cursor:pointer">'
+        + '      🔄 刷新</button>'
+        + '    <button onclick="PlatShell.modal.close(\'lm-receivers-modal\')" '
+        + '            style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
+        + '  </div>'
+        + '</div>'
+        + '<table style="width:100%;border-collapse:collapse;font-size:12px">'
+        + '  <thead><tr style="color:var(--text-dim);background:rgba(255,255,255,.03)">'
+        + '    <th style="text-align:left;padding:8px">Key</th>'
+        + '    <th style="text-align:left;padding:8px">渠道</th>'
+        + '    <th style="text-align:left;padding:8px">账号(脱敏)</th>'
+        + '    <th style="text-align:left;padding:8px">今日负载</th>'
+        + '    <th style="text-align:left;padding:8px">备用</th>'
+        + '    <th style="text-align:left;padding:8px">状态</th>'
+        + '    <th style="text-align:left;padding:8px">操作</th>'
+        + '  </tr></thead><tbody>' + rows + '</tbody>'
+        + '</table>'
+        + '<div style="margin-top:14px;font-size:11px;color:var(--text-dim)">'
+        + '  💡 配置文件: <code>config/referral_receivers.yaml</code>(热加载);'
+        + ' 轮转算法 least_loaded; at_cap 时自动跳 backup_key'
+        + '</div>';
+    } catch (e) {
+      body.innerHTML = '<div style="color:#ef4444;padding:20px">加载失败: ' + _safe(e.message || e) + '</div>';
+    }
+  }
+
+  function _lmReceiverRowHtml(r) {
+    const enabled = r.enabled !== false;
+    const cap = r.cap || r.daily_cap || 0;
+    const cur = r.current || 0;
+    const pct = cap > 0 ? Math.round(cur * 100 / cap) : 0;
+    const barColor = pct >= 90 ? '#ef4444' : pct >= 60 ? '#f59e0b' : '#22c55e';
+    const statusBadge = enabled
+      ? '<span style="color:#22c55e;font-weight:600">● 启用</span>'
+      : '<span style="color:#94a3b8">○ 禁用</span>';
+    const toggleBtn = enabled
+      ? ('<button onclick="lmToggleReceiver(\'' + _safe(r.key) + '\', false)" '
+         + 'style="padding:3px 8px;font-size:11px;background:rgba(245,158,11,.12);color:#f59e0b;border:1px solid rgba(245,158,11,.3);border-radius:4px;cursor:pointer">禁用</button>')
+      : ('<button onclick="lmToggleReceiver(\'' + _safe(r.key) + '\', true)" '
+         + 'style="padding:3px 8px;font-size:11px;background:rgba(34,197,94,.12);color:#22c55e;border:1px solid rgba(34,197,94,.3);border-radius:4px;cursor:pointer">启用</button>');
+    const personaTags = (r.persona_filter || []).slice(0, 2).join(', ') || '所有';
+
+    return ''
+      + '<tr style="border-bottom:1px solid var(--border)">'
+      + '  <td style="padding:8px"><b>' + _safe(r.key) + '</b>'
+      + '    <div style="font-size:10px;color:var(--text-dim)">' + _safe(r.display_name || '') + '</div>'
+      + '    <div style="font-size:10px;color:var(--text-dim)">persona: ' + _safe(personaTags) + '</div>'
+      + '  </td>'
+      + '  <td style="padding:8px;text-transform:uppercase">' + _safe(r.channel) + '</td>'
+      + '  <td style="padding:8px;font-family:monospace">' + _safe(r.account_id_masked || r.account_id || '') + '</td>'
+      + '  <td style="padding:8px;min-width:140px">'
+      + '    <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">'
+      + '      <span>' + cur + ' / ' + cap + '</span>'
+      + '      <span style="color:' + barColor + '">' + pct + '%</span>'
+      + '    </div>'
+      + '    <div style="height:6px;background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden">'
+      + '      <div style="width:' + pct + '%;height:100%;background:' + barColor + '"></div>'
+      + '    </div>'
+      + '  </td>'
+      + '  <td style="padding:8px"><code>' + _safe(r.backup_key || '—') + '</code></td>'
+      + '  <td style="padding:8px">' + statusBadge + '</td>'
+      + '  <td style="padding:8px">' + toggleBtn
+      + '    <button onclick="lmDeleteReceiver(\'' + _safe(r.key) + '\')" '
+      + '            style="margin-left:4px;padding:3px 8px;font-size:11px;background:rgba(239,68,68,.12);color:#ef4444;border:1px solid rgba(239,68,68,.3);border-radius:4px;cursor:pointer">🗑</button>'
+      + '  </td>'
+      + '</tr>';
+  }
+
+  window.lmToggleReceiver = async function (key, enabled) {
+    const Shell = _shell();
+    if (!Shell) return;
+    try {
+      await Shell.api.post('/lead-mesh/receivers/' + encodeURIComponent(key),
+                            { enabled: enabled });
+      showToast((enabled ? '启用' : '禁用') + ' ' + key + ' 成功', 'success');
+      _lmRenderReceivers();
+    } catch (e) {
+      showToast('切换失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  window.lmDeleteReceiver = async function (key) {
+    const Shell = _shell();
+    if (!Shell) return;
+    if (!confirm('删除接收方 ' + key + ' ? 已入账的 handoff 不会受影响, 但无法继续路由新 handoff 到该账号。')) return;
+    try {
+      await Shell.api.delete('/lead-mesh/receivers/' + encodeURIComponent(key));
+      showToast('已删除', 'success');
+      _lmRenderReceivers();
+    } catch (e) {
+      showToast('删除失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  window.lmOpenNewReceiverDialog = function () {
+    const Shell = _shell();
+    if (!Shell) return;
+    Shell.modal.open('lm-new-receiver', ''
+      + '<div style="padding:18px">'
+      + '  <div style="font-size:16px;font-weight:700;margin-bottom:14px">➕ 新增接收方</div>'
+      + '  <div style="display:grid;grid-template-columns:1fr 2fr;gap:8px;font-size:12px">'
+      + '    <label style="align-self:center">Key *:</label>'
+      + '    <input id="lm-nr-key" placeholder="line_jp_01" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '    <label style="align-self:center">渠道 *:</label>'
+      + '    <select id="lm-nr-channel" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '      <option value="line">LINE</option>'
+      + '      <option value="whatsapp">WhatsApp</option>'
+      + '      <option value="telegram">Telegram</option>'
+      + '      <option value="messenger">Messenger</option>'
+      + '      <option value="instagram">Instagram</option>'
+      + '    </select>'
+      + '    <label style="align-self:center">账号 ID *:</label>'
+      + '    <input id="lm-nr-account" placeholder="@jpline01 / +8190... / @username" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '    <label style="align-self:center">显示名:</label>'
+      + '    <input id="lm-nr-display" placeholder="主号 / 首选 LINE" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '    <label style="align-self:center">日上限:</label>'
+      + '    <input id="lm-nr-cap" type="number" value="15" min="1" max="100" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '    <label style="align-self:center">备用 key:</label>'
+      + '    <input id="lm-nr-backup" placeholder="(可空) 配额满时转路由到此 key" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '    <label style="align-self:center">persona 过滤:</label>'
+      + '    <input id="lm-nr-persona" placeholder="(可空,逗号分隔) jp_female_midlife" style="padding:6px 10px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:4px">'
+      + '  </div>'
+      + '  <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">'
+      + '    <button onclick="PlatShell.modal.close(\'lm-new-receiver\')" style="padding:6px 14px;background:none;border:1px solid var(--border);color:var(--text);border-radius:6px;cursor:pointer">取消</button>'
+      + '    <button onclick="lmSubmitNewReceiver()" style="padding:6px 14px;background:#22c55e;color:#fff;border:none;border-radius:6px;font-weight:600;cursor:pointer">创建</button>'
+      + '  </div>'
+      + '</div>',
+      { maxWidth: '560px' });
+  };
+
+  window.lmSubmitNewReceiver = async function () {
+    const Shell = _shell();
+    if (!Shell) return;
+    const key = (document.getElementById('lm-nr-key') || {}).value || '';
+    if (!key) { showToast('Key 必填', 'warning'); return; }
+    const body = {
+      channel: (document.getElementById('lm-nr-channel') || {}).value,
+      account_id: (document.getElementById('lm-nr-account') || {}).value,
+      display_name: (document.getElementById('lm-nr-display') || {}).value,
+      daily_cap: parseInt((document.getElementById('lm-nr-cap') || {}).value) || 15,
+      backup_key: (document.getElementById('lm-nr-backup') || {}).value || null,
+      persona_filter: ((document.getElementById('lm-nr-persona') || {}).value || '')
+          .split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+      enabled: true,
+    };
+    if (!body.channel || !body.account_id) {
+      showToast('渠道和账号 ID 必填', 'warning');
+      return;
+    }
+    try {
+      await Shell.api.post('/lead-mesh/receivers/' + encodeURIComponent(key), body);
+      showToast('创建成功', 'success');
+      PlatShell.modal.close('lm-new-receiver');
+      _lmRenderReceivers();
+    } catch (e) {
+      showToast('创建失败: ' + (e.message || e), 'error');
+    }
+  };
+
 })();

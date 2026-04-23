@@ -274,6 +274,83 @@ def api_query_sync(body: Dict[str, Any] = Body(...)):
     return {"reply": reply, "timed_out": reply is None}
 
 
+# ─── Receivers (接收方账号管理, Phase 6.B) ──────────────────────────
+
+@router.get("/receivers")
+def api_list_receivers(channel: str = "",
+                         enabled_only: bool = False,
+                         with_load: bool = True):
+    """列所有接收方, with_load=True 时附每个的今日负载。"""
+    from src.host.lead_mesh.receivers import (list_receivers, receiver_load,
+                                                 all_loads)
+    items = list_receivers(channel=channel or None,
+                             enabled_only=enabled_only)
+    if with_load:
+        # 按 key 合并 load 信息
+        loads = {l["key"]: l for l in all_loads()}
+        for it in items:
+            ld = loads.get(it["key"], {})
+            for k in ("current", "cap", "remaining",
+                       "percent_used", "at_cap"):
+                if k in ld:
+                    it[k] = ld[k]
+            it["account_id_masked"] = ld.get("account_id_masked", "")
+    return {"receivers": items, "count": len(items)}
+
+
+@router.get("/receivers/{key}")
+def api_get_receiver(key: str):
+    from src.host.lead_mesh.receivers import get_receiver, receiver_load
+    r = get_receiver(key)
+    if not r:
+        raise HTTPException(404, "receiver not found")
+    r.update({"load": receiver_load(key)})
+    return r
+
+
+@router.post("/receivers/{key}")
+def api_upsert_receiver(key: str, body: Dict[str, Any] = Body(...)):
+    """新建或更新一个 receiver。"""
+    from src.host.lead_mesh.receivers import upsert_receiver
+    if not body.get("channel") and not body.get("account_id"):
+        # 允许只改部分字段(如只 toggle enabled), 但至少得有 1 个字段
+        if not any(k in body for k in ("enabled", "daily_cap",
+                                          "backup_key", "persona_filter",
+                                          "display_name", "tags",
+                                          "webhook_url")):
+            raise HTTPException(400, "body 至少包含一个字段")
+    try:
+        r = upsert_receiver(key, body)
+        return {"ok": True, "receiver": r}
+    except Exception as e:
+        raise HTTPException(500, f"upsert 失败: {e}")
+
+
+@router.delete("/receivers/{key}")
+def api_delete_receiver(key: str):
+    from src.host.lead_mesh.receivers import delete_receiver
+    ok = delete_receiver(key)
+    if not ok:
+        raise HTTPException(404, "receiver not found")
+    return {"ok": True, "deleted": key}
+
+
+@router.get("/receivers-pick")
+def api_pick_receiver(channel: str,
+                       persona_key: str = "",
+                       preferred_key: str = ""):
+    """按 channel + persona 模拟 pick_receiver(不实际占位,只返回谁会被选)。
+
+    给 Dashboard 看"当前引流到某渠道会路由到哪个账号"用。
+    """
+    from src.host.lead_mesh.receivers import pick_receiver
+    picked = pick_receiver(channel, persona_key=persona_key or None,
+                             preferred_key=preferred_key or None)
+    return {"channel": channel, "persona_key": persona_key,
+            "picked": picked,
+            "all_at_cap": picked is None}
+
+
 # ─── Webhooks ─────────────────────────────────────────────────────────
 
 @router.post("/webhooks/flush")

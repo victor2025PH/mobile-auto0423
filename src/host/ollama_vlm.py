@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""本地 Ollama VLM 适配器（qwen2.5vl:7b 等）。
+"""本地 Ollama VLM 适配器（qwen2.5vl:7b / 32b 等）。
 
 职责：
     * 对接本地 Ollama /api/generate，发送「多图 + prompt」，拿结构化 JSON 回复。
@@ -23,6 +23,7 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -171,13 +172,19 @@ def warmup_async(force: bool = False) -> bool:
 
 
 def _load_vlm_config() -> Dict[str, Any]:
-    """延迟导入避免循环依赖。"""
+    """延迟导入避免循环依赖。
+
+    环境变量（压测/切换模型，不改 YAML）::
+        FB_VLM_MODEL      — 覆盖 ``model``（默认走 OCR/通用）
+        FB_VLM_MODEL_L2   — 覆盖 ``model_l2``（L2 判读专用）
+        FB_VLM_MODEL_OCR  — 覆盖 ``model_ocr``（profile OCR 专用）
+    """
     try:
         from src.host.fb_target_personas import get_vlm_config
-        return get_vlm_config()
+        cfg: Dict[str, Any] = dict(get_vlm_config())
     except Exception as e:
         logger.warning("读取 fb_target_personas.vlm 失败，用内置默认: %s", e)
-        return {
+        cfg = {
             "provider": "ollama",
             "model": "qwen2.5vl:7b",
             "endpoint": "http://127.0.0.1:11434",
@@ -190,6 +197,19 @@ def _load_vlm_config() -> Dict[str, Any]:
             "num_ctx": 4096,
             "keep_alive": "30m",
         }
+    ow = (os.environ.get("FB_VLM_MODEL") or "").strip()
+    if ow:
+        cfg["model"] = ow
+        logger.info("VLM: env FB_VLM_MODEL overrides model -> %s", ow)
+    ow_l2 = (os.environ.get("FB_VLM_MODEL_L2") or "").strip()
+    if ow_l2:
+        cfg["model_l2"] = ow_l2
+        logger.info("VLM: env FB_VLM_MODEL_L2 overrides model_l2 -> %s", ow_l2)
+    ow_ocr = (os.environ.get("FB_VLM_MODEL_OCR") or "").strip()
+    if ow_ocr:
+        cfg["model_ocr"] = ow_ocr
+        logger.info("VLM: env FB_VLM_MODEL_OCR overrides model_ocr -> %s", ow_ocr)
+    return cfg
 
 
 def _log_ai_cost(
@@ -338,6 +358,7 @@ def generate(
     scene: str = "fb_vlm",
     task_id: str = "",
     device_id: str = "",
+    timeout_sec: Optional[float] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """底层生成函数。返回 (raw_text, meta)。不做 JSON 解析。
 
@@ -346,7 +367,7 @@ def generate(
     cfg = _load_vlm_config()
     use_model = model or cfg["model"]
     endpoint = cfg["endpoint"].rstrip("/")
-    timeout = int(cfg.get("timeout_sec", 30))
+    timeout = int(timeout_sec if timeout_sec is not None else cfg.get("timeout_sec", 30))
     max_retries = int(cfg.get("max_retries", 2))
     temp = float(temperature if temperature is not None else cfg.get("temperature", 0.2))
     max_imgs = int(cfg.get("max_images_per_call", 3))
@@ -469,15 +490,40 @@ def classify_images(
     device_id: str = "",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """高层：发 prompt+图片 → 期望模型返回 JSON → 解析成 dict。
-    解析失败返回 {} 并在 meta.error 标记。"""
+    解析失败返回 {} 并在 meta.error 标记。
+
+    模型选择（``model`` 为 None 时）::
+        * scene=fb_profile_l2 → cfg ``model_l2`` 或回退 ``model``（高端判读）
+        * scene=fb_profile_ocr → cfg ``model_ocr`` 或回退 ``model``（OCR 可保持小模型）
+    """
+    cfg = _load_vlm_config()
+    use_model = model
+    if not use_model:
+        if scene == "fb_profile_l2":
+            use_model = (cfg.get("model_l2") or cfg.get("model") or "").strip() or None
+        elif scene == "fb_profile_ocr":
+            use_model = (cfg.get("model_ocr") or cfg.get("model") or "").strip() or None
+    timeout_override: Optional[float] = None
+    if scene == "fb_profile_l2" and cfg.get("timeout_sec_l2") is not None:
+        try:
+            timeout_override = float(cfg["timeout_sec_l2"])
+        except (TypeError, ValueError):
+            timeout_override = None
+    elif scene == "fb_profile_ocr" and cfg.get("timeout_sec_ocr") is not None:
+        try:
+            timeout_override = float(cfg["timeout_sec_ocr"])
+        except (TypeError, ValueError):
+            timeout_override = None
+
     raw, meta = generate(
         prompt=prompt,
         image_paths=image_paths,
         scene=scene,
         task_id=task_id,
-        model=model,
+        model=use_model,
         max_tokens=800,
         device_id=device_id,
+        timeout_sec=timeout_override,
     )
     meta["raw_response"] = raw[:2000]
     if not meta["ok"]:

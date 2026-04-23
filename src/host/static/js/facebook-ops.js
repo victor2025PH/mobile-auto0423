@@ -206,6 +206,9 @@
         <button class="qa-btn" onclick="lmOpenCommandCenter()" style="padding:6px 10px;font-size:12px;background:rgba(168,85,247,.15);color:#a855f7">
           📊 运营指挥台
         </button>
+        <button class="qa-btn" onclick="lmOpenReceiversConfig()" style="padding:6px 10px;font-size:12px;background:rgba(34,197,94,.15);color:#22c55e">
+          📬 接收方管理
+        </button>
       </div>
     `;
   }

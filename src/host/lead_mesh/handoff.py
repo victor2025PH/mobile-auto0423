@@ -85,22 +85,55 @@ def create_handoff(*, canonical_id: str,
                     source_device: str = "",
                     target_agent: str = "",
                     receiver_account_key: str = "",
+                    persona_key: str = "",
                     conversation_snapshot: Optional[List[Dict[str, Any]]] = None,
                     snippet_sent: str = "",
-                    enqueue_webhook: bool = True) -> str:
+                    enqueue_webhook: bool = True,
+                    auto_pick_receiver: bool = True) -> str:
     """创建交接单, 返回 handoff_id (UUID)。
 
     自动:
       * snapshot 脱敏
-      * append lead_journey: handoff_created
+      * **receiver_account_key 空且 auto_pick_receiver=True**: 调
+        ``receivers.pick_receiver(channel, persona_key)`` 自动路由到空闲的
+        接收方(含 backup 链路); 全部 at_cap 时 receiver_account_key 仍为空,
+        运营可在 Dashboard 手动指派
+      * append lead_journey: handoff_created (带 receiver 信息)
       * 如果 enqueue_webhook=True, 写 webhook_dispatches 待发
 
     **不做**:
       * 不做去重检查 (那是调用方的 gate 职责, 防止 race)
       * 不同步发 webhook (异步由 dispatcher 取走)
+
+    Args:
+        receiver_account_key: 显式指定接收方; 留空则走自动路由
+        persona_key: 配合 auto_pick 过滤 receiver.persona_filter
+        auto_pick_receiver: 关闭则不自动路由(仅测试场景用)
     """
     if not canonical_id or not source_agent or not channel:
         raise ValueError("canonical_id / source_agent / channel 必填")
+
+    # 自动 pick receiver (如果 caller 没指定)
+    auto_picked = False
+    if not receiver_account_key and auto_pick_receiver:
+        try:
+            from .receivers import pick_receiver
+            picked = pick_receiver(channel, persona_key=persona_key or None)
+            if picked and picked.get("key"):
+                receiver_account_key = picked["key"]
+                auto_picked = True
+                logger.info("[handoff] 自动路由 channel=%s persona=%s → %s "
+                            "(current=%d/%d)",
+                            channel, persona_key or "-",
+                            receiver_account_key,
+                            picked.get("current", 0), picked.get("cap", 0))
+            else:
+                logger.warning("[handoff] 自动路由失败 channel=%s persona=%s: "
+                                "无可用 receiver (全部 at_cap 或未配置)",
+                                channel, persona_key or "-")
+        except Exception as e:
+            logger.debug("[handoff] pick_receiver 异常(继续): %s", e)
+
     handoff_id = str(uuid.uuid4())
     snap = _sanitize_snapshot(conversation_snapshot or [])
     try:
@@ -127,6 +160,7 @@ def create_handoff(*, canonical_id: str,
                        actor_device=source_device, platform=channel,
                        data={"handoff_id": handoff_id,
                              "receiver": receiver_account_key,
+                             "auto_picked": auto_picked,
                              "snapshot_turns": len(snap)})
     except Exception:
         pass

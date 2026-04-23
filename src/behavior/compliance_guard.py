@@ -15,6 +15,7 @@ Design decisions:
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -26,6 +27,21 @@ from typing import Dict, Optional, Tuple
 from src.host.device_registry import data_file
 
 log = logging.getLogger(__name__)
+
+
+def _facebook_compliance_relaxed() -> bool:
+    """真机/脚本压测时跳过 Facebook 的 hourly/daily/cooldown/平台总限额检查（仍会 record）。
+
+    设置环境变量（任一为真即可）::
+        MOBILE_AUTO_FB_COMPLIANCE_RELAXED=1
+        MOBILE_AUTO_COMPLIANCE_RELAXED=1   # 全局宽松（含 FB）
+    生产环境勿开启。
+    """
+    for key in ("MOBILE_AUTO_FB_COMPLIANCE_RELAXED", "MOBILE_AUTO_COMPLIANCE_RELAXED"):
+        v = (os.environ.get(key) or "").strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+    return False
 
 
 class QuotaExceeded(Exception):
@@ -343,6 +359,8 @@ class ComplianceGuard:
         return plimits.actions.get(action, ActionLimit())
 
     def _check_cooldown(self, platform: str, action: str, account: str):
+        if platform == "facebook" and _facebook_compliance_relaxed():
+            return
         remaining = self.get_cooldown(platform, action, account)
         if remaining > 0:
             log.debug("Cooldown active for %s/%s [%s]: %.1fs remaining — waiting",
@@ -350,6 +368,9 @@ class ComplianceGuard:
             time.sleep(remaining)
 
     def _check_action_limits(self, platform: str, action: str, account: str):
+        if platform == "facebook" and _facebook_compliance_relaxed():
+            log.debug("ComplianceGuard: Facebook action limits skipped (%s)", action)
+            return
         limits = self._get_action_limit(platform, action)
         now = time.time()
         with self._conn() as conn:
@@ -362,6 +383,9 @@ class ComplianceGuard:
                 raise QuotaExceeded(platform, action, account, "daily", daily, limits.daily)
 
     def _check_platform_totals(self, platform: str, account: str):
+        if platform == "facebook" and _facebook_compliance_relaxed():
+            log.debug("ComplianceGuard: Facebook platform totals skipped")
+            return
         plimits = self._limits.get(platform)
         if not plimits:
             return
