@@ -510,3 +510,79 @@ class TestReviewsCli:
             capture_output=True, text=True, timeout=30,
         )
         assert r.returncode == 2
+
+
+# ─── github_api_get 429 / 5xx retry ──────────────────────────────────────────
+
+class TestGithubApiRetry:
+    """`github_api_get` 429/5xx 指数退避 — cron autonomous loop 稳定性。"""
+
+    def _mock_response(self, body: dict):
+        import json as _j
+        m = MagicMock()
+        m.__enter__ = lambda self_: m
+        m.__exit__ = lambda *a: None
+        m.read.return_value = _j.dumps(body).encode("utf-8")
+        return m
+
+    def _http_error(self, code: int, body: str = "", headers=None):
+        import urllib.error as _ue
+        e = _ue.HTTPError(
+            "https://api.github.com/test", code,
+            f"HTTP {code}", headers or {}, None)
+        e.read = lambda: body.encode("utf-8")
+        return e
+
+    def test_success_no_retry(self):
+        from scripts.check_a_activity import github_api_get
+        with patch("scripts.check_a_activity.urllib.request.urlopen") as m:
+            m.return_value = self._mock_response({"ok": True})
+            assert github_api_get("/t", "tok") == {"ok": True}
+            assert m.call_count == 1
+
+    def test_429_then_success_retries(self):
+        from scripts.check_a_activity import github_api_get
+        waits = []
+        with patch("scripts.check_a_activity.urllib.request.urlopen") as m, \
+             patch("time.sleep", side_effect=waits.append):
+            m.side_effect = [
+                self._http_error(429, "limit", {"Retry-After": "0"}),
+                self._mock_response({"ok": True}),
+            ]
+            assert github_api_get("/t", "tok",
+                                   max_retries=3,
+                                   backoff_base=0.01) == {"ok": True}
+        assert m.call_count == 2
+        assert waits == [0.0]
+
+    def test_5xx_retries_then_success(self):
+        from scripts.check_a_activity import github_api_get
+        with patch("scripts.check_a_activity.urllib.request.urlopen") as m, \
+             patch("time.sleep"):
+            m.side_effect = [
+                self._http_error(503, "bad gateway"),
+                self._mock_response({"ok": True}),
+            ]
+            assert github_api_get("/t", "tok",
+                                   max_retries=3,
+                                   backoff_base=0.01) == {"ok": True}
+
+    def test_429_all_fails_raises(self):
+        from scripts.check_a_activity import github_api_get
+        with patch("scripts.check_a_activity.urllib.request.urlopen") as m, \
+             patch("time.sleep"):
+            m.side_effect = [self._http_error(429, "limit") for _ in range(4)]
+            with pytest.raises(RuntimeError, match="429"):
+                github_api_get("/t", "tok",
+                                max_retries=3, backoff_base=0.01)
+
+    def test_4xx_not_retriable(self):
+        """404 非 retriable: 直接 raise, 不 sleep, 不重试。"""
+        from scripts.check_a_activity import github_api_get
+        with patch("scripts.check_a_activity.urllib.request.urlopen") as m, \
+             patch("time.sleep") as sleep_m:
+            m.side_effect = self._http_error(404, "not found")
+            with pytest.raises(RuntimeError, match="404"):
+                github_api_get("/t", "tok",
+                                max_retries=3, backoff_base=0.01)
+            sleep_m.assert_not_called()
