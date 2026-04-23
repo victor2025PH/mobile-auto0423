@@ -4572,6 +4572,34 @@ class FacebookAutomation(BaseAutomation):
         except Exception as e:
             log.debug("[ai_reply] chat_memory 构建失败(降级): %s", e)
 
+        # P4: 意图分类 (rule-first + LLM fallback) — 为生成 LLM 提供意图 hint,
+        # 并影响引流决策 (buying/referral_ask 强制触发 wa_referral)
+        intent_tag = "smalltalk"
+        intent_confidence = 0.3
+        try:
+            from src.ai.chat_intent import (
+                classify_intent,
+                format_intent_for_llm_hint,
+                should_trigger_referral,
+            )
+            intent_result = classify_intent(
+                incoming_text,
+                history=memory_ctx.get("history") or [],
+                lang_hint=target_lang,
+            )
+            intent_tag = intent_result.intent
+            intent_confidence = intent_result.confidence
+            ih = format_intent_for_llm_hint(intent_result)
+            if ih:
+                ab_style_hint = (ab_style_hint + "\n\n" + ih) if ab_style_hint else ih
+            log.debug(
+                "[ai_reply] peer=%s intent=%s conf=%.2f src=%s",
+                peer_name, intent_tag, intent_confidence, intent_result.source,
+            )
+        except Exception as e:
+            log.debug("[ai_reply] chat_intent 失败(降级 smalltalk): %s", e)
+            # 让后续流程继续用默认 smalltalk 行为
+
         # 空 incoming：破冰时叠一条 greeting 参考（约束 LLM 不要写英文 hello）
         try:
             if not (incoming_text or "").strip():
@@ -4619,6 +4647,19 @@ class FacebookAutomation(BaseAutomation):
                 ref_score = float(getattr(result, "referral_score", 0.0) or 0.0)
                 has_contact = bool(_rc_raw) or bool(_rch_map)
                 decision = "wa_referral" if (has_contact and ref_score > 0.5) else "reply"
+                # P4: intent=buying/referral_ask + has_contact → 强制触发引流
+                # (即使 LLM 的 ref_score 不够 0.5,意图层给出硬信号)
+                try:
+                    from src.ai.chat_intent import should_trigger_referral as _strg
+                    if (has_contact and decision != "wa_referral"
+                            and _strg(intent_tag)):
+                        log.info(
+                            "[ai_reply] peer=%s intent=%s 意图层强制触发 wa_referral",
+                            peer_name, intent_tag,
+                        )
+                        decision = "wa_referral"
+                except Exception:
+                    pass
                 # P3: 上次引流对方未回 → 本轮强制降级 reply,避免 spam 式重复引流
                 if decision == "wa_referral" and memory_ctx.get("should_block_referral"):
                     log.info(
