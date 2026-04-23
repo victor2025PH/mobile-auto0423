@@ -296,6 +296,55 @@ class TestRender:
         assert "dry_conflict" in txt
 
 
+# ─── cleanup_old_backups ────────────────────────────────────────────────────
+
+class TestCleanupOldBackups:
+    def test_no_matching_branches_returns_empty(self):
+        from scripts.rebase_assistant import cleanup_old_backups
+        fake = MagicMock()
+        fake.stdout = "main\nfeat-b-chat-p3\nother-branch\n"
+        with patch("scripts.rebase_assistant.git", return_value=fake):
+            r = cleanup_old_backups(prefix="rebase-backup", keep_days=7)
+        assert r == []
+
+    def test_recent_backup_kept(self):
+        """刚创建的备份 (时间戳在 keep_days 内) 不删。"""
+        import datetime as dt
+        from scripts.rebase_assistant import cleanup_old_backups
+        now = dt.datetime.now(dt.timezone.utc)
+        recent_ts = now.strftime("%Y%m%d%H%M%S")
+        fake = MagicMock()
+        fake.stdout = f"rebase-backup-feat-b-x-{recent_ts}\n"
+        with patch("scripts.rebase_assistant.git", return_value=fake):
+            r = cleanup_old_backups(prefix="rebase-backup", keep_days=7)
+        assert r == []
+
+    def test_old_backup_deleted(self):
+        """14 天前的备份应删。"""
+        import datetime as dt
+        from scripts.rebase_assistant import cleanup_old_backups
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=14)
+        old_ts = old.strftime("%Y%m%d%H%M%S")
+        fake = MagicMock()
+        fake.stdout = f"rebase-backup-feat-b-x-{old_ts}\n"
+        with patch("scripts.rebase_assistant.git", return_value=fake) as mg:
+            r = cleanup_old_backups(prefix="rebase-backup", keep_days=7)
+        assert len(r) == 1
+        assert r[0] == f"rebase-backup-feat-b-x-{old_ts}"
+        # 第二次调用应该是 branch -D
+        calls = [c.args for c in mg.call_args_list]
+        assert any("branch" in c and "-D" in c for c in calls)
+
+    def test_malformed_timestamp_ignored(self):
+        """名字像 backup 但时间戳不合法的 (手工创建) 不删。"""
+        from scripts.rebase_assistant import cleanup_old_backups
+        fake = MagicMock()
+        fake.stdout = "rebase-backup-feat-b-x-abcdefghijklmn\n"
+        with patch("scripts.rebase_assistant.git", return_value=fake):
+            r = cleanup_old_backups(prefix="rebase-backup", keep_days=7)
+        assert r == []
+
+
 # ─── 实仓拓扑排序验证 (不跑 git 命令, 只拉 PR 结构) ─────────────────────────
 
 class TestIntegrationOrderOnRealRepo:

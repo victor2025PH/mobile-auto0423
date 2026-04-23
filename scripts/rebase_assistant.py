@@ -219,7 +219,7 @@ def do_rebase(branch: str, onto: str,
     真冲突 (多半是栈式 rebase 的 upstream 算错), 自动用 `--fork-point` 重试一次。
     这复现了手解 #13/#14/#15 时用的 recovery 手法。
     """
-    ts = _dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S")
     backup = f"{backup_prefix}-{branch}-{ts}"
     try:
         # 拉远端到本地
@@ -274,6 +274,42 @@ def do_rebase(branch: str, onto: str,
         except Exception:
             pass
         return False, str(e)[:200]
+
+
+def cleanup_old_backups(prefix: str = "rebase-backup",
+                         keep_days: int = 7) -> List[str]:
+    """删 `<prefix>-*-YYYYMMDDHHMMSS` 形式的老备份分支 (> keep_days 天)。
+
+    Return 删掉的分支名列表。保留最近 keep_days 天的便于回滚。
+    """
+    try:
+        r = git("for-each-ref", "--format=%(refname:short)",
+                 "refs/heads/", check=False)
+    except Exception:
+        return []
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=keep_days)
+    removed: List[str] = []
+    for name in r.stdout.splitlines():
+        name = name.strip()
+        if not name.startswith(f"{prefix}-"):
+            continue
+        # 尾部 14 位数字 = 时间戳
+        ts = name[-14:]
+        if len(ts) != 14 or not ts.isdigit():
+            continue
+        try:
+            t = _dt.datetime.strptime(ts, "%Y%m%d%H%M%S").replace(
+                tzinfo=_dt.timezone.utc)
+        except ValueError:
+            continue
+        if t >= cutoff:
+            continue
+        try:
+            git("branch", "-D", name, check=False)
+            removed.append(name)
+        except Exception:
+            pass
+    return removed
 
 
 def run_tests_quick() -> Tuple[bool, str]:
@@ -540,6 +576,10 @@ def main() -> int:
                         help="--apply 时 force-with-lease 推远端")
     parser.add_argument("--no-fetch", action="store_true",
                         help="跳过 git fetch (调试用)")
+    parser.add_argument("--cleanup-backups", action="store_true",
+                        help="删 >7 天的 rebase-backup-* 本地分支后直接退出")
+    parser.add_argument("--cleanup-keep-days", type=int, default=7,
+                        help="--cleanup-backups 保留天数 (默认 7)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-color", action="store_true")
     args = parser.parse_args()
@@ -552,6 +592,16 @@ def main() -> int:
         parser.error("--push 需要 --apply")
     if args.test and not args.apply:
         parser.error("--test 需要 --apply")
+
+    if args.cleanup_backups:
+        removed = cleanup_old_backups(keep_days=args.cleanup_keep_days)
+        if removed:
+            print(f"{GREEN}清理 {len(removed)} 个老备份分支:{RESET}")
+            for n in removed:
+                print(f"  - {n}")
+        else:
+            print(f"{YELLOW}(没有老于 {args.cleanup_keep_days} 天的备份分支){RESET}")
+        return 0
 
     if not args.no_fetch:
         git_fetch_all()
