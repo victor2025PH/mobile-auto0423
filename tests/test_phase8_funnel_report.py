@@ -1,0 +1,169 @@
+# -*- coding: utf-8 -*-
+"""Phase 8 funnel_report 单测 (2026-04-24).
+
+构造 fake journey 数据 → 调 compute_funnel → 断言聚合结果正确.
+"""
+from __future__ import annotations
+
+import pytest
+
+
+class TestFunnelAggregation:
+    def test_empty_db_returns_zeros(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import compute_funnel
+        stats = compute_funnel(days=7)
+        assert stats.total_friend_requested == 0
+        assert stats.total_greeting_sent == 0
+        assert stats.rate_greet_after_friend == 0.0
+        assert stats.top_blocked_reason == ""
+
+    def test_basic_funnel(self, tmp_db):
+        """3 个 lead: 全都 extract, 2 个 friend_requested, 1 个 greeting_sent(inline).
+        预期: extracted=3 / friend_req=2 / greeting_sent=1 / rate=50%."""
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+
+        # 3 人 (resolve_identity 自动 append extracted 事件)
+        cid_a = resolve_identity(platform="facebook",
+                                   account_id="fb:Alice", display_name="Alice")
+        cid_b = resolve_identity(platform="facebook",
+                                   account_id="fb:Bob", display_name="Bob")
+        cid_c = resolve_identity(platform="facebook",
+                                   account_id="fb:Carol", display_name="Carol")
+
+        # A 和 B 加了好友
+        append_journey(cid_a, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp_female_midlife"})
+        append_journey(cid_b, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp_female_midlife"})
+        # 只 A 打了招呼 (inline)
+        append_journey(cid_a, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message",
+                               "template_id": "yaml:jp:0"})
+
+        stats = compute_funnel(days=7)
+        assert stats.total_extracted == 3
+        assert stats.total_friend_requested == 2
+        assert stats.total_greeting_sent == 1
+        assert stats.greeting_via_inline == 1
+        assert stats.greeting_via_fallback == 0
+        # 转化率 = 1/2
+        assert abs(stats.rate_greet_after_friend - 0.5) < 1e-6
+        # 100% inline
+        assert abs(stats.rate_inline_vs_fallback - 1.0) < 1e-6
+
+    def test_via_distribution(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:V", display_name="V")
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message"})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "messenger_fallback"})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": ""})  # unknown
+
+        stats = compute_funnel(days=7)
+        assert stats.greeting_via_inline == 1
+        assert stats.greeting_via_fallback == 1
+        assert stats.greeting_via_unknown == 1
+        # rate_inline = 1/3
+        assert abs(stats.rate_inline_vs_fallback - 1.0 / 3) < 1e-6
+
+    def test_top_blocked_reason(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:B", display_name="B")
+        # 5 个 no_message_button, 2 个 phase_blocked, 1 个 template_empty
+        for _ in range(5):
+            append_journey(cid, actor="agent_a", action="greeting_blocked",
+                             data={"reason": "no_message_button"})
+        for _ in range(2):
+            append_journey(cid, actor="agent_a", action="greeting_blocked",
+                             data={"reason": "phase_blocked"})
+        append_journey(cid, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "template_empty"})
+
+        stats = compute_funnel(days=7)
+        assert stats.total_greeting_blocked == 8
+        assert stats.blocked_reasons["no_message_button"] == 5
+        assert stats.blocked_reasons["phase_blocked"] == 2
+        assert stats.blocked_reasons["template_empty"] == 1
+        assert stats.top_blocked_reason == "no_message_button"
+
+    def test_per_persona_grouping(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+
+        cid1 = resolve_identity(platform="facebook",
+                                  account_id="fb:P1", display_name="P1")
+        cid2 = resolve_identity(platform="facebook",
+                                  account_id="fb:P2", display_name="P2")
+        cid3 = resolve_identity(platform="facebook",
+                                  account_id="fb:P3", display_name="P3")
+
+        for cid in (cid1, cid2, cid3):
+            append_journey(cid, actor="agent_a", action="friend_requested",
+                             data={"persona_key": "jp_female_midlife"})
+        # 再加 1 个其他 persona
+        cid4 = resolve_identity(platform="facebook",
+                                  account_id="fb:P4", display_name="P4")
+        append_journey(cid4, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "tw_male_young"})
+
+        stats = compute_funnel(days=7)
+        assert stats.per_persona_friend_requested["jp_female_midlife"] == 3
+        assert stats.per_persona_friend_requested["tw_male_young"] == 1
+
+    def test_actor_filter(self, tmp_db):
+        """actor=agent_a 过滤: 不看 B 机事件."""
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:F", display_name="F")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp"})
+        append_journey(cid, actor="agent_b", action="friend_requested",
+                         data={"persona_key": "jp"})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message"})
+
+        stats_all = compute_funnel(days=7)
+        assert stats_all.total_friend_requested == 2
+
+        stats_a = compute_funnel(days=7, actor="agent_a")
+        assert stats_a.total_friend_requested == 1
+        assert stats_a.total_greeting_sent == 1
+
+
+class TestTextReport:
+    def test_format_text_empty(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import (compute_funnel,
+                                                        format_text_report)
+        stats = compute_funnel(days=7)
+        txt = format_text_report(stats)
+        assert "A 端漏斗报告" in txt
+        assert "近 7 天" in txt
+        assert "rate_greet_after_friend: 0.0%" in txt
+
+    def test_format_text_with_data(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import (compute_funnel,
+                                                        format_text_report)
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:T", display_name="T")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp_female_midlife"})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message"})
+
+        txt = format_text_report(compute_funnel(days=7))
+        assert "friend_requested: 1" in txt
+        assert "greeting_sent: 1" in txt
+        assert "jp_female_midlife: 1" in txt
+        assert "100.0%" in txt   # rate_greet_after_friend
