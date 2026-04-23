@@ -1866,17 +1866,26 @@ class FacebookAutomation(BaseAutomation):
                                     data: Optional[Dict[str, Any]] = None,
                                     discovered_via: str = "") -> None:
         """一步完成 resolve + append, 供 add_friend_with_note 等不走
-        _current_lead_cid 上下文的路径一次性写入。"""
+        _current_lead_cid 上下文的路径一次性写入。
+
+        2026-04-24: persona_key 若非空, 自动合并到 data 里 (若 data 已有同名字段
+        则不覆盖). 这让 funnel_report 按 persona 分组统计时能拿到 persona_key,
+        不必每个 caller 显式写 data={persona_key: ...}.
+        """
         cid = self._resolve_peer_canonical_safe(
             peer_name, did=did, persona_key=persona_key,
             platform=platform, discovered_via=discovered_via)
         if not cid:
             return
+        # 合并 persona_key 到 data (不覆盖 caller 已传的同名 key)
+        merged_data = dict(data or {})
+        if persona_key and "persona_key" not in merged_data:
+            merged_data["persona_key"] = persona_key
         try:
             from src.host.lead_mesh import append_journey
             append_journey(cid, actor="agent_a", actor_device=did or "",
                            platform=platform, action=action,
-                           data=data or {})
+                           data=merged_data)
         except Exception as e:
             log.debug("[journey] append %s 失败: %s", action, e)
 

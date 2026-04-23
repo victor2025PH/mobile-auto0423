@@ -479,13 +479,14 @@
       { maxWidth: '980px' });
     const body = document.getElementById('lm-cc-body');
     try {
-      const [pending, ack, completed, rejected, dead, receivers] = await Promise.all([
+      const [pending, ack, completed, rejected, dead, receivers, funnel] = await Promise.all([
         Shell.api.get('/lead-mesh/handoffs?state=pending&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=acknowledged&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=completed&limit=500'),
         Shell.api.get('/lead-mesh/handoffs?state=rejected&limit=500'),
         Shell.api.get('/lead-mesh/webhooks/dead-letters?limit=100'),
         Shell.api.get('/lead-mesh/receivers?with_load=true&enabled_only=true'),
+        Shell.api.get('/lead-mesh/funnel?days=7&actor=agent_a'),
       ]);
       const pn = (pending.handoffs || []).length;
       const an = (ack.handoffs || []).length;
@@ -598,6 +599,76 @@
           + '<button onclick="lmViewDeadLetters()" '
           + 'style="padding:5px 12px;background:rgba(239,68,68,.12);color:#ef4444;border:1px solid rgba(239,68,68,.3);border-radius:6px;font-size:11px;cursor:pointer">查看 / 重试</button>';
 
+      // Phase 8b: A 端获客漏斗 (从 /lead-mesh/funnel 拿到)
+      const fu = funnel || {};
+      const fuTotal = fu.total_extracted || 0;
+      const fuFr = fu.total_friend_requested || 0;
+      const fuGs = fu.total_greeting_sent || 0;
+      const fuGb = fu.total_greeting_blocked || 0;
+      const fuRate = Math.round(((fu.rate_greet_after_friend || 0) * 100));
+      const fuInline = fu.greeting_via_inline || 0;
+      const fuFallback = fu.greeting_via_fallback || 0;
+      const fuUnknown = fu.greeting_via_unknown || 0;
+      const fuRateColor = fuRate >= 50 ? '#22c55e' : fuRate >= 25 ? '#f59e0b' : '#ef4444';
+      const topBlocked = (fu.top_blocked_reason || '').trim();
+      // persona 分布 top 3
+      const perPersona = fu.per_persona_friend_requested || {};
+      const personaEntries = Object.entries(perPersona)
+        .sort(function (a, b) { return b[1] - a[1]; }).slice(0, 3);
+      const personaHtml = personaEntries.length === 0
+        ? '<span style="color:var(--text-dim);font-size:11px">暂无</span>'
+        : personaEntries.map(function (kv) {
+            return '<span style="display:inline-block;padding:2px 8px;background:rgba(96,165,250,.12);'
+              + 'color:#60a5fa;border-radius:10px;font-size:11px;margin-right:6px">'
+              + _safe(kv[0]) + ': ' + kv[1] + '</span>';
+          }).join('');
+
+      const funnelNumber = function (label, n, color) {
+        return '<div style="flex:1;text-align:center">'
+          + '  <div style="font-size:22px;font-weight:700;color:' + color + '">' + n + '</div>'
+          + '  <div style="font-size:11px;color:var(--text-dim);margin-top:2px">' + label + '</div>'
+          + '</div>';
+      };
+
+      const aFunnelCard = ''
+        + '<div style="grid-column:1/-1;padding:14px;background:rgba(96,165,250,.06);'
+        + '            border:1px solid rgba(96,165,250,.25);border-radius:8px">'
+        + '  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">'
+        + '    <div style="font-size:13px;color:var(--text-muted)">🎯 A 端获客漏斗 (近 7 天)</div>'
+        + '    <div style="font-size:11px">'
+        + '      转化率: <b style="color:' + fuRateColor + ';font-size:14px">' + fuRate + '%</b>'
+        + '      <span style="color:var(--text-dim)"> (greeting/friend_req)</span>'
+        + '    </div>'
+        + '  </div>'
+        + '  <div style="display:flex;gap:4px;align-items:center">'
+        +      funnelNumber('extracted', fuTotal, '#94a3b8')
+        + '    <span style="color:var(--text-dim);font-size:20px">→</span>'
+        +      funnelNumber('friend_req', fuFr, '#60a5fa')
+        + '    <span style="color:var(--text-dim);font-size:20px">→</span>'
+        +      funnelNumber('greeting', fuGs, '#22c55e')
+        + '    <span style="color:var(--text-dim);font-size:20px">·</span>'
+        +      funnelNumber('blocked', fuGb, fuGb > 0 ? '#f59e0b' : '#94a3b8')
+        + '  </div>'
+        + '  <div style="display:flex;justify-content:space-between;margin-top:12px;'
+        + '              padding-top:10px;border-top:1px dashed rgba(255,255,255,.08);font-size:11px">'
+        + '    <div>'
+        + '      <span style="color:var(--text-dim)">via</span>:'
+        + '      <span style="color:#22c55e;margin-left:4px">inline=' + fuInline + '</span>'
+        + '      <span style="color:#60a5fa;margin-left:8px">fallback=' + fuFallback + '</span>'
+        + (fuUnknown > 0
+            ? '      <span style="color:var(--text-dim);margin-left:8px">unknown=' + fuUnknown + '</span>'
+            : '')
+        + '    </div>'
+        + (topBlocked
+            ? '    <div><span style="color:var(--text-dim)">瓶颈:</span>'
+              + '      <code style="color:#f59e0b;margin-left:4px">' + _safe(topBlocked) + '</code></div>'
+            : '    <div style="color:#22c55e">✓ 无主要瓶颈</div>')
+        + '  </div>'
+        + '  <div style="margin-top:10px;font-size:11px">'
+        + '    <span style="color:var(--text-dim)">top persona:</span> ' + personaHtml
+        + '  </div>'
+        + '</div>';
+
       body.innerHTML = ''
         + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
         + '  <div>'
@@ -608,6 +679,7 @@
         + '  <button onclick="PlatShell.modal.close(\'lm-cc-modal\')" style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
         + '</div>'
         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
+        +      aFunnelCard
         + '  <div>'
         + '    <div style="font-size:13px;color:var(--text-muted);margin-bottom:8px">🔻 交接漏斗</div>'
         +      funnelBar('待处理', pn, _STATE_COLOR.pending)
@@ -654,6 +726,22 @@
         showToast('⚠ 接收方负载告警: ' + atRiskReceivers.join(', ')
                    + ' 已 ≥90%, 请考虑启用备用或提升 daily_cap',
                    'error');
+      }
+
+      // Phase 8b: 获客漏斗瓶颈 toast — 有足够样本 (friend_req ≥ 5) 且
+      // 转化率 <25% 或 top_blocked_reason 明显时主动提醒
+      if (fuFr >= 5 && typeof showToast === 'function') {
+        if (fuRate < 25) {
+          showToast('⚠ A 端 greeting 转化率仅 ' + fuRate + '% '
+                     + '(' + fuGs + '/' + fuFr + '). '
+                     + (topBlocked ? '主要瓶颈: ' + topBlocked : '')
+                     + ' 建议检查 profile UI 或 Messenger fallback 配置',
+                     'warning');
+        } else if (topBlocked === 'messenger_not_installed') {
+          showToast('⚠ 瓶颈: messenger_not_installed — '
+                     + '多台设备未装 Messenger, fallback 链路无法启用',
+                     'warning');
+        }
       }
     } catch (e) {
       body.innerHTML = '<div style="color:#ef4444;padding:20px">加载失败: ' + _safe(e.message || e) + '</div>';
