@@ -296,6 +296,97 @@ def list_inbox_messages(device_id: Optional[str] = None,
     return [dict(r) for r in rows]
 
 
+def mark_incoming_replied(device_id: str, peer_name: str, *,
+                          replied_at: Optional[str] = None,
+                          peer_type: Optional[str] = None) -> int:
+    """给该 peer 最近一条尚未标记的 incoming 行写 replied_at。
+
+    触发时机: ``_ai_reply_and_send`` 成功发出回复后同步调用。
+    幂等: 若该 peer 最近的 incoming 行已有 ``replied_at``, 不更新。
+
+    Args:
+        device_id: 设备 ID
+        peer_name: 对方姓名 (与 incoming 行的 peer_name 完全相等)
+        replied_at: 可选,覆盖默认 now; 便于测试注入固定时间
+        peer_type: 可选过滤 (friend/stranger/...);默认不过滤
+
+    Returns:
+        实际更新的行数 (0 或 1)。
+    """
+    if not device_id or not peer_name:
+        return 0
+    ts = replied_at or _now_iso()
+    sql = (
+        "UPDATE facebook_inbox_messages SET replied_at=? "
+        "WHERE id = ("
+        " SELECT id FROM facebook_inbox_messages"
+        " WHERE device_id=? AND peer_name=? AND direction='incoming'"
+        " AND (replied_at IS NULL OR replied_at='')"
+    )
+    params: list = [ts, device_id, peer_name]
+    if peer_type:
+        sql += " AND peer_type=?"
+        params.append(peer_type)
+    sql += " ORDER BY id DESC LIMIT 1)"
+    try:
+        with _connect() as conn:
+            cur = conn.execute(sql, params)
+            return cur.rowcount or 0
+    except Exception as e:
+        logger.debug("mark_incoming_replied 失败: %s", e)
+        return 0
+
+
+def mark_greeting_replied_back(device_id: str, peer_name: str, *,
+                               window_days: int = 7,
+                               replied_at: Optional[str] = None) -> int:
+    """跨 bot 归因:对方回复了 A 写入的 greeting 行 → 回写 ``replied_at``。
+
+    对应 INTEGRATION_CONTRACT §三 "B 允许回写 A 写入的 greeting 行的 replied_at"。
+    扫描条件:
+      * ``direction='outgoing'`` + ``ai_decision='greeting'``
+      * ``peer_type='friend_request'`` (A 的 greeting 路径写入的 peer_type)
+      * ``COALESCE(sent_at, seen_at) >= utcnow() - window_days``
+      * ``replied_at IS NULL`` (幂等,已标记过则跳过)
+
+    命中最新一条 greeting 行写入 ``replied_at``,让 A 端的
+    ``reply_rate_by_template`` / A/B 模板效果统计能跑。
+
+    Args:
+        device_id: 设备 ID
+        peer_name: 对方姓名 (与 greeting 行的 peer_name 完全相等)
+        window_days: 回溯窗口,默认 7 天;超出窗口的 greeting 视为"机缘已过"
+        replied_at: 可选,覆盖默认 now
+
+    Returns:
+        实际更新的行数 (0 或 1)。
+    """
+    if not device_id or not peer_name or window_days <= 0:
+        return 0
+    import datetime as _dt
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=window_days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    ts = replied_at or _now_iso()
+    sql = (
+        "UPDATE facebook_inbox_messages SET replied_at=? "
+        "WHERE id = ("
+        " SELECT id FROM facebook_inbox_messages"
+        " WHERE device_id=? AND peer_name=?"
+        " AND direction='outgoing' AND ai_decision='greeting'"
+        " AND peer_type='friend_request'"
+        " AND COALESCE(sent_at, seen_at) >= ?"
+        " AND (replied_at IS NULL OR replied_at='')"
+        " ORDER BY id DESC LIMIT 1)"
+    )
+    try:
+        with _connect() as conn:
+            cur = conn.execute(sql, (ts, device_id, peer_name, cutoff))
+            return cur.rowcount or 0
+    except Exception as e:
+        logger.debug("mark_greeting_replied_back 失败: %s", e)
+        return 0
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 漏斗聚合 — /facebook/funnel 数据源
 # ─────────────────────────────────────────────────────────────────────
