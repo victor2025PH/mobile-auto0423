@@ -346,6 +346,26 @@ def merge_pr(pr_number: int, method: str,
     return r.get("sha", "")
 
 
+def wait_for_mergeable_settled(plan: MergePlan, token: Optional[str],
+                                 merged_branches: Set[str],
+                                 max_attempts: int = 4,
+                                 wait_seconds: float = 3.0,
+                                 sleep_fn=None) -> None:
+    """Github 对 main 推进后 mergeable 要算几秒。连串合并时第一个合完第二个
+    mergeable=unknown, 直接 PUT /merge 会 405。这里轮询直到 mergeable 落定
+    到明确状态 (clean/stable/dirty/blocked/...) 或 max_attempts 用完。
+    """
+    import time
+    sleep = sleep_fn or time.sleep
+    for i in range(max_attempts):
+        check_readiness(plan, token, merged_branches)
+        if plan.mergeable_state != "unknown":
+            return
+        if i < max_attempts - 1:
+            sleep(wait_seconds)
+    # mergeable_state 还 unknown 就 out, 由 apply_merges 按正常分支处理
+
+
 def apply_merges(plans: List[MergePlan], token: Optional[str],
                   merge_method: str, continue_on_error: bool
                   ) -> List[MergePlan]:
@@ -356,8 +376,9 @@ def apply_merges(plans: List[MergePlan], token: Optional[str],
             p.status = "skipped"
             p.error = "halted by prior failure"
             continue
-        # 先 refresh readiness (上一个 merge 可能改了本 PR 的 base 或 mergeable)
-        check_readiness(p, token, merged_branches)
+        # 先 refresh readiness (上一个 merge 可能改了本 PR 的 base 或 mergeable);
+        # wait_for_mergeable_settled 含 check_readiness + 重试 unknown 状态。
+        wait_for_mergeable_settled(p, token, merged_branches)
         if p.status == "blocked":
             if not continue_on_error:
                 halted = True
@@ -376,8 +397,8 @@ def apply_merges(plans: List[MergePlan], token: Optional[str],
                 if not continue_on_error:
                     halted = True
                 continue
-            # re-check readiness: retarget 后 GitHub 重算 mergeable
-            check_readiness(p, token, merged_branches)
+            # re-check readiness: retarget 后 GitHub 重算 mergeable (也可能 unknown)
+            wait_for_mergeable_settled(p, token, merged_branches)
             if p.status != "ready":
                 if not continue_on_error:
                     halted = True

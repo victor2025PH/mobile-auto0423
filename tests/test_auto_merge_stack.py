@@ -348,6 +348,77 @@ class TestRender:
         assert "blocked" in txt
 
 
+# ─── wait_for_mergeable_settled (GitHub recompute 窗口重试) ─────────────────
+
+class TestWaitForMergeableSettled:
+    def _api_factory(self, states_sequence):
+        """每次调 GET /pulls/:n 返序列里下一个 mergeable_state。"""
+        idx = [0]
+        def fake_api(path, token, method="GET", body=None):
+            if path.endswith("/reviews"):
+                return [{
+                    "state": "APPROVED",
+                    "submitted_at": "2026-04-24T12:00:00Z",
+                    "user": {"login": "a"},
+                }]
+            if "/pulls/" in path:
+                state = states_sequence[
+                    min(idx[0], len(states_sequence) - 1)]
+                idx[0] += 1
+                return {"number": 10, "title": "t", "state": "open",
+                        "mergeable": True, "mergeable_state": state,
+                        "head": {"ref": "x"}, "base": {"ref": "main"}}
+            return []
+        return fake_api
+
+    def test_unknown_then_clean_settles(self):
+        from scripts.auto_merge_stack import (
+            MergePlan, wait_for_mergeable_settled,
+        )
+        plan = MergePlan(pr_number=10, branch="x", base="main")
+        sleep_calls = []
+        with patch("scripts.auto_merge_stack.github_api",
+                   side_effect=self._api_factory(["unknown", "clean"])):
+            wait_for_mergeable_settled(
+                plan, "t", merged_branches=set(),
+                max_attempts=4, wait_seconds=0.01,
+                sleep_fn=lambda s: sleep_calls.append(s))
+        assert plan.mergeable_state == "clean"
+        assert plan.status == "ready"
+        assert len(sleep_calls) == 1
+
+    def test_clean_first_call_no_sleep(self):
+        from scripts.auto_merge_stack import (
+            MergePlan, wait_for_mergeable_settled,
+        )
+        plan = MergePlan(pr_number=10, branch="x", base="main")
+        sleep_calls = []
+        with patch("scripts.auto_merge_stack.github_api",
+                   side_effect=self._api_factory(["clean"])):
+            wait_for_mergeable_settled(
+                plan, "t", merged_branches=set(),
+                max_attempts=4, wait_seconds=0.01,
+                sleep_fn=lambda s: sleep_calls.append(s))
+        assert plan.mergeable_state == "clean"
+        assert sleep_calls == []
+
+    def test_all_unknown_exits_after_max(self):
+        from scripts.auto_merge_stack import (
+            MergePlan, wait_for_mergeable_settled,
+        )
+        plan = MergePlan(pr_number=10, branch="x", base="main")
+        sleep_calls = []
+        with patch("scripts.auto_merge_stack.github_api",
+                   side_effect=self._api_factory(
+                       ["unknown", "unknown", "unknown", "unknown"])):
+            wait_for_mergeable_settled(
+                plan, "t", merged_branches=set(),
+                max_attempts=4, wait_seconds=0.01,
+                sleep_fn=lambda s: sleep_calls.append(s))
+        assert plan.mergeable_state == "unknown"
+        assert len(sleep_calls) == 3
+
+
 # ─── apply_merges (核心合并逻辑, 全部 mock API) ──────────────────────────────
 
 class TestApplyMerges:
