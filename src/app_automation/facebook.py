@@ -103,6 +103,75 @@ class FbWarmupError(Exception):
         self.hint = hint or ""
 
 
+def _levenshtein_le1(a: str, b: str) -> bool:
+    """F5 辅助: Levenshtein 距离 ≤1 的快速判断 (无外部依赖)。
+
+    O(n) 早退: 长度差 >1 直接 False;否则扫第一个不同位置,之后三种情况
+    (substitution/insertion/deletion) 分别只需一次尾部切片对比。
+    """
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if a == b:
+        return True
+    i = 0
+    m = min(la, lb)
+    while i < m and a[i] == b[i]:
+        i += 1
+    if i == m:
+        # 一个是另一个的 prefix, 且长度差恰为 1
+        return abs(la - lb) == 1
+    if la == lb:
+        return a[i + 1:] == b[i + 1:]  # substitution
+    if la > lb:
+        return a[i + 1:] == b[i:]      # a 比 b 多一个字符 (deletion from a 视角)
+    return a[i:] == b[i + 1:]          # b 比 a 多一个字符
+
+
+def _fuzzy_match_lead_by_name(store, name: str) -> Optional[int]:
+    """F5 (A→B review Q5): 对 leads.normalized_name 做 Levenshtein ≤1 fuzzy
+    匹配兜底,处理全角/NBSP 等 normalize_name 未覆盖的边界 case。
+
+    策略:
+      1. 名字 normalize (复用 leads.store.normalize_name)
+      2. LIKE prefix (前 2 字符) 预过滤候选,限制 200 行防止大表全扫
+      3. 对每个候选做 Levenshtein ≤1 判断
+      4. 命中第一个即返回 (假设候选质量够; 多命中场景留给后续告警)
+
+    返回 lead_id 或 None。异常一律静默降级。
+    """
+    try:
+        from src.leads.store import normalize_name
+    except Exception:
+        return None
+    n_name = normalize_name(name) or ""
+    if len(n_name) < 4:
+        # 太短, fuzzy 容易误匹 (比如 "mo" 能匹到一堆 "mo*")
+        return None
+    try:
+        conn = store._conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, normalized_name FROM leads"
+                " WHERE normalized_name LIKE ? AND normalized_name != ''"
+                " ORDER BY id DESC LIMIT 200",
+                (n_name[:2] + "%",),
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        log.debug("[_fuzzy_match_lead_by_name] DB 查询失败: %s", e)
+        return None
+    for row in rows:
+        cand = row[1] or ""
+        if cand == n_name:
+            # 硬匹配本应在 find_match 命中; 这里兜底处理
+            return int(row[0])
+        if _levenshtein_le1(n_name, cand):
+            return int(row[0])
+    return None
+
+
 def _now_iso() -> str:
     """与 fb_store 同格式的 UTC ISO 串（用于 stats 时间戳）。"""
     import datetime as _dt
@@ -3889,14 +3958,20 @@ class FacebookAutomation(BaseAutomation):
                                     safe_accept: bool = True,
                                     max_requests: int = 20,
                                     min_mutual_friends: int = 1,
+                                    min_lead_score: int = 0,
+                                    score_policy: str = "and",
                                     device_id: Optional[str] = None,
                                     persona_key: Optional[str] = None,
                                     phase: Optional[str] = None) -> Dict[str, Any]:
-        """好友请求收件箱 — Sprint 2 完整实现 + 2026-04-22 persona 改造。
+        """好友请求收件箱 — Sprint 2 完整实现 + 2026-04-22 persona 改造 + P1 lead_score gate。
 
         安全策略(safe_accept=True 默认):
-          - 只接受有共同好友 >= min_mutual_friends 的请求(避免 honeypot)
-          - 一次会话最多接受 max_requests/2,剩余留给"礼貌"
+          - mutual_friends >= min_mutual_friends (避免 honeypot)
+          - P1 可选:lead_score >= min_lead_score (对接 A 机 fb_lead_scorer_v2 打分)
+              * min_lead_score=0 禁用评分门,等价旧行为
+              * score_policy='and' 同时满足 mutual & score (默认,最严格)
+              * score_policy='or'  任一满足即通过 (对高质量素人放行)
+          - 一次会话最多接受 max_requests/2 (accept_all 解除上限)
           - 每接受 1 个停顿 6-12s
 
         2026-04-22:``max_requests`` 未显式覆盖时按 phase 从
@@ -3912,13 +3987,28 @@ class FacebookAutomation(BaseAutomation):
         if ab_cfg and max_requests == 20 and "max_requests" in ab_cfg:
             max_requests = int(ab_cfg.get("max_requests") or max_requests)
 
-        stats = {"opened": False, "requests_seen": 0,
-                 "accepted": 0, "skipped": 0, "errors": 0,
-                 "persona_key": persona_key or "",
-                 "phase": eff_phase,
-                 "max_requests": max_requests,
-                 "accept_all": accept_all,
-                 "safe_accept": safe_accept}
+        score_enabled = int(min_lead_score) > 0
+        policy = (score_policy or "and").lower().strip()
+        if policy not in ("and", "or"):
+            policy = "and"
+
+        stats: Dict[str, Any] = {
+            "opened": False, "requests_seen": 0,
+            "accepted": 0, "skipped": 0, "errors": 0,
+            "persona_key": persona_key or "",
+            "phase": eff_phase,
+            "max_requests": max_requests,
+            "accept_all": accept_all,
+            "safe_accept": safe_accept,
+            "min_mutual_friends": min_mutual_friends,
+            "min_lead_score": min_lead_score,
+            "score_policy": policy if score_enabled else "",
+            "score_enabled": score_enabled,
+            "lead_score_checked": 0,
+            "lead_score_hits": 0,
+            "accepted_reasons": {"mutual_only": 0, "score_only": 0, "both": 0, "quota": 0},
+            "skipped_reasons": {"mutual_low": 0, "score_low": 0, "both_low": 0},
+        }
 
         try:
             d.app_start(PACKAGE)
@@ -3944,19 +4034,90 @@ class FacebookAutomation(BaseAutomation):
             for meta in requests_meta:
                 if stats["accepted"] >= accept_quota:
                     break
+
+                mutual = int(meta.get("mutual_friends", 0) or 0)
+                mutual_ok = mutual >= int(min_mutual_friends)
+                score_ok = True
+                lead_score = 0
+                lead_id: Optional[int] = None
+
+                if safe_accept and not accept_all and score_enabled:
+                    lead_id, lead_score = self._lookup_lead_score(meta.get("name", ""))
+                    stats["lead_score_checked"] += 1
+                    if lead_id is not None:
+                        stats["lead_score_hits"] += 1
+                    score_ok = lead_score >= int(min_lead_score)
+
+                meta["lead_id"] = lead_id
+                meta["lead_score"] = lead_score
+
                 if safe_accept and not accept_all:
-                    if int(meta.get("mutual_friends", 0)) < min_mutual_friends:
+                    if score_enabled:
+                        passed = (mutual_ok and score_ok) if policy == "and" \
+                            else (mutual_ok or score_ok)
+                    else:
+                        passed = mutual_ok
+
+                    if not passed:
+                        if score_enabled:
+                            if not mutual_ok and not score_ok:
+                                reason_key = "both_low"
+                            elif not mutual_ok:
+                                reason_key = "mutual_low"
+                            else:
+                                reason_key = "score_low"
+                        else:
+                            reason_key = "mutual_low"
                         stats["skipped"] += 1
+                        stats["skipped_reasons"][reason_key] += 1
+                        meta["skip_reason"] = reason_key
                         continue
+
+                    if score_enabled:
+                        if mutual_ok and score_ok:
+                            accept_key = "both"
+                        elif mutual_ok:
+                            accept_key = "mutual_only"
+                        else:
+                            accept_key = "score_only"
+                    else:
+                        accept_key = "mutual_only"
+                else:
+                    accept_key = "quota"
+
                 try:
                     if self._tap_accept_button_for(d, meta):
                         stats["accepted"] += 1
+                        stats["accepted_reasons"][accept_key] += 1
                         self.hb.wait_think(random.uniform(6.0, 12.0))
                         try:
                             from src.host.fb_store import update_friend_request_status
                             update_friend_request_status(did, meta.get("name", ""), "accepted")
                         except Exception:
                             pass
+                        # P7 §7.1 add_friend_accepted: 给 A 的 Lead Mesh
+                        # Dashboard 提供"好友请求通过"事件。meta 带 lead_id
+                        # (若匹配到)/ mutual_friends / lead_score 方便 A 做
+                        # 质量归因。Phase 5 未 merge 静默 skip (feature-detect)。
+                        try:
+                            from src.host.fb_store import record_contact_event
+                            record_contact_event(
+                                did, meta.get("name", "") or "",
+                                "add_friend_accepted",
+                                meta={
+                                    "lead_id": meta.get("lead_id"),
+                                    "mutual_friends": int(
+                                        meta.get("mutual_friends", 0) or 0),
+                                    "lead_score": int(
+                                        meta.get("lead_score", 0) or 0),
+                                    "accept_key": accept_key,
+                                },
+                            )
+                        except ImportError:
+                            pass  # Phase 5 未 merge
+                        except Exception as e:
+                            log.debug(
+                                "[P7 add_friend_accepted] skip: %s", e)
                     else:
                         stats["errors"] += 1
                 except Exception:
@@ -3965,6 +4126,43 @@ class FacebookAutomation(BaseAutomation):
             stats["error"] = str(e)
             log.warning("[check_friend_requests_inbox] 失败: %s", e)
         return stats
+
+    @staticmethod
+    def _lookup_lead_score(name: str) -> Tuple[Optional[int], int]:
+        """只读查 leads.store 拿 lead_id + score(P1 新增, F5 加 fuzzy fallback)。
+
+        优先用 A 机已落库的 fb_lead_scorer_v2 融合分。未匹配/异常 → (None, 0)。
+        不做 on-the-fly 评分以避免 check_inbox 路径触发 LLM 费用。
+
+        **F5 (A→B review Q5)**: 硬匹配 miss 时,对 ``normalize_name`` 结果做
+        Levenshtein 距离 ≤1 的 fuzzy 兜底,解决全角/NBSP 等未被 normalize_name
+        覆盖的边界 case。用 LIKE 预过滤候选 + 限制 200 行,不全表扫。
+        """
+        n = (name or "").strip()
+        if not n:
+            return None, 0
+        try:
+            from src.leads.store import get_leads_store
+            store = get_leads_store()
+            lid = store.find_match(name=n)
+            if not lid:
+                # F5 fuzzy 兜底
+                lid = _fuzzy_match_lead_by_name(store, n)
+            if not lid:
+                return None, 0
+            rec = store.get_lead(lid) or {}
+            raw = rec.get("score", 0) or 0
+            try:
+                s = int(raw)
+            except (TypeError, ValueError):
+                try:
+                    s = int(float(raw))
+                except Exception:
+                    s = 0
+            return lid, max(0, min(100, s))
+        except Exception:
+            log.debug("[_lookup_lead_score] 查询失败(降级到 0)", exc_info=True)
+            return None, 0
 
     # ── Inbox helpers (Sprint 2 P0 内部支持函数) ─────────────────────────
 
