@@ -495,3 +495,97 @@ class TestTelemetry:
         # 注:_list_friend_requests 返回的是拷贝列表但元素是同一 dict
         assert metas[0].get("lead_id") == 77
         assert metas[0].get("lead_score") == 66
+
+
+# ─── P7 §7.1: add_friend_accepted contact_event ─────────────────────────────
+
+class TestAddFriendAcceptedEvent:
+    """§7.1 B 机在接受好友请求后应写 record_contact_event(add_friend_accepted)
+    给 A 的 Lead Mesh Dashboard,Phase 5 未 merge 时静默 skip。"""
+
+    def test_accepted_writes_contact_event(self, fb_env):
+        fb, set_reqs = fb_env
+        set_reqs([{"name": "Alice", "mutual_friends": 3}])
+        events = []
+        fake_fb_store_mod = MagicMock()
+        fake_fb_store_mod.record_contact_event = lambda *a, **kw: (
+            events.append({"args": a, "kw": kw}) or 1)
+        fake_fb_store_mod.update_friend_request_status = MagicMock()
+        with patch.dict("sys.modules",
+                        {"src.host.fb_store": fake_fb_store_mod}):
+            stats = fb.check_friend_requests_inbox(
+                min_mutual_friends=1, max_requests=4)
+        assert stats["accepted"] == 1
+        accepted_events = [e for e in events
+                           if e["args"][2] == "add_friend_accepted"]
+        assert len(accepted_events) == 1
+        e = accepted_events[0]
+        assert e["args"][0] == "devA"
+        assert e["args"][1] == "Alice"
+        meta = e["kw"]["meta"]
+        assert meta["mutual_friends"] == 3
+        assert meta["accept_key"] == "mutual_only"
+
+    def test_accepted_meta_has_lead_info(self, fb_env):
+        fb, set_reqs = fb_env
+        set_reqs([{"name": "Alice", "mutual_friends": 3}])
+        events = []
+        fake_fb_store_mod = MagicMock()
+        fake_fb_store_mod.record_contact_event = lambda *a, **kw: (
+            events.append(kw) or 1)
+        fake_fb_store_mod.update_friend_request_status = MagicMock()
+        with patch.object(fb, "_lookup_lead_score",
+                          return_value=(77, 88)), \
+             patch.dict("sys.modules",
+                        {"src.host.fb_store": fake_fb_store_mod}):
+            fb.check_friend_requests_inbox(
+                min_mutual_friends=1, min_lead_score=50,
+                max_requests=4)
+        assert events[0]["meta"]["lead_id"] == 77
+        assert events[0]["meta"]["lead_score"] == 88
+        assert events[0]["meta"]["accept_key"] == "both"
+
+    def test_skipped_does_not_emit_event(self, fb_env):
+        """skipped 场景不发 add_friend_accepted 事件。"""
+        fb, set_reqs = fb_env
+        set_reqs([{"name": "Alice", "mutual_friends": 0}])
+        events = []
+        fake_fb_store_mod = MagicMock()
+        fake_fb_store_mod.record_contact_event = lambda *a, **kw: (
+            events.append(a) or 1)
+        fake_fb_store_mod.update_friend_request_status = MagicMock()
+        with patch.dict("sys.modules",
+                        {"src.host.fb_store": fake_fb_store_mod}):
+            fb.check_friend_requests_inbox(
+                min_mutual_friends=1, max_requests=4)
+        assert events == []
+
+    def test_tap_accept_fails_no_event(self, fb_env):
+        """_tap_accept_button_for 返回 False 时不发事件。"""
+        fb, set_reqs = fb_env
+        set_reqs([{"name": "Alice", "mutual_friends": 3}])
+        events = []
+        fake_fb_store_mod = MagicMock()
+        fake_fb_store_mod.record_contact_event = lambda *a, **kw: (
+            events.append(a) or 1)
+        fake_fb_store_mod.update_friend_request_status = MagicMock()
+        with patch.object(fb, "_tap_accept_button_for", return_value=False), \
+             patch.dict("sys.modules",
+                        {"src.host.fb_store": fake_fb_store_mod}):
+            fb.check_friend_requests_inbox(
+                min_mutual_friends=1, max_requests=4)
+        assert events == []
+
+    def test_phase5_not_merged_graceful(self, fb_env):
+        """record_contact_event 不存在 → 不抛异常, stats.accepted 仍正常。"""
+        fb, set_reqs = fb_env
+        set_reqs([{"name": "Alice", "mutual_friends": 3}])
+        # fb_store 没有 record_contact_event
+        fake_fb_store_mod = MagicMock(
+            spec=["update_friend_request_status"])
+        fake_fb_store_mod.update_friend_request_status = MagicMock()
+        with patch.dict("sys.modules",
+                        {"src.host.fb_store": fake_fb_store_mod}):
+            stats = fb.check_friend_requests_inbox(
+                min_mutual_friends=1, max_requests=4)
+        assert stats["accepted"] == 1

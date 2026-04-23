@@ -4095,6 +4095,29 @@ class FacebookAutomation(BaseAutomation):
                             update_friend_request_status(did, meta.get("name", ""), "accepted")
                         except Exception:
                             pass
+                        # P7 §7.1 add_friend_accepted: 给 A 的 Lead Mesh
+                        # Dashboard 提供"好友请求通过"事件。meta 带 lead_id
+                        # (若匹配到)/ mutual_friends / lead_score 方便 A 做
+                        # 质量归因。Phase 5 未 merge 静默 skip (feature-detect)。
+                        try:
+                            from src.host.fb_store import record_contact_event
+                            record_contact_event(
+                                did, meta.get("name", "") or "",
+                                "add_friend_accepted",
+                                meta={
+                                    "lead_id": meta.get("lead_id"),
+                                    "mutual_friends": int(
+                                        meta.get("mutual_friends", 0) or 0),
+                                    "lead_score": int(
+                                        meta.get("lead_score", 0) or 0),
+                                    "accept_key": accept_key,
+                                },
+                            )
+                        except ImportError:
+                            pass  # Phase 5 未 merge
+                        except Exception as e:
+                            log.debug(
+                                "[P7 add_friend_accepted] skip: %s", e)
                     else:
                         stats["errors"] += 1
                 except Exception:
