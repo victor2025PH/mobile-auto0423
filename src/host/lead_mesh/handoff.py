@@ -89,7 +89,9 @@ def create_handoff(*, canonical_id: str,
                     conversation_snapshot: Optional[List[Dict[str, Any]]] = None,
                     snippet_sent: str = "",
                     enqueue_webhook: bool = True,
-                    auto_pick_receiver: bool = True) -> str:
+                    auto_pick_receiver: bool = True,
+                    honor_peer_cooldown: bool = False,
+                    peer_cooldown_days: int = 30) -> str:
     """创建交接单, 返回 handoff_id (UUID)。
 
     自动:
@@ -109,9 +111,41 @@ def create_handoff(*, canonical_id: str,
         receiver_account_key: 显式指定接收方; 留空则走自动路由
         persona_key: 配合 auto_pick 过滤 receiver.persona_filter
         auto_pick_receiver: 关闭则不自动路由(仅测试场景用)
+        honor_peer_cooldown: True=若 peer 最近 peer_cooldown_days 有任何活跃
+            handoff(不管什么 channel) 就拒绝创建, 返回空串。用于 B 端换渠道
+            引流时防骚扰。**默认 False** 保持向后兼容, 调用方应在引流决策
+            层显式启用。
+        peer_cooldown_days: 冷却窗口, 默认 30 天
     """
     if not canonical_id or not source_agent or not channel:
         raise ValueError("canonical_id / source_agent / channel 必填")
+
+    # 跨渠道冷却检查 (默认关闭, 需调用方显式启用)
+    if honor_peer_cooldown:
+        existing = check_peer_cooldown_handoff(
+            canonical_id, cooldown_days=peer_cooldown_days,
+            honor_rejected=True)
+        if existing:
+            logger.info(
+                "[handoff] peer_cooldown 阻塞: canonical=%s 已有 %s 渠道 %s "
+                "handoff (state=%s, created=%s), 跳过 %s",
+                canonical_id[:12], existing.get("channel"),
+                existing.get("handoff_id", "")[:12], existing.get("state"),
+                existing.get("created_at"), channel)
+            # journey 记一笔 blocked 事件
+            try:
+                from .journey import append_journey
+                append_journey(canonical_id, actor=source_agent,
+                               action="handoff_blocked",
+                               actor_device=source_device,
+                               platform=channel,
+                               data={"reason": "peer_cooldown",
+                                     "existing_handoff_id": existing.get("handoff_id"),
+                                     "existing_channel": existing.get("channel"),
+                                     "existing_state": existing.get("state")})
+            except Exception:
+                pass
+            return ""
 
     # 自动 pick receiver (如果 caller 没指定)
     auto_picked = False
@@ -375,6 +409,8 @@ def check_duplicate_handoff(canonical_id: str,
 
     有 → 返回那条 handoff 的关键字段, 调用方应跳过再次引流。
     无 → None。
+
+    **仅同渠道**: 比 check_peer_cooldown_handoff 宽松 - 允许跨渠道重试。
     """
     if not canonical_id or not channel:
         return None
@@ -392,4 +428,58 @@ def check_duplicate_handoff(canonical_id: str,
         return dict(row) if row else None
     except Exception as e:
         logger.debug("[handoff] check_duplicate 失败: %s", e)
+        return None
+
+
+def check_peer_cooldown_handoff(canonical_id: str,
+                                 cooldown_days: int = 30,
+                                 honor_rejected: bool = True
+                                 ) -> Optional[Dict[str, Any]]:
+    """**跨渠道** 冷却检查 - 防止同一 peer 在短时间被多渠道骚扰。
+
+    业务场景:
+      * LINE 引流刚发出 → 对方未回 → B 机想改 WhatsApp 再试?
+        → 此函数返回非空阻止 (pending 视为仍在等结果)
+      * LINE 失败被 reject → 换 WhatsApp 是合理行为?
+        → honor_rejected=True (默认) 时允许换渠道, 返回 None
+
+    与 check_duplicate_handoff 的区别:
+      * duplicate: 同 channel 内去重 (宽松)
+      * peer_cooldown: 跨 channel 去重 (严格, 用于骚扰保护)
+
+    Args:
+        canonical_id: lead canonical_id
+        cooldown_days: 冷却窗口天数, 默认 30
+        honor_rejected: True=rejected/expired 状态不算阻塞(允许换渠道重试);
+                        False=只要有过 handoff 记录都阻塞 (最严格)
+
+    Returns:
+        存在冷却期内的活跃/完成 handoff → 该行 dict;
+        无 / 仅有 rejected 且 honor_rejected=True → None
+    """
+    if not canonical_id:
+        return None
+    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=int(cooldown_days))).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    # 构造排除状态: honor_rejected 时 rejected/expired 不算; 否则都算
+    if honor_rejected:
+        exclude_states = (STATE_REJECTED, STATE_EXPIRED)
+    else:
+        exclude_states = ()
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            sql = ("SELECT handoff_id, channel, state, created_at, source_agent,"
+                   " receiver_account_key FROM lead_handoffs"
+                   " WHERE canonical_id=? AND created_at >= ?")
+            params: list = [canonical_id, cutoff]
+            if exclude_states:
+                sql += " AND state NOT IN ({})".format(
+                    ",".join(["?"] * len(exclude_states)))
+                params.extend(exclude_states)
+            sql += " ORDER BY created_at DESC LIMIT 1"
+            row = conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.debug("[handoff] check_peer_cooldown 失败: %s", e)
         return None

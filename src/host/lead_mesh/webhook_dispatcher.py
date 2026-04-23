@@ -106,20 +106,66 @@ def _get_subscribers(event_type: str) -> List[Dict[str, Any]]:
 
 # ─── 入队 API ────────────────────────────────────────────────────────
 
+def _load_receiver_webhook(related_handoff_id: str) -> Optional[Dict[str, Any]]:
+    """若 handoff 关联到有 webhook_url 的 receiver, 返回一个合成的 sub 条目。
+
+    这让每个接收方账号能独立订阅自己的 handoff 事件 (多租户场景), 和
+    webhook_targets.yaml 的全局订阅并行触发。
+    """
+    if not related_handoff_id:
+        return None
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT receiver_account_key FROM lead_handoffs"
+                " WHERE handoff_id=?",
+                (related_handoff_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        key = row[0]
+        from .receivers import get_receiver
+        r = get_receiver(key)
+        if not r:
+            return None
+        url = (r.get("webhook_url") or "").strip()
+        if not url:
+            return None
+        # per-receiver webhook 不走全局 secret; 如果运营需要 per-receiver
+        # HMAC, 约定环境变量名 WEBHOOK_SECRET_RECEIVER_<KEY>
+        env_var = f"WEBHOOK_SECRET_RECEIVER_{key.upper().replace('-', '_')}"
+        return {
+            "url": url,
+            "secret_key_env": env_var,
+            "enabled": r.get("enabled", True),
+            "_source": f"receiver:{key}",
+        }
+    except Exception as e:
+        logger.debug("[webhook] per-receiver lookup 失败: %s", e)
+        return None
+
+
 def enqueue_webhook(*, event_type: str,
                      payload: Dict[str, Any],
                      related_canonical_id: str = "",
                      related_handoff_id: str = "") -> int:
     """把事件拆成每订阅 URL 一条 webhook_dispatches 行。
 
+    订阅源 (2 份并行):
+      1. **全局**: webhook_targets.yaml 里的 subscribers[event_type] (+ subscribers["*"])
+      2. **per-receiver**: 若事件关联的 handoff 绑定到有 webhook_url 的 receiver,
+         自动加一条 dispatch。多租户/多运营组各自通知场景。
+
     Returns:
         入队的行数 (0 = 无订阅者)
     """
     if not event_type:
         return 0
-    subs = _get_subscribers(event_type)
+    subs = list(_get_subscribers(event_type))
+    # 加入 per-receiver 订阅
+    rx_sub = _load_receiver_webhook(related_handoff_id)
+    if rx_sub and rx_sub.get("enabled", True):
+        subs.append(rx_sub)
     if not subs:
-        # 没订阅者但仍记录一条 "no_subscriber" 用于审计 (可选)
         return 0
     payload_str = ""
     try:
@@ -155,6 +201,27 @@ def _sign_hmac(secret: str, body: bytes) -> str:
     return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 
 
+def _resolve_secret_for_dispatch(dispatch: Dict[str, Any]) -> str:
+    """找到 dispatch 的 HMAC secret (优先级: 全局订阅 → per-receiver)。"""
+    target_url = dispatch.get("target_url") or ""
+    # 1. 全局订阅匹配
+    for sub in _get_subscribers(dispatch.get("event_type") or ""):
+        if sub.get("url") == target_url:
+            env_key = sub.get("secret_key_env") or ""
+            if env_key:
+                s = os.environ.get(env_key, "")
+                if s:
+                    return s
+            break
+    # 2. per-receiver 匹配 (根据 related_handoff_id 反查 receiver.webhook_url)
+    rx_sub = _load_receiver_webhook(dispatch.get("related_handoff_id") or "")
+    if rx_sub and rx_sub.get("url") == target_url:
+        env_key = rx_sub.get("secret_key_env") or ""
+        if env_key:
+            return os.environ.get(env_key, "")
+    return ""
+
+
 def _send_single(dispatch: Dict[str, Any]) -> (bool, str):
     """同步发送一条 dispatch。返回 (ok, error_msg)。"""
     try:
@@ -162,15 +229,7 @@ def _send_single(dispatch: Dict[str, Any]) -> (bool, str):
     except ImportError:
         return False, "requests not installed"
 
-    # 找对应 secret
-    secret = ""
-    subs = _get_subscribers(dispatch.get("event_type") or "")
-    for sub in subs:
-        if sub.get("url") == dispatch["target_url"]:
-            env_key = sub.get("secret_key_env") or ""
-            if env_key:
-                secret = os.environ.get(env_key, "")
-            break
+    secret = _resolve_secret_for_dispatch(dispatch)
 
     payload_str = dispatch.get("payload_json") or "{}"
     body = payload_str.encode("utf-8")

@@ -405,34 +405,8 @@
           + '</span>';
       }).join('');
 
-      // 时间轴
-      const timeline = journey.map(function (ev) {
-        const icon = _ACTION_ICON[ev.action] || '•';
-        const color = _ACTION_COLOR[ev.action] || '#94a3b8';
-        const actor = ev.actor || '';
-        const actorColor = actor.startsWith('agent_a') ? '#22c55e'
-                         : actor.startsWith('agent_b') ? '#a855f7'
-                         : actor.startsWith('human') ? '#0ea5e9'
-                         : '#64748b';
-        const dataStr = ev.data && Object.keys(ev.data).length
-          ? ' <code style="color:var(--text-dim);font-size:10px">' + _safe(JSON.stringify(ev.data).substring(0, 100)) + '</code>'
-          : '';
-        return ''
-          + '<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px dashed rgba(255,255,255,.05)">'
-          + '  <div style="min-width:56px;color:var(--text-dim);font-size:10px;font-family:monospace;padding-top:2px">'
-          +      _safe((ev.at || '').substring(11, 19)) + '</div>'
-          + '  <div style="font-size:14px">' + icon + '</div>'
-          + '  <div style="flex:1;min-width:0">'
-          + '    <div style="font-weight:600;color:' + color + ';font-size:12px">' + _safe(ev.action) + '</div>'
-          + '    <div style="font-size:10px;color:var(--text-muted)">'
-          + '      <span style="color:' + actorColor + '">' + _safe(actor) + '</span>'
-          +        (ev.actor_device ? ' @<code>' + _safe(ev.actor_device.substring(0, 8)) + '</code>' : '')
-          +        (ev.platform ? ' · ' + _safe(ev.platform) : '')
-          +        dataStr
-          + '    </div>'
-          + '  </div>'
-          + '</div>';
-      }).join('');
+      // 时间轴 (按天分组 - Phase 6 UX)
+      const timeline = _lmTimelineHtml(journey);
 
       // 统计
       const statsHtml = Object.entries(summary.by_action || {}).sort(function (a, b) { return b[1] - a[1]; })
@@ -928,6 +902,85 @@
       showToast('加载失败: ' + (e.message || e), 'error');
     }
   };
+
+  // ─── Phase 6 UX: 时间轴按天分组 ─────────────────────────────
+  function _lmDayBucket(atIso) {
+    // 输入格式 "YYYY-MM-DD HH:MM:SS" 或 ISO; 提取日期部分并按本地时区比较
+    const ymd = (atIso || '').substring(0, 10);   // "2026-04-23"
+    if (!ymd) return 'unknown';
+    const today = new Date();
+    const t0 = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const evtDate = new Date(ymd + 'T00:00:00');
+    const diffDays = Math.round((t0 - evtDate) / 86400000);
+    if (diffDays === 0) return '今天 · ' + ymd;
+    if (diffDays === 1) return '昨天 · ' + ymd;
+    if (diffDays < 7) return diffDays + ' 天前 · ' + ymd;
+    if (diffDays < 30) return Math.round(diffDays / 7) + ' 周前 · ' + ymd;
+    return Math.round(diffDays / 30) + ' 个月前 · ' + ymd;
+  }
+
+  function _lmTimelineHtml(journey) {
+    if (!journey || !journey.length) {
+      return '<div style="text-align:center;padding:20px;color:var(--text-dim)">无事件</div>';
+    }
+    // 按天分桶 (保持倒序 - 最新在上)
+    const buckets = [];   // [{label, events[]}, ...]
+    let currentLabel = null;
+    const reversed = journey.slice().reverse();  // 最新在上
+    reversed.forEach(function (ev) {
+      const lbl = _lmDayBucket(ev.at || '');
+      if (lbl !== currentLabel) {
+        buckets.push({ label: lbl, events: [] });
+        currentLabel = lbl;
+      }
+      buckets[buckets.length - 1].events.push(ev);
+    });
+
+    return buckets.map(function (b) {
+      const eventsHtml = b.events.map(function (ev) {
+        const icon = _ACTION_ICON[ev.action] || '•';
+        const color = _ACTION_COLOR[ev.action] || '#94a3b8';
+        const actor = ev.actor || '';
+        const actorColor = actor.startsWith('agent_a') ? '#22c55e'
+                         : actor.startsWith('agent_b') ? '#a855f7'
+                         : actor.startsWith('human') ? '#0ea5e9'
+                         : '#64748b';
+        const actorBadge = actor.startsWith('agent_a') ? '🟢 A'
+                         : actor.startsWith('agent_b') ? '🟣 B'
+                         : actor.startsWith('human') ? '👤 人'
+                         : '⚙️ 系统';
+        const dataKeys = ev.data ? Object.keys(ev.data) : [];
+        const dataStr = dataKeys.length
+          ? ' <details style="display:inline-block;vertical-align:middle"><summary style="cursor:pointer;color:var(--text-dim);font-size:10px">' + dataKeys.length + ' 字段</summary>'
+            + '<pre style="margin:4px 0 0 0;padding:6px 8px;background:var(--bg-card);border-radius:4px;font-size:10px;max-width:500px;overflow:auto">' + _safe(JSON.stringify(ev.data, null, 2)) + '</pre></details>'
+          : '';
+        return ''
+          + '<div style="display:flex;gap:10px;padding:6px 0;border-bottom:1px dashed rgba(255,255,255,.05)">'
+          + '  <div style="min-width:56px;color:var(--text-dim);font-size:10px;font-family:monospace;padding-top:2px">'
+          +      _safe((ev.at || '').substring(11, 19)) + '</div>'
+          + '  <div style="font-size:14px">' + icon + '</div>'
+          + '  <div style="flex:1;min-width:0">'
+          + '    <div style="font-weight:600;color:' + color + ';font-size:12px">' + _safe(ev.action)
+          +       ' <span style="font-size:10px;color:' + actorColor + ';font-weight:400;margin-left:6px">' + actorBadge + '</span>'
+          + '    </div>'
+          + '    <div style="font-size:10px;color:var(--text-muted)">'
+          + '      <span style="color:' + actorColor + '">' + _safe(actor) + '</span>'
+          +        (ev.actor_device ? ' @<code>' + _safe(ev.actor_device.substring(0, 8)) + '</code>' : '')
+          +        (ev.platform ? ' · ' + _safe(ev.platform) : '')
+          +        dataStr
+          + '    </div>'
+          + '  </div>'
+          + '</div>';
+      }).join('');
+      return ''
+        + '<div style="margin-bottom:14px">'
+        + '  <div style="font-size:11px;color:var(--text-dim);font-weight:600;margin-bottom:4px;padding:4px 8px;background:rgba(255,255,255,.03);border-left:3px solid #60a5fa;border-radius:0 4px 4px 0">'
+        + '    📅 ' + _safe(b.label) + ' <span style="color:var(--text-dim);font-weight:400">(' + b.events.length + ' 事件)</span>'
+        + '  </div>'
+        +    eventsHtml
+        + '</div>';
+    }).join('');
+  }
 
   window.lmSubmitReceiverForm = async function (mode) {
     const Shell = _shell();

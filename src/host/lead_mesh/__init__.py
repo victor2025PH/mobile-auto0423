@@ -27,6 +27,7 @@ from .handoff import (  # noqa
     create_handoff, get_handoff, list_handoffs,
     acknowledge_handoff, complete_handoff, reject_handoff,
     expire_pending_handoffs,
+    check_duplicate_handoff, check_peer_cooldown_handoff,
 )
 from .agent_mesh import (  # noqa
     send_message, poll_messages, mark_delivered, mark_acknowledged,
