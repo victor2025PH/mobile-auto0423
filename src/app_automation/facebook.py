@@ -172,6 +172,40 @@ def _fuzzy_match_lead_by_name(store, name: str) -> Optional[int]:
     return None
 
 
+class MessengerError(Exception):
+    """send_message 结构化错误 (P2 — B 机为 A 机 A2 降级路径提供归因语义)。
+
+    A 的 add_friend → send_greeting_after_add_friend 在 'safe_mode=False + 直接走
+    Messenger' 的 A2 降级路径中会 catch 本类,按 code 决定:
+      * xspace_blocked / messenger_unavailable: 返回让 A 稍后重试或切回 FB 搜索加好友
+      * recipient_not_found: A 已加好友但 peer 在 Messenger 里还没索引 → 等 5s 再重试
+      * risk_detected: A 立刻进入 phase=cooldown,全 account 暂停
+      * search_ui_missing / send_button_missing / send_fail: A 降级走 FB 主 app 评论/个人页
+        DM 作二次兜底
+
+    Codes (稳定公开契约,改名要先改 INTEGRATION_CONTRACT §二):
+      - messenger_unavailable:    Messenger 图标点不开 + app_start 也启动失败
+      - xspace_blocked:           MIUI/HyperOS XSpace 选择框挡路无法 dismiss
+      - risk_detected:            Messenger 撞到封禁/校验对话框
+      - search_ui_missing:        Messenger 搜索按钮点不开 (UI 变更或 cold app)
+      - recipient_not_found:      搜索结果里找不到目标联系人
+      - send_button_missing:      Send 按钮未渲染/点不到 (UI 问题)
+      - send_blocked_by_content:  Send 成功但 FB 弹 "message can't be sent"
+                                  (文案违禁/反垃圾规则, F4 来自 A→B Q6);
+                                  同时 record_risk_event(kind='content_blocked')
+                                  入库, hint 带 text_hash 供 A 去重 + 短版本重试
+      - send_fail:                其他未分类失败 (保底)
+    """
+
+    def __init__(self, code: str, message: str = "", hint: str = ""):
+        super().__init__(message or code)
+        self.code = code
+        self.hint = hint or ""
+
+    def __repr__(self) -> str:  # 日志里更清晰
+        return f"MessengerError(code={self.code!r})"
+
+
 def _now_iso() -> str:
     """与 fb_store 同格式的 UTC ISO 串（用于 stats 时间戳）。"""
     import datetime as _dt
@@ -958,37 +992,199 @@ class FacebookAutomation(BaseAutomation):
 
     @_with_fb_foreground
     def send_message(self, recipient: str, message: str,
-                     device_id: Optional[str] = None) -> bool:
-        """Send a message via Messenger."""
+                     device_id: Optional[str] = None,
+                     raise_on_error: bool = False) -> bool:
+        """Send a message via Messenger.
+
+        P2 (2026-04-23): 拆分细分错误码。
+
+          * ``raise_on_error=False`` (默认): 失败 return ``False``,向后兼容所有现有
+            调用 (executor.py/routers/测试脚本)。
+          * ``raise_on_error=True``: 失败抛 :class:`MessengerError` (code=...),供
+            A 机 A2 降级路径按 code 做细粒度归因 (见 ``MessengerError`` docstring)。
+
+        建议新调用方显式传 ``raise_on_error=True``;但**不要**改现有调用 —
+        变更默认会破坏 executor/router 层的 try/except-free 调用点。
+        """
         did = self._did(device_id)
         d = self._u2(did)
+        try:
+            return self._send_message_impl(d, did, recipient, message)
+        except MessengerError as e:
+            if raise_on_error:
+                raise
+            log.warning("[send_message] 失败 code=%s msg=%s", e.code, str(e))
+            return False
 
+    def _send_message_impl(self, d, did: str,
+                           recipient: str, message: str) -> bool:
+        """send_message 内核 — 失败抛 :class:`MessengerError` 不吞 (P2)。
+
+        流程分段,每段失败抛对应 code:
+          1. 进 Messenger (icon tap 失败就 app_start 兜底) → messenger_unavailable
+          2. XSpace 探测 + dismiss → xspace_blocked (dismiss 仍失败)
+          3. 风控对话框扫描 → risk_detected
+          4. Messenger 里点搜索 → search_ui_missing
+          5. 输入 recipient + 选第一个匹配 → recipient_not_found
+          6. 输入正文 + 点 Send → send_button_missing
+        """
         with self.guarded("send_message", device_id=did):
-            rewritten = self.rewrite_message(message, {"platform": "facebook", "recipient": recipient})
+            rewritten = self.rewrite_message(
+                message, {"platform": "facebook", "recipient": recipient})
 
-            if not self.smart_tap("Messenger or chat icon", device_id=did):
-                d.app_start(MESSENGER_PACKAGE)
+            # ── 1. 进 Messenger ─────────────────────────────────────────
+            launched_via_icon = self.smart_tap(
+                "Messenger or chat icon", device_id=did)
+            if not launched_via_icon:
+                try:
+                    d.app_start(MESSENGER_PACKAGE)
+                except Exception as e:
+                    raise MessengerError(
+                        "messenger_unavailable",
+                        f"Messenger icon 点不开且 app_start 抛异常: {e}",
+                        hint="Messenger apk 可能没装或被禁用")
                 time.sleep(3)
                 self._dismiss_dialogs(d)
 
             time.sleep(1)
 
-            if self.smart_tap("Search in Messenger", device_id=did):
-                time.sleep(0.5)
-                self.hb.type_text(d, recipient)
-                time.sleep(1.5)
+            # ── 2. XSpace 挡路检测(MIUI/HyperOS 双开) ─────────────────
+            try:
+                cur_pkg = (d.app_current() or {}).get("package", "") or ""
+            except Exception:
+                cur_pkg = ""
+            if cur_pkg == "com.miui.securitycore" or \
+               self._xspace_select_sheet_visible(d):
+                # 尝试 dismiss,失败才抛 xspace_blocked
+                dismissed = False
+                try:
+                    dismissed = self._handle_xspace_dialog(d, did)
+                except Exception:
+                    dismissed = False
+                if dismissed:
+                    time.sleep(1.0)
+                    try:
+                        cur_pkg = (d.app_current() or {}).get("package", "") or ""
+                    except Exception:
+                        cur_pkg = ""
+                if cur_pkg == "com.miui.securitycore" or \
+                   self._xspace_select_sheet_visible(d):
+                    raise MessengerError(
+                        "xspace_blocked",
+                        "Messenger 启动被 XSpace 双开选择框挡住",
+                        hint="建议 A 切回 FB 主 app 个人页 DM 路径")
 
-                if not self.smart_tap("First matching contact", device_id=did):
-                    log.warning("Recipient not found: %s", recipient)
-                    return False
+            # ── 3. 风控对话框 ───────────────────────────────────────────
+            try:
+                is_risk, risk_msg = self._detect_risk_dialog(d)
+            except Exception:
+                is_risk, risk_msg = False, ""
+            if is_risk:
+                raise MessengerError(
+                    "risk_detected",
+                    f"Messenger 撞风控: {risk_msg}",
+                    hint=risk_msg or "phase 应切 cooldown")
 
-                time.sleep(1)
-                self.hb.type_text(d, rewritten)
-                self.hb.wait_think(0.5)
+            # ── 4. Messenger 搜索入口 ──────────────────────────────────
+            if not self.smart_tap("Search in Messenger", device_id=did):
+                raise MessengerError(
+                    "search_ui_missing",
+                    "Messenger 里搜索按钮未找到",
+                    hint="可能是 cold start/UI 变更,建议 A 稍后重试")
+            time.sleep(0.5)
+            self.hb.type_text(d, recipient)
+            time.sleep(1.5)
 
-                return self.smart_tap("Send message button", device_id=did)
+            # ── 5. 选中搜索结果第一条 ──────────────────────────────────
+            if not self.smart_tap("First matching contact", device_id=did):
+                log.warning("Recipient not found: %s", recipient)
+                raise MessengerError(
+                    "recipient_not_found",
+                    f"Messenger 搜索 '{recipient}' 无匹配联系人",
+                    hint="peer 未加好友/昵称变更/索引延迟,A 可 5-15s 后重试")
 
-        return False
+            time.sleep(1)
+            self.hb.type_text(d, rewritten)
+            self.hb.wait_think(0.5)
+
+            # ── 6. 发送 ─────────────────────────────────────────────────
+            if not self.smart_tap("Send message button", device_id=did):
+                raise MessengerError(
+                    "send_button_missing",
+                    "Messenger Send 按钮点不到",
+                    hint="可能被键盘遮挡/文案违禁被灰出,A 可降级走 FB 个人页 DM")
+
+            # ── 7. F4: 检测 FB 点 Send 后的"内容违禁"弹窗 ─────────────
+            # A→B review Q6 建议的新 code。UI 出现 "This message can't be
+            # sent / 送信できません / 不能发送此消息 / non inviabile" 类提示
+            # → 记 fb_risk_events{kind='content_blocked'} + raise 细分错误,
+            # A 的 A2 降级可按 text_hash 去重并用更短 greeting 重试
+            blocked_text = self._detect_send_blocked(d)
+            if blocked_text:
+                try:
+                    from src.host.fb_store import record_risk_event
+                    # record_risk_event 用 raw_message 文本经 _RISK_KIND_RULES
+                    # 自动分类到 'content_blocked' (该规则由 F4-support
+                    # commit 在 follow-up PR 里扩展)
+                    record_risk_event(did, blocked_text,
+                                      task_id=f"send_message:{recipient[:20]}")
+                except Exception as e:
+                    log.debug("[send_message] record_risk_event 失败: %s", e)
+                import hashlib as _h
+                text_hash = _h.sha256(
+                    (message or "").encode("utf-8", errors="replace")
+                ).hexdigest()[:12]
+                raise MessengerError(
+                    "send_blocked_by_content",
+                    f"FB 拒绝发送 ({blocked_text[:80]})",
+                    hint=(f"text_hash={text_hash}; A 可用更短/更自然的 "
+                          f"greeting 重试, 或用此 hash 去重防重复触发"))
+            return True
+        # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
+        # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
+        return False  # pragma: no cover
+
+    # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (ja/zh/en/it 对齐
+    # persona)。要改请同步改 src/host/fb_store.py::_RISK_KIND_RULES 的
+    # content_blocked 分类规则,否则 record_risk_event 会错分类。
+    _SEND_BLOCKED_KEYWORDS = (
+        "can't be sent", "cannot be sent", "couldn't send", "unable to send",
+        "message can't be sent", "message wasn't sent",
+        "不能发送此消息", "发送失败", "无法发送", "訊息無法傳送",
+        "送信できませんでした", "メッセージを送信できません",
+        "non inviabile", "messaggio non inviato",
+    )
+
+    def _detect_send_blocked(self, d) -> str:
+        """F4: 点 Send 按钮后扫屏查 FB 拒绝发送提示 (snackbar/toast/dialog)。
+
+        返回匹配到的文本片段 (非空即代表被拒); 无匹配返回空串。不抛。
+        """
+        try:
+            time.sleep(0.8)  # wait popup render
+            xml = d.dump_hierarchy()
+        except Exception:
+            return ""
+        low = xml.lower() if xml else ""
+        if not low:
+            return ""
+        for kw in self._SEND_BLOCKED_KEYWORDS:
+            k = kw.lower()
+            idx = low.find(k)
+            if idx >= 0:
+                # 截取一段返回,方便日志 + record_risk_event 分类
+                return xml[max(0, idx - 10):idx + len(kw) + 50]
+        return ""
+
+    def _xspace_select_sheet_visible(self, d) -> bool:
+        """快速探测 MIUI 'Select app' 浅色底 sheet 是否仍在屏(P2 辅助)。"""
+        try:
+            return bool(
+                d(text="Select app").exists(timeout=0.3)
+                or d(text="选择应用").exists(timeout=0.3)
+            )
+        except Exception:
+            return False
 
     def _add_friend_safe_interaction_on_profile(
             self, d, did: str, profile_name: str, note: str,
