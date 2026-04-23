@@ -74,3 +74,7 @@ mobile-auto-project/
 config/analytics_history.json
 config/routers.json
 .restart-required
+
+# 接收方账号配置(含真实运营账号, 不同部署不同, 不入库)
+# 模板见 config/referral_receivers.yaml.example
+config/referral_receivers.yaml
