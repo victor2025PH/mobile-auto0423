@@ -208,6 +208,62 @@ class TestBlockedPeers:
         assert list_blocked_peers("", days=7) == []
 
 
+class TestDateFilter:
+    """Phase 8g: date 参数 (单日下钻) 优先于 days."""
+
+    def test_compute_funnel_with_valid_date_filters_single_day(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+        import datetime as dt
+
+        cid = resolve_identity(platform="facebook", account_id="fb:D1",
+                                 display_name="D1")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={})
+
+        today = dt.datetime.utcnow().date().isoformat()
+        # 单日 date=today 应有 1 个 friend_req
+        stats = compute_funnel(days=30, date=today)
+        assert stats.window_days == 1   # date 生效时强制 1
+        assert stats.total_friend_requested == 1
+
+        # 另一天 date (前 10 天) 应 0
+        other = (dt.datetime.utcnow() - dt.timedelta(days=10)).date().isoformat()
+        stats_other = compute_funnel(days=30, date=other)
+        assert stats_other.total_friend_requested == 0
+
+    def test_compute_funnel_invalid_date_falls_back_to_days(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import compute_funnel
+
+        cid = resolve_identity(platform="facebook", account_id="fb:D2",
+                                 display_name="D2")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={})
+        # "invalid-date" 不合法 → 降级 days=7 窗口 → 应看到该 friend_req
+        stats = compute_funnel(days=7, date="invalid-date")
+        assert stats.window_days == 7
+        assert stats.total_friend_requested == 1
+
+    def test_list_blocked_peers_with_date(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import list_blocked_peers
+        import datetime as dt
+
+        cid = resolve_identity(platform="facebook", account_id="fb:D3",
+                                 display_name="D3")
+        append_journey(cid, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "no_message_button"})
+
+        today = dt.datetime.utcnow().date().isoformat()
+        peers = list_blocked_peers("no_message_button", days=30, date=today)
+        assert len(peers) == 1
+        # 他日 date 不含此事件
+        other = (dt.datetime.utcnow() - dt.timedelta(days=5)).date().isoformat()
+        peers_other = list_blocked_peers("no_message_button", days=30, date=other)
+        assert len(peers_other) == 0
+
+
 class TestTimeseries:
     """Phase 8e: 近 N 天按日分桶的漏斗时序."""
 

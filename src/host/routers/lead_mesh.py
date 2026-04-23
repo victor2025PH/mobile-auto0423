@@ -376,15 +376,19 @@ def api_retry_dead(dispatch_id: int):
 # ── Phase 8b: 漏斗报告 (给 Command Center Dashboard 卡片用) ─────────
 @router.get("/funnel")
 def api_funnel_report(days: int = Query(default=7, ge=1, le=90),
-                       actor: str = Query(default="")):
+                       actor: str = Query(default=""),
+                       date: str = Query(default="")):
     """A 端 add_friend → greeting 漏斗统计. 从 lead_journey 聚合.
 
     Args:
-        days: 时间窗口 (1-90 天)
+        days: 时间窗口 (1-90 天; date 未提供时生效)
         actor: 可选过滤 agent_a / agent_b; 空 = 不限
+        date: Phase 8g 下钻参数, YYYY-MM-DD 单日过滤 (优先于 days).
+              非法格式降级到 days.
     """
     from src.host.lead_mesh.funnel_report import compute_funnel
-    stats = compute_funnel(days=days, actor=actor or None)
+    stats = compute_funnel(days=days, actor=actor or None,
+                             date=date or None)
     return stats.to_dict()
 
 
@@ -402,12 +406,15 @@ def api_funnel_timeseries(days: int = Query(default=7, ge=1, le=90),
 @router.get("/funnel/blocked-peers")
 def api_blocked_peers(reason: str = Query(...),
                        days: int = Query(default=7, ge=1, le=90),
-                       limit: int = Query(default=50, ge=1, le=200)):
+                       limit: int = Query(default=50, ge=1, le=200),
+                       date: str = Query(default="")):
     """被某 greeting_blocked.reason 挡住的 peer 列表, 按最近时间倒序.
 
     供 Dashboard 点击 top_blocked_reason 子 modal 展示, 帮运营定位个案.
+    date 参数 (Phase 8g): YYYY-MM-DD 单日过滤, 优先于 days.
     """
     from src.host.lead_mesh.funnel_report import list_blocked_peers
-    peers = list_blocked_peers(reason=reason, days=days, limit=limit)
-    return {"reason": reason, "days": days, "count": len(peers),
-             "peers": peers}
+    peers = list_blocked_peers(reason=reason, days=days, limit=limit,
+                                 date=date or None)
+    return {"reason": reason, "days": days, "date": date or "",
+             "count": len(peers), "peers": peers}

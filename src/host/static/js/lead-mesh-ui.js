@@ -471,8 +471,9 @@
   // P2 · 运营指挥台
   // ─────────────────────────────────────────────────────────────────
 
-  // Phase 8d: Command Center 过滤器状态 (保留在 window 作用域, 切换时重渲染)
-  window._lmCCFilter = window._lmCCFilter || { days: 7, actor: 'agent_a' };
+  // Phase 8d/8g: Command Center 过滤器状态 (保留在 window 作用域, 切换时重渲染)
+  //   date (Phase 8g): 点 sparkline 某天后, 所有 funnel API 加 date=X 下钻
+  window._lmCCFilter = window._lmCCFilter || { days: 7, actor: 'agent_a', date: '' };
 
   window.lmOpenCommandCenter = async function () {
     const Shell = _shell();
@@ -483,14 +484,20 @@
     await _lmRenderCommandCenter();
   };
 
-  // Phase 8d: 过滤器 change handler (供 select 调用)
+  // Phase 8d/8g: 过滤器 change handler (供 select / sparkline click 调用)
   window.lmCCSetFilter = async function (kind, val) {
     const f = window._lmCCFilter;
-    if (kind === 'days') f.days = parseInt(val) || 7;
+    if (kind === 'days') { f.days = parseInt(val) || 7; f.date = ''; }
     else if (kind === 'actor') f.actor = val || '';
+    else if (kind === 'date') f.date = val || '';
     const body = document.getElementById('lm-cc-body');
     if (body) body.innerHTML = '<div style="padding:18px">加载中…</div>';
     await _lmRenderCommandCenter();
+  };
+
+  // Phase 8g: sparkline 点 circle → 设 date 过滤重渲染
+  window.lmCCDrillDate = async function (date) {
+    await window.lmCCSetFilter('date', date);
   };
 
   async function _lmRenderCommandCenter() {
@@ -499,8 +506,10 @@
     if (!body) return;
     const f = window._lmCCFilter;
     const funnelUrl = '/lead-mesh/funnel?days=' + f.days
-      + (f.actor ? '&actor=' + encodeURIComponent(f.actor) : '');
+      + (f.actor ? '&actor=' + encodeURIComponent(f.actor) : '')
+      + (f.date ? '&date=' + encodeURIComponent(f.date) : '');
     try {
+      // 时序始终用 days (date 下钻时不展示 sparkline 因为单点无意义)
       const tsUrl = '/lead-mesh/funnel/timeseries?days=' + f.days
         + (f.actor ? '&actor=' + encodeURIComponent(f.actor) : '');
       const [pending, ack, completed, rejected, dead, receivers, funnel, timeseries] = await Promise.all([
@@ -671,11 +680,27 @@
           + (o.v === ff.actor ? ' selected' : '') + '>'
           + o.label + '</option>';
       }).join('');
+      // Phase 8g: date 下钻时显示 chip, 点 × 清除回到 days 窗口
+      const dateChipHtml = ff.date
+        ? '  <span style="display:inline-flex;align-items:center;gap:4px;'
+          + '             padding:3px 8px;background:rgba(245,158,11,.15);'
+          + '             color:#f59e0b;border:1px solid rgba(245,158,11,.4);'
+          + '             border-radius:12px;font-size:11px">'
+          + '    📅 ' + _safe(ff.date)
+          + '    <button onclick="lmCCSetFilter(\'date\', \'\')" '
+          + '            title="清除单日过滤, 回到 ' + ff.days + ' 天窗口"'
+          + '            style="background:none;border:none;color:#f59e0b;'
+          + '                   cursor:pointer;padding:0;font-size:13px;line-height:1">✕</button>'
+          + '  </span>'
+        : '';
+
       const filterHtml = ''
         + '<div style="display:flex;gap:8px;align-items:center;font-size:11px">'
         + '  <select onchange="lmCCSetFilter(\'days\', this.value)" '
+        + '          ' + (ff.date ? 'disabled title="清除 date chip 才能切 days"' : '')
         + '          style="padding:3px 8px;background:var(--bg-main);color:var(--text);'
-        + '                 border:1px solid var(--border);border-radius:4px;font-size:11px">'
+        + '                 border:1px solid var(--border);border-radius:4px;font-size:11px'
+        + (ff.date ? ';opacity:.5' : '') + '">'
         +    daysOpts
         + '  </select>'
         + '  <select onchange="lmCCSetFilter(\'actor\', this.value)" '
@@ -683,6 +708,7 @@
         + '                 border:1px solid var(--border);border-radius:4px;font-size:11px">'
         +    actorOpts
         + '  </select>'
+        +    dateChipHtml
         + '</div>';
 
       // 瓶颈可点击: 点 code 跳 blocked peer 子 modal
@@ -845,12 +871,15 @@
       const pts = series.map(function (p, i) {
         return (PAD_X + i * stepX).toFixed(1) + ',' + yToPx(p[key] || 0).toFixed(1);
       }).join(' ');
+      // Phase 8g: circle 加 onclick → 下钻到单日 (点任意颜色都是同一天)
       const circles = series.map(function (p, i) {
         const cx = (PAD_X + i * stepX).toFixed(1);
         const cy = yToPx(p[key] || 0).toFixed(1);
         const v = p[key] || 0;
-        return '<circle cx="' + cx + '" cy="' + cy + '" r="2.5" fill="' + color + '">'
-          + '<title>' + p.date + ' ' + key + '=' + v + '</title></circle>';
+        return '<circle cx="' + cx + '" cy="' + cy + '" r="2.5" fill="' + color + '"'
+          + ' style="cursor:pointer"'
+          + ' onclick="lmCCDrillDate(\'' + p.date + '\')">'
+          + '<title>' + p.date + ' ' + key + '=' + v + ' (点击下钻)</title></circle>';
       }).join('');
       return '<polyline fill="none" stroke="' + color
         + '" stroke-width="1.5" points="' + pts + '"/>' + circles;
@@ -910,7 +939,8 @@
     try {
       const r = await Shell.api.get(
         '/lead-mesh/funnel/blocked-peers?reason=' + encodeURIComponent(reason)
-        + '&days=' + f.days + '&limit=50');
+        + '&days=' + f.days + '&limit=50'
+        + (f.date ? '&date=' + encodeURIComponent(f.date) : ''));
       const peers = (r && r.peers) || [];
       const rows = peers.length === 0
         ? '<div style="text-align:center;padding:30px;color:var(--text-dim)">✓ 该 reason 下无被挡 peer (时间窗口内)</div>'
