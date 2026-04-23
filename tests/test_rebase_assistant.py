@@ -124,6 +124,73 @@ class TestCollectPlans:
         assert plans[1].branch == "feat-b-b"
 
 
+# ─── _classify_rebase_output (纯解析, 可测) ─────────────────────────────────
+
+class TestClassifyRebaseOutput:
+    def test_empty(self):
+        from scripts.rebase_assistant import _classify_rebase_output
+        r = _classify_rebase_output("", "")
+        assert r["skipped_commits"] == []
+        assert r["conflict_files"] == []
+        assert r["has_real_conflict"] is False
+
+    def test_skipped_only_no_conflict(self):
+        """只有 skipped previously applied warnings — 不是失败原因。"""
+        from scripts.rebase_assistant import _classify_rebase_output
+        stderr = (
+            "warning: skipped previously applied commit a83c7ef\n"
+            "warning: skipped previously applied commit 746bd26\n"
+        )
+        r = _classify_rebase_output("", stderr)
+        assert len(r["skipped_commits"]) == 2
+        assert r["skipped_commits"][0] == "a83c7ef"
+        assert r["conflict_files"] == []
+        assert r["has_real_conflict"] is False
+
+    def test_real_conflict_detected(self):
+        from scripts.rebase_assistant import _classify_rebase_output
+        out = (
+            "Auto-merging src/foo.py\n"
+            "CONFLICT (content): Merge conflict in src/foo.py\n"
+            "error: could not apply abc1234... feat: foo\n"
+        )
+        r = _classify_rebase_output(out, "")
+        assert r["has_real_conflict"] is True
+        assert "src/foo.py" in r["conflict_files"]
+
+    def test_mixed_skipped_and_conflict_triggers_recovery_path(self):
+        """栈式常见: 先 skipped 几个已应用 commits, 然后下游某 commit 冲突。"""
+        from scripts.rebase_assistant import _classify_rebase_output
+        out = (
+            "warning: skipped previously applied commit a83c7ef\n"
+            "warning: skipped previously applied commit 746bd26\n"
+            "Auto-merging src/bar.py\n"
+            "CONFLICT (content): Merge conflict in src/bar.py\n"
+            "error: could not apply xyz9012... feat: bar\n"
+        )
+        r = _classify_rebase_output(out, "")
+        assert len(r["skipped_commits"]) == 2
+        assert "src/bar.py" in r["conflict_files"]
+        assert r["has_real_conflict"] is True
+
+    def test_could_not_apply_without_file_still_real(self):
+        """某些 rebase 失败只输出 could not apply 不列具体文件, 也应判定为真。"""
+        from scripts.rebase_assistant import _classify_rebase_output
+        out = "error: could not apply abc1234\n"
+        r = _classify_rebase_output(out, "")
+        assert r["has_real_conflict"] is True
+
+    def test_conflict_files_deduplicated(self):
+        from scripts.rebase_assistant import _classify_rebase_output
+        out = (
+            "CONFLICT (content): Merge conflict in src/x.py\n"
+            "Auto-merging src/x.py\n"
+            "Merge conflict in src/x.py\n"
+        )
+        r = _classify_rebase_output(out, "")
+        assert r["conflict_files"].count("src/x.py") == 1
+
+
 # ─── predict_rebase_conflict ────────────────────────────────────────────────
 
 class TestPredictRebaseConflict:

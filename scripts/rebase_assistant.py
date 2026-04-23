@@ -167,10 +167,58 @@ def predict_rebase_conflict(branch: str, onto: str) -> List[str]:
         return [f"(merge-tree 检查失败: {e})"]
 
 
+def _classify_rebase_output(stdout: str, stderr: str) -> Dict[str, Any]:
+    """解析 git rebase 的 stdout/stderr, 区分三类信号:
+
+      * skipped_commits: `warning: skipped previously applied commit <sha>`
+        — 栈式 rebase 很常见, **不是失败原因**
+      * conflict_files: `CONFLICT (...): Merge conflict in <path>` 或
+        `Merge conflict in <path>` — 真文件级冲突
+      * has_real_conflict: 有冲突文件或输出里含 `could not apply`
+
+    只有 (returncode != 0 且 has_real_conflict) 才是真正的失败。
+    单纯 skipped 常和 returncode==0 一起出现 — 老工具把 skipped 误当失败正是
+    因为没区分这三者。
+    """
+    combined = ((stdout or "") + "\n" + (stderr or "")).strip()
+    skipped: List[str] = []
+    conflict_files: List[str] = []
+    for raw_line in combined.splitlines():
+        line = raw_line.strip()
+        if "skipped previously applied commit" in line:
+            parts = line.split()
+            if parts:
+                skipped.append(parts[-1][:12])
+            continue
+        if "Merge conflict in " in line:
+            fpart = line.split("Merge conflict in ", 1)[1].strip()
+            if fpart:
+                conflict_files.append(fpart)
+            continue
+        if line.startswith("CONFLICT") and " in " in line:
+            fpart = line.split(" in ", 1)[1].strip().rstrip(":")
+            if fpart:
+                conflict_files.append(fpart)
+    # 去重保序
+    conflict_files = list(dict.fromkeys(conflict_files))
+    has_real_conflict = bool(conflict_files) or "could not apply" in combined
+    return {
+        "skipped_commits": skipped,
+        "conflict_files": conflict_files,
+        "has_real_conflict": has_real_conflict,
+        "raw": combined[-400:],
+    }
+
+
 def do_rebase(branch: str, onto: str,
               backup_prefix: str = "rebase-backup") -> Tuple[bool, str]:
-    """实际 rebase branch onto origin/<onto>。成功 return (True, ''),
-    失败 auto-abort + return (False, reason)。"""
+    """实际 rebase branch onto origin/<onto>。成功 return (True, backup_note),
+    失败 auto-abort + return (False, reason)。
+
+    Self-healing: 若首次 rebase 失败且输出含 `skipped previously applied` +
+    真冲突 (多半是栈式 rebase 的 upstream 算错), 自动用 `--fork-point` 重试一次。
+    这复现了手解 #13/#14/#15 时用的 recovery 手法。
+    """
     ts = _dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
     backup = f"{backup_prefix}-{branch}-{ts}"
     try:
@@ -183,12 +231,43 @@ def do_rebase(branch: str, onto: str,
             git("reset", "--hard", f"origin/{branch}")
         # backup
         git("branch", backup)
-        # rebase
+
+        # 第一次尝试: 普通 rebase
         r = git("rebase", f"origin/{onto}", check=False)
-        if r.returncode != 0:
+        cls = _classify_rebase_output(r.stdout, r.stderr)
+        if r.returncode == 0:
+            if cls["skipped_commits"]:
+                return True, (f"{backup} "
+                               f"(skipped {len(cls['skipped_commits'])} 已应用 commits)")
+            return True, backup
+
+        # rebase 状态机半成品, 先 abort
+        git("rebase", "--abort", check=False)
+
+        # 自动恢复: skipped + 真冲突 → 多半是栈式 rebase 的 upstream 算错,
+        # --fork-point 让 git 靠 reflog 找真正的分叉点
+        if cls["skipped_commits"] and cls["has_real_conflict"]:
+            r2 = git("rebase", "--fork-point", f"origin/{onto}",
+                      check=False)
+            cls2 = _classify_rebase_output(r2.stdout, r2.stderr)
+            if r2.returncode == 0:
+                note = " (--fork-point 自动恢复"
+                if cls2["skipped_commits"]:
+                    note += f", skipped {len(cls2['skipped_commits'])}"
+                note += ")"
+                return True, f"{backup}{note}"
             git("rebase", "--abort", check=False)
-            return False, (r.stderr or r.stdout or "unknown").strip()[:200]
-        return True, backup
+            flist = cls2["conflict_files"][:3] or cls["conflict_files"][:3]
+            if flist:
+                return False, (f"真冲突 (--fork-point 恢复后仍冲突): "
+                                f"{', '.join(flist)}")
+            return False, f"rebase 失败: {cls2['raw'][-150:]}"
+
+        # 纯粹真冲突, 无 skipped — 直接报告冲突文件
+        flist = cls["conflict_files"][:3]
+        if flist:
+            return False, f"冲突: {', '.join(flist)}"
+        return False, (cls["raw"][-150:] or "unknown")
     except Exception as e:
         try:
             git("rebase", "--abort", check=False)
