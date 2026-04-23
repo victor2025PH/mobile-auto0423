@@ -103,6 +103,28 @@ class FbWarmupError(Exception):
         self.hint = hint or ""
 
 
+def _messenger_active_lock(device_id: str, timeout: float = 30.0):
+    """F3 (A→B review Q10): ``device_section_lock("messenger_active")`` 的
+    feature-detect wrapper。
+
+    A 机 Phase 5 (``src.host.fb_concurrency``) 未合入 main 前,返回
+    ``contextlib.nullcontext()`` 不加锁不报错,功能不降级;Phase 5 合入后
+    自动启用真锁,和 A 的 ``send_greeting_after_add_friend`` fallback 分支
+    共用 "messenger_active" section,实现同 device 两边 Messenger UI 操作
+    串行化(避免抢输入框/撞 daily_cap)。
+
+    超时行为: A 的实现超时 ``raise RuntimeError``,调用方要 catch 并降级
+    (通常是 skip 本轮,记日志)。
+    """
+    try:
+        from src.host.fb_concurrency import device_section_lock
+        return device_section_lock(device_id, "messenger_active",
+                                    timeout=timeout)
+    except ImportError:
+        from contextlib import nullcontext
+        return nullcontext()
+
+
 def _now_iso() -> str:
     """与 fb_store 同格式的 UTC ISO 串（用于 stats 时间戳）。"""
     import datetime as _dt
@@ -3757,57 +3779,69 @@ class FacebookAutomation(BaseAutomation):
                  "max_conversations_applied": max_conversations,
                  "messages": []}
 
+        # F3 (A→B review Q10): 拿 device-level "messenger_active" 锁,和 A 的
+        # send_greeting_after_add_friend fallback 串行化,避免抢输入框。
+        # A 的 device_section_lock 实现在拿不到锁超时时 raise RuntimeError。
         try:
-            d.app_stop(MESSENGER_PACKAGE)
-            time.sleep(0.5)
-            d.app_start(MESSENGER_PACKAGE)
-            time.sleep(3)
-            self._dismiss_dialogs(d)
-            stats["opened"] = True
+            with _messenger_active_lock(did, timeout=30.0):
+                d.app_stop(MESSENGER_PACKAGE)
+                time.sleep(0.5)
+                d.app_start(MESSENGER_PACKAGE)
+                time.sleep(3)
+                self._dismiss_dialogs(d)
+                stats["opened"] = True
 
-            is_risk, msg = self._detect_risk_dialog(d)
-            if is_risk:
-                stats["risk_detected"] = msg
-                return stats
+                is_risk, msg = self._detect_risk_dialog(d)
+                if is_risk:
+                    stats["risk_detected"] = msg
+                    return stats
 
-            convs = self._list_messenger_conversations(d, max_conversations)
-            stats["conversations_listed"] = len(convs)
+                convs = self._list_messenger_conversations(d, max_conversations)
+                stats["conversations_listed"] = len(convs)
 
-            for c in convs:
-                if not c.get("unread"):
-                    continue
-                if stats["unread_processed"] >= max_conversations:
-                    break
-                try:
-                    detail = self._open_and_read_conversation(d, c, did,
-                                                              preset_key=preset_key)
-                    if detail:
-                        stats["unread_processed"] += 1
-                        stats["messages"].append(detail)
-
-                        if auto_reply and detail.get("incoming_text"):
-                            reply, decision = self._ai_reply_and_send(
-                                d, did,
-                                peer_name=c["name"],
-                                incoming_text=detail["incoming_text"],
-                                referral_contact=referral_contact,
-                                preset_key=preset_key,
-                                persona_key=persona_key,
-                            )
-                            if reply:
-                                stats["replied"] += 1
-                                if decision == "wa_referral":
-                                    stats["wa_referrals"] += 1
-
-                    d.press("back")
-                    time.sleep(random.uniform(1.0, 1.8))
-                except Exception as e:
-                    log.debug("[messenger_inbox] 单对话失败: %s", e)
-                    stats["errors"] += 1
+                for c in convs:
+                    if not c.get("unread"):
+                        continue
+                    if stats["unread_processed"] >= max_conversations:
+                        break
                     try:
+                        detail = self._open_and_read_conversation(d, c, did,
+                                                                  preset_key=preset_key)
+                        if detail:
+                            stats["unread_processed"] += 1
+                            stats["messages"].append(detail)
+
+                            if auto_reply and detail.get("incoming_text"):
+                                reply, decision = self._ai_reply_and_send(
+                                    d, did,
+                                    peer_name=c["name"],
+                                    incoming_text=detail["incoming_text"],
+                                    referral_contact=referral_contact,
+                                    preset_key=preset_key,
+                                    persona_key=persona_key,
+                                )
+                                if reply:
+                                    stats["replied"] += 1
+                                    if decision == "wa_referral":
+                                        stats["wa_referrals"] += 1
+
                         d.press("back")
-                    except Exception:
-                        pass
+                        time.sleep(random.uniform(1.0, 1.8))
+                    except Exception as e:
+                        log.debug("[messenger_inbox] 单对话失败: %s", e)
+                        stats["errors"] += 1
+                        try:
+                            d.press("back")
+                        except Exception:
+                            pass
+        except RuntimeError as e:
+            if "device_section_lock timeout" in str(e):
+                log.info("[check_messenger_inbox] messenger_active 锁超时,skip: %s", e)
+                stats["error"] = "device_busy_messenger_active"
+                stats["lock_timeout"] = True
+            else:
+                stats["error"] = str(e)
+                log.warning("[check_messenger_inbox] 失败: %s", e)
         except Exception as e:
             stats["error"] = str(e)
             log.warning("[check_messenger_inbox] 失败: %s", e)
@@ -3865,63 +3899,73 @@ class FacebookAutomation(BaseAutomation):
             "max_requests": max_requests,
         }
 
+        # F3 (A→B review Q10): 和 A 的 send_greeting fallback 串行化
         try:
-            d.app_start(MESSENGER_PACKAGE)
-            time.sleep(2.5)
-            self._dismiss_dialogs(d)
+            with _messenger_active_lock(did, timeout=30.0):
+                d.app_start(MESSENGER_PACKAGE)
+                time.sleep(2.5)
+                self._dismiss_dialogs(d)
 
-            if not (self.smart_tap("Message Requests entry", device_id=did)
-                    or self._open_message_requests_fallback(d)):
-                stats["error"] = "Message Requests 入口未找到"
-                return stats
+                if not (self.smart_tap("Message Requests entry", device_id=did)
+                        or self._open_message_requests_fallback(d)):
+                    stats["error"] = "Message Requests 入口未找到"
+                    return stats
 
-            time.sleep(2)
-            stats["opened"] = True
+                time.sleep(2)
+                stats["opened"] = True
 
-            is_risk, msg = self._detect_risk_dialog(d)
-            if is_risk:
-                stats["risk_detected"] = msg
-                return stats
+                is_risk, msg = self._detect_risk_dialog(d)
+                if is_risk:
+                    stats["risk_detected"] = msg
+                    return stats
 
-            convs = self._list_messenger_conversations(d, max_requests)
-            stats["requests_seen"] = len(convs)
+                convs = self._list_messenger_conversations(d, max_requests)
+                stats["requests_seen"] = len(convs)
 
-            for c in convs[:max_requests]:
-                try:
-                    detail = self._open_and_read_conversation(d, c, did,
-                                                              peer_type="stranger",
-                                                              preset_key=preset_key)
-                    if detail and detail.get("incoming_text"):
-                        stats["messages_collected"] += 1
-
-                        # P6: 陌生人场景自动回复 (peer_type='stranger' 触发
-                        # referral_gate 保守配置)
-                        if auto_reply and not detail.get("risk"):
-                            reply, decision = self._ai_reply_and_send(
-                                d, did,
-                                peer_name=c["name"],
-                                incoming_text=detail["incoming_text"],
-                                referral_contact=referral_contact,
-                                preset_key=preset_key,
-                                persona_key=persona_key,
-                                peer_type="stranger",
-                            )
-                            if reply:
-                                stats["replies_sent"] += 1
-                                if decision == "wa_referral":
-                                    stats["wa_referrals"] += 1
-                            else:
-                                stats["reply_skipped"] += 1
-
-                    d.press("back")
-                    time.sleep(random.uniform(0.8, 1.5))
-                except Exception as e:
-                    log.debug("[check_message_requests] 单对话失败: %s", e)
-                    stats["errors"] += 1
+                for c in convs[:max_requests]:
                     try:
+                        detail = self._open_and_read_conversation(d, c, did,
+                                                                  peer_type="stranger",
+                                                                  preset_key=preset_key)
+                        if detail and detail.get("incoming_text"):
+                            stats["messages_collected"] += 1
+
+                            # P6: 陌生人场景自动回复 (peer_type='stranger' 触发
+                            # referral_gate 保守配置)
+                            if auto_reply and not detail.get("risk"):
+                                reply, decision = self._ai_reply_and_send(
+                                    d, did,
+                                    peer_name=c["name"],
+                                    incoming_text=detail["incoming_text"],
+                                    referral_contact=referral_contact,
+                                    preset_key=preset_key,
+                                    persona_key=persona_key,
+                                    peer_type="stranger",
+                                )
+                                if reply:
+                                    stats["replies_sent"] += 1
+                                    if decision == "wa_referral":
+                                        stats["wa_referrals"] += 1
+                                else:
+                                    stats["reply_skipped"] += 1
+
                         d.press("back")
-                    except Exception:
-                        pass
+                        time.sleep(random.uniform(0.8, 1.5))
+                    except Exception as e:
+                        log.debug("[check_message_requests] 单对话失败: %s", e)
+                        stats["errors"] += 1
+                        try:
+                            d.press("back")
+                        except Exception:
+                            pass
+        except RuntimeError as e:
+            if "device_section_lock timeout" in str(e):
+                log.info("[check_message_requests] messenger_active 锁超时,skip: %s", e)
+                stats["error"] = "device_busy_messenger_active"
+                stats["lock_timeout"] = True
+            else:
+                stats["error"] = str(e)
+                log.warning("[check_message_requests] 失败: %s", e)
         except Exception as e:
             stats["error"] = str(e)
             log.warning("[check_message_requests] 失败: %s", e)
