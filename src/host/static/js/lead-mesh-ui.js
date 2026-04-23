@@ -475,13 +475,61 @@
   //   date (Phase 8g): 点 sparkline 某天后, 所有 funnel API 加 date=X 下钻
   window._lmCCFilter = window._lmCCFilter || { days: 7, actor: 'agent_a', date: '' };
 
+  // Phase 10-lite: 自动刷新 state — setInterval ID + 暂停标志 + 最后刷新时间戳
+  window._lmCCRefresh = window._lmCCRefresh || {
+    intervalId: null,
+    paused: false,
+    intervalMs: 15000,
+    lastRefreshAt: 0,
+  };
+
   window.lmOpenCommandCenter = async function () {
     const Shell = _shell();
     if (!Shell) return;
+    // 每次 modal open 视为新 session, 清 toast dedup 让当前所有告警都能弹一次
+    window._lmCCToastKeys = {};
     Shell.modal.open('lm-cc-modal',
       '<div id="lm-cc-body" style="padding:18px">加载中…</div>',
       { maxWidth: '980px' });
     await _lmRenderCommandCenter();
+    // Phase 10-lite: 启动 15s 轮询自动刷新
+    _lmCCStartAutoRefresh();
+  };
+
+  function _lmCCStartAutoRefresh() {
+    const state = window._lmCCRefresh;
+    if (state.intervalId) return;  // 已启动
+    state.intervalId = setInterval(function () {
+      if (state.paused) return;
+      // modal 不存在时自动停 (用户已关闭)
+      if (!document.getElementById('lm-cc-body')) {
+        _lmCCStopAutoRefresh();
+        return;
+      }
+      _lmRenderCommandCenter();
+    }, state.intervalMs);
+  }
+
+  function _lmCCStopAutoRefresh() {
+    const state = window._lmCCRefresh;
+    if (state.intervalId) {
+      clearInterval(state.intervalId);
+      state.intervalId = null;
+    }
+  }
+
+  // Phase 10-lite: 暂停 / 继续切换
+  window.lmCCToggleRefresh = function () {
+    const state = window._lmCCRefresh;
+    state.paused = !state.paused;
+    // 刷新按钮图标 (不整屏重渲染, 只改 button state)
+    const btn = document.getElementById('lm-cc-refresh-btn');
+    if (btn) {
+      btn.innerHTML = state.paused ? '▶ 继续刷新' : '⏸ 暂停刷新';
+      btn.title = state.paused
+        ? '当前已暂停 15s 自动刷新, 点击恢复'
+        : '暂停自动刷新 (保留当前截图观察)';
+    }
   };
 
   // Phase 8d/8g: 过滤器 change handler (供 select / sparkline click 调用)
@@ -764,14 +812,33 @@
         +    sparkHtml
         + '</div>';
 
+      // Phase 10-lite: 记录本次刷新时间戳 + 渲染刷新控件
+      const refreshState = window._lmCCRefresh;
+      refreshState.lastRefreshAt = Date.now();
+      const nowHms = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      const refreshBtnLabel = refreshState.paused ? '▶ 继续刷新' : '⏸ 暂停刷新';
+      const refreshBtnTitle = refreshState.paused
+        ? '当前已暂停 15s 自动刷新, 点击恢复'
+        : '暂停自动刷新 (保留当前截图观察)';
+
       body.innerHTML = ''
         + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
         + '  <div>'
         + '    <div style="font-size:18px;font-weight:700">📊 运营指挥台</div>'
         + '    <div style="font-size:11px;color:var(--text-muted);margin-top:2px">'
-        +        '本周总 ' + total + ' 单 · 完成率 ' + (total > 0 ? Math.round(cn * 100 / total) : 0) + '%</div>'
+        +        '本周总 ' + total + ' 单 · 完成率 ' + (total > 0 ? Math.round(cn * 100 / total) : 0) + '%'
+        + '      <span style="margin-left:10px;color:var(--text-dim)">'
+        + '        · 自动刷新 15s · last ' + nowHms + '</span></div>'
         + '  </div>'
-        + '  <button onclick="PlatShell.modal.close(\'lm-cc-modal\')" style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
+        + '  <div style="display:flex;gap:6px;align-items:center">'
+        + '    <button id="lm-cc-refresh-btn" onclick="lmCCToggleRefresh()" '
+        + '            title="' + refreshBtnTitle + '"'
+        + '            style="padding:4px 10px;background:rgba(96,165,250,.12);'
+        + '                   color:#60a5fa;border:1px solid rgba(96,165,250,.3);'
+        + '                   border-radius:6px;font-size:11px;cursor:pointer">'
+        +        refreshBtnLabel + '</button>'
+        + '    <button onclick="PlatShell.modal.close(\'lm-cc-modal\')" style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:6px;cursor:pointer">✕</button>'
+        + '  </div>'
         + '</div>'
         + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
         +      aFunnelCard
@@ -816,26 +883,44 @@
       // 注入一次 keyframes — 让 atRisk 行呼吸红光
       _lmInjectPulseKeyframes();
 
-      // 负载告警 toast — 有 ≥90% 的 receiver 时弹红色警告 (每次打开 dashboard 一次)
+      // Phase 10-lite: toast 防抖 — 基于内容 key 的跟踪, 状态无变化时不重复弹.
+      // 15s 轮询刷新下原本会每次都弹, 改成 "内容变了才弹" 运营不烦.
+      window._lmCCToastKeys = window._lmCCToastKeys || {};
+      const seenToast = window._lmCCToastKeys;
+      const maybeToast = function (key, msg, level) {
+        if (seenToast[key]) return;   // 同 key 跳过
+        seenToast[key] = Date.now();
+        showToast(msg, level);
+      };
+      // 每次 render 前清理 10 分钟前的记录 (避免状态恢复后永不弹)
+      const tenMinAgo = Date.now() - 600000;
+      Object.keys(seenToast).forEach(function (k) {
+        if (seenToast[k] < tenMinAgo) delete seenToast[k];
+      });
+
+      // 负载告警 toast — 有 ≥90% 的 receiver 时弹红色警告
       if (atRiskReceivers.length > 0 && typeof showToast === 'function') {
-        showToast('⚠ 接收方负载告警: ' + atRiskReceivers.join(', ')
-                   + ' 已 ≥90%, 请考虑启用备用或提升 daily_cap',
-                   'error');
+        maybeToast('receivers:' + atRiskReceivers.sort().join(','),
+          '⚠ 接收方负载告警: ' + atRiskReceivers.join(', ')
+          + ' 已 ≥90%, 请考虑启用备用或提升 daily_cap',
+          'error');
       }
 
       // Phase 8b: 获客漏斗瓶颈 toast — 有足够样本 (friend_req ≥ 5) 且
       // 转化率 <25% 或 top_blocked_reason 明显时主动提醒
       if (fuFr >= 5 && typeof showToast === 'function') {
         if (fuRate < 25) {
-          showToast('⚠ A 端 greeting 转化率仅 ' + fuRate + '% '
-                     + '(' + fuGs + '/' + fuFr + '). '
-                     + (topBlocked ? '主要瓶颈: ' + topBlocked : '')
-                     + ' 建议检查 profile UI 或 Messenger fallback 配置',
-                     'warning');
+          maybeToast('funnel_low:' + fuRate + ':' + topBlocked,
+            '⚠ A 端 greeting 转化率仅 ' + fuRate + '% '
+            + '(' + fuGs + '/' + fuFr + '). '
+            + (topBlocked ? '主要瓶颈: ' + topBlocked : '')
+            + ' 建议检查 profile UI 或 Messenger fallback 配置',
+            'warning');
         } else if (topBlocked === 'messenger_not_installed') {
-          showToast('⚠ 瓶颈: messenger_not_installed — '
-                     + '多台设备未装 Messenger, fallback 链路无法启用',
-                     'warning');
+          maybeToast('messenger_not_installed',
+            '⚠ 瓶颈: messenger_not_installed — '
+            + '多台设备未装 Messenger, fallback 链路无法启用',
+            'warning');
         }
       }
     } catch (e) {
