@@ -2792,40 +2792,95 @@ class FacebookAutomation(BaseAutomation):
     def _tap_group_members_tab(self, d, did: str) -> bool:
         """点击群内 Members tab 的精确路径。
 
-        - text 精确匹配 + clickable 过滤,避免命中推荐群卡片 description
-        - fallback 到 resourceId (部分 FB 版本)
+        2026-04-24 Phase 9 升级 (对齐 Phase 7 search_bar 修复):
+          1. **精确短 text/desc + clickable=True**, 防止命中推荐群长描述
+          2. **新增 content-desc 分支** — 新版 FB katana 的 Members 入口
+             可能是 content-desc 而非 text
+          3. **点击后验证** — dump hierarchy 看是否出现 members list (name list 多个)
+             或顶栏出现 "Members · N" 统计, 不是仍在群首页
+          4. **噪音过滤** — 即使命中也要看 label 长度: 推荐群卡片 desc
+             通常 > 40 字, Members Tab 短 label 一般 ≤ 20
         """
+        def _is_on_members_list() -> bool:
+            """自检: 点击后是否到了 Members 列表页."""
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                return False
+            # 成员列表特征: 多个 "Admin"/"Moderator" 标签 或 "Added by" 文案
+            markers = ("Added by", "Admin", "Moderator", "管理员", "管理者")
+            return sum(1 for m in markers if m in xml) >= 1
+
+        # ① 精确 text + clickable (原版路径, 保留)
         for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
             try:
                 el = d(text=txt, clickable=True)
                 if el.exists(timeout=0.8):
                     self.hb.tap(d, *self._el_center(el))
-                    time.sleep(0.5)
-                    log.info("[extract_members] tap Members tab by text='%s'", txt)
-                    return True
+                    time.sleep(1.2)
+                    if _is_on_members_list():
+                        log.info("[extract_members] tap Members tab by text='%s' ✓",
+                                  txt)
+                        return True
+                    log.debug("[extract_members] text='%s' 点后不像 members 列表,"
+                              " 继续尝试", txt)
             except Exception:
                 continue
-        # resourceId 兜底
+
+        # ② 精确 content-desc + clickable (新版 FB katana 常见)
+        for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
+            try:
+                el = d(description=txt, clickable=True)
+                if el.exists(timeout=0.8):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(1.2)
+                    if _is_on_members_list():
+                        log.info("[extract_members] tap Members tab by desc='%s' ✓",
+                                  txt)
+                        return True
+            except Exception:
+                continue
+
+        # ③ descriptionContains 但只取短 label (过滤推荐群长描述)
+        for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
+            try:
+                el = d(descriptionContains=txt, clickable=True)
+                if el.exists(timeout=0.6):
+                    try:
+                        info = el.info
+                        desc = (info.get("contentDescription") or "").strip()
+                    except Exception:
+                        desc = ""
+                    # 长描述 = 推荐群卡片, 短描述 = Tab
+                    if desc and len(desc) > 40:
+                        log.debug("[extract_members] descContains '%s' 命中长描述"
+                                  " (len=%d), 跳过防误点推荐群", txt, len(desc))
+                        continue
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(1.2)
+                    if _is_on_members_list():
+                        log.info("[extract_members] tap Members tab by descContains "
+                                  "short desc='%s' ✓", desc[:30])
+                        return True
+            except Exception:
+                continue
+
+        # ④ resourceId 兜底 (FB 老版本可能 expose)
         for rid in ("com.facebook.katana:id/members_tab",
                     "com.facebook.katana:id/group_members_tab"):
             try:
                 el = d(resourceId=rid)
                 if el.exists(timeout=0.4):
                     self.hb.tap(d, *self._el_center(el))
-                    time.sleep(0.5)
-                    log.info("[extract_members] tap Members tab by resourceId")
-                    return True
+                    time.sleep(1.2)
+                    if _is_on_members_list():
+                        log.info("[extract_members] tap Members tab by resourceId ✓")
+                        return True
             except Exception:
                 continue
-        # descriptionMatches: 不命中 "Suggested group" 前缀的 Members 标签
-        try:
-            el = d(descriptionMatches=r"^Members(?:, tab)?\b.*")
-            if el.exists(timeout=0.5):
-                self.hb.tap(d, *self._el_center(el))
-                time.sleep(0.5)
-                return True
-        except Exception:
-            pass
+
+        log.warning("[extract_members] Members tab 4 种路径全部失败, 需跑"
+                     " debug_extract_members_trace.py 诊断真实 UI 结构")
         return False
 
     def _assert_on_groups_page(self, d) -> bool:
