@@ -1,0 +1,103 @@
+# -*- coding: utf-8 -*-
+"""Phase 8b: /lead-mesh/funnel API endpoint 单测 (2026-04-24).
+
+用 FastAPI TestClient 真调 route, 验证:
+  * 空 DB 返回结构化 0 值
+  * 有数据时返回 dict 含预期 key
+  * 过滤参数 days / actor 生效
+  * days 越界参数拒绝
+"""
+from __future__ import annotations
+
+import os
+
+import pytest
+
+os.environ["OPENCLAW_API_KEY"] = ""
+
+from fastapi.testclient import TestClient
+from src.host.api import app
+import src.host.database as db_mod
+
+
+@pytest.fixture(autouse=True)
+def _use_tmp_db(tmp_path):
+    original = db_mod.DB_PATH
+    db_mod.DB_PATH = tmp_path / "funnel_api_test.db"
+    db_mod.init_db()
+    yield
+    db_mod.DB_PATH = original
+
+
+@pytest.fixture
+def api_client():
+    return TestClient(app, raise_server_exceptions=False)
+
+
+class TestFunnelApi:
+    def test_api_empty(self, api_client, tmp_db):
+        r = api_client.get("/lead-mesh/funnel")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["window_days"] == 7
+        assert body["total_friend_requested"] == 0
+        assert body["total_greeting_sent"] == 0
+        assert body["rate_greet_after_friend"] == 0.0
+        assert body["top_blocked_reason"] == ""
+
+    def test_api_with_data(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        cid = resolve_identity(platform="facebook", account_id="fb:X",
+                                 display_name="X")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp_female_midlife"})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message"})
+
+        r = api_client.get("/lead-mesh/funnel?days=7")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total_friend_requested"] == 1
+        assert body["total_greeting_sent"] == 1
+        assert body["greeting_via_inline"] == 1
+        assert body["rate_greet_after_friend"] == 1.0
+        # persona dict
+        assert body["per_persona_friend_requested"].get("jp_female_midlife") == 1
+
+    def test_api_actor_filter(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        cid = resolve_identity(platform="facebook", account_id="fb:Y",
+                                 display_name="Y")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={"persona_key": "jp"})
+        append_journey(cid, actor="agent_b", action="friend_requested",
+                         data={"persona_key": "jp"})
+
+        r_all = api_client.get("/lead-mesh/funnel?days=7")
+        r_a = api_client.get("/lead-mesh/funnel?days=7&actor=agent_a")
+        assert r_all.json()["total_friend_requested"] == 2
+        assert r_a.json()["total_friend_requested"] == 1
+
+    def test_api_rejects_invalid_days(self, api_client, tmp_db):
+        # days=0 < ge=1 → 422
+        r = api_client.get("/lead-mesh/funnel?days=0")
+        assert r.status_code == 422
+        # days=365 > le=90 → 422
+        r = api_client.get("/lead-mesh/funnel?days=365")
+        assert r.status_code == 422
+
+    def test_api_top_blocked_reason(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        cid = resolve_identity(platform="facebook", account_id="fb:BR",
+                                 display_name="BR")
+        for _ in range(3):
+            append_journey(cid, actor="agent_a", action="greeting_blocked",
+                             data={"reason": "no_message_button"})
+        append_journey(cid, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "cap_hit"})
+
+        r = api_client.get("/lead-mesh/funnel")
+        body = r.json()
+        assert body["total_greeting_blocked"] == 4
+        assert body["top_blocked_reason"] == "no_message_button"
+        assert body["blocked_reasons"]["no_message_button"] == 3

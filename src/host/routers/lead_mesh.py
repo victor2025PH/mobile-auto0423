@@ -371,3 +371,18 @@ def api_retry_dead(dispatch_id: int):
     from src.host.lead_mesh.webhook_dispatcher import retry_dead_letter
     ok = retry_dead_letter(dispatch_id)
     return {"ok": ok}
+
+
+# ── Phase 8b: 漏斗报告 (给 Command Center Dashboard 卡片用) ─────────
+@router.get("/funnel")
+def api_funnel_report(days: int = Query(default=7, ge=1, le=90),
+                       actor: str = Query(default="")):
+    """A 端 add_friend → greeting 漏斗统计. 从 lead_journey 聚合.
+
+    Args:
+        days: 时间窗口 (1-90 天)
+        actor: 可选过滤 agent_a / agent_b; 空 = 不限
+    """
+    from src.host.lead_mesh.funnel_report import compute_funnel
+    stats = compute_funnel(days=days, actor=actor or None)
+    return stats.to_dict()
