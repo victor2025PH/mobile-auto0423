@@ -600,11 +600,40 @@ _MIGRATIONS = [
 ]
 
 
+_PRE_MIGRATIONS = [
+    # 2026-04-24: 修复 audit_logs schema drift (B 机 PR #17 报告).
+    # 老 DB 该表列名是 `ts`, _SCHEMA 里已改为 `timestamp`, 但 CREATE INDEX
+    # IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp) 在老表找不到该列
+    # **直接抛异常, executescript 整体中断, 下游 FB 业务表全建不起来**.
+    # 必须在 executescript *之前* 先把老列改名, 索引建立才能继续.
+    # 新 DB 没 `ts` 列 → OperationalError → try/except 忽略.
+    "ALTER TABLE audit_logs RENAME COLUMN ts TO timestamp",
+]
+
+
 def init_db():
-    """建表（幂等）+ 增量迁移。服务启动时调用一次。"""
+    """建表（幂等）+ 增量迁移。服务启动时调用一次。
+
+    执行顺序:
+      1. _PRE_MIGRATIONS — 在 executescript 前必须跑的 schema 漂移修复
+         (老列重命名, 否则 CREATE INDEX 在老表找不到新列会炸 executescript)
+      2. executescript(_SCHEMA) — 幂等建表 + 索引 (新 DB 走这里)
+      3. _MIGRATIONS — 常规增量列/表/索引 (老 DB 升级走这里)
+    """
     conn = _connect()
     try:
+        # 步骤 1: pre-migrate (必须在 executescript 之前)
+        for sql in _PRE_MIGRATIONS:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+
+        # 步骤 2: schema (幂等 CREATE TABLE IF NOT EXISTS + 索引)
         conn.executescript(_SCHEMA)
+
+        # 步骤 3: 常规 migrations
         for sql in _MIGRATIONS:
             try:
                 conn.execute(sql)
