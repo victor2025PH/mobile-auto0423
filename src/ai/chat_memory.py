@@ -305,19 +305,173 @@ def format_profile_for_llm(profile: Dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# P10: L3 结构化记忆读侧 (MVP — 复用 A 的 fb_contact_events.meta_json)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 设计理念:
+#   * **零新 schema**: 不建 fb_chat_memory 表。复用 A Phase 5 的
+#     fb_contact_events.meta_json 的 reserved key `extracted_facts`。
+#   * **只做读侧**: 本 commit 不做 LLM 抽取写入 (那需要 careful sampling
+#     + 成本控制, 留给后续 P10b)。读侧接口就绪, 任意 event 的 meta_json
+#     里有 extracted_facts 字段, chat_memory 就能读出来合并进 prompt。
+#   * **跨事件合并**: 遍历 peer 的所有 contact events, 按时序合并
+#     extracted_facts dict, 最新值覆盖旧值。
+#
+# 约定 extracted_facts 的 schema (开放,可扩展):
+#   {
+#     "birthday": "YYYY-MM-DD" | "YYYY-MM",   # 对方透露的生日 (完整或月份)
+#     "occupation": "设计师" | "老师" | ...,    # 职业
+#     "interests": ["摄影", "旅游", ...],       # 兴趣标签列表
+#     "location": "Tokyo" | "Rome" | ...,      # 所在地
+#     "family": "已婚|单身|有孩子" | ...,        # 家庭状态
+#     "pain_points": ["失眠", "肩颈痛"],        # 痛点 (健康/生活类客群)
+#     "budget_signal": "high"|"mid"|"low",     # 消费力信号
+#     "timezone_hint": "UTC+9",                # 时区线索
+#     "<任意 key>": "<任意 value>",             # 业务可扩展
+#   }
+#
+
+def get_peer_extracted_facts(device_id: str, peer_name: str,
+                             max_events: int = 200) -> Dict[str, Any]:
+    """读 A 的 fb_contact_events.meta_json 合并 peer 的 extracted_facts。
+
+    遍历 peer 最近 ``max_events`` 条 contact events, 收集每个事件 meta_json
+    里的 ``extracted_facts`` dict, 按时序合并 — 新事件的同名 key 覆盖旧事件。
+
+    Args:
+        device_id: 设备 ID
+        peer_name: peer 姓名
+        max_events: 扫描事件数上限 (防止扫太多历史 events)
+
+    Returns:
+        合并后的 facts dict。Phase 5 未 merge 或 peer 无 events 时返 ``{}``。
+        永不抛。
+
+    如果一个字段在多个 event 里出现:
+      * 标量(str/int/bool): 新覆盖旧
+      * 列表: 去重合并 (最新列表放前面)
+      * dict: 浅合并 (新 key 覆盖旧 key)
+    """
+    if not device_id or not peer_name:
+        return {}
+    # Phase 5 未 merge 时 list_contact_events_by_peer 不存在 → 返空
+    try:
+        from src.host.fb_store import list_contact_events_by_peer
+    except ImportError:
+        return {}
+    try:
+        events = list_contact_events_by_peer(device_id, peer_name,
+                                              limit=max_events) or []
+    except Exception as e:
+        logger.debug("[L3] list_contact_events_by_peer 失败: %s", e)
+        return {}
+
+    # 按 id/detected_at 升序处理 (旧→新, 新覆盖旧)
+    try:
+        events = sorted(events, key=lambda e: (e.get("id") or 0,
+                                                 e.get("detected_at") or ""))
+    except Exception:
+        pass
+
+    import json as _json
+    merged: Dict[str, Any] = {}
+    for ev in events:
+        raw_meta = ev.get("meta_json") or ev.get("meta") or ""
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+        elif isinstance(raw_meta, str) and raw_meta:
+            try:
+                meta = _json.loads(raw_meta)
+            except Exception:
+                continue
+        else:
+            continue
+        facts = meta.get("extracted_facts")
+        if not isinstance(facts, dict):
+            continue
+        for k, v in facts.items():
+            if isinstance(v, list):
+                # 列表: 去重合并, 新值优先
+                existing = merged.get(k)
+                if isinstance(existing, list):
+                    combined: List[Any] = list(v)
+                    for item in existing:
+                        if item not in combined:
+                            combined.append(item)
+                    merged[k] = combined
+                else:
+                    merged[k] = list(v)
+            elif isinstance(v, dict):
+                existing = merged.get(k)
+                if isinstance(existing, dict):
+                    merged[k] = {**existing, **v}
+                else:
+                    merged[k] = dict(v)
+            else:
+                merged[k] = v  # 标量覆盖
+    return merged
+
+
+def format_extracted_facts_for_llm(facts: Dict[str, Any]) -> str:
+    """把 extracted_facts 拼成 LLM 可读段。空 facts 返空串。
+
+    输出示例:
+      【对方已知事实 (L3 结构化记忆)】
+      - 生日: 1988-05
+      - 职业: 设计师
+      - 兴趣: 摄影, 旅游, 日本料理
+      - 所在地: Tokyo
+      - 痛点: 失眠, 肩颈痛
+
+    字段名中文化 + 只显示非空字段。未知字段直接 k=v 打出来。
+    """
+    if not facts:
+        return ""
+
+    # 字段中文化映射 (和 extracted_facts schema 对齐)
+    field_names = {
+        "birthday": "生日",
+        "occupation": "职业",
+        "interests": "兴趣",
+        "location": "所在地",
+        "family": "家庭",
+        "pain_points": "痛点",
+        "budget_signal": "消费力",
+        "timezone_hint": "时区",
+    }
+    lines = ["【对方已知事实 (L3 结构化记忆)】"]
+    for k, v in facts.items():
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        label = field_names.get(k, k)
+        if isinstance(v, list):
+            value = ", ".join(str(x) for x in v if x)
+        elif isinstance(v, dict):
+            value = ", ".join(f"{kk}={vv}" for kk, vv in v.items())
+        else:
+            value = str(v)
+        if value:
+            lines.append(f"- {label}: {value}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 统一入口 — _ai_reply_and_send 调用
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_context_block(device_id: str, peer_name: str, *,
-                        history_limit: int = 5) -> Dict[str, Any]:
+                        history_limit: int = 5,
+                        include_l3_facts: bool = True) -> Dict[str, Any]:
     """一站式拼装记忆块 — 调用方通常只看 ``hint_text``。
 
     返回:
       history:      List[Dict]         — 原始历史 (供调用方另用)
-      profile:      Dict[str, Any]     — 原始画像 (供 telemetry/调试)
+      profile:      Dict[str, Any]     — 原始派生画像 (L1+L2)
       history_text: str                — LLM 可读历史段
       profile_text: str                — LLM 可读画像段
-      hint_text:    str                — history_text + profile_text 的拼接 (注入 ab_style_hint)
+      facts:        Dict[str, Any]     — P10 L3 extracted_facts (Phase 5 未 merge 时 {})
+      facts_text:   str                — L3 facts 的 LLM 可读段
+      hint_text:    str                — 三段拼接 (注入 ab_style_hint)
       should_block_referral: bool      — 是否要在本轮阻止引流 (来自画像判断)
 
     无历史时 hint_text='', should_block_referral=False (由 caller 走 cold-start 路径)。
@@ -328,7 +482,17 @@ def build_context_block(device_id: str, peer_name: str, *,
     history_text = format_history_for_llm(history)
     profile_text = format_profile_for_llm(profile)
 
-    pieces = [p for p in (history_text, profile_text) if p]
+    # P10 L3 读侧 (Phase 5 未 merge 时 facts={}, facts_text="")
+    facts: Dict[str, Any] = {}
+    facts_text = ""
+    if include_l3_facts:
+        try:
+            facts = get_peer_extracted_facts(device_id, peer_name)
+            facts_text = format_extracted_facts_for_llm(facts)
+        except Exception as e:
+            logger.debug("[L3] build_context_block 读取 facts 失败: %s", e)
+
+    pieces = [p for p in (history_text, profile_text, facts_text) if p]
     hint_text = "\n\n".join(pieces)
 
     # 引流阻塞: 上次引流后对方没回 → 本轮不要再引
@@ -342,6 +506,8 @@ def build_context_block(device_id: str, peer_name: str, *,
         "profile": profile,
         "history_text": history_text,
         "profile_text": profile_text,
+        "facts": facts,
+        "facts_text": facts_text,
         "hint_text": hint_text,
         "should_block_referral": should_block_referral,
     }
