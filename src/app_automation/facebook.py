@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base_automation import BaseAutomation
+from .fb_profile_signals import is_likely_fb_profile_page_xml as _fb_xml_is_profile
 
 log = logging.getLogger(__name__)
 
@@ -612,6 +613,16 @@ class FacebookAutomation(BaseAutomation):
         # 5) 其他（含空格、非拉丁字符等）→ display_name
         return "display_name", s
 
+    def _is_likely_fb_profile_page_xml(self, x: str) -> bool:
+        """从 hierarchy 文本判断当前是否像「个人资料页」（委托 ``fb_profile_signals``）。"""
+        return _fb_xml_is_profile(x)
+
+    def _is_likely_fb_profile_page(self, d) -> bool:
+        try:
+            return _fb_xml_is_profile(d.dump_hierarchy())
+        except Exception:
+            return False
+
     def navigate_to_profile(self, candidate: str,
                             device_id: Optional[str] = None,
                             post_open_dwell_sec: Tuple[float, float] = (2.5, 4.0),
@@ -685,15 +696,36 @@ class FacebookAutomation(BaseAutomation):
                         "target_key": target_key, "url": "",
                         "reason": "search_no_result"}
             d = self._u2(did)
-            first = self._first_search_result_element(d)
+            first = self._first_search_result_element(d, query_hint=norm)
             if first is None:
                 return {"ok": False, "kind": "display_name", "via": "search",
                         "target_key": target_key, "url": "",
                         "reason": "search_no_clickable"}
             self.hb.tap(d, *self._el_center(first))
             time.sleep(random.uniform(lo_d, hi_d))
+            try:
+                xml_chk = d.dump_hierarchy()
+            except Exception:
+                xml_chk = ""
+            if not self._is_likely_fb_profile_page_xml(xml_chk):
+                like_name = (results[0].get("name") or "").strip()
+                if like_name and self._search_result_name_plausible(like_name, norm):
+                    try:
+                        el = d(text=like_name)
+                        if el.exists(timeout=2.0):
+                            el.click()
+                            time.sleep(random.uniform(lo_d, hi_d))
+                            xml_chk = d.dump_hierarchy()
+                    except Exception:
+                        pass
+                if not self._is_likely_fb_profile_page_xml(xml_chk):
+                    return {"ok": False, "kind": "display_name", "via": "search",
+                            "target_key": target_key, "url": "",
+                            "reason": "not_profile_page"}
+            disp = (results[0].get("name") or "").strip() or norm
             return {"ok": True, "kind": "display_name", "via": "search",
-                    "target_key": target_key, "url": "", "reason": ""}
+                    "target_key": target_key, "url": "", "reason": "",
+                    "display_name": disp}
         except Exception as e:
             log.warning("[navigate_to_profile] search 失败: %s", e)
             return {"ok": False, "kind": "display_name", "via": "search",
@@ -768,14 +800,55 @@ class FacebookAutomation(BaseAutomation):
 
         with self.guarded("search", device_id=did):
             if not self._tap_search_bar_preferred(d, did):
-                log.warning("[search_people] 无法打开搜索栏")
+                # 进搜索页失败时必须 early-return — 否则后续 type_text 会在
+                # 当前页(可能是 Home/Messenger)乱输,导致伪"搜索"毫无结果。
+                log.warning("[search_people] 无法打开搜索栏, 放弃本次 search")
+                return []
 
-            time.sleep(0.8)
-            self.hb.type_text(d, query)
-            time.sleep(1.5)
+            time.sleep(1.0)
+            # 生产 bug fix (2026-04-23 v2): 必须模拟真实 IME 输入才能触发 FB 搜索 API.
+            # 先 click focus EditText, 清空, 再用 d.send_keys (走 IME / TextWatcher);
+            # set_text 直接 setText Android API 绕过 TextWatcher, FB 不会发搜索请求.
+            input_done = False
+            for edit_sel in (
+                {"resourceId": "com.facebook.katana:id/search_query_text_view"},
+                {"className": "android.widget.EditText",
+                 "description": "Search Facebook"},
+                {"className": "android.widget.EditText"},
+            ):
+                try:
+                    edit_el = d(**edit_sel)
+                    if edit_el.exists(timeout=1.8):
+                        try:
+                            edit_el.click()
+                            time.sleep(0.5)
+                        except Exception:
+                            pass
+                        try:
+                            edit_el.clear_text()
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+                        # 走 d.send_keys — 走 IME 通道触发 TextWatcher
+                        try:
+                            d.send_keys(query, clear=False)
+                            log.info("[search_people] 输入 query=%r via IME send_keys "
+                                      "(focused=%s)", query, edit_sel)
+                            input_done = True
+                        except Exception as e:
+                            log.debug("[search_people] send_keys 失败, 回退 set_text: %s", e)
+                            edit_el.set_text(query)
+                            input_done = True
+                        break
+                except Exception:
+                    continue
+            if not input_done:
+                log.warning("[search_people] 找不到 EditText, 退回 hb.type_text 兜底")
+                self.hb.type_text(d, query)
+            time.sleep(2.0)
 
             d.press("enter")
-            time.sleep(2.5)
+            time.sleep(3.0)
 
             # 点击 People 过滤器——先用 u2 精确选择，失败再用 ADB 固定坐标回退
             # 不使用 smart_tap（缓存坐标可能混入搜索栏坐标）
@@ -797,7 +870,21 @@ class FacebookAutomation(BaseAutomation):
                 self._people_tab_fallback_adb(d, did)
             time.sleep(1.5)
 
-        results = self._extract_search_results(d, max_results, query_hint=query)
+        # People tab 切换后 FB 重新加载过滤结果, 在 720p 中低端机上需要 2-4s
+        # 才稳定渲染. 之前 1.5s 太紧, 常见 extract 返回 0 条.
+        # 修复: extract 返回空时 retry 最多 2 轮, 每轮再等 1.2s 让页面稳定.
+        results: List[Dict[str, str]] = []
+        for attempt in range(3):
+            results = self._extract_search_results(d, max_results, query_hint=query)
+            if results:
+                if attempt > 0:
+                    log.info("[search_people] 第 %d 轮 extract 拿到 %d 个结果 (重试生效)",
+                              attempt + 1, len(results))
+                break
+            if attempt < 2:
+                log.debug("[search_people] extract 空, 等 1.2s 再重试 (第 %d 轮)",
+                          attempt + 1)
+                time.sleep(1.2)
         return results
 
     @_with_fb_foreground
@@ -834,6 +921,78 @@ class FacebookAutomation(BaseAutomation):
 
         return False
 
+    def _add_friend_safe_interaction_on_profile(
+            self, d, did: str, profile_name: str, note: str,
+            *, persona_key: Optional[str], source: str, preset_key: str) -> bool:
+        """已在对方资料页：风控 → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。"""
+        is_risk, msg = self._detect_risk_dialog(d)
+        if is_risk:
+            log.warning("[add_friend_with_note] 检测到风控提示: %s", msg)
+            return False
+
+        for _ in range(random.randint(1, 2)):
+            self.hb.scroll_down(d)
+            time.sleep(random.uniform(2.0, 4.0))
+
+        self.hb.wait_read(random.randint(2000, 6000))
+
+        for _ in range(random.randint(2, 4)):
+            self.hb.scroll_up(d)
+            time.sleep(random.uniform(0.35, 0.7))
+        time.sleep(0.8)
+
+        tapped = self.smart_tap("Add Friend button on profile page",
+                                device_id=did)
+        if not tapped:
+            tapped = self.smart_tap("Add Friend button", device_id=did)
+        if not tapped:
+            for sel in (
+                {"resourceId": "com.facebook.katana:id/profile_actionbar_addfriend_button"},
+                {"descriptionContains": "Add friend"},
+                {"textContains": "友達"},
+                {"descriptionContains": "友達"},
+                {"textContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},  # 友達を追加
+                {"textContains": "\u53cb\u9054\u306b\u306a\u308b"},  # 友達になる
+                {"descriptionContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},
+            ):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=1.2):
+                        el.click()
+                        tapped = True
+                        log.info("[add_friend_with_note] Add friend via u2 %s", sel)
+                        break
+                except Exception:
+                    pass
+        if not tapped:
+            log.info("[add_friend_with_note] 该用户无加好友按钮(可能已是好友/被限)")
+            return False
+        time.sleep(1.5)
+
+        if note:
+            if d(textContains="Add").exists(timeout=1.0) or d(textContains="note").exists(timeout=0.5):
+                note_input = d(className="android.widget.EditText")
+                if note_input.exists(timeout=1.0):
+                    try:
+                        self.hb.tap(d, *self._el_center(note_input))
+                        time.sleep(0.4)
+                        self.hb.type_text(d, note[:200])
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                self.smart_tap("Send button", device_id=did)
+                time.sleep(1.0)
+
+        log.info("[add_friend_with_note] 好友请求已发送: %s (note=%s)",
+                 profile_name, bool(note))
+
+        self._record_friend_request_safely(
+            did, profile_name, note=note,
+            persona_key=persona_key,
+            source=source, preset_key=preset_key,
+            status="sent")
+        return True
+
     @_with_fb_foreground
     def add_friend(self, profile_name: str,
                    device_id: Optional[str] = None) -> bool:
@@ -863,7 +1022,8 @@ class FacebookAutomation(BaseAutomation):
                              persona_key: Optional[str] = None,
                              phase: Optional[str] = None,
                              source: str = "",
-                             preset_key: str = "") -> bool:
+                             preset_key: str = "",
+                             from_current_profile: bool = False) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -884,6 +1044,8 @@ class FacebookAutomation(BaseAutomation):
             device_id: 设备 ID
             persona_key: 目标客群 key(router 层已经 setdefault 注入)
             phase: 显式覆盖 phase；为空走 fb_account_phase.get_phase
+            from_current_profile: True 时跳过 search_people/点首条,假定已在资料页
+                (获客任务 navigate 后加友,避免二次搜索误点)
         """
         did = self._did(device_id)
         d = self._u2(did)
@@ -908,12 +1070,14 @@ class FacebookAutomation(BaseAutomation):
                 profile_name, note, safe_mode, did, d,
                 ab_cfg, daily_cap=int(ab_cfg.get("daily_cap_per_account") or 0),
                 persona_key=persona_key, eff_phase=eff_phase,
-                source=source, preset_key=preset_key)
+                source=source, preset_key=preset_key,
+                from_current_profile=from_current_profile)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
                                      persona_key, eff_phase,
-                                     source: str = "", preset_key: str = ""):
+                                     source: str = "", preset_key: str = "",
+                                     from_current_profile: bool = False):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
         if daily_cap > 0:
@@ -942,6 +1106,15 @@ class FacebookAutomation(BaseAutomation):
                 log.debug("[add_friend_with_note] get_verification_note 失败: %s", e)
 
         with self.guarded("add_friend", device_id=did):
+            if from_current_profile:
+                time.sleep(random.uniform(2.0, 4.0))
+                if not self._is_likely_fb_profile_page(d):
+                    log.warning("[add_friend_with_note] from_current_profile=True 但当前不像资料页, 中止")
+                    return False
+                return self._add_friend_safe_interaction_on_profile(
+                    d, did, profile_name, note,
+                    persona_key=persona_key, source=source, preset_key=preset_key)
+
             results = self.search_people(profile_name, did, max_results=3)
             if not results:
                 log.warning("[add_friend_with_note] 未找到目标: %s", profile_name)
@@ -951,39 +1124,18 @@ class FacebookAutomation(BaseAutomation):
 
             if safe_mode:
                 # 安全路径: 点击第一个搜索结果进主页 → 停留 → 找主页内的 Add Friend
-                first = self._first_search_result_element(d)
+                first = self._first_search_result_element(d, query_hint=profile_name)
                 if first is None:
                     log.warning("[add_friend_with_note] 无法定位首个搜索结果")
                     return False
                 self.hb.tap(d, *self._el_center(first))
                 time.sleep(random.uniform(4.5, 7.0))
 
-                def _xml_has_profile_signals(x: str) -> bool:
-                    if not x:
-                        return False
-                    low = x.lower()
-                    if any(s in low for s in ("add friend", "message", "follow")):
-                        return True
-                    # 资料页常见 resource-id 片段（不依赖界面语言）
-                    if "profile_actionbar" in low or "profile_header" in low:
-                        return True
-                    if "com.facebook.katana:id/profile_" in low:
-                        return True
-                    # 日文界面常见文案
-                    return any(
-                        s in x
-                        for s in (
-                            "\u53cb\u9054\u3092\u8ffd\u52a0",  # 友達を追加
-                            "\u30e1\u30c3\u30bb\u30fc\u30b8",  # メッセージ
-                            "\u30d5\u30a9\u30ed\u30fc",  # フォロー
-                        )
-                    )
-
                 try:
                     xml_chk = d.dump_hierarchy()
                 except Exception:
                     xml_chk = ""
-                if not _xml_has_profile_signals(xml_chk):
+                if not self._is_likely_fb_profile_page_xml(xml_chk):
                     like_name = (results[0].get("name") or "").strip()
                     if like_name and self._search_result_name_plausible(
                             like_name, profile_name):
@@ -997,65 +1149,18 @@ class FacebookAutomation(BaseAutomation):
                                 xml_chk = d.dump_hierarchy()
                         except Exception:
                             pass
-                if not _xml_has_profile_signals(xml_chk):
+                if not self._is_likely_fb_profile_page_xml(xml_chk):
                     log.info("[add_friend_with_note] 未检测到资料页特征，尝试列表区坐标点击")
                     w, _h = d.window_size()
                     self._adb(f"shell input tap {int(w * 0.5)} {int(620)}", device_id=did)
                     time.sleep(random.uniform(3.0, 5.0))
 
-                # 检测风控
-                is_risk, msg = self._detect_risk_dialog(d)
-                if is_risk:
-                    log.warning("[add_friend_with_note] 检测到风控提示: %s", msg)
-                    return False
-
-                # 模拟看资料：随机滚动 1-2 次
-                for _ in range(random.randint(1, 2)):
-                    self.hb.scroll_down(d)
-                    time.sleep(random.uniform(2.0, 4.0))
-
-                # 总停留时长 8-15s（含上面滚动）
-                self.hb.wait_read(random.randint(2000, 6000))
-
-                # 向下滚动会把顶部资料头（含 Add friend）滚出屏外，先滚回顶部再找按钮
-                for _ in range(random.randint(2, 4)):
-                    self.hb.scroll_up(d)
-                    time.sleep(random.uniform(0.35, 0.7))
-                time.sleep(0.8)
-
-                # 主页内找 Add Friend（smart_tap → u2 日文/资源 id 回退）
-                tapped = self.smart_tap("Add Friend button on profile page",
-                                        device_id=did)
-                if not tapped:
-                    tapped = self.smart_tap("Add Friend button", device_id=did)
-                if not tapped:
-                    # 日文 FB 常用：友達を追加 / 友達になる（用 Unicode 避免源文件编码问题）
-                    for sel in (
-                        {"resourceId": "com.facebook.katana:id/profile_actionbar_addfriend_button"},
-                        {"descriptionContains": "Add friend"},
-                        {"textContains": "友達"},
-                        {"descriptionContains": "友達"},
-                        {"textContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},  # 友達を追加
-                        {"textContains": "\u53cb\u9054\u306b\u306a\u308b"},  # 友達になる
-                        {"descriptionContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},
-                    ):
-                        try:
-                            el = d(**sel)
-                            if el.exists(timeout=1.2):
-                                el.click()
-                                tapped = True
-                                log.info("[add_friend_with_note] Add friend via u2 %s", sel)
-                                break
-                        except Exception:
-                            pass
-                if not tapped:
-                    log.info("[add_friend_with_note] 该用户无加好友按钮(可能已是好友/被限)")
-                    return False
-                time.sleep(1.5)
-            else:
-                if not self.smart_tap("Add Friend button", device_id=did):
-                    return False
-                time.sleep(1)
+                return self._add_friend_safe_interaction_on_profile(
+                    d, did, profile_name, note,
+                    persona_key=persona_key, source=source, preset_key=preset_key)
+            if not self.smart_tap("Add Friend button", device_id=did):
+                return False
+            time.sleep(1)
 
             # 部分 FB 版本会弹"加备注/Send"对话框
             if note:
@@ -1075,8 +1180,6 @@ class FacebookAutomation(BaseAutomation):
             log.info("[add_friend_with_note] 好友请求已发送: %s (note=%s)",
                      profile_name, bool(note))
 
-            # P3-1 2026-04-23: 入库移到锁内,消除 record 和下一 worker check cap 之间
-            # 的竞态窗口。调用方(executor) 不再重复 record(仅在 UI 失败时补 risk)。
             self._record_friend_request_safely(
                 did, profile_name, note=note,
                 persona_key=persona_key,
@@ -1664,7 +1767,7 @@ class FacebookAutomation(BaseAutomation):
                 log.warning("[send_greeting] 未找到目标: %s", profile_name)
                 self._set_greet_reason("search_miss")
                 return False
-            first = self._first_search_result_element(d)
+            first = self._first_search_result_element(d, query_hint=profile_name)
             if first is None:
                 log.warning("[send_greeting] 无法定位首个搜索结果: %s", profile_name)
                 self._set_greet_reason("first_tap_miss")
@@ -2784,7 +2887,7 @@ class FacebookAutomation(BaseAutomation):
             results = self.search_people(profile_name, did, max_results=3)
             if not results:
                 return False
-            first = self._first_search_result_element(d)
+            first = self._first_search_result_element(d, query_hint=profile_name)
             if first is None:
                 return False
             self.hb.tap(d, *self._el_center(first))
@@ -3982,25 +4085,123 @@ class FacebookAutomation(BaseAutomation):
     # ── Internal Helpers ──────────────────────────────────────────────────
 
     def _tap_search_bar_preferred(self, d, device_id: Optional[str] = None) -> bool:
-        """优先用 resourceId 点搜索框，避免 AutoSelector 把 Feed 顶栏缓存成错误坐标。"""
+        """优先用 resourceId/description 点搜索框，避免 AutoSelector 把 Feed 顶栏缓存成错误坐标。
+
+        关键修复 (2026-04-23): 某些 FB 版本 (katana 最新) 的顶栏搜索 icon 是
+          <Button content-desc="Search" class="Button"> 而不是 EditText "Search Facebook".
+        加硬编码 `description="Search"` + 点击后做"是否进搜索页"自检，
+        自检失败就回退 (避免把 AutoSelector 缓存的污染坐标当成进了)。
+        """
         did = self._did(device_id)
+
+        def _is_on_fb_home() -> bool:
+            """Home feed 的稳定特征: 'What's on your mind?' 发帖框或底栏 'Home, tab 1 of' 描述。"""
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                return False
+            return ("What's on your mind?" in xml
+                     or "Home, tab 1 of" in xml
+                     or "id/feed_list" in xml)
+
+        def _force_back_to_home(max_attempts: int = 5) -> bool:
+            """从任何 FB 子页(Messenger/Profile/Search/Settings)退回 Home.
+            超过尝试次数仍不行就重启 FB."""
+            for _ in range(max_attempts):
+                if _is_on_fb_home():
+                    return True
+                # 当前还在 FB 包内就 back; 跳出 FB 就重启
+                try:
+                    cur_pkg = (d.app_current() or {}).get("package", "")
+                except Exception:
+                    cur_pkg = ""
+                if cur_pkg != "com.facebook.katana":
+                    # 意外跳出 FB (小米 home / 天气 / 任何 app), 重启
+                    log.warning("[search] FB 不在前台 (cur=%s), 重启 FB", cur_pkg)
+                    try:
+                        d.app_start("com.facebook.katana", use_monkey=True)
+                        time.sleep(5.0)
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    d.press("back")
+                    time.sleep(0.8)
+                except Exception:
+                    return False
+            return _is_on_fb_home()
+
+        def _is_on_search_page() -> bool:
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                return False
+            return ("Recent searches" in xml
+                     or "Search Facebook" in xml
+                     or 'resource-id="com.facebook.katana:id/search_query_text_view"' in xml)
+
+        def _is_on_messenger_or_chats() -> bool:
+            """误点到 Messenger/Chats 页需要先退出, 不然后续操作全在 Messenger 里。"""
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                return False
+            # 标志: Chats 顶栏 + Get Messenger 横幅 + com.facebook.orca/katana:id/chat_*
+            return ("Get Messenger" in xml
+                     or "id/chats_fragment" in xml
+                     or (xml.count("Messages and calls are") >= 1))
+
+        def _back_to_fb_home(max_presses: int = 4) -> None:
+            for _ in range(max_presses):
+                if not _is_on_messenger_or_chats():
+                    return
+                try:
+                    d.press("back")
+                    time.sleep(0.8)
+                except Exception:
+                    return
+
+        # 入口先 ensure 在 FB Home — 上一个任务的污染常让 FB 停在 Messenger/Profile/子页,
+        # 不回 Home 直接找 selector 全部对不上, 搜索失败概率 100%.
+        if not _is_on_search_page():
+            if not _force_back_to_home():
+                log.warning("[search] 无法回到 FB Home feed, 继续尝试但可能失败")
+
+        # 严格 selector 列表 - 按优先级; 每次点完做页面自检
         for sel in (
             {"resourceId": "com.facebook.katana:id/search_query_text_view"},
             {"resourceId": "com.facebook.katana:id/search_bar_text_view"},
             {"resourceId": "com.facebook.katana:id/search_bar"},
             {"resourceId": "com.facebook.katana:id/search_button"},
             {"className": "android.widget.EditText", "description": "Search Facebook"},
+            # ↓ FB 新版顶栏 icon: Button desc="Search" (不是 EditText!)
+            {"className": "android.widget.Button", "description": "Search"},
+            {"description": "Search", "clickable": True},
         ):
             try:
                 el = d(**sel)
                 if el.exists(timeout=1.8):
                     self.hb.tap(d, *self._el_center(el))
-                    log.info("[search] opened search via selector %s", sel)
-                    return True
+                    time.sleep(1.5)
+                    if _is_on_search_page():
+                        log.info("[search] opened search via selector %s", sel)
+                        return True
+                    log.warning("[search] selector %s 点了但未进搜索页, 继续试下一个", sel)
             except Exception:
                 continue
-        if self.smart_tap("Search bar or search icon", device_id=did):
+
+        # 2026-04-23: 不再调 smart_tap 找搜索入口 —
+        # MEMORY / AutoSelector pitfall: smart_tap 历史把这个 key 学成 Messenger 图标
+        # 坐标, 内置 heal 机制还会 back+重启 FB 让页面乱跳, 让下游更难复原.
+        # 导航类入口必须硬编码 selector + 坐标 fallback (已有 _fallback_search_tap).
+
+        # fallback 前检查: 已在搜索页就直接返回; 若在 Messenger (历史污染遗留) 先退回
+        if _is_on_search_page():
             return True
+        if _is_on_messenger_or_chats():
+            log.info("[search] 当前在 Messenger Chats 页, 按 back 退回 FB 主页")
+            _back_to_fb_home()
+            time.sleep(1.0)
         return bool(self._fallback_search_tap(d))
 
     def _people_tab_fallback_adb(self, d, device_id: str) -> None:
@@ -4159,20 +4360,41 @@ class FacebookAutomation(BaseAutomation):
         nl = n.lower()
         return any(t.lower() in nl for t in qtok)
 
-    def _first_search_result_element(self, d):
-        """返回搜索结果列表里第 1 个可点击的人员卡片元素(用于进入主页)。
+    def _first_search_result_element(self, d, query_hint: str = ""):
+        """返回搜索结果列表里第 1 个**匹配 query_hint**的人员卡片元素(用于进入主页)。
+
+        2026-04-23 修复: 原版只返回屏幕最顶的人卡片 — 若搜"佐藤花子"排序返回
+        [佐藤葵花, 佐藤花子, ...], 旧版会点到"佐藤葵花"(屏幕最上)进错 profile.
+        现在按 query_hint 做 plausible 匹配, 优先返回第一个匹配候选; 若全不匹配
+        才回退到原行为(最顶卡片). 避免明显误点.
 
         优先宽卡片（与 w0_capture_direct.search_and_navigate 一致），再回退 TextView，
         避免误点筛选标签或窄 TextView。
         """
+        def _card_text(el) -> str:
+            """从 person card 提取主要人名文字 (content_desc 优先 - 格式通常是 '人名,地点')。"""
+            cd = (getattr(el, "content_desc", "") or "").strip()
+            if cd:
+                return cd.split(",")[0].strip()
+            return (getattr(el, "text", "") or "").strip()
+
         try:
             xml = d.dump_hierarchy()
             from ..vision.screen_parser import XMLParser
             elements = XMLParser.parse(xml)
 
-            # ① 全宽人员卡片（英文 Button / ViewGroup，与 w0 脚本同序）
-            for el in elements:
-                if self._is_person_card(el):
+            # ① 全宽人员卡片（英文 Button / ViewGroup）— 收集所有, 按 query 优先排
+            cards = [el for el in elements if self._is_person_card(el)]
+            if cards and query_hint:
+                plausible = [c for c in cards
+                              if self._search_result_name_plausible(
+                                  _card_text(c), query_hint)]
+                if plausible:
+                    el = plausible[0]
+                    if len(plausible) < len(cards):
+                        log.info("[first_result] query=%r 跳过 %d 个不匹配卡片, 选第 %d 张",
+                                  query_hint, cards.index(el),
+                                  cards.index(el) + 1)
                     b = el.bounds
                     return type("E", (), {
                         "info": {"bounds": {
@@ -4180,8 +4402,17 @@ class FacebookAutomation(BaseAutomation):
                             "right": b[2], "bottom": b[3],
                         }}
                     })()
+            for el in cards:
+                b = el.bounds
+                return type("E", (), {
+                    "info": {"bounds": {
+                        "left": b[0], "top": b[1],
+                        "right": b[2], "bottom": b[3],
+                    }}
+                })()
 
-            # ② 中文等：可点击 TextView，排除筛选词与顶栏噪声
+            # ② 中文等：可点击 TextView, 同样应用 query 优先
+            textviews = []
             for el in elements:
                 if (el.clickable and el.text and len(el.text) >= 2
                         and el.class_name and "TextView" in el.class_name):
@@ -4190,6 +4421,19 @@ class FacebookAutomation(BaseAutomation):
                         continue
                     if el.bounds and el.bounds[1] < 280 and len(t) < 30:
                         continue
+                    textviews.append(el)
+            if textviews and query_hint:
+                plausible = [el for el in textviews
+                              if self._search_result_name_plausible(el.text, query_hint)]
+                if plausible:
+                    el = plausible[0]
+                    return type("E", (), {
+                        "info": {"bounds": {
+                            "left": el.bounds[0], "top": el.bounds[1],
+                            "right": el.bounds[2], "bottom": el.bounds[3],
+                        }}
+                    })()
+            for el in textviews:
                     return type("E", (), {
                         "info": {"bounds": {
                             "left": el.bounds[0], "top": el.bounds[1],
