@@ -50,7 +50,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "min_turns": 3,                # soft: 累积对话轮数门槛
-    "min_lead_score": 60,          # soft: A 打分门槛
+    "min_lead_score": 0,           # soft: A 打分门槛; **0 = 禁用此信号**
+                                   # (A 机 review 反馈: fb_lead_scorer_v2 融合分
+                                   # 均值约 45-55,60 会筛掉一半早期 lead。等积累
+                                   # 2 周 ≥500 leads 数据后查 P75 分位再调)
     "min_peer_replies": 2,         # soft: 对方回复次数门槛
     "score_threshold": 3,          # soft: 5 档评分里满足 3 档即通过
     "refer_cooldown_hours": 1,     # hard: 同 peer 再次引流的冷却期
@@ -173,9 +176,11 @@ def should_refer(*,
     except (TypeError, ValueError):
         pass
 
-    if int(lead_score) >= int(cfg["min_lead_score"]):
+    # min_lead_score=0 禁用此信号,避免 "lead_score >= 0" 总是 True 给 +1
+    _min_ls = int(cfg["min_lead_score"])
+    if _min_ls > 0 and int(lead_score) >= _min_ls:
         score += 1
-        reasons.append(f"lead_score={lead_score} ≥ {cfg['min_lead_score']}")
+        reasons.append(f"lead_score={lead_score} ≥ {_min_ls}")
 
     peer_replies = int(profile.get("peer_reply_count", 0) or 0)
     if peer_replies >= int(cfg["min_peer_replies"]):
