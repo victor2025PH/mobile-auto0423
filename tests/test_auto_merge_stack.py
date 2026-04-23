@@ -225,6 +225,26 @@ class TestCheckReadiness:
         assert plan.retarget_base_to == "main"
         assert plan.status == "ready"
 
+    def test_blocked_when_base_not_main_and_parent_unmerged(self):
+        """base 指向栈上层分支但 parent PR 还没合 → 保守 blocked, 防止
+        直接 PUT /merge 合进栈分支 (2026-04-24 PR #10 踩过的坑: #10 approved
+        + mergeable=clean, base=feat-b-followup-a-review, #9 仍 blocked;
+        旧版工具直接 merge 把 #10 合进了 #9 分支而不是 main)。"""
+        from scripts.auto_merge_stack import MergePlan, check_readiness
+        plan = MergePlan(pr_number=10, branch="feat-b-p7",
+                          base="feat-b-followup-a-review")
+        reviews = [{"state": "APPROVED",
+                     "submitted_at": "2026-04-24T12:00:00Z",
+                     "user": {"login": "a"}}]
+        with patch("scripts.auto_merge_stack.github_api",
+                   side_effect=self._api_factory(
+                       self._pr(base="feat-b-followup-a-review"),
+                       reviews)):
+            check_readiness(plan, "t", merged_branches=set())
+        assert plan.status == "blocked"
+        assert "base" in plan.error
+        assert "feat-b-followup-a-review" in plan.error
+
     def test_commented_with_approve_marker_is_approved(self):
         """A 的 approve-equivalent COMMENTED 识别为 APPROVED (GitHub 不让自审)。"""
         from scripts.auto_merge_stack import MergePlan, check_readiness
