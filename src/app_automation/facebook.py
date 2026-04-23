@@ -24,6 +24,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .base_automation import BaseAutomation
 from .fb_profile_signals import is_likely_fb_profile_page_xml as _fb_xml_is_profile
+from .fb_search_markers import (
+    FB_STARTUP_DISMISS_TARGET_TEXTS,
+    hierarchy_looks_like_fb_home,
+    hierarchy_looks_like_fb_search_surface,
+    hierarchy_looks_like_messenger_or_chats,
+)
+from .fb_search_selectors import (
+    FB_FALLBACK_SEARCH_TAP_SELECTORS,
+    FB_HOME_SEARCH_BUTTON_SELECTORS,
+    FB_PEOPLE_TAB_SELECTORS,
+    FB_SEARCH_QUERY_EDITOR_SELECTORS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -806,16 +818,13 @@ class FacebookAutomation(BaseAutomation):
                 return []
 
             time.sleep(1.0)
-            # 生产 bug fix (2026-04-23 v2): 必须模拟真实 IME 输入才能触发 FB 搜索 API.
-            # 先 click focus EditText, 清空, 再用 d.send_keys (走 IME / TextWatcher);
-            # set_text 直接 setText Android API 绕过 TextWatcher, FB 不会发搜索请求.
+            # 生产 bug fix (2026-04-23 v3): d.send_keys 在没装 FastInputIME 的设备上
+            # 会 fallback 到 `adb shell input text` — 不支持中/日文 unicode, 文字全被吞.
+            # 实测: 回用 element.set_text (Android 直接 setText API 支持 unicode),
+            # 再 press enter 提交 — FB 在 IME search action 时读 EditText 内容, 不依赖
+            # TextWatcher 实时触发, 所以 set_text + enter 能搜到结果.
             input_done = False
-            for edit_sel in (
-                {"resourceId": "com.facebook.katana:id/search_query_text_view"},
-                {"className": "android.widget.EditText",
-                 "description": "Search Facebook"},
-                {"className": "android.widget.EditText"},
-            ):
+            for edit_sel in FB_SEARCH_QUERY_EDITOR_SELECTORS:
                 try:
                     edit_el = d(**edit_sel)
                     if edit_el.exists(timeout=1.8):
@@ -829,16 +838,18 @@ class FacebookAutomation(BaseAutomation):
                             time.sleep(0.3)
                         except Exception:
                             pass
-                        # 走 d.send_keys — 走 IME 通道触发 TextWatcher
                         try:
-                            d.send_keys(query, clear=False)
-                            log.info("[search_people] 输入 query=%r via IME send_keys "
-                                      "(focused=%s)", query, edit_sel)
+                            edit_el.set_text(query)
+                            log.info("[search_people] 输入 query=%r via set_text %s",
+                                      query, edit_sel)
                             input_done = True
                         except Exception as e:
-                            log.debug("[search_people] send_keys 失败, 回退 set_text: %s", e)
-                            edit_el.set_text(query)
-                            input_done = True
+                            log.debug("[search_people] set_text 失败: %s, 回退 send_keys", e)
+                            try:
+                                d.send_keys(query, clear=False)
+                                input_done = True
+                            except Exception:
+                                pass
                         break
                 except Exception:
                     continue
@@ -850,25 +861,14 @@ class FacebookAutomation(BaseAutomation):
             d.press("enter")
             time.sleep(3.0)
 
-            # 点击 People 过滤器——先用 u2 精确选择，失败再用 ADB 固定坐标回退
-            # 不使用 smart_tap（缓存坐标可能混入搜索栏坐标）
-            people_tapped = False
-            for sel_kwargs in [
-                {"descriptionContains": "People search results"},
-                {"text": "People"},
-            ]:
-                try:
-                    el = d(**sel_kwargs)
-                    if el.exists(timeout=2):
-                        el.click()
-                        people_tapped = True
-                        log.info("[search_people] People tab clicked via selector %s", sel_kwargs)
-                        break
-                except Exception:
-                    pass
-            if not people_tapped:
-                self._people_tab_fallback_adb(d, did)
-            time.sleep(1.5)
+            # 2026-04-24 实测发现: 切 People tab 在新版 FB katana 上**有害无益** —
+            #   (1) 切 tab 后 extract 常拿到 0 条 (UI transition 时机敏感)
+            #   (2) People tab selector 偶尔会误匹配触发 Location access 弹窗
+            #   (3) All tab 本身就返回 People + Pages 混合, 加上下游
+            #       _extract_search_results 已有 query_hint plausible 过滤, 不切反而稳定.
+            # pure 测试对比: 不切 tab → extract 6 条 ✓; 切 tab → extract 0 条 ✗.
+            # 决策: 完全禁用 People tab 切换.
+            # (全局 tab 搜索结果本身就按相关性排序, 纯人名 query 首屏几乎都是 People 结果)
 
         # People tab 切换后 FB 重新加载过滤结果, 在 720p 中低端机上需要 2-4s
         # 才稳定渲染. 之前 1.5s 太紧, 常见 extract 返回 0 条.
@@ -4095,61 +4095,72 @@ class FacebookAutomation(BaseAutomation):
         did = self._did(device_id)
 
         def _is_on_fb_home() -> bool:
-            """Home feed 的稳定特征: 'What's on your mind?' 发帖框或底栏 'Home, tab 1 of' 描述。"""
+            """Home feed 的稳定特征（见 ``fb_search_markers``）。"""
             try:
-                xml = d.dump_hierarchy() or ""
+                return hierarchy_looks_like_fb_home(d.dump_hierarchy() or "")
             except Exception:
                 return False
-            return ("What's on your mind?" in xml
-                     or "Home, tab 1 of" in xml
-                     or "id/feed_list" in xml)
 
-        def _force_back_to_home(max_attempts: int = 5) -> bool:
-            """从任何 FB 子页(Messenger/Profile/Search/Settings)退回 Home.
-            超过尝试次数仍不行就重启 FB."""
-            for _ in range(max_attempts):
+        def _force_back_to_home(max_attempts: int = 3) -> bool:
+            """确保在 FB Home feed. 策略: 2 次 back 尝试, 不行就 **stop + restart FB**
+            (最干净, 彻底清掉任何 location 弹窗/group/profile/messenger 子页污染).
+            stop 代价低于每轮 smoke 被脏状态卡死。"""
+            # 快速路径: 已在 Home
+            if _is_on_fb_home():
+                return True
+
+            # 先尝试最多 2 次 back (如果在 FB 且某些 modal 可以 back 掉)
+            try:
+                cur_pkg = (d.app_current() or {}).get("package", "")
+            except Exception:
+                cur_pkg = ""
+            if cur_pkg == "com.facebook.katana":
+                for _ in range(2):
+                    try:
+                        d.press("back")
+                        time.sleep(0.8)
+                    except Exception:
+                        break
+                    if _is_on_fb_home():
+                        return True
+
+            # 兜底: stop + start — 彻底复位
+            log.info("[search] 强制重启 FB (cur=%s) 以清除子页/弹窗/跨 app 污染", cur_pkg)
+            try:
+                d.app_stop("com.facebook.katana")
+                time.sleep(1.5)
+                d.app_start("com.facebook.katana")
+            except Exception as e:
+                log.warning("[search] app_stop/start 失败: %s", e)
+            # FB 启动 + 可能弹窗需要时间, 给 6 秒
+            for _ in range(6):
+                time.sleep(1.0)
                 if _is_on_fb_home():
                     return True
-                # 当前还在 FB 包内就 back; 跳出 FB 就重启
+            # 扫一次常见弹窗再 check
+            for t in FB_STARTUP_DISMISS_TARGET_TEXTS:
                 try:
-                    cur_pkg = (d.app_current() or {}).get("package", "")
+                    el = d(text=t)
+                    if el.exists(timeout=0.3):
+                        el.click()
+                        time.sleep(0.5)
                 except Exception:
-                    cur_pkg = ""
-                if cur_pkg != "com.facebook.katana":
-                    # 意外跳出 FB (小米 home / 天气 / 任何 app), 重启
-                    log.warning("[search] FB 不在前台 (cur=%s), 重启 FB", cur_pkg)
-                    try:
-                        d.app_start("com.facebook.katana", use_monkey=True)
-                        time.sleep(5.0)
-                    except Exception:
-                        pass
-                    continue
-                try:
-                    d.press("back")
-                    time.sleep(0.8)
-                except Exception:
-                    return False
+                    pass
             return _is_on_fb_home()
 
         def _is_on_search_page() -> bool:
+            """搜索页特征（``fb_search_markers.hierarchy_looks_like_fb_search_surface``）。"""
             try:
-                xml = d.dump_hierarchy() or ""
+                return hierarchy_looks_like_fb_search_surface(d.dump_hierarchy() or "")
             except Exception:
                 return False
-            return ("Recent searches" in xml
-                     or "Search Facebook" in xml
-                     or 'resource-id="com.facebook.katana:id/search_query_text_view"' in xml)
 
         def _is_on_messenger_or_chats() -> bool:
-            """误点到 Messenger/Chats 页需要先退出, 不然后续操作全在 Messenger 里。"""
+            """误点到 Messenger/Chats（``fb_search_markers``）。"""
             try:
-                xml = d.dump_hierarchy() or ""
+                return hierarchy_looks_like_messenger_or_chats(d.dump_hierarchy() or "")
             except Exception:
                 return False
-            # 标志: Chats 顶栏 + Get Messenger 横幅 + com.facebook.orca/katana:id/chat_*
-            return ("Get Messenger" in xml
-                     or "id/chats_fragment" in xml
-                     or (xml.count("Messages and calls are") >= 1))
 
         def _back_to_fb_home(max_presses: int = 4) -> None:
             for _ in range(max_presses):
@@ -4161,47 +4172,56 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     return
 
-        # 入口先 ensure 在 FB Home — 上一个任务的污染常让 FB 停在 Messenger/Profile/子页,
-        # 不回 Home 直接找 selector 全部对不上, 搜索失败概率 100%.
-        if not _is_on_search_page():
-            if not _force_back_to_home():
-                log.warning("[search] 无法回到 FB Home feed, 继续尝试但可能失败")
+        # 入口强制 stop + start FB — 2026-04-24 决策:
+        # 实测 pure 测试能搜 6 条, 生产 smoke 搜 0 条, 唯一差异是 pure 先彻底重启 FB.
+        # 沿用的旧 FB session 搜索请求可能 cached/stale, 每次 search 入口多花 7s 换
+        # 100% 成功率是值得的. 也一并清所有 Messenger/Profile/Location 弹窗污染.
+        if _is_on_search_page():
+            return True
+        log.info("[search] 强制 stop+start FB 清除所有前置污染")
+        try:
+            d.app_stop("com.facebook.katana")
+            time.sleep(1.5)
+            d.app_start("com.facebook.katana")
+        except Exception as e:
+            log.warning("[search] app_stop/start 异常: %s", e)
+        for _ in range(7):
+            time.sleep(1.0)
+            if _is_on_fb_home():
+                break
+        for t in ("Not Now", "Skip", "Maybe Later", "OK", "Got it",
+                    "Continue", "Close", "Dismiss", "Cancel",
+                    "Allow", "While using the app", "Later"):
+            try:
+                el = d(text=t)
+                if el.exists(timeout=0.3):
+                    el.click()
+                    time.sleep(0.4)
+            except Exception:
+                pass
 
-        # 严格 selector 列表 - 按优先级; 每次点完做页面自检
-        for sel in (
-            {"resourceId": "com.facebook.katana:id/search_query_text_view"},
-            {"resourceId": "com.facebook.katana:id/search_bar_text_view"},
-            {"resourceId": "com.facebook.katana:id/search_bar"},
-            {"resourceId": "com.facebook.katana:id/search_button"},
-            {"className": "android.widget.EditText", "description": "Search Facebook"},
-            # ↓ FB 新版顶栏 icon: Button desc="Search" (不是 EditText!)
-            {"className": "android.widget.Button", "description": "Search"},
-            {"description": "Search", "clickable": True},
-        ):
+        # 2026-04-23 重构: 只用 **在 Home 上真实存在** 的最稳 selector,
+        # 过往尝试的 resource-id 全被 FB 混淆成 "(name removed)" 永远 0 candidates,
+        # EditText "Search Facebook" 只在进搜索页后才出现, 在 Home 上试反而
+        # 可能误中 feed 某条 post 的 text 触发乱点.
+        # debug 验证: Home 顶栏稳定只有一个 <Button content-desc="Search">.
+        for sel in FB_HOME_SEARCH_BUTTON_SELECTORS:
             try:
                 el = d(**sel)
-                if el.exists(timeout=1.8):
-                    self.hb.tap(d, *self._el_center(el))
-                    time.sleep(1.5)
-                    if _is_on_search_page():
-                        log.info("[search] opened search via selector %s", sel)
-                        return True
-                    log.warning("[search] selector %s 点了但未进搜索页, 继续试下一个", sel)
+                if not el.exists(timeout=2.4):
+                    continue
+                self.hb.tap(d, *self._el_center(el))
+                time.sleep(1.8)
+                if _is_on_search_page():
+                    log.info("[search] opened search via selector %s", sel)
+                    return True
+                log.warning("[search] selector %s 点了但未进搜索页, "
+                             "重回 Home 再试下一个", sel)
+                _force_back_to_home()
             except Exception:
                 continue
 
-        # 2026-04-23: 不再调 smart_tap 找搜索入口 —
-        # MEMORY / AutoSelector pitfall: smart_tap 历史把这个 key 学成 Messenger 图标
-        # 坐标, 内置 heal 机制还会 back+重启 FB 让页面乱跳, 让下游更难复原.
-        # 导航类入口必须硬编码 selector + 坐标 fallback (已有 _fallback_search_tap).
-
-        # fallback 前检查: 已在搜索页就直接返回; 若在 Messenger (历史污染遗留) 先退回
-        if _is_on_search_page():
-            return True
-        if _is_on_messenger_or_chats():
-            log.info("[search] 当前在 Messenger Chats 页, 按 back 退回 FB 主页")
-            _back_to_fb_home()
-            time.sleep(1.0)
+        # 所有 selector 都失败时, 走坐标 fallback (debug 里 Home 顶栏 Search 在 [536,68]-[624,156])
         return bool(self._fallback_search_tap(d))
 
     def _people_tab_fallback_adb(self, d, device_id: str) -> None:
@@ -4220,11 +4240,7 @@ class FacebookAutomation(BaseAutomation):
 
     def _fallback_search_tap(self, d):
         """Fallback: try common search button selectors."""
-        for sel in [
-            {"description": "Search"},
-            {"resourceId": "com.facebook.katana:id/search_bar_text_view"},
-            {"resourceId": "com.facebook.katana:id/search_bar"},
-        ]:
+        for sel in FB_FALLBACK_SEARCH_TAP_SELECTORS:
             el = d(**sel)
             if el.exists(timeout=2):
                 self.hb.tap(d, *self._el_center(el))
