@@ -64,6 +64,24 @@ if os.environ.get("NO_COLOR") or (sys.platform == "win32" and
 REPO = "victor2025PH/mobile-auto0423"
 DEFAULT_HEAD_PREFIX = "feat-b-"
 
+# A 在 PR #26 反馈: GitHub 不允许 author 自审 (A/B 共用 victor2025PH token),
+# APPROVED state 走不通。A 承诺每次 approve-equivalent 评论必带 marker。
+APPROVE_EQUIVALENT_MARKERS = (
+    "✅ A 侧 review 通过",
+    "approve-equivalent",
+)
+
+
+def _is_approve_equivalent(review: Dict[str, Any]) -> bool:
+    """state=APPROVED 或 state=COMMENTED 且 body 含 approve marker。"""
+    state = review.get("state", "")
+    if state == "APPROVED":
+        return True
+    if state == "COMMENTED":
+        body = review.get("body") or ""
+        return any(m in body for m in APPROVE_EQUIVALENT_MARKERS)
+    return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GitHub API
@@ -261,21 +279,28 @@ def check_readiness(plan: MergePlan, token: Optional[str],
     for r in reviews:
         user = (r.get("user") or {}).get("login", "")
         state = r.get("state", "")
-        if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
-            continue  # COMMENTED 不改授权状态
+        # COMMENTED + approve-equivalent marker → 视同 APPROVED (GitHub 不让
+        # author 自审, A/B 共用同 token 时唯一出路)
+        if state == "COMMENTED" and _is_approve_equivalent(r):
+            r = dict(r)
+            r["_effective_state"] = "APPROVED"
+        elif state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        else:
+            r = dict(r)
+            r["_effective_state"] = state
         prev = latest_by_user.get(user)
         if prev is None or (r.get("submitted_at", "") >
                              prev.get("submitted_at", "")):
             latest_by_user[user] = r
-    # 只要有至少一个 APPROVED, 且无 CHANGES_REQUESTED, 就算通过
+    # 按 _effective_state (考虑 approve-equivalent) 分类
     approved_users = [u for u, r in latest_by_user.items()
-                       if r["state"] == "APPROVED"]
+                       if r["_effective_state"] == "APPROVED"]
     changes_users = [u for u, r in latest_by_user.items()
-                      if r["state"] == "CHANGES_REQUESTED"]
+                      if r["_effective_state"] == "CHANGES_REQUESTED"]
     plan.approved_by_a = bool(approved_users)
     plan.has_changes_requested = bool(changes_users)
     if latest_by_user:
-        # 展示用最新一条
         latest_overall = max(latest_by_user.values(),
                               key=lambda r: r.get("submitted_at", ""))
         plan.latest_review_state = latest_overall.get("state")
@@ -291,7 +316,7 @@ def check_readiness(plan: MergePlan, token: Optional[str],
         return
     if not plan.approved_by_a:
         plan.status = "blocked"
-        plan.error = "未 APPROVED"
+        plan.error = "未 APPROVED (或未带 approve-equivalent marker)"
         return
     # mergeable_state: clean / stable = 绿灯; blocked / dirty / behind = 问题
     if plan.mergeable_state in ("dirty", "blocked"):

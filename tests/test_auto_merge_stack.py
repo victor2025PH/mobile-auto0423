@@ -225,6 +225,50 @@ class TestCheckReadiness:
         assert plan.retarget_base_to == "main"
         assert plan.status == "ready"
 
+    def test_commented_with_approve_marker_is_approved(self):
+        """A 的 approve-equivalent COMMENTED 识别为 APPROVED (GitHub 不让自审)。"""
+        from scripts.auto_merge_stack import MergePlan, check_readiness
+        plan = MergePlan(pr_number=10, branch="feat-b-x", base="main")
+        reviews = [{
+            "state": "COMMENTED",
+            "submitted_at": "2026-04-23T21:17:24Z",
+            "user": {"login": "victor2025PH"},
+            "body": "## ✅ A 侧 review 通过 (approve-equivalent)\n\n..."
+        }]
+        with patch("scripts.auto_merge_stack.github_api",
+                   side_effect=self._api_factory(self._pr(), reviews)):
+            check_readiness(plan, "t", merged_branches=set())
+        assert plan.approved_by_a is True
+        assert plan.status == "ready"
+
+    def test_commented_without_marker_blocks(self):
+        from scripts.auto_merge_stack import MergePlan, check_readiness
+        plan = MergePlan(pr_number=10, branch="feat-b-x", base="main")
+        reviews = [{
+            "state": "COMMENTED",
+            "submitted_at": "2026-04-23T21:17:24Z",
+            "user": {"login": "other"},
+            "body": "looks interesting"
+        }]
+        with patch("scripts.auto_merge_stack.github_api",
+                   side_effect=self._api_factory(self._pr(), reviews)):
+            check_readiness(plan, "t", merged_branches=set())
+        assert plan.approved_by_a is False
+        assert plan.status == "blocked"
+
+    def test_is_approve_equivalent_pure(self):
+        from scripts.auto_merge_stack import _is_approve_equivalent
+        assert _is_approve_equivalent({"state": "APPROVED"}) is True
+        assert _is_approve_equivalent({
+            "state": "COMMENTED",
+            "body": "## ✅ A 侧 review 通过 (approve-equivalent)",
+        }) is True
+        assert _is_approve_equivalent({
+            "state": "COMMENTED", "body": "nope"}) is False
+        assert _is_approve_equivalent({
+            "state": "CHANGES_REQUESTED",
+            "body": "approve-equivalent jk"}) is False
+
     def test_dismissed_review_not_counted_as_approved(self):
         """DISMISSED review 不当 APPROVED。"""
         from scripts.auto_merge_stack import MergePlan, check_readiness
