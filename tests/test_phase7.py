@@ -358,9 +358,11 @@ class TestPublisherCircuitBreakerCheck(unittest.TestCase):
 # ═══════════════════════════════════════════════
 class TestMockLocationAPKStructure(unittest.TestCase):
 
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
     def test_manifest_exists(self):
         """AndroidManifest.xml 应存在且包含正确包名。"""
-        manifest = Path("D:/mobile-auto-0327/mobile-auto-project/tools/mock_location_helper/apk_src/AndroidManifest.xml")
+        manifest = self._PROJECT_ROOT / "tools/mock_location_helper/apk_src/AndroidManifest.xml"
         self.assertTrue(manifest.exists(), "AndroidManifest.xml 不存在")
         content = manifest.read_text(encoding="utf-8")
         self.assertIn("com.openclaw.mocklocation", content)
@@ -370,7 +372,7 @@ class TestMockLocationAPKStructure(unittest.TestCase):
 
     def test_receiver_java_exists(self):
         """MockLocationReceiver.java 应存在且包含关键实现。"""
-        java = Path("D:/mobile-auto-0327/mobile-auto-project/tools/mock_location_helper/apk_src/MockLocationReceiver.java")
+        java = self._PROJECT_ROOT / "tools/mock_location_helper/apk_src/MockLocationReceiver.java"
         self.assertTrue(java.exists(), "MockLocationReceiver.java 不存在")
         content = java.read_text(encoding="utf-8")
         self.assertIn("class MockLocationReceiver", content)
@@ -382,7 +384,7 @@ class TestMockLocationAPKStructure(unittest.TestCase):
 
     def test_service_java_exists(self):
         """MockLocationService.java 应存在（持续位置维持）。"""
-        java = Path("D:/mobile-auto-0327/mobile-auto-project/tools/mock_location_helper/apk_src/MockLocationService.java")
+        java = self._PROJECT_ROOT / "tools/mock_location_helper/apk_src/MockLocationService.java"
         self.assertTrue(java.exists(), "MockLocationService.java 不存在")
         content = java.read_text(encoding="utf-8")
         self.assertIn("class MockLocationService", content)
@@ -392,7 +394,7 @@ class TestMockLocationAPKStructure(unittest.TestCase):
 
     def test_build_script_exists(self):
         """build.py 应存在且可解析。"""
-        build = Path("D:/mobile-auto-0327/mobile-auto-project/tools/mock_location_helper/build.py")
+        build = self._PROJECT_ROOT / "tools/mock_location_helper/build.py"
         self.assertTrue(build.exists(), "build.py 不存在")
         content = build.read_text(encoding="utf-8")
         self.assertIn("def build(", content)
@@ -418,8 +420,8 @@ class TestMockLocationAPKStructure(unittest.TestCase):
         print("  [OK] _RECOMMENDED_APK 指向 OpenClaw 自建 APK")
 
     def test_apks_dir_created(self):
-        """config/apks/ 目录应已创建。"""
-        apks_dir = Path("D:/mobile-auto-0327/mobile-auto-project/config/apks")
+        """config/apks/ 目录应已创建（runtime APK 投放目录，由 .gitkeep 占位）。"""
+        apks_dir = self._PROJECT_ROOT / "config/apks"
         self.assertTrue(apks_dir.exists(), "config/apks/ 目录未创建")
         print("  [OK] config/apks/ 目录已创建")
 
