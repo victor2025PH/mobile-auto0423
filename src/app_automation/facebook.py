@@ -3330,8 +3330,12 @@ class FacebookAutomation(BaseAutomation):
         try:
             from src.ai.chat_brain import ChatBrain, UserProfile
             brain = ChatBrain.get_instance()
-            profile = UserProfile(lead_id=peer_name, name=peer_name,
-                                  bio="", source="fb_inbox")
+            # Fix 2026-04-24: UserProfile dataclass 实际字段是 username/bio/
+            # source (不含 lead_id/name)。原代码 UserProfile(lead_id=...,
+            # name=...) 会 raise TypeError,被外层 try/except catch 后
+            # return None, "skip" — 生产 auto_reply 从未真正生成 reply。
+            # 真机 dry-run (scripts/messenger_production_dryrun.py) 发现。
+            profile = UserProfile(username=peer_name, bio="", source="fb_inbox")
             result = brain.generate_reply(
                 lead_id=peer_name,
                 incoming_message=incoming_text,
