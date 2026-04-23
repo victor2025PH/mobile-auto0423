@@ -155,11 +155,25 @@ def main():
     print(f"  [click] 搜索入口 via {search_btn[1]}")
     time.sleep(1.5)
     xml2, _ = tr.snap(d, "search_opened")
-    tr.mark("android.widget.EditText" in xml2, "搜索页: EditText 存在")
+    # Messenger 新版搜索框可能是 EditText 或 AutoCompleteTextView
+    has_input = ("android.widget.EditText" in xml2
+                  or "android.widget.AutoCompleteTextView" in xml2)
+    tr.mark(has_input, "搜索页: 输入控件存在 (EditText/AutoCompleteTextView)")
 
     # ── 3. 输入 peer 名字 ────────────────────────────────────────
     print(f"\n─── 3. 输入搜索 peer={args.peer!r} ───")
-    ed = d(className="android.widget.EditText")
+    ed = None
+    for sel in (
+        {"className": "android.widget.EditText"},
+        {"className": "android.widget.AutoCompleteTextView"},
+    ):
+        cand = d(**sel)
+        if cand.exists(timeout=1.0):
+            ed = cand
+            print(f"  [input_sel] 命中 {sel}")
+            break
+    if ed is None:
+        ed = d(className="android.widget.EditText")  # 保持后续代码结构
     if not ed.exists(timeout=2):
         tr.mark(False, "EditText 不存在")
         return
@@ -195,20 +209,45 @@ def main():
             buckets.append(bucket_text)
     print(f"  [analyze] 可见 section buckets: {buckets}")
 
-    # 提取名字候选 (包含 peer 子串的 TextView)
+    # 提取名字候选 — 不限属性顺序, 抓每个 node 的所有属性独立解析.
+    # Android XML 里 content-desc 可能出现在 class 之前或之后, 正则一次写死反而漏.
     cands = []
-    for m in re.finditer(
-        r'<node[^>]*\btext="([^"]*' + re.escape(args.peer[:2]) + r'[^"]*)"'
-        r'[^>]*\bclass="([^"]+)"[^>]*\bbounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-        xml3,
-    ):
-        txt = m.group(1)
-        cls = m.group(2)
-        y1 = int(m.group(4))
-        if y1 < 260:
+    peer_frag = args.peer[:2]
+    seen_bounds = set()
+    for nm in re.finditer(r'<node\s[^>]+/>', xml3):
+        node_str = nm.group(0)
+
+        def _attr(name):
+            mm = re.search(rf'\b{name}="([^"]*)"', node_str)
+            return mm.group(1) if mm else ""
+
+        desc = _attr("content-desc")
+        text = _attr("text")
+        cls = _attr("class")
+        bounds_raw = _attr("bounds")
+        # 取含 peer 片段的字段 (content-desc 优先)
+        label = ""
+        if peer_frag in desc:
+            label = desc
+        elif peer_frag in text:
+            label = text
+        if not label:
             continue
-        cands.append({"text": txt, "class": cls.split(".")[-1], "y1": y1,
-                       "bounds": (int(m.group(3)), y1, int(m.group(5)), int(m.group(6)))})
+        # 解析 bounds
+        bm = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_raw)
+        if not bm:
+            continue
+        x1, y1, x2, y2 = map(int, bm.groups())
+        if y1 < 200:  # 顶部搜索框 excluded
+            continue
+        if x2 - x1 < 400:  # 必须足宽是整行
+            continue
+        key = (x1, y1, x2, y2)
+        if key in seen_bounds:
+            continue
+        seen_bounds.add(key)
+        cands.append({"text": label, "class": cls.split(".")[-1] if cls else "?",
+                       "y1": y1, "bounds": key})
     print(f"  [analyze] 含 {args.peer[:2]!r} 的候选 {len(cands)} 个:")
     for c in cands[:6]:
         print(f"    y={c['y1']:4d} {c['class']:20s} text={c['text'][:40]!r}")
@@ -236,9 +275,18 @@ def main():
 
     # ── 6. 输入 greeting (unicode) ──────────────────────────────
     print(f"\n─── 6. 输入 greeting={args.greeting!r} ───")
-    input_box = d(className="android.widget.EditText")
-    if not input_box.exists(timeout=2.5):
-        tr.mark(False, "对话页无 EditText (可能进了 info 页, 不是对话)")
+    input_box = None
+    for sel in (
+        {"className": "android.widget.EditText"},
+        {"className": "android.widget.AutoCompleteTextView"},
+    ):
+        cand = d(**sel)
+        if cand.exists(timeout=2.5):
+            input_box = cand
+            print(f"  [input_sel] 对话页命中 {sel}")
+            break
+    if input_box is None:
+        tr.mark(False, "对话页无 EditText/AutoCompleteTextView (可能进了 info 页)")
         return
     input_box.click()
     time.sleep(0.4)

@@ -112,13 +112,16 @@ class TestMessengerActiveLock:
         mock_send.assert_not_called()
 
     def test_lock_ok_proceeds_to_send(self, tmp_db):
-        """拿到锁 → send_message 被正常调用。
+        """拿到锁 → _send_messenger_greeting_to_peer 被正常调用。
 
         真 fb_concurrency.device_section_lock 契约: 成功 yield (无值),
-        我们直接用真锁 (空锁池, 必然能拿) 验证 success path。
+        我们直接用真锁 (空锁池, 必然能拿) 验证 success path.
+        Phase 7c 重构 (2026-04-24): fallback 走 _send_messenger_greeting_to_peer
+        (返回 (ok, code) tuple), 而非旧 send_message (bool).
         """
         fb = _stub_fb()
-        with patch.object(fb, "send_message", return_value=True) as mock_send:
+        with patch.object(fb, "_send_messenger_greeting_to_peer",
+                            return_value=(True, "")) as mock_send:
             with patch("src.host.fb_store.record_inbox_message"):
                 with patch("src.host.fb_store.record_contact_event"):
                     result = fb._send_greeting_messenger_fallback(
@@ -137,7 +140,8 @@ class TestFallbackSuccess:
     def test_success_records_fallback_event(self, tmp_db):
         """成功 fallback → 入库行 template_id 含 |fallback 后缀 + contact event。"""
         fb = _stub_fb()
-        with patch.object(fb, "send_message", return_value=True):
+        with patch.object(fb, "_send_messenger_greeting_to_peer",
+                            return_value=(True, "")):
             with patch("src.host.fb_store.record_inbox_message") as mock_inbox:
                 with patch("src.host.fb_store.record_contact_event") as mock_evt:
                     result = fb._send_greeting_messenger_fallback(
@@ -156,31 +160,7 @@ class TestFallbackSuccess:
         assert mock_evt.called
 
 
-# ─── send_message 老版兼容(raise_on_error kwarg 不存在) ─────────────
-class TestBackwardCompatNoRaiseOnError:
-    def test_typeerror_falls_back_to_bool(self, tmp_db):
-        """B 的 PR #1 未合并时, send_message 没有 raise_on_error 参数,
-        调用时 TypeError → 退回 bool 路径。"""
-        fb = _stub_fb()
-        call_count = {"n": 0}
-
-        def _fake_send(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1 and "raise_on_error" in kwargs:
-                # 第一次带 raise_on_error, 模拟老 send_message 抛 TypeError
-                raise TypeError("send_message() got unexpected keyword"
-                                 " argument 'raise_on_error'")
-            # 第二次调用应不带 raise_on_error, 返回 True
-            return True
-
-        with patch.object(fb, "send_message", side_effect=_fake_send):
-            with patch("src.host.fb_store.record_inbox_message"):
-                with patch("src.host.fb_store.record_contact_event"):
-                    result = fb._send_greeting_messenger_fallback(
-                        did="D_compat", profile_name="Alice",
-                        greeting="hi", template_id="yaml:en:0",
-                        persona_key=None, eff_phase="mature",
-                        preset_key="", ai_decision="greeting")
-        assert result is True
-        assert call_count["n"] == 2   # 第 1 次 TypeError, 第 2 次退回 bool
-        assert fb._last_greet_skip_reason == "ok_via_fallback"
+# Phase 7c (2026-04-24): 不再依赖 send_message 的 raise_on_error 参数 —
+# _send_greeting_messenger_fallback 现直接调 _send_messenger_greeting_to_peer
+# (返回 (ok, code) tuple). 老的 TestBackwardCompatNoRaiseOnError 测试场景
+# 不存在了, 删除.

@@ -1426,6 +1426,184 @@ class FacebookAutomation(BaseAutomation):
         # send_fail 或未知
         return f"fallback_fail:{code or 'unknown'}"
 
+    def _send_messenger_greeting_to_peer(self, *, did: str,
+                                           peer_name: str,
+                                           greeting: str
+                                           ) -> Tuple[bool, str]:
+        """Messenger App 内发消息给 peer_name — Phase 7c 新版 UI 专用.
+
+        基于 debug_messenger_fallback_trace.py 已 dry-run 验证的流程:
+          1. app_stop + app_start com.facebook.orca → 干净状态
+          2. 点搜索入口 (descriptionContains='search')
+          3. AutoCompleteTextView.set_text(peer_name)  (u2 Android SetText API, 支持 unicode)
+          4. 从搜索结果里找 content-desc=peer 且 bounds 宽度 ≥ 400 的 row, 点第一个
+          5. 对话页 EditText.set_text(greeting) + 找 desc='Send' 按钮点击
+
+        返回 (ok, error_code):
+          * (True, "")                            成功发出
+          * (False, "messenger_unavailable")      app 未启动 / XSpace 挡路
+          * (False, "search_ui_missing")          搜索入口找不到
+          * (False, "recipient_not_found")        搜索无命中候选
+          * (False, "send_button_missing")        Send 按钮找不到
+          * (False, "send_fail")                  通用失败 (异常 / 兜底)
+        """
+        import re as _re
+        MESSENGER_PKG = "com.facebook.orca"
+
+        d = self._u2(did)
+        try:
+            # 1) stop+start 确保干净状态
+            try:
+                d.app_stop(MESSENGER_PKG)
+                time.sleep(1.0)
+                d.app_start(MESSENGER_PKG)
+            except Exception as e:
+                log.warning("[messenger_send] app_start 异常: %s", e)
+                return False, "messenger_unavailable"
+            time.sleep(6.0)
+            # 跳常见弹窗
+            for t in ("Not Now", "Skip", "OK", "Continue", "Allow",
+                        "Close", "Got it", "Later", "Dismiss"):
+                try:
+                    el = d(text=t)
+                    if el.exists(timeout=0.3):
+                        el.click()
+                        time.sleep(0.4)
+                except Exception:
+                    pass
+
+            try:
+                cur_pkg = (d.app_current() or {}).get("package", "")
+            except Exception:
+                cur_pkg = ""
+            if cur_pkg != MESSENGER_PKG:
+                log.warning("[messenger_send] Messenger 未到前台 cur=%s", cur_pkg)
+                return False, "messenger_unavailable"
+
+            # 2) 搜索入口
+            search_clicked = False
+            for sel in ({"descriptionContains": "search"},
+                          {"description": "Search"},
+                          {"text": "Search"}):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=1.5):
+                        el.click()
+                        search_clicked = True
+                        break
+                except Exception:
+                    continue
+            if not search_clicked:
+                log.warning("[messenger_send] 搜索入口找不到")
+                return False, "search_ui_missing"
+            time.sleep(1.5)
+
+            # 3) 输入 peer_name
+            input_el = None
+            for sel in ({"className": "android.widget.EditText"},
+                          {"className": "android.widget.AutoCompleteTextView"}):
+                cand = d(**sel)
+                if cand.exists(timeout=2.0):
+                    input_el = cand
+                    break
+            if input_el is None:
+                return False, "search_ui_missing"
+            try:
+                input_el.click()
+                time.sleep(0.4)
+                input_el.clear_text()
+                time.sleep(0.2)
+                input_el.set_text(peer_name)
+            except Exception as e:
+                log.debug("[messenger_send] 输入 peer 异常: %s", e)
+                return False, "search_ui_missing"
+            time.sleep(2.5)
+
+            # 4) 找候选 row (content-desc 包含 peer 的整行 ImageView, 不是搜索框)
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            peer_frag = peer_name[:2] if len(peer_name) >= 2 else peer_name
+            cands = []
+            for nm in _re.finditer(r'<node\s[^>]+/>', xml):
+                ns = nm.group(0)
+                def _a(name):
+                    mm = _re.search(rf'\b{name}="([^"]*)"', ns)
+                    return mm.group(1) if mm else ""
+                desc = _a("content-desc")
+                if peer_frag not in desc and peer_frag not in _a("text"):
+                    continue
+                bm = _re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                                 _a("bounds"))
+                if not bm:
+                    continue
+                x1, y1, x2, y2 = map(int, bm.groups())
+                if y1 < 200:  # 搜索框排除
+                    continue
+                if x2 - x1 < 400:  # 必须整行宽
+                    continue
+                cands.append({"y1": y1, "bounds": (x1, y1, x2, y2),
+                               "label": desc or _a("text")})
+            cands.sort(key=lambda c: c["y1"])
+            if not cands:
+                log.warning("[messenger_send] 搜索结果无 %r 候选", peer_name)
+                return False, "recipient_not_found"
+            # 点第一个
+            target = cands[0]
+            cx = (target["bounds"][0] + target["bounds"][2]) // 2
+            cy = (target["bounds"][1] + target["bounds"][3]) // 2
+            d.click(cx, cy)
+            time.sleep(3.5)
+
+            # 5) 对话页输入 greeting
+            chat_input = None
+            for sel in ({"className": "android.widget.EditText"},
+                          {"className": "android.widget.AutoCompleteTextView"}):
+                cand = d(**sel)
+                if cand.exists(timeout=2.5):
+                    chat_input = cand
+                    break
+            if chat_input is None:
+                return False, "send_fail"
+            try:
+                chat_input.click()
+                time.sleep(0.4)
+                chat_input.clear_text()
+                time.sleep(0.2)
+                chat_input.set_text(greeting)
+            except Exception as e:
+                log.debug("[messenger_send] 输入 greeting 异常: %s", e)
+                return False, "send_fail"
+            time.sleep(1.5)
+
+            # 6) Send 按钮
+            send_btn = None
+            for sel in ({"description": "Send"},
+                          {"text": "Send"},
+                          {"descriptionContains": "Send"}):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=1.5):
+                        send_btn = el
+                        break
+                except Exception:
+                    continue
+            if send_btn is None:
+                return False, "send_button_missing"
+            try:
+                send_btn.click()
+                time.sleep(2.5)
+            except Exception as e:
+                log.debug("[messenger_send] 点 Send 异常: %s", e)
+                return False, "send_fail"
+            log.info("[messenger_send] 消息已发送给 %s", peer_name)
+            return True, ""
+
+        except Exception as e:
+            log.warning("[messenger_send] 未预期异常: %s", e)
+            return False, "send_fail"
+
     def _send_greeting_messenger_fallback(self, *, did: str,
                                            profile_name: str,
                                            greeting: str,
@@ -1449,25 +1627,12 @@ class FacebookAutomation(BaseAutomation):
         from src.host.fb_concurrency import device_section_lock
 
         def _core() -> bool:
-            fallback_ok = False
-            error_code = ""
-            try:
-                # 优先 raise_on_error=True 拿结构化异常 (B 的 PR #1)
-                try:
-                    fallback_ok = self.send_message(profile_name, greeting,
-                                                      device_id=did,
-                                                      raise_on_error=True)
-                except TypeError:
-                    # PR #1 未合并时 send_message 没有 raise_on_error 参数
-                    fallback_ok = self.send_message(profile_name, greeting,
-                                                      device_id=did)
-            except Exception as e:
-                error_code = (getattr(e, "code", "") or "").strip()
-                if not error_code:
-                    error_code = "send_fail"
-                log.debug("[send_greeting fallback] 异常 code=%s msg=%s",
-                          error_code, str(e)[:120])
-                fallback_ok = False
+            # Phase 7c (2026-04-24): 走 trace 已验证的 _send_messenger_greeting_to_peer
+            # (而不是旧 send_message, 它依赖 AutoSelector 学习 + 不适配新版 Messenger UI
+            # 的 AutoCompleteTextView + content-desc 行结构).
+            # 新方法返回 (ok, error_code) 对齐 §7.6 分流矩阵.
+            fallback_ok, error_code = self._send_messenger_greeting_to_peer(
+                did=did, peer_name=profile_name, greeting=greeting)
 
             if fallback_ok:
                 try:
