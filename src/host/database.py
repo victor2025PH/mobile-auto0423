@@ -428,6 +428,146 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_fb_inbox_sent_at ON facebook_inbox_messages(device_id, direction, sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_fb_inbox_template ON facebook_inbox_messages(template_id)",
 
+    # ─── 2026-04-23 Phase 5: Lead Mesh (跨平台 Lead Dossier + Agent 通信) ──
+    # 动机: 把引流交接从"单一 handoffs 表"升级为"Lead 全旅程卷宗 + Agent Mesh
+    # 通信层"。让 A 机 / B 机 / 人工 / 外部 Webhook 系统都能用统一模型操作 lead,
+    # 跨真机/云手机、跨账号自动去重、跨平台身份聚合(FB+LINE+WA+TG+IG)。
+    #
+    # 5 张表:
+    #   leads_canonical    — 跨平台统一 lead 抽象(UUID 主键)
+    #   lead_identities    — 平台身份映射(platform, account_id)→canonical_id
+    #   lead_journey       — append-only 事件流, 所有 agent/人动作都记一笔
+    #   lead_handoffs      — 引流交接状态机(pending→ack→completed/rejected)
+    #   agent_messages     — Agent 间消息队列(SQLite 持久化 + HTTP 实时入口)
+    #   lead_locks         — 软锁, 防止多 agent 并发操作同一 lead
+    #   lead_merges        — 合并审计日志, 自动合并可撤销
+    #   webhook_dispatches — Webhook 外发记录 + 失败重试跟踪
+
+    """CREATE TABLE IF NOT EXISTS leads_canonical (
+        canonical_id TEXT PRIMARY KEY,
+        primary_name TEXT DEFAULT '',
+        primary_language TEXT DEFAULT '',
+        primary_persona_key TEXT DEFAULT '',
+        merged_into TEXT,                      -- 若本 lead 被合并到另一个, 存 target canonical_id
+        tags TEXT DEFAULT '',                  -- 逗号分隔标签 (便于简单查询)
+        metadata_json TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_leads_canonical_merged ON leads_canonical(merged_into)",
+    "CREATE INDEX IF NOT EXISTS idx_leads_canonical_name ON leads_canonical(primary_name)",
+
+    """CREATE TABLE IF NOT EXISTS lead_identities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        canonical_id TEXT NOT NULL,
+        platform TEXT NOT NULL,               -- facebook / line / whatsapp / telegram / instagram / messenger
+        account_id TEXT NOT NULL,             -- FB profile_url / LINE @id / phone / @tg_user ...
+        display_name TEXT DEFAULT '',
+        verified INTEGER NOT NULL DEFAULT 1,  -- 1=硬匹配(account_id 唯一), 0=软匹配候选
+        discovered_via TEXT DEFAULT '',       -- 来源: group_extract / inbox / handoff ...
+        discovered_by_device TEXT DEFAULT '',
+        metadata_json TEXT DEFAULT '{}',
+        discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(platform, account_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lead_identities_canonical ON lead_identities(canonical_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lead_identities_platform ON lead_identities(platform, account_id)",
+
+    """CREATE TABLE IF NOT EXISTS lead_journey (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        canonical_id TEXT NOT NULL,
+        actor TEXT NOT NULL,                  -- agent_a / agent_b / human:<user> / lead_self / system
+        actor_device TEXT DEFAULT '',
+        platform TEXT DEFAULT '',
+        action TEXT NOT NULL,                 -- 事件类型枚举, 新增不改 schema
+        data_json TEXT DEFAULT '{}',
+        at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lead_journey_canonical ON lead_journey(canonical_id, at)",
+    "CREATE INDEX IF NOT EXISTS idx_lead_journey_action ON lead_journey(action, at)",
+    "CREATE INDEX IF NOT EXISTS idx_lead_journey_actor ON lead_journey(actor, at)",
+
+    """CREATE TABLE IF NOT EXISTS lead_handoffs (
+        handoff_id TEXT PRIMARY KEY,
+        canonical_id TEXT NOT NULL,
+        source_agent TEXT NOT NULL,           -- 发起方 agent/device
+        source_device TEXT DEFAULT '',
+        target_agent TEXT DEFAULT '',          -- 接手方 agent/人(可空 = 等人认领)
+        channel TEXT NOT NULL,                -- line / whatsapp / ...
+        receiver_account_key TEXT DEFAULT '',  -- 接收方账号 key (配置在 referral_receivers.yaml)
+        conversation_snapshot_json TEXT DEFAULT '[]',  -- 最近 N 轮对话 (已脱敏)
+        snippet_sent TEXT DEFAULT '',          -- 发出的引流话术原文
+        state TEXT NOT NULL DEFAULT 'pending',    -- pending / acknowledged / completed / rejected / expired / duplicate_blocked
+        state_updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        state_notes TEXT DEFAULT '',
+        webhook_dispatched INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_canonical ON lead_handoffs(canonical_id)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_receiver ON lead_handoffs(receiver_account_key, state, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_state ON lead_handoffs(state, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_channel_dedup ON lead_handoffs(canonical_id, channel, state)",
+
+    """CREATE TABLE IF NOT EXISTS agent_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_agent TEXT NOT NULL,
+        to_agent TEXT NOT NULL,
+        canonical_id TEXT DEFAULT '',         -- 关联的 lead (可空 = 通用消息)
+        message_type TEXT NOT NULL,           -- query / reply / notification / command / ack
+        correlation_id TEXT DEFAULT '',       -- request-response 配对 (query/reply 同一 id)
+        payload_json TEXT DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'pending',   -- pending / delivered / acknowledged / failed
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        delivered_at TEXT,
+        acknowledged_at TEXT,
+        error TEXT DEFAULT ''
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agent_msg_to ON agent_messages(to_agent, status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_msg_correlation ON agent_messages(correlation_id, message_type)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_msg_canonical ON agent_messages(canonical_id, created_at)",
+
+    """CREATE TABLE IF NOT EXISTS lead_locks (
+        canonical_id TEXT NOT NULL,
+        action TEXT NOT NULL,                 -- 被锁的动作类型 (referring / chatting / merging)
+        locked_by TEXT NOT NULL,              -- agent/device key
+        acquired_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,             -- TTL 过期时间
+        PRIMARY KEY (canonical_id, action)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lead_locks_expires ON lead_locks(expires_at)",
+
+    """CREATE TABLE IF NOT EXISTS lead_merges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_canonical_id TEXT NOT NULL,    -- 被合并的(loser)
+        target_canonical_id TEXT NOT NULL,    -- 合并到的(winner)
+        merge_mode TEXT NOT NULL,             -- 'auto' / 'manual'
+        confidence REAL DEFAULT 0.0,
+        merge_reasons_json TEXT DEFAULT '[]', -- 触发合并的规则 list
+        merged_by TEXT DEFAULT '',            -- 'system' / 'human:<user>'
+        reverted_at TEXT,                     -- 若后来撤销, 填撤销时间
+        reverted_reason TEXT DEFAULT '',
+        merged_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lead_merges_source ON lead_merges(source_canonical_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lead_merges_target ON lead_merges(target_canonical_id)",
+
+    """CREATE TABLE IF NOT EXISTS webhook_dispatches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,             -- handoff.created / handoff.completed / lead.merged ...
+        target_url TEXT NOT NULL,
+        payload_json TEXT DEFAULT '{}',
+        related_canonical_id TEXT DEFAULT '',
+        related_handoff_id TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending', -- pending / delivered / failed / dead_letter
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT DEFAULT '',
+        next_retry_at TEXT,                   -- 下次重试时间
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        delivered_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_pending ON webhook_dispatches(status, next_retry_at)",
+    "CREATE INDEX IF NOT EXISTS idx_webhook_related ON webhook_dispatches(related_handoff_id, related_canonical_id)",
+
     # ─── 2026-04-23 Phase 3 P3-3: 统一接触事件流水表 ──────────────────────
     # 动机:
     #   * facebook_friend_requests + facebook_inbox_messages 按"对象"组织,

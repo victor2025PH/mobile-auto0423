@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+"""Lead Mesh HTTP API (Phase 5)。
+
+暴露:
+  * /lead-mesh/leads/{cid}         GET   — 拉 dossier
+  * /lead-mesh/leads/search        GET   — 按名字/平台搜 lead
+  * /lead-mesh/leads/{cid}/journey GET   — 单独拿事件流 (便于时间轴)
+  * /lead-mesh/leads/{cid}/merge-candidates GET — 合并候选
+  * /lead-mesh/leads/merge         POST  — 手动合并
+  * /lead-mesh/leads/merges/{id}/revert POST — 撤销合并
+
+  * /lead-mesh/handoffs            GET   — 队列 (带状态/接收方过滤)
+  * /lead-mesh/handoffs            POST  — 创建
+  * /lead-mesh/handoffs/{id}       GET   — 单详情
+  * /lead-mesh/handoffs/{id}/acknowledge POST
+  * /lead-mesh/handoffs/{id}/complete    POST
+  * /lead-mesh/handoffs/{id}/reject      POST
+  * /lead-mesh/handoffs/check-duplicate  GET (query: canonical_id, channel)
+
+  * /lead-mesh/agents/messages     POST  — send_message (HTTP 通道)
+  * /lead-mesh/agents/messages     GET   — 拉自己的队列
+  * /lead-mesh/agents/messages/{id}/deliver POST
+  * /lead-mesh/agents/messages/{id}/ack     POST
+  * /lead-mesh/agents/query-sync   POST  — 同步 query-reply (阻塞)
+
+  * /lead-mesh/webhooks/flush      POST  — 触发 webhook dispatcher
+  * /lead-mesh/webhooks/dead-letters GET — 死信查询
+  * /lead-mesh/webhooks/{id}/retry POST — 重置死信
+
+所有端点都可以被人 (curl) 或 AI Agent 直接调, 统一 JSON 接口。
+"""
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Body, HTTPException, Query
+
+from src.host import lead_mesh as lm
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/lead-mesh", tags=["lead-mesh"])
+
+
+# ─── Leads / Dossier ─────────────────────────────────────────────────
+
+@router.get("/leads/{canonical_id}")
+def api_get_dossier(canonical_id: str, journey_limit: int = 100):
+    d = lm.get_dossier(canonical_id, journey_limit=journey_limit)
+    if not d:
+        raise HTTPException(404, "lead not found")
+    return d
+
+
+@router.get("/leads/search")
+def api_search_leads(name_like: str = "",
+                       platform: str = "",
+                       account_id_like: str = "",
+                       limit: int = Query(default=50, ge=1, le=500)):
+    return {"results": lm.search_leads(
+        name_like=name_like, platform=platform,
+        account_id_like=account_id_like, limit=limit)}
+
+
+@router.get("/leads/{canonical_id}/journey")
+def api_get_journey(canonical_id: str,
+                     limit: int = Query(default=100, ge=1, le=1000),
+                     action_prefix: str = "",
+                     since_iso: str = ""):
+    return {"journey": lm.get_journey(canonical_id, limit=limit,
+                                        action_prefix=action_prefix,
+                                        since_iso=since_iso)}
+
+
+@router.post("/leads/resolve")
+def api_resolve_identity(body: Dict[str, Any] = Body(...)):
+    """按 (platform, account_id) 拿 canonical_id (不存在则创建)。
+
+    请求体: {platform, account_id, display_name?, language?,
+             discovered_via?, discovered_by_device?, extra_metadata?}
+    """
+    platform = (body.get("platform") or "").strip().lower()
+    account_id = (body.get("account_id") or "").strip()
+    if not platform or not account_id:
+        raise HTTPException(400, "platform / account_id 必填")
+    try:
+        cid = lm.resolve_identity(
+            platform=platform, account_id=account_id,
+            display_name=body.get("display_name") or "",
+            language=body.get("language") or "",
+            persona_key=body.get("persona_key") or "",
+            extra_metadata=body.get("extra_metadata") or {},
+            discovered_via=body.get("discovered_via") or "",
+            discovered_by_device=body.get("discovered_by_device") or "",
+            auto_merge=bool(body.get("auto_merge", True)),
+        )
+        return {"canonical_id": cid}
+    except Exception as e:
+        raise HTTPException(500, f"resolve 失败: {e}")
+
+
+@router.get("/leads/{canonical_id}/merge-candidates")
+def api_merge_candidates(canonical_id: str,
+                          min_confidence: float = 0.70):
+    return {"candidates": lm.auto_merge_candidates(canonical_id,
+                                                      min_confidence=min_confidence)}
+
+
+@router.post("/leads/merge")
+def api_merge_manually(body: Dict[str, Any] = Body(...)):
+    """手动合并 {source_canonical_id, target_canonical_id, merged_by, reason}。"""
+    from src.host.lead_mesh.canonical import merge_manually
+    src = (body.get("source_canonical_id") or "").strip()
+    tgt = (body.get("target_canonical_id") or "").strip()
+    if not src or not tgt:
+        raise HTTPException(400, "source/target 必填")
+    ok = merge_manually(src, tgt,
+                         merged_by=body.get("merged_by") or "human",
+                         reason=body.get("reason") or "")
+    return {"ok": ok, "source": src, "target": tgt}
+
+
+@router.post("/leads/merges/{merge_id}/revert")
+def api_revert_merge(merge_id: int, body: Dict[str, Any] = Body(default={})):
+    from src.host.lead_mesh.canonical import revert_merge
+    ok = revert_merge(merge_id,
+                       reverted_by=body.get("reverted_by") or "human",
+                       reason=body.get("reason") or "")
+    return {"ok": ok, "merge_id": merge_id}
+
+
+# ─── Handoffs ────────────────────────────────────────────────────────
+
+@router.get("/handoffs/check-duplicate")
+def api_check_duplicate(canonical_id: str, channel: str, since_days: int = 30):
+    """B 发引流前的去重检查端点。
+
+    ⚠ 注意: 此路由必须在 ``/handoffs/{handoff_id}`` 之前注册, 否则
+    ``check-duplicate`` 会被当成 handoff_id 匹配走。
+    """
+    from src.host.lead_mesh.handoff import check_duplicate_handoff
+    dup = check_duplicate_handoff(canonical_id, channel, since_days=since_days)
+    return {"is_duplicate": dup is not None, "existing": dup}
+
+
+@router.get("/handoffs")
+def api_list_handoffs(state: str = "",
+                       receiver_account_key: str = "",
+                       canonical_id: str = "",
+                       channel: str = "",
+                       limit: int = Query(default=100, ge=1, le=500)):
+    return {"handoffs": lm.list_handoffs(
+        state=state, receiver_account_key=receiver_account_key,
+        canonical_id=canonical_id, channel=channel, limit=limit)}
+
+
+@router.post("/handoffs")
+def api_create_handoff(body: Dict[str, Any] = Body(...)):
+    cid = (body.get("canonical_id") or "").strip()
+    src_agent = (body.get("source_agent") or "").strip()
+    channel = (body.get("channel") or "").strip()
+    if not cid or not src_agent or not channel:
+        raise HTTPException(400, "canonical_id / source_agent / channel 必填")
+    hid = lm.create_handoff(
+        canonical_id=cid, source_agent=src_agent, channel=channel,
+        source_device=body.get("source_device") or "",
+        target_agent=body.get("target_agent") or "",
+        receiver_account_key=body.get("receiver_account_key") or "",
+        conversation_snapshot=body.get("conversation_snapshot") or [],
+        snippet_sent=body.get("snippet_sent") or "",
+        enqueue_webhook=bool(body.get("enqueue_webhook", True)),
+    )
+    if not hid:
+        raise HTTPException(500, "create handoff 失败")
+    return {"handoff_id": hid}
+
+
+@router.get("/handoffs/{handoff_id}")
+def api_get_handoff(handoff_id: str):
+    h = lm.get_handoff(handoff_id)
+    if not h:
+        raise HTTPException(404, "handoff not found")
+    return h
+
+
+@router.post("/handoffs/{handoff_id}/acknowledge")
+def api_ack_handoff(handoff_id: str, body: Dict[str, Any] = Body(default={})):
+    by = (body.get("by") or "").strip() or "human"
+    ok = lm.acknowledge_handoff(handoff_id, by=by, notes=body.get("notes") or "")
+    if not ok:
+        raise HTTPException(409, "状态转移失败(可能已非 pending)")
+    return {"ok": True, "new_state": "acknowledged"}
+
+
+@router.post("/handoffs/{handoff_id}/complete")
+def api_complete_handoff(handoff_id: str, body: Dict[str, Any] = Body(default={})):
+    by = (body.get("by") or "").strip() or "human"
+    ok = lm.complete_handoff(handoff_id, by=by, notes=body.get("notes") or "")
+    if not ok:
+        raise HTTPException(409, "状态转移失败")
+    return {"ok": True, "new_state": "completed"}
+
+
+@router.post("/handoffs/{handoff_id}/reject")
+def api_reject_handoff(handoff_id: str, body: Dict[str, Any] = Body(default={})):
+    by = (body.get("by") or "").strip() or "human"
+    ok = lm.reject_handoff(handoff_id, by=by, notes=body.get("notes") or "")
+    if not ok:
+        raise HTTPException(409, "状态转移失败")
+    return {"ok": True, "new_state": "rejected"}
+
+
+# ─── Agent Mesh ──────────────────────────────────────────────────────
+
+@router.post("/agents/messages")
+def api_send_message(body: Dict[str, Any] = Body(...)):
+    """SQLite + HTTP 双通道的 HTTP 入口。"""
+    frm = (body.get("from_agent") or "").strip()
+    to = (body.get("to_agent") or "").strip()
+    if not frm or not to:
+        raise HTTPException(400, "from_agent / to_agent 必填")
+    cid = lm.send_message(
+        from_agent=frm, to_agent=to,
+        message_type=body.get("message_type") or "notification",
+        canonical_id=body.get("canonical_id") or "",
+        payload=body.get("payload") or {},
+        correlation_id=body.get("correlation_id") or "",
+    )
+    return {"correlation_id": cid}
+
+
+@router.get("/agents/messages")
+def api_poll_messages(to_agent: str,
+                        message_type: str = "",
+                        status: str = "pending",
+                        limit: int = Query(default=50, ge=1, le=200)):
+    msgs = lm.poll_messages(to_agent, message_type=message_type,
+                              status=status, limit=limit)
+    return {"messages": msgs, "count": len(msgs)}
+
+
+@router.post("/agents/messages/{message_id}/deliver")
+def api_mark_delivered(message_id: int):
+    ok = lm.mark_delivered(message_id)
+    return {"ok": ok}
+
+
+@router.post("/agents/messages/{message_id}/ack")
+def api_mark_ack(message_id: int, body: Dict[str, Any] = Body(default={})):
+    ok = lm.mark_acknowledged(message_id, error=body.get("error") or "")
+    return {"ok": ok}
+
+
+@router.post("/agents/query-sync")
+def api_query_sync(body: Dict[str, Any] = Body(...)):
+    """HTTP 同步 query-reply。阻塞等 reply 或超时。
+
+    ⚠ 慎用: 阻塞 FastAPI worker thread. 对于不需实时的场景仍推荐异步 poll 模式。
+    """
+    frm = (body.get("from_agent") or "").strip()
+    to = (body.get("to_agent") or "").strip()
+    if not frm or not to:
+        raise HTTPException(400, "from_agent / to_agent 必填")
+    reply = lm.query_sync(
+        from_agent=frm, to_agent=to,
+        payload=body.get("payload") or {},
+        canonical_id=body.get("canonical_id") or "",
+        timeout_sec=float(body.get("timeout_sec", 30)),
+        poll_interval=float(body.get("poll_interval", 1.0)),
+    )
+    return {"reply": reply, "timed_out": reply is None}
+
+
+# ─── Webhooks ─────────────────────────────────────────────────────────
+
+@router.post("/webhooks/flush")
+def api_flush_webhooks(max_batch: int = Query(default=50, ge=1, le=500)):
+    """手动触发 webhook dispatcher (也可由定时任务周期调)。"""
+    stats = lm.flush_pending_webhooks(max_batch=max_batch)
+    return {"ok": True, "stats": stats}
+
+
+@router.get("/webhooks/dead-letters")
+def api_list_dead_letters(limit: int = Query(default=100, ge=1, le=500)):
+    from src.host.lead_mesh.webhook_dispatcher import list_dead_letters
+    return {"dead_letters": list_dead_letters(limit)}
+
+
+@router.post("/webhooks/{dispatch_id}/retry")
+def api_retry_dead(dispatch_id: int):
+    from src.host.lead_mesh.webhook_dispatcher import retry_dead_letter
+    ok = retry_dead_letter(dispatch_id)
+    return {"ok": ok}

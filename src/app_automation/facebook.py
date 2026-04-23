@@ -961,7 +961,7 @@ class FacebookAutomation(BaseAutomation):
                     log.warning("[add_friend_with_note] 无法定位首个搜索结果")
                     return False
                 self.hb.tap(d, *self._el_center(first))
-                time.sleep(random.uniform(2.5, 4.0))
+                time.sleep(random.uniform(4.5, 7.0))
 
                 # 检测风控
                 is_risk, msg = self._detect_risk_dialog(d)
@@ -977,12 +977,36 @@ class FacebookAutomation(BaseAutomation):
                 # 总停留时长 8-15s（含上面滚动）
                 self.hb.wait_read(random.randint(2000, 6000))
 
-                # 主页内找 Add Friend
-                if not self.smart_tap("Add Friend button on profile page",
-                                      device_id=did):
-                    if not self.smart_tap("Add Friend button", device_id=did):
-                        log.info("[add_friend_with_note] 该用户无加好友按钮(可能已是好友/被限)")
-                        return False
+                # 向下滚动会把顶部资料头（含 Add friend）滚出屏外，先滚回顶部再找按钮
+                for _ in range(random.randint(2, 4)):
+                    self.hb.scroll_up(d)
+                    time.sleep(random.uniform(0.35, 0.7))
+                time.sleep(0.8)
+
+                # 主页内找 Add Friend（smart_tap → u2 日文/资源 id 回退）
+                tapped = self.smart_tap("Add Friend button on profile page",
+                                        device_id=did)
+                if not tapped:
+                    tapped = self.smart_tap("Add Friend button", device_id=did)
+                if not tapped:
+                    for sel in (
+                        {"resourceId": "com.facebook.katana:id/profile_actionbar_addfriend_button"},
+                        {"descriptionContains": "Add friend"},
+                        {"textContains": "友達"},
+                        {"descriptionContains": "友達"},
+                    ):
+                        try:
+                            el = d(**sel)
+                            if el.exists(timeout=1.2):
+                                el.click()
+                                tapped = True
+                                log.info("[add_friend_with_note] Add friend via u2 %s", sel)
+                                break
+                        except Exception:
+                            pass
+                if not tapped:
+                    log.info("[add_friend_with_note] 该用户无加好友按钮(可能已是好友/被限)")
+                    return False
                 time.sleep(1.5)
             else:
                 if not self.smart_tap("Add Friend button", device_id=did):
@@ -3733,28 +3757,25 @@ class FacebookAutomation(BaseAutomation):
             log.warning("Failed to extract search results: %s", e)
         return results
 
+    # 搜索结果顶栏筛选词 — 不可当作「第一条人名」点击
+    _SEARCH_FILTER_TAB_TEXTS = frozenset({
+        "All", "Posts", "People", "Groups", "Pages", "Events", "Reels",
+        "Photos", "Marketplace", "Videos", "Places", "News",
+        "全部", "贴文", "用户", "小组", "公共主页", "活动", "影片", "照片",
+    })
+
     def _first_search_result_element(self, d):
         """返回搜索结果列表里第 1 个可点击的人员卡片元素(用于进入主页)。
-        
-        支持中文（TextView）和英文（Button/content_desc）两种 FB 界面。
+
+        优先宽卡片（与 w0_capture_direct.search_and_navigate 一致），再回退 TextView，
+        避免误点筛选标签或窄 TextView。
         """
         try:
             xml = d.dump_hierarchy()
             from ..vision.screen_parser import XMLParser
             elements = XMLParser.parse(xml)
 
-            # 先尝试 TextView 模式
-            for el in elements:
-                if (el.clickable and el.text and len(el.text) >= 2
-                        and el.class_name and "TextView" in el.class_name):
-                    return type("E", (), {
-                        "info": {"bounds": {
-                            "left": el.bounds[0], "top": el.bounds[1],
-                            "right": el.bounds[2], "bottom": el.bounds[3],
-                        }}
-                    })()
-
-            # 英文界面 Button 模式
+            # ① 全宽人员卡片（英文 Button / ViewGroup，与 w0 脚本同序）
             for el in elements:
                 if self._is_person_card(el):
                     b = el.bounds
@@ -3762,6 +3783,22 @@ class FacebookAutomation(BaseAutomation):
                         "info": {"bounds": {
                             "left": b[0], "top": b[1],
                             "right": b[2], "bottom": b[3],
+                        }}
+                    })()
+
+            # ② 中文等：可点击 TextView，排除筛选词与顶栏噪声
+            for el in elements:
+                if (el.clickable and el.text and len(el.text) >= 2
+                        and el.class_name and "TextView" in el.class_name):
+                    t = (el.text or "").strip()
+                    if t in self._SEARCH_FILTER_TAB_TEXTS:
+                        continue
+                    if el.bounds and el.bounds[1] < 280 and len(t) < 30:
+                        continue
+                    return type("E", (), {
+                        "info": {"bounds": {
+                            "left": el.bounds[0], "top": el.bounds[1],
+                            "right": el.bounds[2], "bottom": el.bounds[3],
                         }}
                     })()
         except Exception:
