@@ -140,6 +140,97 @@ class TestLookupLeadScore:
             assert FacebookAutomation._lookup_lead_score("Hank") == (5, 0)
 
 
+# ─── F5: Levenshtein 兜底测试 ────────────────────────────────────────────────
+
+class TestLevenshteinLe1:
+    def test_identical(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("alice", "alice") is True
+
+    def test_single_substitution(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("alice", "alise") is True  # c→s
+
+    def test_single_insertion(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("alice", "alices") is True
+        assert _levenshtein_le1("alice", "aalice") is True
+
+    def test_single_deletion(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("alice", "alic") is True
+        assert _levenshtein_le1("alice", "lice") is True
+
+    def test_two_substitutions_rejected(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("alice", "bloce") is False
+
+    def test_length_diff_2_rejected(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("alice", "alices!") is False
+
+    def test_prefix_of_other_with_diff_1(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("bob", "bobb") is True
+
+    def test_empty_strings(self):
+        from src.app_automation.facebook import _levenshtein_le1
+        assert _levenshtein_le1("", "") is True
+        assert _levenshtein_le1("", "a") is True
+        assert _levenshtein_le1("", "ab") is False
+
+
+class TestFuzzyLookupLeadScore:
+    """F5: 硬 find_match miss 时 Levenshtein 兜底匹配。"""
+
+    def test_fuzzy_matches_fullwidth_space(self, tmp_db):
+        """全角空格 vs 半角空格 normalize 差异 1,Levenshtein 应命中。"""
+        from src.app_automation.facebook import FacebookAutomation
+        from src.leads.store import get_leads_store
+        store = get_leads_store()
+        # 先用半角空格存入 A 的 normalize 结果 (e.g. "山田 花子")
+        lid = store.add_lead(name="yamada hanako",  # 模拟 normalize 后
+                             source_platform="facebook")
+        # B 扫到 UI 文本是带全角空格或拼写略差的 "yamada hanakoo"
+        # find_match 硬匹配会 miss, fuzzy 兜底命中
+        result = FacebookAutomation._lookup_lead_score("yamada hanakoo")
+        assert result[0] == lid
+        assert result[1] == 0  # 默认 score=0
+
+    def test_fuzzy_rejects_too_different(self, tmp_db):
+        """距离 >1 应 miss 而非错匹。"""
+        from src.app_automation.facebook import FacebookAutomation
+        from src.leads.store import get_leads_store
+        store = get_leads_store()
+        store.add_lead(name="yamada hanako", source_platform="facebook")
+        result = FacebookAutomation._lookup_lead_score("yamasuki nanoko")
+        assert result == (None, 0)
+
+    def test_fuzzy_skips_too_short(self, tmp_db):
+        """目标名太短 (<4 chars) fuzzy 不启用,避免 "bo"→"bob" 之类误匹。"""
+        from src.app_automation.facebook import FacebookAutomation
+        from src.leads.store import get_leads_store
+        store = get_leads_store()
+        store.add_lead(name="bob", source_platform="facebook")
+        # normalized = "bob", 长度 3 < 4
+        result = FacebookAutomation._lookup_lead_score("box")
+        assert result == (None, 0)
+
+    def test_exact_match_preferred_over_fuzzy(self, tmp_db):
+        """有硬匹配时不走 fuzzy (find_match 结果优先)。"""
+        from src.app_automation.facebook import FacebookAutomation
+        from src.leads.store import get_leads_store
+        store = get_leads_store()
+        exact_lid = store.add_lead(name="charles dupont",
+                                   source_platform="facebook")
+        near_lid = store.add_lead(name="charles dupond",
+                                  source_platform="facebook")
+        # 期望硬命中 exact_lid
+        result = FacebookAutomation._lookup_lead_score("charles dupont")
+        assert result[0] == exact_lid
+        assert result[0] != near_lid
+
+
 # ─── mutual_friends 单维度 (向后兼容) ─────────────────────────────────────────
 
 class TestMutualOnlyGate:
