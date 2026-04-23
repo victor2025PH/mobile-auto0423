@@ -775,9 +775,31 @@ class FacebookAutomation(BaseAutomation):
             time.sleep(1.5)
 
             d.press("enter")
-            time.sleep(2)
+            time.sleep(2.5)
 
-            self.smart_tap("People tab or filter", device_id=did)
+            # 点击 People 过滤器——先用 u2 精确选择，失败再用 ADB 固定坐标回退
+            # 不使用 smart_tap（缓存坐标可能混入搜索栏坐标）
+            people_tapped = False
+            for sel_kwargs in [
+                {"descriptionContains": "People search results"},
+                {"text": "People"},
+            ]:
+                try:
+                    el = d(**sel_kwargs)
+                    if el.exists(timeout=2):
+                        el.click()
+                        people_tapped = True
+                        log.info("[search_people] People tab clicked via selector %s", sel_kwargs)
+                        break
+                except Exception:
+                    pass
+            if not people_tapped:
+                # ADB 固定坐标回退（基于 w0 实测：People tab 约在 y=204）
+                log.info("[search_people] People tab: using fallback ADB tap (332, 204)")
+                try:
+                    self._adb("shell input tap 332 204", device_id=did)
+                except Exception:
+                    pass
             time.sleep(1.5)
 
         results = self._extract_search_results(d, max_results)

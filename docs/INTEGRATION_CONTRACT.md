@@ -263,6 +263,101 @@ with device_section_lock(device_id, "check_inbox", timeout=120.0):
 
 section name 自选,但不要用 A 已占用的 `add_friend` / `send_greeting`。
 
+## 七点五、多渠道引流接口（A 机 Phase 4 新建,2026-04-23）
+
+### 7.5.1 `src/app_automation/referral_channels.py`
+
+A 机建立了统一的多渠道引流抽象层。**B 的 `_ai_reply_and_send` 可选迁移**到
+新接口,零破坏现有流程(旧的 `parse_referral_channels` / `pick_referral_for_persona`
+仍然保留)。
+
+**核心概念**:
+* `ReferralChannel` — 每个渠道一个子类
+  - `LineChannel` / `WhatsAppChannel` / `TelegramChannel` / `MessengerChannel` / `InstagramChannel`
+  - 每类自带 `validate_account` / `build_deep_link` / `detect_intent` / `format_snippet` / `mask`
+* `REFERRAL_REGISTRY` — 中央注册表;第三方渠道(如 KakaoTalk) 运行时注册
+* `pick_channel_smart()` — 三段式智能选渠道:
+  1. **意图感知**: 对方消息里问"LINE 有吗?" → 直接回 LINE(不管 persona 优先级)
+  2. **persona 优先级**: 无意图时按 `referral_priority` 排序
+  3. **兜底**: 任意可用渠道
+
+**B 迁移建议**(可选, 不迁移不破坏):
+
+```python
+# 旧代码 (fb_store 的 _ai_reply_and_send 里, B 的 P0 分支保留即可):
+from src.host.fb_referral_contact import (
+    parse_referral_channels, pick_referral_for_persona)
+_rch_map = parse_referral_channels(referral_contact)
+_r_val, _r_channel = pick_referral_for_persona(_rch_map, persona_key)
+# 仍然工作, 但不做意图识别
+
+# 新推荐 (B 未来迁移):
+from src.app_automation.referral_channels import pick_channel_smart
+from src.host.fb_referral_contact import parse_referral_channels
+channel_obj, value = pick_channel_smart(
+    incoming_text=incoming_text,
+    persona_key=persona_key,
+    available_accounts=parse_referral_channels(referral_contact),
+)
+if channel_obj and value:
+    snippet = channel_obj.format_snippet(value, persona_key=persona_key, name=peer_name)
+    # deep link 自动按渠道策略拼接(WA/TG 有,LINE 故意无)
+```
+
+### 7.5.2 LINE 特化
+
+**重要**: LINE 渠道刻意不发 `line.me/...` deep link。
+- FB 风控对 line.me 屏蔽严, 多次触发会把账号判为 spam
+- 改用**纯文本 @ID**: `LINE: @myid` + 提示对方搜索
+- 如果运营要用 QR 落地页, 直接在账号 value 里填 `https://xxx.example.com/mypage.png`,
+  `validate_account` 会识别 URL 形式并原样保留
+
+### 7.5.3 数据层扩展
+
+`fb_contact_events` 事件枚举**保持不变**(无破坏性迁移), 新增 `meta_json` 字段约定:
+
+| event_type | meta 字段 |
+|-----------|-----------|
+| `wa_referral_sent` (legacy,保留) | `{"channel": "whatsapp", "account_masked": "+8*******"}` |
+| `wa_referral_sent` | B 也可以用这个 event_type 记其他渠道(通过 meta.channel 区分) |
+
+**新建议**: B 用 `ReferralChannel.event_meta(value)` 直接返回 meta dict:
+
+```python
+from src.app_automation.referral_channels import pick_channel_smart
+from src.host.fb_store import record_contact_event, CONTACT_EVT_WA_REFERRAL_SENT
+
+channel_obj, value = pick_channel_smart(...)
+if channel_obj:
+    # 发消息...
+    record_contact_event(
+        device_id, peer_name, CONTACT_EVT_WA_REFERRAL_SENT,
+        meta=channel_obj.event_meta(value),  # 自动含 channel + masked
+    )
+```
+
+这样 A 的 `/facebook/contact-events?event_type=wa_referral_sent` 能按
+`meta.channel` 聚合出 LINE / WA / TG 各自的转化数据。
+
+### 7.5.4 新渠道扩展流程
+
+双方任意一方想加新渠道(如 KakaoTalk / Viber / WeChat):
+
+1. 在 `src/app_automation/referral_channels.py` 新建 `KakaoChannel(ReferralChannel)` 子类
+2. 在 `REFERRAL_REGISTRY["kakao"] = KakaoChannel()` 注册
+3. 在 `config/fb_target_personas.yaml` 的某 persona 的 `referral_priority` 里可选加 `kakao`
+4. 在 `config/chat_messages.yaml` 的 `countries[cc].referral_kakao` 加本地化文案
+5. 不改 B 的 `_ai_reply_and_send` 也不改 A 的 greeting 代码 —— 注册表自动生效
+
+**决策权**: 添加新渠道**A 主导** (因为属于共享基础设施),
+B 给出"需要这个渠道"的需求在遗留问题里列, A 实现后 B 直接 import 用。
+
+### 7.5.5 测试
+
+覆盖 47 个 test case: `tests/test_referral_channels.py`。
+
+---
+
 ## 八、遗留问题 / 待协商
 
 > 双方遇到不确定归属的事情先写在这里，不要直接动代码。
