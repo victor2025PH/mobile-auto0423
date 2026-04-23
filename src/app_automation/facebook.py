@@ -1451,6 +1451,21 @@ class FacebookAutomation(BaseAutomation):
         MESSENGER_PKG = "com.facebook.orca"
 
         d = self._u2(did)
+
+        def _wait_pkg_foreground(pkg: str, timeout: float = 8.0) -> bool:
+            """轮询 d.app_current().package 直到等于 pkg 或超时."""
+            import time as _t
+            deadline = _t.time() + timeout
+            while _t.time() < deadline:
+                try:
+                    cur = (d.app_current() or {}).get("package", "")
+                except Exception:
+                    cur = ""
+                if cur == pkg:
+                    return True
+                _t.sleep(0.4)
+            return False
+
         try:
             # 1) stop+start 确保干净状态
             try:
@@ -1460,7 +1475,11 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.warning("[messenger_send] app_start 异常: %s", e)
                 return False, "messenger_unavailable"
-            time.sleep(6.0)
+            # 自适应时序: 轮询 Messenger 到前台, 最多等 8s (替代固定 sleep 6s)
+            if not _wait_pkg_foreground(MESSENGER_PKG, timeout=8.0):
+                log.warning("[messenger_send] Messenger 8s 内未到前台")
+                return False, "messenger_unavailable"
+
             # 跳常见弹窗
             for t in ("Not Now", "Skip", "OK", "Continue", "Allow",
                         "Close", "Got it", "Later", "Dismiss"):
@@ -1471,14 +1490,6 @@ class FacebookAutomation(BaseAutomation):
                         time.sleep(0.4)
                 except Exception:
                     pass
-
-            try:
-                cur_pkg = (d.app_current() or {}).get("package", "")
-            except Exception:
-                cur_pkg = ""
-            if cur_pkg != MESSENGER_PKG:
-                log.warning("[messenger_send] Messenger 未到前台 cur=%s", cur_pkg)
-                return False, "messenger_unavailable"
 
             # 2) 搜索入口
             search_clicked = False
@@ -1496,7 +1507,7 @@ class FacebookAutomation(BaseAutomation):
             if not search_clicked:
                 log.warning("[messenger_send] 搜索入口找不到")
                 return False, "search_ui_missing"
-            time.sleep(1.5)
+            time.sleep(1.2)
 
             # 3) 输入 peer_name
             input_el = None
@@ -1517,54 +1528,77 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug("[messenger_send] 输入 peer 异常: %s", e)
                 return False, "search_ui_missing"
-            time.sleep(2.5)
 
-            # 4) 找候选 row (content-desc 包含 peer 的整行 ImageView, 不是搜索框)
-            try:
-                xml = d.dump_hierarchy() or ""
-            except Exception:
-                xml = ""
+            # 4) 自适应轮询搜索结果 — 而不是固定 sleep 后 dump
+            #    最多等 4s, 每 0.6s 尝试一次 dump, 发现候选就立即进下一步.
+            import time as _t
             peer_frag = peer_name[:2] if len(peer_name) >= 2 else peer_name
             cands = []
-            for nm in _re.finditer(r'<node\s[^>]+/>', xml):
-                ns = nm.group(0)
-                def _a(name):
-                    mm = _re.search(rf'\b{name}="([^"]*)"', ns)
-                    return mm.group(1) if mm else ""
-                desc = _a("content-desc")
-                if peer_frag not in desc and peer_frag not in _a("text"):
-                    continue
-                bm = _re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
-                                 _a("bounds"))
-                if not bm:
-                    continue
-                x1, y1, x2, y2 = map(int, bm.groups())
-                if y1 < 200:  # 搜索框排除
-                    continue
-                if x2 - x1 < 400:  # 必须整行宽
-                    continue
-                cands.append({"y1": y1, "bounds": (x1, y1, x2, y2),
-                               "label": desc or _a("text")})
-            cands.sort(key=lambda c: c["y1"])
+            deadline = _t.time() + 4.0
+            while _t.time() < deadline:
+                try:
+                    xml = d.dump_hierarchy() or ""
+                except Exception:
+                    xml = ""
+                cands_tmp = []
+                for nm in _re.finditer(r'<node\s[^>]+/>', xml):
+                    ns = nm.group(0)
+                    def _a(name):
+                        mm = _re.search(rf'\b{name}="([^"]*)"', ns)
+                        return mm.group(1) if mm else ""
+                    desc = _a("content-desc")
+                    text = _a("text")
+                    # peer 名优先精确匹配, 找不到再 2 字符片段. 打分让精确排前.
+                    if peer_name in desc or peer_name in text:
+                        score = 100
+                    elif peer_frag in desc or peer_frag in text:
+                        score = 50
+                    else:
+                        continue
+                    bm = _re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                                     _a("bounds"))
+                    if not bm:
+                        continue
+                    x1, y1, x2, y2 = map(int, bm.groups())
+                    if y1 < 200:  # 搜索框排除
+                        continue
+                    if x2 - x1 < 400:  # 必须整行宽
+                        continue
+                    cands_tmp.append({
+                        "score": score, "y1": y1, "bounds": (x1, y1, x2, y2),
+                        "label": desc or text,
+                    })
+                if cands_tmp:
+                    cands = cands_tmp
+                    break
+                _t.sleep(0.6)
             if not cands:
-                log.warning("[messenger_send] 搜索结果无 %r 候选", peer_name)
+                log.warning("[messenger_send] 4s 内搜索结果无 %r 候选", peer_name)
                 return False, "recipient_not_found"
-            # 点第一个
+            # 排序: 分数高优先, 同分数顶部优先
+            cands.sort(key=lambda c: (-c["score"], c["y1"]))
             target = cands[0]
+            log.info("[messenger_send] 候选 %r score=%d (精确=100/片段=50)",
+                      target["label"], target["score"])
             cx = (target["bounds"][0] + target["bounds"][2]) // 2
             cy = (target["bounds"][1] + target["bounds"][3]) // 2
             d.click(cx, cy)
-            time.sleep(3.5)
 
-            # 5) 对话页输入 greeting
+            # 5) 对话页输入 greeting — 轮询 EditText 出现, 最多等 5s
             chat_input = None
-            for sel in ({"className": "android.widget.EditText"},
-                          {"className": "android.widget.AutoCompleteTextView"}):
-                cand = d(**sel)
-                if cand.exists(timeout=2.5):
-                    chat_input = cand
+            deadline = _t.time() + 5.0
+            while _t.time() < deadline:
+                for sel in ({"className": "android.widget.EditText"},
+                              {"className": "android.widget.AutoCompleteTextView"}):
+                    cand = d(**sel)
+                    if cand.exists(timeout=0.5):
+                        chat_input = cand
+                        break
+                if chat_input is not None:
                     break
+                _t.sleep(0.4)
             if chat_input is None:
+                log.warning("[messenger_send] 5s 内对话页无 EditText")
                 return False, "send_fail"
             try:
                 chat_input.click()
@@ -1577,7 +1611,15 @@ class FacebookAutomation(BaseAutomation):
                 return False, "send_fail"
             time.sleep(1.5)
 
-            # 6) Send 按钮
+            # 6) Send 前先处理可能的 Message Request 确认弹窗 (非好友场景)
+            try:
+                if self._confirm_message_request_if_any(d):
+                    log.info("[messenger_send] 已处理 Message Request 确认框")
+                    time.sleep(1.0)
+            except Exception as e:
+                log.debug("[messenger_send] 确认弹窗处理异常(非致命): %s", e)
+
+            # 7) Send 按钮
             send_btn = None
             for sel in ({"description": "Send"},
                           {"text": "Send"},
@@ -1597,7 +1639,39 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug("[messenger_send] 点 Send 异常: %s", e)
                 return False, "send_fail"
-            log.info("[messenger_send] 消息已发送给 %s", peer_name)
+
+            # 8) Send 后 UI 验证 — 输入框清空 或 消息气泡出现在对话里是发送成功的弱信号
+            #    (防止 Send 按钮点了但实际因网络/权限未发出)
+            sent_confirmed = False
+            try:
+                # (a) 输入框清空验证: Messenger 发送成功后输入框会 clear
+                for sel in ({"className": "android.widget.EditText"},
+                              {"className": "android.widget.AutoCompleteTextView"}):
+                    cand = d(**sel)
+                    if cand.exists(timeout=0.8):
+                        cur_text = (cand.get_text() or "").strip()
+                        # 空串 / 只剩占位 hint / 原 greeting 前 2 字不在 => 已清空
+                        if not cur_text or greeting[:2] not in cur_text:
+                            sent_confirmed = True
+                        break
+                # (b) 如果输入框检测不到清空, 检查对话里是否新出现含 greeting 开头的气泡
+                if not sent_confirmed:
+                    try:
+                        xml_post = d.dump_hierarchy() or ""
+                        if greeting[:4] in xml_post:
+                            sent_confirmed = True
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.debug("[messenger_send] send 后验证异常(非致命): %s", e)
+
+            if not sent_confirmed:
+                log.warning("[messenger_send] Send 已点但未见 UI 确认信号 "
+                              "(输入框未清空 + 消息气泡未出现), 疑似未真发: %s",
+                              peer_name)
+                return False, "send_fail"
+
+            log.info("[messenger_send] 消息已发送给 %s (UI 确认通过)", peer_name)
             return True, ""
 
         except Exception as e:
