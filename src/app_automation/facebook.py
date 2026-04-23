@@ -3190,27 +3190,41 @@ class FacebookAutomation(BaseAutomation):
                 reply = result.message
                 ref_score = float(getattr(result, "referral_score", 0.0) or 0.0)
                 has_contact = bool(_rc_raw) or bool(_rch_map)
-                decision = "wa_referral" if (has_contact and ref_score > 0.5) else "reply"
-                # P4: intent=buying/referral_ask + has_contact → 强制触发引流
-                # (即使 LLM 的 ref_score 不够 0.5,意图层给出硬信号)
+                # P5: 统一引流决策闸 — 替代 P3 post-block + P4 硬触发的散落逻辑
                 try:
-                    from src.ai.chat_intent import should_trigger_referral as _strg
-                    if (has_contact and decision != "wa_referral"
-                            and _strg(intent_tag)):
-                        log.info(
-                            "[ai_reply] peer=%s intent=%s 意图层强制触发 wa_referral",
-                            peer_name, intent_tag,
-                        )
-                        decision = "wa_referral"
-                except Exception:
-                    pass
-                # P3: 上次引流对方未回 → 本轮强制降级 reply,避免 spam 式重复引流
-                if decision == "wa_referral" and memory_ctx.get("should_block_referral"):
-                    log.info(
-                        "[ai_reply] peer=%s 上次引流后未回复,本轮降级为 reply",
-                        peer_name,
+                    from src.ai.referral_gate import should_refer
+                    # 只读拉 leads.store 的 A 打分供 gate 评估
+                    lead_score_val = 0
+                    try:
+                        from src.leads.store import get_leads_store
+                        _store = get_leads_store()
+                        _lid = _store.find_match(name=peer_name)
+                        if _lid:
+                            _rec = _store.get_lead(_lid) or {}
+                            try:
+                                lead_score_val = int(_rec.get("score", 0) or 0)
+                            except (TypeError, ValueError):
+                                lead_score_val = 0
+                    except Exception:
+                        lead_score_val = 0
+                    gate = should_refer(
+                        intent=intent_tag,
+                        ref_score=ref_score,
+                        memory_ctx=memory_ctx,
+                        lead_score=lead_score_val,
+                        has_contact=has_contact,
                     )
-                    decision = "reply"
+                    decision = "wa_referral" if gate.refer else "reply"
+                    log.info(
+                        "[ai_reply] peer=%s gate level=%s refer=%s score=%d "
+                        "reasons=%s",
+                        peer_name, gate.level, gate.refer, gate.score,
+                        "; ".join(gate.reasons)[:200],
+                    )
+                except Exception as e:
+                    # gate 不可用降级到 pre-P5 行为
+                    log.debug("[ai_reply] referral_gate 失败(降级): %s", e)
+                    decision = "wa_referral" if (has_contact and ref_score > 0.5) else "reply"
                 # P1-1 + P1-5: 引流出站用 **首推渠道 + 对应 ID** 的本地化模板
                 if decision == "wa_referral" and _r_val:
                     try:
