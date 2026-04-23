@@ -1389,6 +1389,59 @@ class FacebookAutomation(BaseAutomation):
             log.info("[add_friend_with_note] peer=%s 在 blocklist, skip", profile_name)
             return False
 
+        # Phase 9 (2026-04-24): persona L1 gate — 名字不匹配目标客群 (如 jp_female_midlife
+        # 对"John Smith")直接 skip, 避免骚扰非目标用户. 只跑 L1 (名字启发式),
+        # L2 VLM 需要 profile 截图, 留到进 profile 页后做更深的判断 (Phase 10 预告).
+        if persona_key:
+            try:
+                from src.host.fb_profile_classifier import classify as _persona_classify
+                _cls = _persona_classify(
+                    device_id=did,
+                    persona_key=persona_key,
+                    target_key=f"fb:{profile_name}",
+                    display_name=profile_name,
+                    do_l2=False,  # 无 profile 截图, 只跑 L1
+                    dry_run=False,
+                )
+                _l1 = _cls.get("l1") or {}
+                if not _l1.get("pass", True):
+                    l1_score = _l1.get("score", 0)
+                    reasons = _l1.get("reasons") or []
+                    log.info(
+                        "[add_friend_with_note] persona L1 不命中 peer=%s "
+                        "score=%.0f reasons=%s, skip",
+                        profile_name, l1_score, reasons[:3])
+                    # journey 写 persona_rejected 供 funnel 统计
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "add_friend_blocked",
+                            did=did, persona_key=persona_key,
+                            data={
+                                "reason": "persona_l1_rejected",
+                                "l1_score": l1_score,
+                                "l1_pass_threshold": _l1.get("pass_threshold"),
+                                "top_reasons": reasons[:3],
+                            })
+                    except Exception:
+                        pass
+                    return False
+                # L1 PASS — 记一条 journey 让 funnel 能看到命中率
+                try:
+                    self._append_journey_for_action(
+                        profile_name, "persona_classified",
+                        did=did, persona_key=persona_key,
+                        data={
+                            "stage": "L1",
+                            "match": True,
+                            "score": _l1.get("score", 0),
+                            "reasons": (_l1.get("reasons") or [])[:3],
+                        })
+                except Exception:
+                    pass
+            except Exception as e:
+                # classify 异常时保守放行 (不阻塞主流程)
+                log.debug("[add_friend_with_note] persona classify 异常, 放行: %s", e)
+
         # P0-2: phase + playbook 参数解析
         eff_phase, ab_cfg = _resolve_phase_and_cfg("add_friend",
                                                    device_id=did,
