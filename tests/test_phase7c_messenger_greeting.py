@@ -22,8 +22,15 @@ def _stub_fb():
 
 
 class FakeEl:
-    def __init__(self, exists_ret: bool = True):
+    """FakeEl — 用于 mock u2 UiObject.
+
+    get_text() 固定返回 get_text_value (默认空), 模拟 "Messenger 发送后输入框
+    自动 clear" 的真机行为. set_text 不改这个, 因为我们要测的是发送后 UI
+    验证, 而不是 set_text 自身; 要测 set_text 需要分别注入不同 FakeEl.
+    """
+    def __init__(self, exists_ret: bool = True, get_text_value: str = ""):
         self._exists = exists_ret
+        self._get_text_value = get_text_value
 
     def exists(self, timeout=0):
         return self._exists
@@ -36,6 +43,9 @@ class FakeEl:
 
     def set_text(self, t):
         return True
+
+    def get_text(self):
+        return self._get_text_value
 
 
 class FakeDevice:
@@ -136,6 +146,49 @@ class TestMessengerFallbackPathways:
             did="D1", peer_name="山田花子", greeting="はじめまして")
         assert ok is True
         assert code == ""
+
+    def test_peer_exact_match_wins_over_prefix_partial(self):
+        """搜"山田花子"遇到同姓不同名 "山田太郎" (片段匹 50 分) 和
+        "山田花子" (精确匹 100 分) — 应选精确匹配, 不管顺序."""
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb._messenger_installed_cache = {}
+
+        # 第 1 行是"山田太郎"(片段匹, score 50, y1=388 最顶),
+        # 第 2 行是"山田花子"(精确匹, score 100, y1=527)
+        xml_mixed = """<?xml version='1.0'?>
+<hierarchy>
+  <node index="0" class="android.widget.ImageView" text="" content-desc="山田太郎" bounds="[0,388][720,527]" clickable="false" />
+  <node index="1" class="android.widget.ImageView" text="" content-desc="山田花子" bounds="[0,527][720,639]" clickable="false" />
+</hierarchy>"""
+
+        clicked_points = []
+
+        class FakeDev(FakeDevice):
+            def click(self2, x, y):  # noqa: N805
+                clicked_points.append((x, y))
+
+        fake = FakeDev(
+            cur_pkg_seq=["com.facebook.orca"],
+            xml_seq=[xml_mixed],
+            el_map={
+                (("descriptionContains", "search"),): FakeEl(True),
+                (("className", "android.widget.EditText"),): FakeEl(True),
+                (("description", "Send"),): FakeEl(True),
+            },
+        )
+        fb._u2 = lambda did=None: fake
+        # 只要求 peer 目标点击对应 "山田花子"(第 2 行 y1=527, 中心 y=(527+639)/2=583)
+        # 而不是第 1 行"山田太郎" (y1=388, 中心 y=(388+527)/2=457).
+        ok, _ = fb._send_messenger_greeting_to_peer(
+            did="D1", peer_name="山田花子", greeting="hi")
+        assert ok is True
+        # 找第一次人名 click (不是 send btn, 也不是 search 入口)
+        assert clicked_points, "没 click 任何点"
+        # 点的 y 应在 (527, 639) 区间, 而不是 (388, 527)
+        first_click_y = clicked_points[0][1]
+        assert 527 <= first_click_y <= 639, (
+            f"预期点击 '山田花子' y 在 [527, 639], 实际 {first_click_y}")
 
     def test_send_button_missing(self):
         fb = _stub_fb()
