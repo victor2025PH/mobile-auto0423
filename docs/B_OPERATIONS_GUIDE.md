@@ -433,6 +433,26 @@ openclaw_vlm_level4_last_error_code 0
 openclaw_vlm_level4_provider_info{provider="gemini",vision_model="gemini-2.5-flash"} 1
 ```
 
+**Latency histogram (P18)** — find_element 每次 call 落入 cumulative bucket:
+```
+openclaw_vlm_level4_call_duration_seconds_bucket{le="0.5"} 0
+openclaw_vlm_level4_call_duration_seconds_bucket{le="1.0"} 0
+openclaw_vlm_level4_call_duration_seconds_bucket{le="2.0"} 0
+openclaw_vlm_level4_call_duration_seconds_bucket{le="5.0"} 12
+openclaw_vlm_level4_call_duration_seconds_bucket{le="10.0"} 25      # HIT 集中这 ~8s
+openclaw_vlm_level4_call_duration_seconds_bucket{le="20.0"} 28
+openclaw_vlm_level4_call_duration_seconds_bucket{le="30.0"} 30
+openclaw_vlm_level4_call_duration_seconds_bucket{le="60.0"} 32      # MISS-retry ~32s
+openclaw_vlm_level4_call_duration_seconds_bucket{le="+Inf"} 32
+openclaw_vlm_level4_call_duration_seconds_sum 294.350
+openclaw_vlm_level4_call_duration_seconds_count 32
+```
+
+Grafana 公式:
+- P95: `histogram_quantile(0.95, rate(openclaw_vlm_level4_call_duration_seconds_bucket[5m]))`
+- 平均: `rate(..._sum[5m]) / rate(..._count[5m])`
+- "MISS-with-retry" 比例: `1 - (rate(..._bucket{le="10.0"}[5m]) / rate(..._count[5m]))`
+
 推荐 Grafana alert rules:
 | rule | 语义 |
 |---|---|
@@ -442,6 +462,7 @@ openclaw_vlm_level4_provider_info{provider="gemini",vision_model="gemini-2.5-fla
 | `vlm_level4_last_error_code == 429 for 2m` | Gemini rate limit 持续 |
 | `vlm_level4_last_error_code >= 500 for 2m` | provider 5xx 持续 |
 | `vlm_level4_ready == 0 and vlm_level4_init_attempted == 1` | 无 VLM provider 可用 (Gemini key 未设 + Ollama 没起) |
+| `histogram_quantile(0.95, ..._duration_seconds_bucket) > 15 for 10m` | P95 latency 异常 (可能全员 MISS-with-retry, provider 深度降级) |
 
 按 `provider_info` label 分面板, 可分别看 Gemini / Ollama 时段的命中/失败分布。
 

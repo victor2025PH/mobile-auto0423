@@ -1310,6 +1310,8 @@ def fb_vlm_level4_status():
       * swapped: P5b 是否已从 Gemini runtime 切到 Ollama (true 单向不回)
       * consecutive_failures: 当前连续 HTTP 失败 count (阈值 3 触发 swap)
       * swap_events_total: 累计 swap 触发次数 (P16; Prometheus 同源 counter)
+      * latency: {count, sum_sec, avg_sec} — P18 累计 find_element latency
+        (histogram 按 bucket 导出到 Prometheus, 这里 JSON 只给 count/sum/avg)
       * last_error_code: int | null (Gemini 503/429 等; null = 上次成功)
       * last_error_body: str (截 120 chars; "timeout" 字面值表 httpx timeout)
       * budget: {hourly_used, hourly_budget, budget_remaining, cache_size}
@@ -1324,6 +1326,7 @@ def fb_vlm_level4_status():
         "consecutive_failures": 0, "swap_events_total": 0,
         "last_error_code": None, "last_error_body": "",
         "budget": {}, "init_attempted": False,
+        "latency": {"count": 0, "sum_sec": 0.0, "avg_sec": 0.0},
     }
     out["swapped"] = bool(getattr(fb, "_vlm_provider_swapped", False))
     out["consecutive_failures"] = int(
@@ -1332,6 +1335,12 @@ def fb_vlm_level4_status():
         getattr(fb, "_vlm_swap_events_total", 0))
     out["init_attempted"] = bool(
         getattr(fb, "_vision_fallback_init_attempted", False))
+    lat_count = int(getattr(fb, "_vlm_latency_count", 0))
+    lat_sum = float(getattr(fb, "_vlm_latency_sum", 0.0))
+    out["latency"] = {
+        "count": lat_count, "sum_sec": round(lat_sum, 3),
+        "avg_sec": round(lat_sum / lat_count, 3) if lat_count > 0 else 0.0,
+    }
     vf = getattr(fb, "_vision_fallback_instance", None)
     if vf is None:
         return out
