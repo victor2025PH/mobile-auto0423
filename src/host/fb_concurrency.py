@@ -67,6 +67,19 @@ _METRICS_LOCK = threading.Lock()
 DEFAULT_LOCK_TIMEOUT_SEC = 180.0
 
 
+class LockTimeoutError(RuntimeError):
+    """device_section_lock 等待超时。
+
+    子类 RuntimeError 保向后兼容:
+      * 老 caller 用 ``except RuntimeError`` 仍能捕获
+      * 老 caller 用 ``"device_section_lock timeout" in str(e)`` 字符串 match 仍 work
+        (B 在 round 3 时的 ``_messenger_active_lock`` 上层 catch)
+
+    新代码应改 ``except LockTimeoutError`` 拿到清晰类型契约。
+    """
+    pass
+
+
 def _get_lock(device_id: str, section: str) -> threading.Lock:
     """返回 (device_id, section) 对应的锁(懒创建)。"""
     key = (device_id, section)
@@ -107,7 +120,7 @@ def device_section_lock(device_id: Optional[str],
         logger.warning(
             "[fb_lock] timeout device=%s section=%s 等锁 %.1fs,放弃",
             device_id[:8], section, timeout)
-        raise RuntimeError(
+        raise LockTimeoutError(
             f"device_section_lock timeout: device={device_id[:8]} "
             f"section={section} after {timeout:.0f}s")
 
