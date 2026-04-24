@@ -311,6 +311,156 @@ SQLite (WAL mode), 迁移逻辑在 `src/host/database.py::init_db()`。
 
 ---
 
-## 十二、历史变更
+## 十二、VLM (Level 4 UI Fallback) 运维
+
+**2026-04-24 新增** — Messenger 2026 Compose UI 下 `smart_tap` + multi-locale selector + coordinate 三级 fallback 仍可能 miss (搜索栏、搜索结果、Compose-rendered Send 按钮偶有 SDUI 渲染, 不在 AccessibilityNode tree)。第 4 级使用 VisionFallback (`src/ai/vision_fallback.py`) 用多模态 LLM 识别屏幕上目标元素坐标。
+
+### 12.1 什么时候会启用 VLM
+
+自动触发 — caller 无感知。流程:
+
+```
+smart_tap → multi-locale selector → coordinate → VLM vision
+     ↑ L1             ↑ L2                ↑ L3        ↑ L4 (本节)
+```
+
+已接入 VLM 的 send_message 子步骤:
+- `_enter_messenger_search` (打开搜索框)
+- `_tap_first_search_result` (选中搜索结果第一条; **2026-04-24 新接入**)
+- `_tap_messenger_send` (点 Send 按钮)
+
+前 3 级 miss 时自动 fall through 到 L4, 成功无日志中断, 命中时 `log.info("[_xxx_] VLM hit @ (x, y)")`。
+
+### 12.2 Provider 选择
+
+按优先级 (`get_free_vision_client()`):
+
+| Provider | 限额 | 适用场景 | 配置 |
+|---|---|---|---|
+| **Gemini 2.5 Flash** | 1500 req/day 免费 | 默认 — 识别准确率高 | `export GEMINI_API_KEY=...` |
+| **Ollama (llava/moondream/minicpm/bakllava/qwen2.5vl)** | 本地无限 | Gemini 不可用 / 隐私敏感 | `ollama pull llava:7b` |
+| (无) | — | 禁用 L4 (前 3 级失败直接抛) | 两者均不设 |
+
+### 12.3 配置
+
+**Gemini (推荐)**:
+```bash
+export GEMINI_API_KEY=AIzaSy...      # 从 https://aistudio.google.com/apikey 申请
+```
+首次 `_get_vision_fallback()` 调用会 lazy init, 日志:
+```
+[vision] VisionFallback ready (Level 4 UI fallback, 免费 provider)
+```
+
+**Ollama 本地 (备用 / fallback 的 fallback)**:
+```bash
+# 装 Ollama: https://ollama.com/download
+ollama pull llava:7b                 # 或 moondream (体积小), qwen2.5vl:7b (更新)
+# Ollama 默认监听 localhost:11434, 无需其他配置
+```
+无 GEMINI_API_KEY 时 `get_free_vision_client()` 自动 probe Ollama。**两者都有时默认 Gemini**; Gemini 连续失败时自动 swap (见 §12.4)。
+
+### 12.4 Gemini → Ollama 运行时 swap (P5b, 2026-04-24)
+
+Peak-hour Gemini 经常返 503 "high demand"。若连续 3 次 VLM HTTP 失败 (code 非 None 或 timeout) 且当前 provider 是 Gemini 且 Ollama 本地可用 → 自动 swap `_vision_fallback_instance` 为 Ollama client。
+
+**观察日志**:
+```
+[vision] VLM HTTP failure #3 (code=503, body=The service is currently unavailable...)
+[vision] Gemini 连续 3 次 HTTP 失败 (last code=503), 切 Ollama (model=llava:7b)
+```
+
+**Swap 单向** — 一次 swap 后不再 flip-flop 回 Gemini (避免来回抖)。想恢复 Gemini 需重启 bot 进程 (`_vlm_provider_swapped` reset 到 False)。
+
+### 12.5 运行时状态查询
+
+**Python REPL / 调试**:
+```python
+from src.app_automation import facebook as fb
+print({
+    "instance":  fb._vision_fallback_instance,          # None = 未 init
+    "swapped":   fb._vlm_provider_swapped,              # True = 已 swap 到 Ollama
+    "failures":  fb._vlm_consecutive_failures,          # 连续 HTTP 失败 count
+    "provider":  getattr(
+        fb._vision_fallback_instance and fb._vision_fallback_instance._client.config,
+        "provider", None),
+})
+# VisionFallback 本身的 budget + cache
+if fb._vision_fallback_instance:
+    print(fb._vision_fallback_instance.stats())
+    # → {"hourly_used": 7, "hourly_budget": 20, "budget_remaining": 13, "cache_size": 4}
+```
+
+**LLMClient last error (P5c)**:
+```python
+c = fb._vision_fallback_instance._client
+c.last_error_code    # 最后一次 HTTP 状态码 (None = 上次是 success or non-HTTP 层错)
+c.last_error_body    # 最后一次 error 响应 body[:500] 或 "timeout"
+```
+
+### 12.6 日志诊断 checklist
+
+| 症状 | 根因 | 处理 |
+|---|---|---|
+| 未见 `[vision] VisionFallback ready` | 无 provider — `GEMINI_API_KEY` 未设 + Ollama 未起 | 按 §12.3 二选一 |
+| `VisionFallback budget exhausted (20/20)` | 每小时 20 次调用上限用完 | 调 `VisionConfig(hourly_budget=...)` 或 1h 等待 |
+| `VLM out-of-bounds coords (x, y)` | VLM 返超屏坐标 (e.g. 720x1600 上返 (980, 2020)) | 自动 reject + retry, 无需人工; 参见 PR #57 |
+| `VLM click (x, y) 后 EditText 未出现, invalidate cache` | post-verify 失败, 5min TTL 内不复发坏坐标 | 正常 self-healing, 无需人工 |
+| `[vision] VLM HTTP failure #N (code=503)` 反复 | Gemini peak-hour 过载 | 等 §12.4 自动 swap 或手动起 Ollama |
+| Level 4 抛 `xxx_missing 4 级 fallback 都失败` hint | 4 级全 miss, Messenger UI 大改版 / provider 挂 | 跑 `scripts/messenger_vlm_prompt_eval.py` 验 prompt 是否还准 |
+
+### 12.7 Prompt 质量回归 (eval 工具)
+
+`scripts/messenger_vlm_prompt_eval.py` — offline 用真机截图 + ground truth bbox 跑 VLM, 算命中率。**改 prompt / 切 Gemini 版本 / 换 provider 前后都跑一遍**。
+
+```bash
+# 基础回归 (default dataset)
+python scripts/messenger_vlm_prompt_eval.py
+
+# JSON 输出供 CI / 对比
+python scripts/messenger_vlm_prompt_eval.py --json > eval_before.json
+# ... 改 prompt ...
+python scripts/messenger_vlm_prompt_eval.py --json > eval_after.json
+diff <(jq -S . eval_before.json) <(jq -S . eval_after.json)
+```
+
+**退出码**: 0 = 全 HIT / SKIP, 1 = 有 WRONG/MISS/ERROR, 2 = 依赖错误 (no dataset / no VLM provider)。
+
+**数据集**: `scripts/vlm_eval_dataset/cases.yaml` (metadata 入库) + `screenshots/` (真机截图 gitignored, 本地 populate)。增 case 只需:
+1. 截屏存 `scripts/vlm_eval_dataset/screenshots/<name>.png`
+2. cases.yaml 加一条 `{ screenshot, target, context, ground_truth_bbox: [x1,y1,x2,y2] }`
+3. 跑 eval 看 hit rate
+
+当前 14 cases 覆盖 inbox search bar / conversation row / 搜索结果 / composer / send button / note popup / DM screen 等核心 Messenger UI。
+
+### 12.8 Provider 不可用 playbook
+
+```bash
+# 症状: Level 4 也 miss, recipient_not_found 频发
+
+# 1. 确认 provider 状态
+python -c "from src.ai.llm_client import get_free_vision_client as g; \
+           c = g(); print('provider:', c and c.config.provider)"
+
+# 2a. Gemini 路: 验 API key
+curl -H "x-goog-api-key: $GEMINI_API_KEY" \
+    "https://generativelanguage.googleapis.com/v1beta/models" | head
+
+# 2b. Ollama 路: 验服务 + model
+curl -s http://localhost:11434/api/tags | jq '.models[].name'
+
+# 3. 两个都不可用时: 准备 Ollama
+ollama pull llava:7b     # 或 moondream:latest (~1.6GB, 更轻)
+
+# 4. 进程内 reset swap 状态 (重启 bot 更简单)
+python -c "from src.app_automation import facebook as fb; \
+           fb._vlm_provider_swapped=False; fb._vision_fallback_instance=None; \
+           fb._vision_fallback_init_attempted=False"
+```
+
+---
+
+## 十三、历史变更
 
 - 2026-04-24 首版 — B Claude 在 autonomous loop Iter 2 写, 关闭 `B_PRODUCTION_READINESS §四.3` flag 的 ops runbook gap
+- 2026-04-24 (P4, 本次) — 加 §十二 VLM Level 4 fallback 运维章节: provider 选择 / Gemini→Ollama swap / 状态查询 / 日志诊断 / eval 工具
