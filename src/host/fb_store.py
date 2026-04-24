@@ -745,11 +745,10 @@ def count_contact_events(device_id: Optional[str] = None, *,
     """
     if hours <= 0:
         return 0
-    import datetime as _dt
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
-    sql = "SELECT COUNT(*) FROM fb_contact_events WHERE at >= ?"
-    params: list = [cutoff]
+    # at 列用 datetime('now') 默认格式 (空格分隔), 用 SQL 原生 datetime('now', '-N hours')
+    # 做 cutoff 避免字符串格式不一致 (Phase 11 发现的 silent bug, 2026-04-25 修).
+    sql = "SELECT COUNT(*) FROM fb_contact_events WHERE at >= datetime('now', ?)"
+    params: list = [f"-{int(hours)} hours"]
     if device_id:
         sql += " AND device_id=?"
         params.append(device_id)
@@ -765,6 +764,40 @@ def count_contact_events(device_id: Optional[str] = None, *,
         return int(row[0]) if row else 0
     except Exception:
         return 0
+
+
+def list_recent_contact_events_by_types(event_types: List[str],
+                                        hours: int = 24,
+                                        limit: int = 200,
+                                        device_id: Optional[str] = None
+                                        ) -> List[Dict[str, Any]]:
+    """Phase 11: 扫近 N 小时指定类型 (多选) 的事件, 新 → 旧.
+
+    用于 fb_line_dispatch_from_reply 消费 greeting_replied/message_received.
+    ``at`` 列用 ``datetime('now')`` 默认格式 (空格分隔), 用 SQL 原生
+    ``datetime('now', '-N hours')`` 做 cutoff 避免字符串格式不一致.
+    """
+    if not event_types or hours <= 0:
+        return []
+    placeholders = ",".join(["?"] * len(event_types))
+    sql = ("SELECT id, device_id, peer_name, event_type, template_id,"
+           " preset_key, meta_json, at FROM fb_contact_events"
+           " WHERE at >= datetime('now', ?) AND event_type IN"
+           f" ({placeholders})")
+    params: list = [f"-{int(hours)} hours", *event_types]
+    if device_id:
+        sql += " AND device_id = ?"
+        params.append(device_id)
+    sql += " ORDER BY at DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 200), 2000)))
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.debug("[fb_contact_events] list_recent_by_types 失败: %s", e)
+        return []
 
 
 def list_contact_events_by_peer(device_id: str, peer_name: str,

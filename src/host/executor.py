@@ -1029,11 +1029,204 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_campaign_run":
             return _run_facebook_campaign(fb, resolved, params)
 
+        # Phase 11 (2026-04-25): fb_line_dispatch_from_reply
+        # 扫近 N 小时 contact_events (greeting_replied/message_received) → 按
+        # canonical.metadata (l2_verified / persona 匹配) 过滤 → allocate LINE
+        # pool → 写 line_dispatch_log + 返 "派发计划" 给调用方 (B 机/运营).
+        if task_type == "facebook_line_dispatch_from_reply":
+            return _fb_line_dispatch_from_reply(resolved, params)
+
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
     except Exception as e:
         logger.exception("Facebook 任务执行异常: %s", task_type)
         return False, f"{task_type} 异常: {e}", None
+
+
+def _fb_line_dispatch_from_reply(resolved: str,
+                                  params: Dict[str, Any]
+                                  ) -> tuple:
+    """Phase 11 (2026-04-25) dispatcher.
+
+    Flow:
+      1. 扫 hours_window 内 greeting_replied + message_received events
+      2. 去重: 每个 canonical_id 在 dedupe_hours 内最多派发一次
+      3. 按 persona / l2_verified / is_japanese / min_score 过滤
+         (仅当 require_l2_verified=True)
+      4. line_pool.allocate(region, persona_key, canonical_id, peer_name, ...)
+      5. 写 line_dispatch_log (planned) + 可选 wa_referral_sent contact_event
+      6. 返 stats {scanned, filtered_out, dispatched, no_account, dispatches}
+
+    Params:
+      hours_window: int = 6           # 扫近几小时事件
+      dedupe_hours: int = 24          # 同一 canonical 去重窗口
+      require_l2_verified: bool = True
+      persona_key: str = ""           # 只对匹配 persona 的 lead 分配
+      region: str = ""                # 按区域过滤 line pool
+      min_score: float = 0
+      limit: int = 20                 # 单次最多派发几条
+      write_contact_event: bool = False  # True 时写 wa_referral_sent 供 B 看
+    """
+    hours_window = int(params.get("hours_window", 6) or 6)
+    dedupe_hours = int(params.get("dedupe_hours", 24) or 24)
+    require_l2 = bool(params.get("require_l2_verified", True))
+    persona_key = (params.get("persona_key") or "").strip()
+    region = (params.get("region") or "").strip()
+    min_score = float(params.get("min_score", 0) or 0)
+    limit = max(1, min(int(params.get("limit", 20) or 20), 200))
+    write_ce = bool(params.get("write_contact_event", False))
+
+    from src.host.fb_store import (list_recent_contact_events_by_types,
+                                    CONTACT_EVT_GREETING_REPLIED,
+                                    CONTACT_EVT_MESSAGE_RECEIVED)
+    from src.host import line_pool as _lp
+    try:
+        from src.host.fb_store import record_contact_event
+    except Exception:
+        record_contact_event = None  # type: ignore
+
+    events = list_recent_contact_events_by_types(
+        [CONTACT_EVT_GREETING_REPLIED, CONTACT_EVT_MESSAGE_RECEIVED],
+        hours=hours_window, limit=limit * 5,
+    )
+
+    dispatches: List[Dict[str, Any]] = []
+    seen_canonical: set = set()
+    filtered_out = 0
+    no_account = 0
+
+    from src.host.lead_mesh import resolve_identity
+    from src.host.lead_mesh.canonical import _connect as _lm_connect
+    import json as _json
+
+    # line_dispatch_log.created_at 用 datetime('now') 空格分隔格式, 用 SQL 原生
+    # datetime('now', '-N hours') 做 cutoff 避免字符串格式不一致.
+    dedupe_sql_offset = f"-{int(dedupe_hours)} hours"
+
+    for ev in events:
+        if len(dispatches) >= limit:
+            break
+        peer_name = ev.get("peer_name") or ""
+        device_id = ev.get("device_id") or ""
+        event_id = str(ev.get("id") or "")
+        if not peer_name:
+            filtered_out += 1
+            continue
+
+        try:
+            cid = resolve_identity(
+                platform="facebook",
+                account_id=f"fb:{peer_name}",
+                display_name=peer_name)
+        except Exception:
+            filtered_out += 1
+            continue
+
+        if cid in seen_canonical:
+            filtered_out += 1
+            continue
+
+        # 去重: dedupe_hours 内已有 line_dispatch_log 就跳
+        try:
+            with _lm_connect() as conn:
+                prev = conn.execute(
+                    "SELECT 1 FROM line_dispatch_log WHERE canonical_id=?"
+                    " AND status != 'skipped'"
+                    " AND created_at >= datetime('now', ?) LIMIT 1",
+                    (cid, dedupe_sql_offset),
+                ).fetchone()
+            if prev:
+                seen_canonical.add(cid)
+                filtered_out += 1
+                continue
+        except Exception:
+            pass
+
+        # 读 canonical metadata 决定是否值得引流
+        meta: Dict[str, Any] = {}
+        try:
+            with _lm_connect() as conn:
+                row = conn.execute(
+                    "SELECT metadata_json, tags FROM leads_canonical"
+                    " WHERE canonical_id=?", (cid,),
+                ).fetchone()
+                if row:
+                    try:
+                        meta = _json.loads(row["metadata_json"] or "{}")
+                    except Exception:
+                        meta = {}
+                    tags_set = {t.strip() for t in
+                                 (row["tags"] or "").split(",") if t.strip()}
+                else:
+                    tags_set = set()
+        except Exception:
+            tags_set = set()
+
+        if require_l2 and "l2_verified" not in tags_set:
+            filtered_out += 1
+            continue
+        try:
+            if float(meta.get("l2_score", 0) or 0) < min_score:
+                filtered_out += 1
+                continue
+        except (TypeError, ValueError):
+            pass
+        if persona_key and meta.get("l2_persona_key") != persona_key:
+            filtered_out += 1
+            continue
+
+        # 分配 LINE 账号
+        acc = _lp.allocate(
+            region=region or None,
+            persona_key=persona_key or None,
+            owner_device_id=device_id or None,
+            canonical_id=cid, peer_name=peer_name,
+            source_device_id=device_id, source_event_id=event_id,
+        )
+        if acc is None:
+            no_account += 1
+            seen_canonical.add(cid)
+            continue
+
+        seen_canonical.add(cid)
+        dispatch = {
+            "canonical_id": cid,
+            "peer_name": peer_name,
+            "source_device_id": device_id,
+            "source_event_id": event_id,
+            "source_event_type": ev.get("event_type"),
+            "line_account_id": acc["id"],
+            "line_id": acc["line_id"],
+            "metadata": {
+                "age_band": meta.get("age_band"),
+                "gender": meta.get("gender"),
+                "is_japanese": meta.get("is_japanese"),
+                "l2_score": meta.get("l2_score"),
+            },
+        }
+        dispatches.append(dispatch)
+
+        if write_ce and record_contact_event is not None:
+            try:
+                record_contact_event(
+                    device_id or resolved, peer_name,
+                    "wa_referral_sent",
+                    preset_key=f"line_pool:{acc['id']}",
+                    meta={"line_id": acc["line_id"],
+                          "dispatched_by": "agent_a_phase11",
+                          "source_event_id": event_id,
+                          "canonical_id": cid})
+            except Exception as e:
+                logger.debug("[phase11] write wa_referral_sent 失败: %s", e)
+
+    stats = {
+        "scanned": len(events),
+        "dispatched": len(dispatches),
+        "filtered_out": filtered_out,
+        "no_account": no_account,
+        "dispatches": dispatches,
+    }
+    return True, "", stats
 
 
 _FB_CAMPAIGN_DEFAULT_STEPS = ["warmup", "group_engage", "extract_members",

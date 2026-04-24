@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>LINE Pool 管理 · Phase 11</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a222c;
+    --border: #2a3644;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --success: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --hover: #22303d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI"; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 0 0 12px; display: flex;
+       align-items: center; gap: 10px; }
+  h1 .badge { font-size: 12px; background: var(--accent); color: #fff;
+              padding: 2px 8px; border-radius: 10px; font-weight: normal; }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+  .panel h2 { font-size: 14px; margin: 0 0 8px; color: var(--muted);
+              text-transform: uppercase; letter-spacing: 0.04em; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  label { color: var(--muted); font-size: 12px; }
+  input, select, textarea, button {
+    font: inherit; padding: 6px 10px; border-radius: 4px;
+    border: 1px solid var(--border); background: #0d1117; color: var(--text);
+  }
+  input[type=file] { padding: 4px; }
+  button { cursor: pointer; background: var(--accent); color: #fff;
+           border-color: transparent; padding: 6px 14px; }
+  button:hover { filter: brightness(1.1); }
+  button.sec { background: #30363d; }
+  button.danger { background: var(--danger); }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 8px 10px;
+           border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { font-size: 12px; color: var(--muted); text-transform: uppercase;
+       letter-spacing: 0.04em; }
+  tr:hover td { background: var(--hover); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
+          font-size: 11px; }
+  .pill.active { background: #0d4429; color: var(--success); }
+  .pill.cooldown { background: #4a3e00; color: var(--warn); }
+  .pill.banned, .pill.disabled { background: #4a1d1d; color: var(--danger); }
+  .log { font-family: ui-monospace, monospace; font-size: 12px;
+         background: #0d1117; padding: 8px; border-radius: 4px;
+         max-height: 160px; overflow: auto; white-space: pre-wrap; }
+  .log .ok { color: var(--success); }
+  .log .err { color: var(--danger); }
+  .muted { color: var(--muted); }
+  .flex-1 { flex: 1 1 auto; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap;
+             align-items: flex-end; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>LINE Pool 管理 <span class="badge">Phase 11</span></h1>
+
+  <!-- ── 单条新增 ── -->
+  <div class="panel">
+    <h2>单条新增</h2>
+    <div class="row">
+      <input id="f_line_id" placeholder="line_id (@xxx / URL / phone)" style="min-width:220px">
+      <input id="f_owner" placeholder="owner_device_id (可空)" style="width:200px">
+      <input id="f_persona" placeholder="persona_key (可空)" style="width:150px">
+      <input id="f_region" placeholder="region (jp/it/...)" style="width:90px">
+      <select id="f_status">
+        <option value="active">active</option>
+        <option value="cooldown">cooldown</option>
+        <option value="disabled">disabled</option>
+        <option value="banned">banned</option>
+      </select>
+      <input id="f_cap" type="number" min="1" value="20" style="width:70px" title="daily_cap">
+      <input id="f_notes" placeholder="notes" style="flex:1 1 200px">
+      <button onclick="onAdd()">+ 添加</button>
+    </div>
+  </div>
+
+  <!-- ── 批量导入 CSV ── -->
+  <div class="panel">
+    <h2>批量导入 CSV</h2>
+    <div class="row">
+      <input type="file" id="f_csv" accept=".csv">
+      <button class="sec" onclick="onUploadCsv()">上传 CSV</button>
+      <span class="muted">首行 header: <code>line_id,owner_device_id,persona_key,region,status,daily_cap,notes</code></span>
+    </div>
+    <div id="import_log" class="log" style="margin-top:8px; display:none"></div>
+  </div>
+
+  <!-- ── 筛选 + 列表 ── -->
+  <div class="panel">
+    <h2>账号列表</h2>
+    <div class="toolbar">
+      <div><label>状态</label><br>
+        <select id="q_status">
+          <option value="">全部</option>
+          <option value="active">active</option>
+          <option value="cooldown">cooldown</option>
+          <option value="disabled">disabled</option>
+          <option value="banned">banned</option>
+        </select>
+      </div>
+      <div><label>region</label><br>
+        <input id="q_region" placeholder="" style="width:80px">
+      </div>
+      <div><label>persona</label><br>
+        <input id="q_persona" placeholder="" style="width:140px">
+      </div>
+      <div><label>owner</label><br>
+        <input id="q_owner" placeholder="" style="width:160px">
+      </div>
+      <button class="sec" onclick="reload()">刷新</button>
+      <span class="muted flex-1" style="text-align:right"
+            id="count_label">—</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>ID</th><th>line_id</th><th>region</th><th>persona</th>
+        <th>owner</th><th>status</th><th>cap</th>
+        <th>used (24h / total)</th>
+        <th>last_used_at</th><th>notes</th><th></th>
+      </tr></thead>
+      <tbody id="tbl"></tbody>
+    </table>
+  </div>
+
+  <!-- ── 最近分发日志 ── -->
+  <div class="panel">
+    <h2>最近分发日志 (dispatch_log)</h2>
+    <div class="row" style="margin-bottom:6px">
+      <button class="sec" onclick="reloadLog()">刷新日志</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th>ID</th><th>time</th><th>line_id</th>
+        <th>canonical</th><th>peer</th><th>source</th><th>status</th>
+      </tr></thead>
+      <tbody id="log_tbl"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const API_KEY = new URLSearchParams(location.search).get("api_key") ||
+                localStorage.getItem("OPENCLAW_API_KEY") || "";
+if (API_KEY) localStorage.setItem("OPENCLAW_API_KEY", API_KEY);
+
+function $(id) { return document.getElementById(id); }
+
+function headers() {
+  const h = {"Content-Type": "application/json"};
+  if (API_KEY) h["X-API-Key"] = API_KEY;
+  return h;
+}
+
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, headers());
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`${r.status}: ${text}`);
+  }
+  return r.json();
+}
+
+async function reload() {
+  const params = new URLSearchParams();
+  if ($("q_status").value) params.set("status", $("q_status").value);
+  if ($("q_region").value) params.set("region", $("q_region").value);
+  if ($("q_persona").value) params.set("persona_key", $("q_persona").value);
+  if ($("q_owner").value) params.set("owner_device_id", $("q_owner").value);
+  params.set("limit", "500");
+  try {
+    const data = await api("/line-pool?" + params);
+    render(data.results || []);
+    $("count_label").textContent = `共 ${data.count} 条`;
+  } catch (e) {
+    alert("加载失败: " + e.message);
+  }
+}
+
+function render(rows) {
+  const body = $("tbl");
+  body.innerHTML = "";
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.id}</td>
+      <td><code>${escapeHtml(r.line_id)}</code></td>
+      <td>${escapeHtml(r.region)}</td>
+      <td>${escapeHtml(r.persona_key)}</td>
+      <td>${escapeHtml(r.owner_device_id) || '<span class="muted">—</span>'}</td>
+      <td><span class="pill ${r.status}">${r.status}</span></td>
+      <td>${r.daily_cap}</td>
+      <td>? / ${r.times_used}</td>
+      <td class="muted">${r.last_used_at || "—"}</td>
+      <td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.notes || "")}</td>
+      <td>
+        <button class="sec" onclick="onToggle(${r.id}, '${r.status}')">
+          ${r.status === "active" ? "停用" : "启用"}
+        </button>
+        <button class="danger" onclick="onDelete(${r.id})">删</button>
+      </td>
+    `;
+    body.appendChild(tr);
+  }
+  // 近 24h 使用次数: 查 dispatch_log 计算 (后端 daily_cap 自己有校验, UI 先 ? 占位)
+  // 后端暂未暴露 per-account 计数 API, 保持 ? / total 用户能看到已 allocate 过几次.
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g,
+    c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function onAdd() {
+  const body = {
+    line_id: $("f_line_id").value.trim(),
+    owner_device_id: $("f_owner").value.trim(),
+    persona_key: $("f_persona").value.trim(),
+    region: $("f_region").value.trim(),
+    status: $("f_status").value,
+    daily_cap: Number($("f_cap").value) || 20,
+    notes: $("f_notes").value.trim(),
+  };
+  if (!body.line_id) { alert("line_id 必填"); return; }
+  try {
+    await api("/line-pool", {method: "POST",
+      body: JSON.stringify(body)});
+    $("f_line_id").value = "";
+    $("f_notes").value = "";
+    await reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function onToggle(id, cur) {
+  const next = cur === "active" ? "disabled" : "active";
+  try {
+    await api(`/line-pool/${id}`, {method: "PUT",
+      body: JSON.stringify({status: next})});
+    await reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function onDelete(id) {
+  if (!confirm("确认删除账号 " + id + " ?")) return;
+  try {
+    await api(`/line-pool/${id}`, {method: "DELETE"});
+    await reload();
+  } catch (e) { alert(e.message); }
+}
+
+async function onUploadCsv() {
+  const f = $("f_csv").files[0];
+  if (!f) { alert("请选文件"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  const h = {};
+  if (API_KEY) h["X-API-Key"] = API_KEY;
+  const r = await fetch("/line-pool/bulk-import-csv",
+    {method: "POST", headers: h, body: fd});
+  const data = await r.json();
+  const log = $("import_log");
+  log.style.display = "block";
+  if (r.ok) {
+    log.innerHTML = `<div class="ok">✓ 总 ${data.total} | 新增 ${data.inserted} | 重复 ${data.duplicate} | 无效 ${data.invalid}</div>` +
+      (data.errors && data.errors.length
+        ? data.errors.map(e => `<div class="err">× ${escapeHtml(e.line_id)}: ${escapeHtml(e.reason)}</div>`).join("")
+        : "");
+    await reload();
+  } else {
+    log.innerHTML = `<div class="err">× ${r.status}: ${JSON.stringify(data)}</div>`;
+  }
+}
+
+async function reloadLog() {
+  try {
+    const data = await api("/line-pool/dispatch-log?limit=100");
+    const body = $("log_tbl");
+    body.innerHTML = "";
+    for (const r of data.results || []) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${r.id}</td>
+        <td class="muted">${r.created_at}</td>
+        <td><code>${escapeHtml(r.line_id)}</code></td>
+        <td class="muted" style="font-family:ui-monospace">${escapeHtml(r.canonical_id.slice(0,12))}</td>
+        <td>${escapeHtml(r.peer_name || "")}</td>
+        <td class="muted">${escapeHtml(r.source_device_id || "")}</td>
+        <td><span class="pill ${r.status === 'sent' ? 'active' : (r.status === 'failed' ? 'banned' : 'cooldown')}">${r.status}</span></td>
+      `;
+      body.appendChild(tr);
+    }
+  } catch (e) { alert(e.message); }
+}
+
+reload();
+reloadLog();
+</script>
+</body>
+</html>
