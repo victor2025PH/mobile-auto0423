@@ -86,3 +86,7 @@ debug/
 # (cases.yaml 的 metadata 入库, 截图 开发者本地按需 populate)
 scripts/vlm_eval_dataset/screenshots/*
 !scripts/vlm_eval_dataset/screenshots/.gitkeep
+
+# Debug screenshots from interactive sessions (root-level and subdirs)
+**/real_*.png
+**/screen_*.png
