@@ -662,6 +662,37 @@ def count_risk_events_recent(device_id: str, hours: int = 24) -> int:
         return 0
 
 
+# 2026-04-24 v2: L2 pause 决策要区分 severity.
+# CRITICAL (account-level): 触发 L2 pause (12h default)
+# MEDIUM/LOW (message-level, content_blocked 等): 不 pause L2, 只影响 greeting send
+_CRITICAL_RISK_KINDS = frozenset({
+    "identity_verify", "captcha", "checkpoint",
+    "account_review", "policy_warning",
+})
+
+
+def count_critical_risk_events_recent(device_id: str, hours: int = 12) -> int:
+    """仅 CRITICAL 级风控事件计数 (会触发 L2 pause 的).
+
+    排除: kind='other' (通常是 content_blocked 一类短期 message-level friction),
+    因为 content_blocked 只说 "今天这条消息被 FB 拒发", 不代表账号有长期风险,
+    不该 pause L2 12 小时.
+    """
+    if not device_id:
+        return 0
+    try:
+        with _connect() as conn:
+            placeholders = ",".join("?" for _ in _CRITICAL_RISK_KINDS)
+            sql = (f"SELECT COUNT(*) FROM fb_risk_events "
+                   f"WHERE device_id=? AND detected_at > datetime('now', ?) "
+                   f"AND kind IN ({placeholders})")
+            params = [device_id, f"-{int(hours)} hours", *list(_CRITICAL_RISK_KINDS)]
+            row = conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
 def list_recent_risk_events(device_id: Optional[str] = None,
                             hours: int = 24,
                             limit: int = 50) -> List[Dict[str, Any]]:

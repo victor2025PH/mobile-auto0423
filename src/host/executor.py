@@ -719,7 +719,8 @@ def _execute_facebook(manager, resolved, task_type, params):
                                              persona_key=_persona_key or None,
                                              phase=_phase_override or None,
                                              source=params.get("source", "") or params.get("group_name", ""),
-                                             preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")))
+                                             preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")),
+                                             force=bool(params.get("force_add_friend")))
             else:
                 ok = fb.add_friend(target, device_id=resolved)
 
@@ -1175,6 +1176,7 @@ def _run_facebook_campaign(fb, resolved, params):
                             phase=_ph,
                             preset_key=_pr,
                             source=_camp_src,
+                            force=bool(params.get("force_add_friend")),
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
                         if ok:
@@ -1202,7 +1204,8 @@ def _run_facebook_campaign(fb, resolved, params):
                                                      persona_key=_pk,
                                                      phase=_ph,
                                                      source=_camp_src,
-                                                     preset_key=_pr)
+                                                     preset_key=_pr,
+                                                     force=bool(params.get("force_add_friend")))
                         if ok:
                             sent += 1
                     else:

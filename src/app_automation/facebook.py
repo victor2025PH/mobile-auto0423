@@ -588,6 +588,27 @@ class FacebookAutomation(BaseAutomation):
             _fb_phase_on_risk(did)
         except Exception:
             log.debug("[risk] fb_account_phase on_risk 失败", exc_info=True)
+        # 2026-04-24 v3: 账号验证类风控 → 推送 critical 告警 (需人工验证处理)
+        msg_lower = (message or "").lower()
+        is_verify_required = any(kw in msg_lower for kw in (
+            "confirm your identity", "identity", "verify", "we need to confirm",
+            "checkpoint", "temporarily blocked", "temporarily restricted",
+            "suspicious", "account is locked", "account has been",
+        ))
+        if is_verify_required:
+            try:
+                from src.host.alert_notifier import AlertNotifier
+                AlertNotifier.get().notify(
+                    level="critical",
+                    device_id=did,
+                    message=(f"🚨 FB 账号触发验证/限制需人工处理: "
+                             f"device={did[:12]} trigger='{message[:120]}' — "
+                             f"请在真机 FB app 完成 identity 验证 / 退出 Checkpoint / "
+                             f"或切换账号. 任务已停, L2 pause 12h."),
+                )
+                log.warning("[FB Risk] 已推送 critical 告警: %s", message[:80])
+            except Exception:
+                log.debug("[risk] alert 推送失败", exc_info=True)
         log.warning("[FB Risk] 设备 %s: %s", did[:12], message)
 
     # ── Core Actions ──────────────────────────────────────────────────────
@@ -874,17 +895,19 @@ class FacebookAutomation(BaseAutomation):
         # 才稳定渲染. 之前 1.5s 太紧, 常见 extract 返回 0 条.
         # 修复: extract 返回空时 retry 最多 2 轮, 每轮再等 1.2s 让页面稳定.
         results: List[Dict[str, str]] = []
-        for attempt in range(3):
+        # Phase 9 (2026-04-24): extract retry 加强 — 从 3×1.2s (最多 3.6s) 增加到
+        # 6×2.0s (最多 12s), 覆盖慢设备/慢网的搜索渲染. FB search 偶尔要 8-10s 返回.
+        for attempt in range(6):
             results = self._extract_search_results(d, max_results, query_hint=query)
             if results:
                 if attempt > 0:
                     log.info("[search_people] 第 %d 轮 extract 拿到 %d 个结果 (重试生效)",
                               attempt + 1, len(results))
                 break
-            if attempt < 2:
-                log.debug("[search_people] extract 空, 等 1.2s 再重试 (第 %d 轮)",
+            if attempt < 5:
+                log.debug("[search_people] extract 空, 等 2.0s 再重试 (第 %d 轮)",
                           attempt + 1)
-                time.sleep(1.2)
+                time.sleep(2.0)
         return results
 
     @_with_fb_foreground
@@ -924,22 +947,264 @@ class FacebookAutomation(BaseAutomation):
     def _add_friend_safe_interaction_on_profile(
             self, d, did: str, profile_name: str, note: str,
             *, persona_key: Optional[str], source: str, preset_key: str) -> bool:
-        """已在对方资料页：风控 → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。"""
+        """已在对方资料页：风控 → 模拟阅读滚动 → 回顶 → L2 VLM persona gate →
+        Add Friend → 备注弹窗 → 入库。
+
+        Phase 10 (2026-04-24): 进 profile 后拍截图调 L2 VLM 做精细 persona
+        判断 (头像+bio 看性别年龄), L1 仅名字启发式不够精确 (山田太郎是男性名
+        但 L1 会 PASS). L2 REJECT 时不点 Add Friend.
+        """
         is_risk, msg = self._detect_risk_dialog(d)
         if is_risk:
             log.warning("[add_friend_with_note] 检测到风控提示: %s", msg)
             return False
 
-        for _ in range(random.randint(1, 2)):
+        # 2026-04-24 v3: 识别并跳出 "NewUserPromotionActivity" 等干扰页
+        # FB 有时自动弹 "新用户推荐好友墙", 不是真 profile, 截图还会被
+        # FLAG_SECURE 挡返 3KB 腐败 PNG → VLM 超时. 检测到 → BACK 关闭.
+        try:
+            cur = d.app_current() or {}
+            _act = (cur.get("activity") or "").lower()
+            if any(x in _act for x in (
+                "newuserpromotion", "friending.newuser",
+                "friendsuggestions", "userpromotion")):
+                log.warning("[add_friend_with_note] 干扰页 %s, BACK 返 profile",
+                             _act)
+                try:
+                    d.press("back")
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+                # 再判一次, 若仍在 promotion 页则放弃
+                cur = d.app_current() or {}
+                if any(x in (cur.get("activity") or "").lower() for x in (
+                    "newuserpromotion", "friending.newuser",
+                    "friendsuggestions", "userpromotion")):
+                    log.warning("[add_friend_with_note] 仍在干扰页, 放弃该候选")
+                    return False
+        except Exception:
+            pass
+
+        # 2026-04-24 v2: L2 gate 阶段本身要 scroll 3 次抓 posts 截图
+        # (已经覆盖 "模拟真人阅读" 的视觉效果), 这里只做最短预热 (1 次 scroll_down + 1s)
+        # 省下原 5-17 秒的 pre-L2 scroll 时间.
+        try:
             self.hb.scroll_down(d)
-            time.sleep(random.uniform(2.0, 4.0))
-
-        self.hb.wait_read(random.randint(2000, 6000))
-
-        for _ in range(random.randint(2, 4)):
+            time.sleep(1.0)
             self.hb.scroll_up(d)
-            time.sleep(random.uniform(0.35, 0.7))
-        time.sleep(0.8)
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        # Phase 9F (2026-04-24 v2): L2 VLM 硬门 — 必须真跑 VLM 且 match=True 才继续
+        # 用户要求: 目标好友必须 UI+截图+VLM 确认是日本 37-60 岁女性, 然后才打招呼.
+        # 截图: profile 首屏 + 滑动 3 次抓 posts, 4 张合并送 qwen2.5vl:7b.
+        if persona_key:
+            try:
+                import os as _os
+                import pathlib as _pl
+                from src.host.fb_profile_classifier import classify as _persona_classify
+
+                # 截图目录: logs/screenshots/phase9_{ts} — 方便回溯
+                _ts = int(time.time())
+                _shot_dir = _pl.Path("logs") / "screenshots" / f"phase9_{did[:8]}_{_ts}"
+                try:
+                    _shot_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    _shot_dir = _pl.Path(".")
+
+                image_paths: list = []
+                # T3: profile 首屏截图
+                try:
+                    p0 = str(_shot_dir / "T3_profile_top.png")
+                    # 用 base_automation.screenshot (via dm.capture_screen) 而非
+                    # d.screenshot — AdbFallbackDevice 没有 screenshot 方法
+                    self.screenshot(device_id=did, save_path=p0)
+                    _sz = _os.path.getsize(p0) if _os.path.exists(p0) else 0
+                    # 2026-04-24 v3: < 10KB 认为腐败 PNG (MIUI FLAG_SECURE /
+                    # screencap 阻塞). 不送 VLM 避免 timeout.
+                    if _sz > 10000:
+                        image_paths.append(p0)
+                        log.info("[l2_gate] T3 profile 首屏 saved %s (size=%d)",
+                                  p0, _sz)
+                    else:
+                        log.warning("[l2_gate] T3 截图腐败或空 size=%d, 丢弃 (FLAG_SECURE?)", _sz)
+                except Exception as e:
+                    log.warning("[l2_gate] T3 截图失败: %s", e)
+
+                # T4-T6: 滑动 3 次抓 posts (每次 scroll 等 1.5s 让图片/文字加载)
+                for _i in range(3):
+                    try:
+                        self.hb.scroll_down(d)
+                        time.sleep(random.uniform(1.8, 2.8))
+                        p = str(_shot_dir / f"T{4+_i}_post_{_i+1}.png")
+                        self.screenshot(device_id=did, save_path=p)
+                        _sz2 = _os.path.getsize(p) if _os.path.exists(p) else 0
+                        if _sz2 > 10000:
+                            image_paths.append(p)
+                            log.info("[l2_gate] T%d post_%d saved %s (size=%d)",
+                                      4+_i, _i+1, p, _sz2)
+                        else:
+                            log.warning("[l2_gate] T%d 截图腐败 size=%d, 丢弃",
+                                         4+_i, _sz2)
+                    except Exception as e:
+                        log.warning("[l2_gate] T%d 截图失败: %s", 4+_i, e)
+
+                # 从页面 dump 抓 bio/简介文字作为 L2 ctx
+                bio = ""
+                try:
+                    # 先滚回顶 (便于 bio 抓取 + 之后的 Add Friend)
+                    for _ in range(4):
+                        self.hb.scroll_up(d)
+                        time.sleep(0.4)
+                    xml_p = d.dump_hierarchy() or ""
+                    import re as _re
+                    for m in _re.finditer(
+                        r'<node[^>]+\bclass="android\.widget\.TextView"[^>]+\btext="([^"]{3,120})"[^>]*/>',
+                        xml_p):
+                        t = m.group(1).strip()
+                        if t in ("Add Friend", "Message", "Follow", "More",
+                                    "Edit profile", "About", "发消息", "加好友",
+                                    "关注", "Home", "首页"):
+                            continue
+                        bio += t + " "
+                        if len(bio) >= 400:
+                            break
+                except Exception:
+                    pass
+
+                if not image_paths:
+                    log.warning("[l2_gate] 截图全败, 按 persona_l2_rejected 拦(保守)")
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "add_friend_blocked",
+                            did=did, persona_key=persona_key,
+                            data={"reason": "l2_screenshot_failed"})
+                    except Exception:
+                        pass
+                    return False
+
+                # 2026-04-24 v3: qwen2.5vl context_length=4096 限制, 多图一次送必定超.
+                # 改成 **逐张送** — 每张独立 classify, 命中 match=True 立即停止.
+                # 优先 profile 首屏 (T3), 模糊则追加 post 图.
+                r = None
+                agg_insights = {}
+                for _attempt_idx, _img in enumerate(image_paths[:3], 1):
+                    try:
+                        rk = f"fb:{profile_name}:shot_{_ts}_{_attempt_idx}"
+                        r_i = _persona_classify(
+                            device_id=did,
+                            persona_key=persona_key,
+                            target_key=rk,
+                            display_name=profile_name,
+                            bio=bio[:400],
+                            image_paths=[_img],
+                            l2_image_paths=[_img],
+                            do_l2=True,
+                            dry_run=False,
+                        )
+                        _stage_i = r_i.get("stage_reached")
+                        _match_i = r_i.get("match")
+                        _score_i = r_i.get("score", 0)
+                        _ins_i = r_i.get("insights") or {}
+                        log.info("[l2_gate] 单图 #%d %s → stage=%s match=%s score=%.1f",
+                                  _attempt_idx, _img[-40:], _stage_i, _match_i, _score_i)
+                        # 聚合 insights (保留非空字段)
+                        for k, v in _ins_i.items():
+                            if v and not agg_insights.get(k):
+                                agg_insights[k] = v
+                        # 命中 match=True → 立即停
+                        if _stage_i == "L2" and _match_i:
+                            r = r_i
+                            break
+                        # 若已明确拒绝 (gender=male / is_japanese=False 高置信) → 也停
+                        if _stage_i == "L2" and not _match_i:
+                            _g = (_ins_i.get("gender") or "").lower()
+                            _jp = _ins_i.get("is_japanese")
+                            _jp_conf = float(_ins_i.get("is_japanese_confidence", 0) or 0)
+                            if _g == "male" or (_jp is False and _jp_conf > 0.7):
+                                r = r_i
+                                log.info("[l2_gate] 单图 #%d 明确 REJECT, 停", _attempt_idx)
+                                break
+                        r = r_i  # 保留最后一次结果
+                    except Exception as _e:
+                        log.warning("[l2_gate] 单图 #%d VLM 异常: %s", _attempt_idx, _e)
+                        continue
+                if r is None:
+                    log.warning("[l2_gate] 所有图 VLM 调用失败, 保守拦截")
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "add_friend_blocked",
+                            did=did, persona_key=persona_key,
+                            data={"reason": "l2_all_images_failed"})
+                    except Exception:
+                        pass
+                    return False
+                # 若单张都未触发 match=True, 最终状态 = 最后一次结果 (通常 L2 REJECT)
+                matched = bool(r.get("match"))
+                stage = r.get("stage_reached", "")
+                score = float(r.get("score", 0) or 0)
+                insights = r.get("insights") or {}
+                log.info("[l2_gate] %s L2 result: match=%s stage=%s "
+                          "score=%.1f insights=%s", profile_name, matched,
+                          stage, score, str(insights)[:200])
+
+                # 硬门: 必须真跑 L2 + match=True 才继续. L2 没跑到 (stage=L1)
+                # 说明 VLM 未触发, 视为未验证, 保守拦.
+                if stage != "L2":
+                    log.warning("[l2_gate] %s L2 未真跑 (stage=%s), 保守拦截",
+                                profile_name, stage)
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "add_friend_blocked",
+                            did=did, persona_key=persona_key,
+                            data={"reason": "l2_not_executed",
+                                  "stage_reached": stage,
+                                  "quota": r.get("quota") or {}})
+                    except Exception:
+                        pass
+                    return False
+                if not matched:
+                    log.info("[l2_gate] %s L2 REJECT, skip Add Friend", profile_name)
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "add_friend_blocked",
+                            did=did, persona_key=persona_key,
+                            data={"reason": "persona_l2_rejected",
+                                  "l2_score": score,
+                                  "insights": insights})
+                    except Exception:
+                        pass
+                    return False
+
+                # L2 PASS — 写完整 journey 带 age/gender/is_japanese 信息
+                try:
+                    self._append_journey_for_action(
+                        profile_name, "persona_classified",
+                        did=did, persona_key=persona_key,
+                        data={
+                            "stage": stage, "match": matched,
+                            "score": score, "has_bio": bool(bio),
+                            "age_band": insights.get("age_band"),
+                            "gender": insights.get("gender"),
+                            "is_japanese": insights.get("is_japanese"),
+                            "is_japanese_confidence": insights.get("is_japanese_confidence"),
+                            "overall_confidence": insights.get("overall_confidence"),
+                            "n_images": len(image_paths),
+                        })
+                except Exception:
+                    pass
+            except Exception as e:
+                # L2 代码异常: 保守拦 + 写 journey (用户要求 L2 必走)
+                log.warning("[l2_gate] 异常, persona_l2_rejected 拦截: %s", e)
+                try:
+                    self._append_journey_for_action(
+                        profile_name, "add_friend_blocked",
+                        did=did, persona_key=persona_key,
+                        data={"reason": "l2_exception", "err": str(e)[:200]})
+                except Exception:
+                    pass
+                return False
 
         tapped = self.smart_tap("Add Friend button on profile page",
                                 device_id=did)
@@ -954,6 +1219,13 @@ class FacebookAutomation(BaseAutomation):
                 {"textContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},  # 友達を追加
                 {"textContains": "\u53cb\u9054\u306b\u306a\u308b"},  # 友達になる
                 {"descriptionContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},
+                # 2026-04-24 zh-CN katana 添加
+                {"textContains": "加好友"},
+                {"descriptionContains": "加好友"},
+                {"textContains": "添加好友"},
+                {"descriptionContains": "添加好友"},
+                {"textContains": "加为好友"},
+                {"descriptionContains": "加为好友"},
             ):
                 try:
                     el = d(**sel)
@@ -965,6 +1237,76 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     pass
         if not tapped:
+            # 2026-04-24: Add Friend not found -> check if already friend
+            #   (Message/发消息/メッセージ = already friends, let greeting continue).
+            already_friend = False
+            self._already_friend_msg_xy = None
+            try:
+                for sel in (
+                    {"className": "android.widget.Button", "description": "Message"},
+                    {"className": "android.widget.Button", "description": "发消息"},
+                    {"className": "android.widget.Button", "description": "メッセージ"},
+                    {"text": "Message"},
+                    {"text": "发消息"},
+                ):
+                    el = d(**sel)
+                    if el.exists(timeout=0.8):
+                        already_friend = True
+                        # 2026-04-24 Phase 9F: stash center coords so send_greeting can
+                        # tap the EXACT same Message button (avoid ambiguity with Home
+                        # top-bar Messenger icon also labeled 发消息 in zh-CN).
+                        try:
+                            info = el.info or {}
+                            b_ = info.get("bounds") or {}
+                            if b_:
+                                cx = (b_.get("left", 0) + b_.get("right", 0)) // 2
+                                cy = (b_.get("top", 0) + b_.get("bottom", 0)) // 2
+                                self._already_friend_msg_xy = (cx, cy)
+                        except Exception:
+                            pass
+                        log.info("[add_friend_with_note] already_friend (hit %s) xy=%s",
+                                 sel, self._already_friend_msg_xy)
+                        break
+            except Exception:
+                pass
+            if already_friend:
+                try:
+                    self._append_journey_for_action(
+                        profile_name, "friend_already",
+                        did=did, persona_key=persona_key,
+                        data={"source": source, "preset_key": preset_key})
+                except Exception:
+                    pass
+                return True
+            # 2026-04-24 v3: 检查是否是 "Pending outgoing request" state
+            # profile 有 "取消好友申请"/"Cancel Request"/"Request Sent"/"好友申请已发送"
+            # 说明之前已发过 friend request, 对方还没接受. 记 journey 并跳过.
+            try:
+                pending = False
+                for sel in (
+                    {"textContains": "取消好友申请"},
+                    {"descriptionContains": "取消好友申请"},
+                    {"textContains": "好友申请已发送"},
+                    {"textContains": "Cancel Request"},
+                    {"textContains": "Request Sent"},
+                    {"descriptionContains": "Request Sent"},
+                    {"textContains": "リクエスト済み"},  # リクエスト済み (JP pending)
+                ):
+                    if d(**sel).exists(timeout=0.6):
+                        pending = True
+                        log.info("[add_friend_with_note] 检测到 pending request: %s", sel)
+                        break
+                if pending:
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "add_friend_blocked",
+                            did=did, persona_key=persona_key,
+                            data={"reason": "request_already_pending"})
+                    except Exception:
+                        pass
+                    return False
+            except Exception:
+                pass
             log.info("[add_friend_with_note] 该用户无加好友按钮(可能已是好友/被限)")
             return False
         time.sleep(1.5)
@@ -1023,7 +1365,8 @@ class FacebookAutomation(BaseAutomation):
                              phase: Optional[str] = None,
                              source: str = "",
                              preset_key: str = "",
-                             from_current_profile: bool = False) -> bool:
+                             from_current_profile: bool = False,
+                             force: bool = False) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -1070,8 +1413,32 @@ class FacebookAutomation(BaseAutomation):
                     do_l2=False,  # 无 profile 截图, 只跑 L1
                     dry_run=False,
                 )
+                # 2026-04-24: 去重缓存命中时 l1/l2=None, 用顶层 match 判断
+                # 避免空 dict 的 pass 默认 True 导致误放行 cache 里标过 False 的目标.
                 _l1 = _cls.get("l1") or {}
-                if not _l1.get("pass", True):
+                _from_cache = bool(_cls.get("from_cache"))
+                if _from_cache:
+                    _matched = bool(_cls.get("match", True))
+                    if not _matched:
+                        log.info(
+                            "[add_friend_with_note] persona 缓存 match=False "
+                            "peer=%s (stage=%s), skip", profile_name,
+                            _cls.get("stage_reached"))
+                        try:
+                            self._append_journey_for_action(
+                                profile_name, "add_friend_blocked",
+                                did=did, persona_key=persona_key,
+                                data={
+                                    "reason": "persona_cached_rejected",
+                                    "stage_reached": _cls.get("stage_reached"),
+                                    "score": _cls.get("score", 0),
+                                })
+                        except Exception:
+                            pass
+                        return False
+                    # 缓存且 match=True: 已经在第一次分类时写过 journey,
+                    # 不再重复写 persona_classified, 直接放行.
+                elif not _l1.get("pass", True):
                     l1_score = _l1.get("score", 0)
                     reasons = _l1.get("reasons") or []
                     log.info(
@@ -1092,19 +1459,20 @@ class FacebookAutomation(BaseAutomation):
                     except Exception:
                         pass
                     return False
-                # L1 PASS — 记一条 journey 让 funnel 能看到命中率
-                try:
-                    self._append_journey_for_action(
-                        profile_name, "persona_classified",
-                        did=did, persona_key=persona_key,
-                        data={
-                            "stage": "L1",
-                            "match": True,
-                            "score": _l1.get("score", 0),
-                            "reasons": (_l1.get("reasons") or [])[:3],
-                        })
-                except Exception:
-                    pass
+                else:
+                    # 新一次 L1 PASS — 记一条 journey 让 funnel 能看到命中率
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "persona_classified",
+                            did=did, persona_key=persona_key,
+                            data={
+                                "stage": "L1",
+                                "match": True,
+                                "score": _l1.get("score", 0),
+                                "reasons": (_l1.get("reasons") or [])[:3],
+                            })
+                    except Exception:
+                        pass
             except Exception as e:
                 # classify 异常时保守放行 (不阻塞主流程)
                 log.debug("[add_friend_with_note] persona classify 异常, 放行: %s", e)
@@ -1130,16 +1498,20 @@ class FacebookAutomation(BaseAutomation):
                 ab_cfg, daily_cap=int(ab_cfg.get("daily_cap_per_account") or 0),
                 persona_key=persona_key, eff_phase=eff_phase,
                 source=source, preset_key=preset_key,
-                from_current_profile=from_current_profile)
+                from_current_profile=from_current_profile,
+                force=force)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
                                      persona_key, eff_phase,
                                      source: str = "", preset_key: str = "",
-                                     from_current_profile: bool = False):
+                                     from_current_profile: bool = False,
+                                     force: bool = False):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
-        if daily_cap > 0:
+        # 2026-04-24: force=True (运维显式 override, 对应 params.force_add_friend)
+        #   跳过 cap 检查, 供 smoke/QA 在高水位下验证真机链路.
+        if daily_cap > 0 and not force:
             try:
                 from src.host.fb_store import count_friend_requests_sent_since
                 n24 = count_friend_requests_sent_since(did, hours=24)
@@ -1149,6 +1521,9 @@ class FacebookAutomation(BaseAutomation):
                     return False
             except Exception as e:
                 log.debug("[add_friend_with_note] daily_cap 检查异常(继续): %s", e)
+        elif force and daily_cap > 0:
+            log.info("[add_friend_with_note] force=True, 跳过 daily_cap=%s 检查",
+                     daily_cap)
 
         # P0-2: note 空 + playbook 要求携带验证语 → 从 persona 文案池抽
         require_note = bool(ab_cfg.get("require_verification_note", True))
@@ -1182,41 +1557,113 @@ class FacebookAutomation(BaseAutomation):
             time.sleep(1)
 
             if safe_mode:
-                # 安全路径: 点击第一个搜索结果进主页 → 停留 → 找主页内的 Add Friend
-                first = self._first_search_result_element(d, query_hint=profile_name)
-                if first is None:
-                    log.warning("[add_friend_with_note] 无法定位首个搜索结果")
+                # 2026-04-24 v3: Walk top 5 candidates, 快速跳过明显男性, L2 VLM 精筛.
+                # 姓搜(如 '田中')会返回混合性别/年龄候选; 原版只点首个常撞 L2 REJECT
+                # (上一轮 A1 田中 正好中男性). 现在: 男性名跳过不浪费 VLM; 遇 L2
+                # REJECT 按 BACK 返搜索页 → 下一候选; 遇 L2 PASS 继续 Add Friend 流程.
+                candidates = self._list_top_search_result_cards(
+                    d, query_hint=profile_name, max_n=5)
+                if not candidates:
+                    log.warning("[add_friend_with_note] 搜索结果无候选卡片")
                     return False
-                self.hb.tap(d, *self._el_center(first))
-                time.sleep(random.uniform(4.5, 7.0))
+                log.info("[add_friend_with_note] 候选 %d 个: %s",
+                         len(candidates),
+                         [(c["name"][:20], "M" if c["male_hint"] else "?")
+                          for c in candidates])
 
-                try:
-                    xml_chk = d.dump_hierarchy()
-                except Exception:
+                last_result = False
+                for idx, cand in enumerate(candidates):
+                    cand_name = cand["name"] or profile_name
+                    if cand["male_hint"]:
+                        log.info("[add_friend_with_note] 跳过候选 #%d '%s' (男性名启发式)",
+                                 idx+1, cand_name[:30])
+                        continue
+                    # 2026-04-24: 跳过已联系过的 peer (避免重复骚扰)
+                    contacted, _reason = self._peer_already_contacted(cand_name)
+                    if contacted:
+                        log.info("[add_friend_with_note] 跳过候选 #%d '%s' (%s)",
+                                 idx+1, cand_name[:30], _reason)
+                        continue
+                    # Tap candidate card
+                    cx = (cand["bounds"][0] + cand["bounds"][2]) // 2
+                    cy = (cand["bounds"][1] + cand["bounds"][3]) // 2
+                    log.info("[add_friend_with_note] 尝试候选 #%d '%s' at (%d,%d)",
+                             idx+1, cand_name[:30], cx, cy)
+                    try:
+                        self.hb.tap(d, cx, cy)
+                    except Exception as e:
+                        log.warning("[add_friend_with_note] tap 候选 #%d 失败: %s",
+                                     idx+1, e)
+                        continue
+                    # FB profile 首次加载可能 6-8s, 轮询最多 12s 再判
                     xml_chk = ""
-                if not self._is_likely_fb_profile_page_xml(xml_chk):
-                    like_name = (results[0].get("name") or "").strip()
-                    if like_name and self._search_result_name_plausible(
-                            like_name, profile_name):
+                    loaded = False
+                    for _poll in range(6):
+                        time.sleep(2.0)
                         try:
-                            el = d(text=like_name)
-                            if el.exists(timeout=2.0):
+                            xml_chk = d.dump_hierarchy() or ""
+                        except Exception:
+                            xml_chk = ""
+                        if self._is_likely_fb_profile_page_xml(xml_chk):
+                            loaded = True
+                            break
+
+                    # 若还不在 profile, 试按 display_name 点 (FB 可能渲染 TextView 而非 Card)
+                    if not loaded and cand_name:
+                        try:
+                            el = d(text=cand_name)
+                            if el.exists(timeout=1.5):
                                 el.click()
-                                log.info("[add_friend_with_note] 按提取人名重试进入主页: %r",
-                                         like_name[:80])
-                                time.sleep(random.uniform(3.5, 5.5))
-                                xml_chk = d.dump_hierarchy()
+                                log.info("[add_friend_with_note] 候选 #%d 按 text 名字重点",
+                                         idx+1)
+                                time.sleep(random.uniform(3.5, 5.0))
+                                xml_chk = d.dump_hierarchy() or ""
+                                loaded = self._is_likely_fb_profile_page_xml(xml_chk)
                         except Exception:
                             pass
-                if not self._is_likely_fb_profile_page_xml(xml_chk):
-                    log.info("[add_friend_with_note] 未检测到资料页特征，尝试列表区坐标点击")
-                    w, _h = d.window_size()
-                    self._adb(f"shell input tap {int(w * 0.5)} {int(620)}", device_id=did)
-                    time.sleep(random.uniform(3.0, 5.0))
 
-                return self._add_friend_safe_interaction_on_profile(
-                    d, did, profile_name, note,
-                    persona_key=persona_key, source=source, preset_key=preset_key)
+                    if not loaded:
+                        log.info("[add_friend_with_note] 候选 #%d 点击后非资料页(轮询 12s+ 重试), 跳过",
+                                 idx+1)
+                        # BACK 回搜索页
+                        try:
+                            d.press("back")
+                        except Exception:
+                            pass
+                        time.sleep(1.5)
+                        continue
+
+                    # 在 profile 页跑完整流程: L2 VLM + Add Friend / Message / 记录
+                    # 用 cand_name (实际 profile 名) 而非 surname 查询, 让 journey 分离
+                    res = self._add_friend_safe_interaction_on_profile(
+                        d, did, cand_name, note,
+                        persona_key=persona_key,
+                        source=source, preset_key=preset_key)
+                    if res:
+                        log.info("[add_friend_with_note] 候选 #%d '%s' 成功",
+                                 idx+1, cand_name[:30])
+                        return True
+                    # L2 REJECT 或其他失败 → BACK 回搜索页, 试下一个
+                    last_result = False
+                    log.info("[add_friend_with_note] 候选 #%d '%s' 失败, BACK 试下一个",
+                             idx+1, cand_name[:30])
+                    try:
+                        d.press("back")
+                    except Exception:
+                        pass
+                    time.sleep(random.uniform(1.5, 2.5))
+                    # 验证回到搜索页 (若不是就再 BACK)
+                    try:
+                        _chk = d.dump_hierarchy() or ""
+                        if self._is_likely_fb_profile_page_xml(_chk):
+                            # 还在资料页, 再 BACK
+                            d.press("back")
+                            time.sleep(1.2)
+                    except Exception:
+                        pass
+
+                log.info("[add_friend_with_note] 候选全部失败 (%d 个)", len(candidates))
+                return False
             if not self.smart_tap("Add Friend button", device_id=did):
                 return False
             time.sleep(1)
@@ -1366,6 +1813,22 @@ class FacebookAutomation(BaseAutomation):
         优先 smart_tap (走 AutoSelector 学习 + 自愈),失败降级到文本兜底。
         返回 True 表示点击成功(不保证对话页已加载,调用方需自行等待 + 校验)。
         """
+        # 2026-04-24 Phase 9F: profile 上 Chinese "发消息" Button 用 u2 el.click()
+        #   而非坐标 hb.tap — 实测 hb.tap (360,488) 落点似乎偏进 decorative layer,
+        #   tap 被吞. u2 el.click() 走 UIAutomation inject 更可靠命中 onClick.
+        try:
+            for sel in (
+                {"className": "android.widget.Button", "description": "发消息"},
+                {"className": "android.widget.Button", "description": "Message"},
+                {"className": "android.widget.Button", "description": "メッセージ"},
+            ):
+                el = d(**sel)
+                if el.exists(timeout=0.8):
+                    el.click()
+                    log.info("[_tap_profile_message_button] u2 el.click() via %s", sel)
+                    return True
+        except Exception as e:
+            log.debug("[_tap_profile_message_button] u2 el.click 异常: %s", e)
         for alt in self._GREETING_MESSAGE_BTN_ALTS:
             try:
                 if self.smart_tap(alt, device_id=did):
@@ -1373,7 +1836,9 @@ class FacebookAutomation(BaseAutomation):
             except Exception:
                 continue
         # 文本兜底 —— 避免被 Feed 内的 "Message" TextView 误命中：
-        # 限制必须是 clickable 且屏幕上半部（profile 页按钮一般在资料卡下方）
+        # 限制必须是 clickable 且不在最底部导航区 (Messenger tab 通常占屏 > 90% 位置)
+        # 2026-04-24: 之前 cy<0.65 过严, zh-CN profile 的 发消息 Button
+        #   在资料卡下方 actions row (约 65-80% 位置), 被误过滤.
         try:
             try:
                 sh = d.window_size()[1]
@@ -1387,9 +1852,31 @@ class FacebookAutomation(BaseAutomation):
                         bounds = info.get("bounds") or {}
                         cx = (bounds.get("left", 0) + bounds.get("right", 0)) // 2
                         cy = (bounds.get("top", 0) + bounds.get("bottom", 0)) // 2
-                        # 限定在屏幕 1/8 ~ 5/8 区域避免命中底部导航 Messenger tab
-                        if cx > 0 and cy > 0 and cy < sh * 0.65:
-                            self.hb.tap(d, cx, cy, device_id=did)
+                        # 限定: 避开屏幕最底 12% (底部导航 Messenger tab 区)
+                        if cx > 0 and cy > 0 and cy < sh * 0.88:
+                            log.info("[_tap_profile_message_button] tap '%s' "
+                                      "at (%d,%d) sh=%d", txt, cx, cy, sh)
+                            self.hb.tap(d, cx, cy)
+                            return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # 最后兜底: description (content-desc) 变体 (Chinese Button 常用 desc 而非 text)
+        try:
+            for desc in ("Message", "发消息", "メッセージ", "消息",
+                          "Send Message"):
+                try:
+                    btn = d(description=desc, clickable=True)
+                    if btn.exists(timeout=0.5):
+                        info = btn.info or {}
+                        bounds = info.get("bounds") or {}
+                        cx = (bounds.get("left", 0) + bounds.get("right", 0)) // 2
+                        cy = (bounds.get("top", 0) + bounds.get("bottom", 0)) // 2
+                        if cx > 0 and cy > 0:
+                            log.info("[_tap_profile_message_button] tap desc='%s' "
+                                      "at (%d,%d)", desc, cx, cy)
+                            self.hb.tap(d, cx, cy)
                             return True
                 except Exception:
                     continue
@@ -1534,10 +2021,12 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.warning("[messenger_send] app_start 异常: %s", e)
                 return False, "messenger_unavailable"
-            # 自适应时序: 轮询 Messenger 到前台, 最多等 8s (替代固定 sleep 6s)
-            if not _wait_pkg_foreground(MESSENGER_PKG, timeout=8.0):
-                log.warning("[messenger_send] Messenger 8s 内未到前台")
+            # 自适应时序: 轮询 Messenger 到前台, 最多等 15s (新机冷启动更慢)
+            if not _wait_pkg_foreground(MESSENGER_PKG, timeout=15.0):
+                log.warning("[messenger_send] Messenger 15s 内未到前台")
                 return False, "messenger_unavailable"
+            # 额外等待 chats 列表渲染 (auth splash → 主页 过渡)
+            time.sleep(3.0)
 
             # 跳常见弹窗
             for t in ("Not Now", "Skip", "OK", "Continue", "Allow",
@@ -1551,18 +2040,34 @@ class FacebookAutomation(BaseAutomation):
                     pass
 
             # 2) 搜索入口
+            # 2026-04-24: Messenger app 也 zh-CN 本地化. chats 列表顶部搜索框是一个
+            # 复合 label Button (如 "问问 Meta AI 或自行搜索"), 精确 text='搜索' 匹配不到,
+            # 改用 textContains/descriptionContains 兜底所有语言所有版本.
             search_clicked = False
-            for sel in ({"descriptionContains": "search"},
-                          {"description": "Search"},
-                          {"text": "Search"}):
-                try:
-                    el = d(**sel)
-                    if el.exists(timeout=1.5):
-                        el.click()
-                        search_clicked = True
-                        break
-                except Exception:
-                    continue
+            # 轮询 5 次 × 1.5s 让 UI 渲染稳定再找, 适配 auth splash → chats 过渡
+            search_poll_deadline = time.time() + 8.0
+            while time.time() < search_poll_deadline and not search_clicked:
+                for sel in ({"textContains": "自行搜索"},     # zh-CN 复合 "问问 Meta AI 或自行搜索"
+                              {"descriptionContains": "search"},
+                              {"descriptionContains": "搜索"},
+                              {"textContains": "search"},
+                              {"textContains": "搜索"},
+                              {"textContains": "Search"},
+                              {"description": "Search"},
+                              {"description": "搜索"},
+                              {"text": "Search"},
+                              {"text": "搜索"}):
+                    try:
+                        el = d(**sel)
+                        if el.exists(timeout=0.6):
+                            el.click()
+                            log.info("[messenger_send] 点搜索入口 via %s", sel)
+                            search_clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not search_clicked:
+                    time.sleep(1.5)
             if not search_clicked:
                 log.warning("[messenger_send] 搜索入口找不到")
                 return False, "search_ui_missing"
@@ -1679,14 +2184,22 @@ class FacebookAutomation(BaseAutomation):
                 log.debug("[messenger_send] 确认弹窗处理异常(非致命): %s", e)
 
             # 7) Send 按钮
+            # 2026-04-24 v3: zh-CN Messenger 用 '发送', 日文用 '送信'
             send_btn = None
             for sel in ({"description": "Send"},
+                          {"description": "发送"},
+                          {"description": "送信"},
                           {"text": "Send"},
-                          {"descriptionContains": "Send"}):
+                          {"text": "发送"},
+                          {"text": "送信"},
+                          {"descriptionContains": "Send"},
+                          {"descriptionContains": "发送"},
+                          {"descriptionContains": "送信"}):
                 try:
                     el = d(**sel)
-                    if el.exists(timeout=1.5):
+                    if el.exists(timeout=1.0):
                         send_btn = el
+                        log.info("[messenger_send] Send button via %s", sel)
                         break
                 except Exception:
                     continue
@@ -2209,25 +2722,54 @@ class FacebookAutomation(BaseAutomation):
                          profile_name)
                 self._set_greet_reason("no_message_button")
                 return False
-            time.sleep(random.uniform(2.0, 3.5))
+            time.sleep(random.uniform(1.5, 2.5))
 
-            # 可能弹 "Send Message Request?" 确认框（对非好友首次发）—— 先处理输入再确认
-            # 部分版本顺序: 打开对话 → 输入 → 点 Send → 弹 Request 确认框
-            # 部分版本顺序: 打开对话 → 立即弹确认框 → 同意后才显示输入
-            # 所以这里先试一次: 若当前是确认框, 先点确认再继续
+            # 2026-04-24 v2: 极简化流程
+            #   1. 点 Message 后等 4s
+            #   2. confirm request (若有)
+            #   3. 找 EditText, 找不到 → 直接 Messenger fallback (不做 BACK+reprobe, 节省 40-60s)
             self._confirm_message_request_if_any(d)
-
-            # 打开对话页后的思考时间（像真人打字前的停顿）
-            tlo, thi = sg_cfg.get("think_before_type_sec") or (3, 7)
-            time.sleep(random.uniform(float(tlo), float(thi)))
-
-            # 输入文字 + 发送
+            time.sleep(random.uniform(1.5, 2.5))  # 砍 think_before_type_sec
             try:
                 input_box = d(className="android.widget.EditText")
                 if not input_box.exists(timeout=3.0):
-                    log.warning("[send_greeting] 未找到输入框,放弃: %s", profile_name)
-                    self._set_greet_reason("input_miss")
-                    return False
+                    # 诊断
+                    _cur_pkg = ""
+                    try:
+                        cur = d.app_current() or {}
+                        _cur_pkg = cur.get("package", "") or ""
+                        log.info("[send_greeting] inline 无 EditText, cur_pkg=%s",
+                                  _cur_pkg)
+                    except Exception:
+                        pass
+                    # 若 tap 跳到 Messenger app, 多等 4s 再看一次
+                    if _cur_pkg == "com.facebook.orca":
+                        log.info("[send_greeting] 在 Messenger app, 等 4s 再找 EditText")
+                        time.sleep(4.0)
+                        input_box = d(className="android.widget.EditText")
+
+                    if not input_box.exists(timeout=1.0):
+                        # 不再 BACK+reprobe+expand 多层重试 (每层 10-20s, 总浪费 40-60s).
+                        # 直接走 Messenger app 独立 fallback — 经实测更可靠.
+                        if bool(sg_cfg.get("allow_messenger_fallback", False)):
+                            log.info("[send_greeting] inline miss → Messenger fallback: %s",
+                                      profile_name)
+                            try:
+                                if self._is_messenger_installed(did):
+                                    return self._send_greeting_messenger_fallback(
+                                        did=did, profile_name=profile_name,
+                                        greeting=greeting,
+                                        template_id=template_id,
+                                        persona_key=persona_key,
+                                        eff_phase=eff_phase,
+                                        preset_key=preset_key,
+                                        ai_decision=ai_decision)
+                            except Exception as e:
+                                log.warning("[send_greeting] Messenger fallback 异常: %s", e)
+                        log.warning("[send_greeting] 多路径后仍未找到输入框,放弃: %s",
+                                    profile_name)
+                        self._set_greet_reason("input_miss")
+                        return False
                 self.hb.tap(d, *self._el_center(input_box))
                 time.sleep(random.uniform(0.4, 0.9))
                 self.hb.type_text(d, greeting[:300])
@@ -2242,6 +2784,23 @@ class FacebookAutomation(BaseAutomation):
                 send_ok = self.smart_tap("Send message button", device_id=did)
             except Exception:
                 send_ok = False
+            if not send_ok:
+                # 2026-04-24 v3: zh-CN/JP selector 显式 fallback
+                for sel in ({"description": "发送"},
+                              {"description": "送信"},
+                              {"description": "Send"},
+                              {"text": "发送"},
+                              {"text": "送信"},
+                              {"text": "Send"}):
+                    try:
+                        el = d(**sel)
+                        if el.exists(timeout=0.8):
+                            el.click()
+                            log.info("[send_greeting] inline send via %s", sel)
+                            send_ok = True
+                            break
+                    except Exception:
+                        continue
             if not send_ok:
                 # 兜底: 回车键触发发送
                 try:
@@ -2312,7 +2871,8 @@ class FacebookAutomation(BaseAutomation):
                              phase: Optional[str] = None,
                              preset_key: str = "",
                              source: str = "",
-                             greet_on_failure: bool = False) -> Dict[str, Any]:
+                             greet_on_failure: bool = False,
+                             force: bool = False) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -2353,6 +2913,7 @@ class FacebookAutomation(BaseAutomation):
             phase=phase,
             source=source,
             preset_key=preset_key,
+            force=force,
         )
         out["add_friend_ok"] = bool(add_ok)
 
@@ -4585,6 +5146,10 @@ class FacebookAutomation(BaseAutomation):
             # 兜底: stop + start — 彻底复位
             log.info("[search] 强制重启 FB (cur=%s) 以清除子页/弹窗/跨 app 污染", cur_pkg)
             try:
+                # Phase 9 修 (2026-04-24): FB 启动时常被 Messenger(orca) 抢焦点,
+                # 特别是用户最近用过 Messenger 时. 同步 force-stop orca 避免它挡道.
+                d.app_stop("com.facebook.orca")
+                time.sleep(0.5)
                 d.app_stop("com.facebook.katana")
                 time.sleep(1.5)
                 d.app_start("com.facebook.katana")
@@ -4630,33 +5195,47 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     return
 
-        # 入口强制 stop + start FB — 2026-04-24 决策:
-        # 实测 pure 测试能搜 6 条, 生产 smoke 搜 0 条, 唯一差异是 pure 先彻底重启 FB.
-        # 沿用的旧 FB session 搜索请求可能 cached/stale, 每次 search 入口多花 7s 换
-        # 100% 成功率是值得的. 也一并清所有 Messenger/Profile/Location 弹窗污染.
+        # 2026-04-24 v2: 不再无条件 stop+start FB (25-35s/task 浪费).
+        # 仅在以下情况才重启: (a) 不在 FB katana; (b) 在 Messenger; (c) 不像 Home/搜索页.
         if _is_on_search_page():
             return True
-        log.info("[search] 强制 stop+start FB 清除所有前置污染")
         try:
-            d.app_stop("com.facebook.katana")
-            time.sleep(1.5)
-            d.app_start("com.facebook.katana")
-        except Exception as e:
-            log.warning("[search] app_stop/start 异常: %s", e)
-        for _ in range(7):
-            time.sleep(1.0)
-            if _is_on_fb_home():
-                break
-        for t in ("Not Now", "Skip", "Maybe Later", "OK", "Got it",
-                    "Continue", "Close", "Dismiss", "Cancel",
-                    "Allow", "While using the app", "Later"):
+            cur_pkg = (d.app_current() or {}).get("package", "")
+        except Exception:
+            cur_pkg = ""
+        need_restart = False
+        if cur_pkg != "com.facebook.katana":
+            need_restart = True
+            log.info("[search] cur_pkg=%s, 需 restart FB", cur_pkg)
+        elif not _is_on_fb_home():
+            need_restart = True
+            log.info("[search] 已在 FB katana 但不在 Home/搜索页, 需 restart")
+        if need_restart:
+            log.info("[search] 强制 stop+start FB 清除前置污染")
             try:
-                el = d(text=t)
-                if el.exists(timeout=0.3):
-                    el.click()
-                    time.sleep(0.4)
-            except Exception:
-                pass
+                d.app_stop("com.facebook.orca")
+                time.sleep(0.5)
+                d.app_stop("com.facebook.katana")
+                time.sleep(1.2)
+                d.app_start("com.facebook.katana")
+            except Exception as e:
+                log.warning("[search] app_stop/start 异常: %s", e)
+            for _ in range(7):
+                time.sleep(1.0)
+                if _is_on_fb_home():
+                    break
+            for t in ("Not Now", "Skip", "Maybe Later", "OK", "Got it",
+                        "Continue", "Close", "Dismiss", "Cancel",
+                        "Allow", "While using the app", "Later"):
+                try:
+                    el = d(text=t)
+                    if el.exists(timeout=0.3):
+                        el.click()
+                        time.sleep(0.4)
+                except Exception:
+                    pass
+        else:
+            log.info("[search] 已在 FB Home, 跳过 restart (省 25-35s)")
 
         # 2026-04-23 重构: 只用 **在 Home 上真实存在** 的最稳 selector,
         # 过往尝试的 resource-id 全被 FB 混淆成 "(name removed)" 永远 0 candidates,
@@ -4833,6 +5412,104 @@ class FacebookAutomation(BaseAutomation):
             return True
         nl = n.lower()
         return any(t.lower() in nl for t in qtok)
+
+    # 2026-04-24 v3: 姓搜 + walk candidates 支持
+    # 常见男性日文名后缀 — 在搜索结果卡片级就快速跳过, 不浪费 L2 VLM quota
+    _MALE_JP_NAME_SUFFIXES = (
+        "郎", "太", "雄", "健", "輔", "介", "也", "司", "彦",
+        "男", "夫", "之", "治", "樹", "一", "二", "三", "博",
+        "志", "朗", "哉", "佑", "翔", "斗", "馬", "弥",
+    )
+
+    def _peer_already_contacted(self, name: str) -> tuple:
+        """检查 peer 是否已联系过 (journey 里有 greeting_sent / friend_requested /
+        add_friend_blocked{reason=request_already_pending}).
+
+        用于 walk candidates 时跳过已互动过的 peer, 避免骚扰.
+        Returns (contacted: bool, reason: str).
+        """
+        if not name:
+            return False, ""
+        try:
+            from src.host.lead_mesh import resolve_identity, get_journey
+            cid = resolve_identity(platform="facebook",
+                                    account_id=f"fb:{name}",
+                                    display_name=name)
+            events = get_journey(cid) or []
+            actions = [e.get("action") for e in events]
+            if "greeting_sent" in actions:
+                return True, "already_greeted"
+            if "friend_requested" in actions:
+                return True, "already_friend_requested"
+            if "friend_already" in actions:
+                return True, "already_friend_contacted"
+            # 2026-04-24 v3: 查 pending request — 写在 add_friend_blocked 里
+            for e in events:
+                if (e.get("action") == "add_friend_blocked"
+                        and (e.get("data") or {}).get("reason") == "request_already_pending"):
+                    return True, "request_already_pending"
+        except Exception:
+            pass
+        return False, ""
+
+    def _is_likely_male_jp_name(self, name: str) -> bool:
+        """通过姓名末尾汉字启发式判断是否明显为男性日文名.
+
+        不是100%准确 (如"祐子"女性但末字"子"不在此表), 目的是**快速跳过明显男性**,
+        让 L2 VLM 聚焦于剩余候选 (女性 + 性别中性名) 做精细确认.
+        """
+        if not name:
+            return False
+        # 去掉姓氏部分 (按空格或全角空格分隔)
+        parts = name.replace("　", " ").split()
+        first_name = parts[-1] if parts else name
+        if not first_name:
+            return False
+        last_char = first_name[-1]
+        return last_char in self._MALE_JP_NAME_SUFFIXES
+
+    def _list_top_search_result_cards(self, d, query_hint: str = "",
+                                        max_n: int = 5) -> list:
+        """列出搜索结果 top N 人员卡片, 供 walk candidates 用.
+
+        返回 list of dict: [{name: str, bounds: (l,t,r,b), male_hint: bool}, ...]
+        """
+        out: list = []
+        def _card_text(el) -> str:
+            cd = (getattr(el, "content_desc", "") or "").strip()
+            if cd:
+                return cd.split(",")[0].strip()
+            return (getattr(el, "text", "") or "").strip()
+        try:
+            xml = d.dump_hierarchy()
+            from ..vision.screen_parser import XMLParser
+            elements = XMLParser.parse(xml)
+            cards = [el for el in elements if self._is_person_card(el)]
+            if not cards:
+                for el in elements:
+                    if (el.clickable and el.text and len(el.text) >= 2
+                            and el.class_name and "TextView" in el.class_name):
+                        t = (el.text or "").strip()
+                        if t in self._SEARCH_FILTER_TAB_TEXTS:
+                            continue
+                        if el.bounds and el.bounds[1] < 280 and len(t) < 30:
+                            continue
+                        cards.append(el)
+            # 按 plausibility 排序, query_hint 匹配的卡片优先
+            if query_hint:
+                cards.sort(key=lambda c: 0 if self._search_result_name_plausible(
+                    _card_text(c), query_hint) else 1)
+            for el in cards[:max_n]:
+                nm = _card_text(el)
+                b = el.bounds
+                out.append({
+                    "name": nm,
+                    "bounds": (b[0], b[1], b[2], b[3]),
+                    "male_hint": self._is_likely_male_jp_name(nm),
+                })
+        except Exception as e:
+            log.debug("[list_top_cards] failed: %s", e)
+        return out
 
     def _first_search_result_element(self, d, query_hint: str = ""):
         """返回搜索结果列表里第 1 个**匹配 query_hint**的人员卡片元素(用于进入主页)。

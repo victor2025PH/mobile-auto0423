@@ -20,6 +20,15 @@ def is_likely_fb_profile_page_xml(x: str) -> bool:
         return True
     if any(s in low for s in ("add friend", "message", "follow")):
         return True
+    # 2026-04-24 v3: zh-CN FB katana profile markers
+    zh_markers = (
+        "加好友",
+        "发消息",
+        "添加好友",
+        "取消好友申请",
+    )
+    if any(s in x for s in zh_markers):
+        return True
     return any(
         s in x
         for s in (

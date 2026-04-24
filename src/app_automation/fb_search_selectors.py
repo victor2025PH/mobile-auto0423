@@ -16,13 +16,17 @@ from typing import Any, Dict, Tuple
 Selector = Dict[str, Any]
 
 # ── 从 Home 打开「搜索页」：顶栏 Search（2026-04-23 katana 实测为 Button，非 EditText）──
+# 2026-04-24 v2: zh-CN 优先 (实测当前 FB katana 中文), 省 10s/task
 FB_HOME_SEARCH_BUTTON_SELECTORS: Tuple[Selector, ...] = (
+    {"className": "android.widget.Button", "description": "搜索"},
+    {"description": "搜索", "clickable": True},
     {"className": "android.widget.Button", "description": "Search"},
     {"description": "Search", "clickable": True},
 )
 
 # ── ``_fallback_search_tap``：主循环全失败后的兜底 ─────────────────────
 FB_FALLBACK_SEARCH_TAP_SELECTORS: Tuple[Selector, ...] = (
+    {"description": "搜索"},
     {"description": "Search"},
     {"resourceId": "com.facebook.katana:id/search_bar_text_view"},
     {"resourceId": "com.facebook.katana:id/search_bar"},
@@ -35,6 +39,8 @@ FB_SEARCH_SURFACE_EXTRA_SELECTORS: Tuple[Selector, ...] = (
     {"resourceId": "com.facebook.katana:id/search_bar"},
     {"resourceId": "com.facebook.katana:id/search_button"},
     {"className": "android.widget.EditText", "description": "Search Facebook"},
+    {"className": "android.widget.EditText", "description": "搜索Facebook"},
+    {"className": "android.widget.EditText", "description": "搜索 Facebook"},
 )
 
 # ── ``search_people``：在搜索页内向 EditText 写入 query（set_text）────
@@ -48,9 +54,14 @@ FB_SEARCH_QUERY_EDITOR_SELECTORS: Tuple[Selector, ...] = (
 )
 
 # ── ``search_people``：People 筛选条 ───────────────────────────────────
+# 2026-04-24 追加中文本地化 '用户' / '人' 变体
 FB_PEOPLE_TAB_SELECTORS: Tuple[Selector, ...] = (
     {"descriptionContains": "People search results"},
+    {"descriptionContains": "用户搜索结果"},
     {"text": "People"},
+    {"text": "用户"},
+    {"text": "人"},
     # 日文等界面可能只有 content-desc 含 People，无英文精确 text
     {"descriptionContains": "People"},
+    {"descriptionContains": "用户"},
 )

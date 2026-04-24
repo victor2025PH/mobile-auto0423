@@ -84,9 +84,11 @@ defaults:
     # 两条打招呼之间的间隔 [sec_lo, sec_hi]
     inter_greeting_sec: [240, 600]
     # 加好友成功后先等待多久再点 Message（模拟"看了下资料再想起打个招呼"）
-    post_add_friend_wait_sec: [8, 18]
+    # 2026-04-24 v2: 砍 [8,18] → [3,6], L2 VLM 阶段已占 50-90s 足够模拟真人阅读
+    post_add_friend_wait_sec: [3, 6]
     # 进入对话页后停留多久再输入（像真人打字前的停顿）
-    think_before_type_sec: [3, 7]
+    # 2026-04-24 v2: 砍 [3,7] → [1,3]
+    think_before_type_sec: [1, 3]
     # 触发概率（1.0 = 必发；降低可做 A/B 实验，如 0.7 只对 70% 样本发）
     enabled_probability: 1.0
     # 文案为空时是否强制走 persona 本地化模板（关闭则跳过发送，防发错语言）
