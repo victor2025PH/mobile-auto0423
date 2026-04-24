@@ -86,6 +86,31 @@ def fb_env():
     stack.enter_context(patch.object(fb, "rewrite_message",
                                      side_effect=lambda msg, _ctx: msg))
     stack.enter_context(patch.object(fb, "smart_tap", side_effect=_smart_tap))
+    # 2026-04-24: helper 方法 `_enter_messenger_search` / `_tap_messenger_send`
+    # 在 fixture 里 mock 成"smart_tap 语义对齐" — smart_tap MISS 则 raise 对应
+    # MessengerError, smart_tap HIT 则 no-op, 使现有以 smart_tap 为 knob 的测试
+    # 仍然覆盖 helper 之后的三级 fallback 逻辑 (三级 fallback 本身另有
+    # TestMessengerUIFallback 专门测)。
+    def _enter_search_mock(_d, _did):
+        if not _smart_tap("Search in Messenger", device_id=_did):
+            from src.app_automation.facebook import MessengerError
+            raise MessengerError(
+                "search_ui_missing", "fixture-mock three-tier miss",
+                hint="mocked fixture — 真实 fallback 路径见 TestMessengerUIFallback")
+
+    def _tap_send_mock(_d, _did):
+        if not _smart_tap("Send message button", device_id=_did):
+            from src.app_automation.facebook import MessengerError
+            raise MessengerError(
+                "send_button_missing", "fixture-mock three-tier miss",
+                hint="mocked fixture — 真实 fallback 路径见 TestMessengerUIFallback")
+
+    stack.enter_context(patch.object(fb, "_enter_messenger_search",
+                                     side_effect=_enter_search_mock))
+    stack.enter_context(patch.object(fb, "_tap_messenger_send",
+                                     side_effect=_tap_send_mock))
+    stack.enter_context(patch.object(fb, "_focus_messenger_composer",
+                                     return_value=False))
     stack.enter_context(patch.object(fb, "_dismiss_dialogs"))
     stack.enter_context(patch.object(fb, "_handle_xspace_dialog",
                                      side_effect=_handle_xspace))
@@ -443,3 +468,176 @@ class TestDetectSendBlocked:
         d.dump_hierarchy = MagicMock(side_effect=RuntimeError("disconnected"))
         with patch("src.app_automation.facebook.time.sleep"):
             assert fb._detect_send_blocked(d) == ""
+
+
+# ─── Messenger UI 三级 fallback (2026-04-24 真机发现中文化失配) ─────────────
+
+class TestMessengerUIFallback:
+    """``_find_messenger_ui_fallback`` + ``_enter_messenger_search`` +
+    ``_tap_messenger_send`` + ``_focus_messenger_composer`` — 修 2026 中文
+    Messenger UI 导致 smart_tap MISS 的三级 fallback。"""
+
+    # ── _find_messenger_ui_fallback ──────────────────────────────────
+
+    def test_find_hits_first_selector(self):
+        fb = _make_fb()
+        d = MagicMock()
+        obj = MagicMock(); obj.exists = MagicMock(return_value=True)
+        d.return_value = obj
+        assert fb._find_messenger_ui_fallback(
+            d, ({"description": "A"}, {"description": "B"})) is obj
+        assert d.call_count == 1  # 第 1 hit 即退出
+
+    def test_find_hits_third_selector(self):
+        fb = _make_fb()
+        d = MagicMock()
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        hit = MagicMock(); hit.exists = MagicMock(return_value=True)
+        d.side_effect = [miss, miss, hit]
+        assert fb._find_messenger_ui_fallback(
+            d, ({"a": 1}, {"b": 2}, {"c": 3})) is hit
+        assert d.call_count == 3
+
+    def test_find_all_miss_returns_none(self):
+        fb = _make_fb()
+        d = MagicMock()
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+        assert fb._find_messenger_ui_fallback(
+            d, ({"x": 1}, {"y": 2})) is None
+
+    def test_find_empty_selectors(self):
+        fb = _make_fb()
+        assert fb._find_messenger_ui_fallback(MagicMock(), ()) is None
+
+    def test_find_selector_exception_continues(self):
+        """某 selector 抛异常, 工具继续 try 下一个。"""
+        fb = _make_fb()
+        d = MagicMock()
+        hit = MagicMock(); hit.exists = MagicMock(return_value=True)
+        d.side_effect = [RuntimeError("boom"), hit]
+        assert fb._find_messenger_ui_fallback(
+            d, ({"a": 1}, {"b": 2})) is hit
+
+    # ── _enter_messenger_search 三级 fallback ─────────────────────────
+
+    def test_enter_search_smart_tap_hit_returns(self):
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=True)
+        fb._enter_messenger_search(MagicMock(), "devA")  # 不抛
+        fb.smart_tap.assert_called_once_with(
+            "Search in Messenger", device_id="devA")
+
+    def test_enter_search_multi_locale_hit(self):
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        obj = MagicMock(); obj.exists = MagicMock(return_value=True)
+        d.return_value = obj
+        with patch("src.app_automation.facebook.time.sleep"):
+            fb._enter_messenger_search(d, "devA")
+        obj.click.assert_called_once()
+
+    def test_enter_search_coordinate_fallback_ok(self):
+        """smart_tap + 所有 selector MISS → coordinate click → EditText 出现 → 返回。"""
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        edit = MagicMock(); edit.exists = MagicMock(return_value=True)
+
+        def _sel(**kw):
+            if kw.get("className") == "android.widget.EditText":
+                return edit
+            return miss
+        d.side_effect = _sel
+        with patch("src.app_automation.facebook.time.sleep"):
+            fb._enter_messenger_search(d, "devA")
+        d.click.assert_called_once_with(360, int(1600 * 0.20))
+
+    def test_enter_search_all_three_miss_raises(self):
+        from src.app_automation.facebook import MessengerError
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+        with patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._enter_messenger_search(d, "devA")
+        assert ei.value.code == "search_ui_missing"
+        assert "三路 fallback" in str(ei.value)
+
+    # ── _tap_messenger_send 三级 fallback ───────────────────────────
+
+    def test_tap_send_smart_tap_hit(self):
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=True)
+        fb._tap_messenger_send(MagicMock(), "devA")
+        fb.smart_tap.assert_called_once_with(
+            "Send message button", device_id="devA")
+
+    def test_tap_send_multi_locale_hit(self):
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        obj = MagicMock(); obj.exists = MagicMock(return_value=True)
+        d.return_value = obj
+        fb._tap_messenger_send(d, "devA")
+        obj.click.assert_called_once()
+
+    def test_tap_send_coordinate_fallback(self):
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+        fb._tap_messenger_send(d, "devA")
+        d.click.assert_called_once_with(
+            int(720 * 0.93), int(1600 * 0.91))
+
+    def test_tap_send_all_three_miss_raises(self):
+        """coordinate fallback 里 ``d.window_size`` 抛 → 三级都挂 → raise."""
+        from src.app_automation.facebook import MessengerError
+        fb = _make_fb()
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+        with pytest.raises(MessengerError) as ei:
+            fb._tap_messenger_send(d, "devA")
+        assert ei.value.code == "send_button_missing"
+
+    # ── _focus_messenger_composer (safety, 不抛) ─────────────────────
+
+    def test_focus_composer_hit_returns_true(self):
+        fb = _make_fb()
+        d = MagicMock()
+        obj = MagicMock(); obj.exists = MagicMock(return_value=True)
+        d.return_value = obj
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._focus_messenger_composer(d) is True
+        obj.click.assert_called_once()
+
+    def test_focus_composer_miss_returns_false(self):
+        """composer selector 全 miss → 返回 False, 不抛 (不阻塞后续 type_text)。"""
+        fb = _make_fb()
+        d = MagicMock()
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+        assert fb._focus_messenger_composer(d) is False
+
+    def test_focus_composer_click_exception_returns_false(self):
+        """composer click 抛异常 → 返回 False 不重抛 (type_text 仍能跑)。"""
+        fb = _make_fb()
+        d = MagicMock()
+        obj = MagicMock()
+        obj.exists = MagicMock(return_value=True)
+        obj.click = MagicMock(side_effect=RuntimeError("boom"))
+        d.return_value = obj
+        with patch("src.app_automation.facebook.time.sleep"):
+            assert fb._focus_messenger_composer(d) is False
