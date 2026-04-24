@@ -568,7 +568,11 @@ class TestMessengerUIFallback:
             with pytest.raises(MessengerError) as ei:
                 fb._enter_messenger_search(d, "devA")
         assert ei.value.code == "search_ui_missing"
-        assert "三路 fallback" in str(ei.value)
+        # 2026-04-24: raise 消息升到 "4 级 fallback" (含 VLM Level 4);
+        # 老测试本质是"三级 fallback 全 miss 时 raise", 现在 Level 4 也 miss
+        # 时 raise, 语义保持。断言通用 "fallback" + 含 "4 级"。
+        assert "fallback" in str(ei.value)
+        assert "4 级" in str(ei.value)
 
     # ── _tap_messenger_send 三级 fallback ───────────────────────────
 
@@ -641,3 +645,192 @@ class TestMessengerUIFallback:
         d.return_value = obj
         with patch("src.app_automation.facebook.time.sleep"):
             assert fb._focus_messenger_composer(d) is False
+
+
+# ─── Level 4 VLM vision fallback (2026-04-24 对抗 Messenger 2026 Compose UI) ─
+
+class TestMessengerUIVLMLevel4:
+    """第 4 级 VLM vision fallback — 前 3 级 (smart_tap + multi-locale +
+    coordinate) 全 miss 时用 VisionFallback 图像识别兜底。复用
+    src/ai/vision_fallback.py (免费 Gemini/Ollama provider)。"""
+
+    def _mk_vf(self, coords=None, raises=False, returns_none=False):
+        """造 mock VisionFallback: 可控 find_element 返回。"""
+        vf = MagicMock()
+        if raises:
+            vf.find_element = MagicMock(side_effect=RuntimeError("vlm boom"))
+        elif returns_none or coords is None:
+            vf.find_element = MagicMock(return_value=None)
+        else:
+            from src.ai.vision_fallback import VisionResult
+            result = VisionResult(coordinates=coords, confidence="high")
+            vf.find_element = MagicMock(return_value=result)
+        return vf
+
+    # ── _enter_messenger_search Level 4 ────────────────────────────
+
+    def test_enter_search_vlm_hit_after_3_miss(self):
+        """前 3 级 miss + VLM 返 coordinates + click 后 EditText 出现 → return。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        call_count = {"n": 0}
+
+        def _sel(**kw):
+            obj = MagicMock()
+            if kw.get("className") == "android.widget.EditText":
+                # coord (level 3) check: miss; VLM (level 4) post-click: hit
+                call_count["n"] += 1
+                obj.exists = MagicMock(return_value=call_count["n"] >= 2)
+            else:
+                obj.exists = MagicMock(return_value=False)
+            return obj
+        d.side_effect = _sel
+
+        mock_vf = self._mk_vf(coords=(360, 280))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            fb._enter_messenger_search(d, "devA")
+        mock_vf.find_element.assert_called_once()
+        # VLM click @ (360, 280) 应 called
+        calls = [c.args for c in d.click.call_args_list]
+        assert (360, 280) in calls
+
+    def test_enter_search_vlm_miss_raises(self):
+        """前 3 级 + VLM 返 None → raise search_ui_missing 带 "4 级" hint。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import (
+            FacebookAutomation, MessengerError)
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(returns_none=True)
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._enter_messenger_search(d, "devA")
+        assert ei.value.code == "search_ui_missing"
+        assert "4 级" in str(ei.value)
+        mock_vf.find_element.assert_called_once()
+
+    def test_enter_search_vlm_provider_unavailable(self):
+        """无 VLM provider → raise 4 级 (Level 4 跳过)。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import (
+            FacebookAutomation, MessengerError)
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=None), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._enter_messenger_search(d, "devA")
+        assert ei.value.code == "search_ui_missing"
+
+    def test_enter_search_vlm_exception_raises(self):
+        """VLM find_element 抛异常 → 不 bubble, 降为 search_ui_missing raise。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import (
+            FacebookAutomation, MessengerError)
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(raises=True)
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._enter_messenger_search(d, "devA")
+        assert ei.value.code == "search_ui_missing"
+
+    # ── _tap_messenger_send Level 4 ────────────────────────────────
+
+    def test_tap_send_vlm_hit_after_3_miss(self):
+        """send 的 VLM 命中路径 (coord level 异常触发 Level 4)。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(coords=(670, 1460))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf):
+            fb._tap_messenger_send(d, "devA")
+        mock_vf.find_element.assert_called_once()
+        d.click.assert_called_with(670, 1460)
+
+    def test_tap_send_vlm_miss_raises(self):
+        """前 3 级 + VLM miss → raise send_button_missing 带 "4 级"。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import (
+            FacebookAutomation, MessengerError)
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(returns_none=True)
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf):
+            with pytest.raises(MessengerError) as ei:
+                fb._tap_messenger_send(d, "devA")
+        assert ei.value.code == "send_button_missing"
+        assert "4 级" in str(ei.value)
+
+    # ── _get_vision_fallback lazy init ─────────────────────────────
+
+    def test_get_vision_fallback_no_provider_returns_none(self):
+        """get_free_vision_client 返 None → lazy init 返 None + 不重试。"""
+        from src.app_automation import facebook as fb_mod
+        fb_mod._vision_fallback_instance = None
+        fb_mod._vision_fallback_init_attempted = False
+        try:
+            with patch("src.ai.llm_client.get_free_vision_client",
+                       return_value=None):
+                r1 = fb_mod._get_vision_fallback()
+                r2 = fb_mod._get_vision_fallback()
+            assert r1 is None and r2 is None
+            assert fb_mod._vision_fallback_init_attempted is True
+        finally:
+            # reset module state for subsequent tests
+            fb_mod._vision_fallback_instance = None
+            fb_mod._vision_fallback_init_attempted = False
+
+    def test_get_vision_fallback_init_exception_returns_none(self):
+        """get_free_vision_client 抛异常 → lazy init 返 None 不重试。"""
+        from src.app_automation import facebook as fb_mod
+        fb_mod._vision_fallback_instance = None
+        fb_mod._vision_fallback_init_attempted = False
+        try:
+            with patch("src.ai.llm_client.get_free_vision_client",
+                       side_effect=RuntimeError("import boom")):
+                r = fb_mod._get_vision_fallback()
+            assert r is None
+            assert fb_mod._vision_fallback_init_attempted is True
+        finally:
+            fb_mod._vision_fallback_instance = None
+            fb_mod._vision_fallback_init_attempted = False
