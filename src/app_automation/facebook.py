@@ -368,6 +368,95 @@ _vision_fallback_instance = None
 _vision_fallback_init_lock = _b_threading.Lock()
 _vision_fallback_init_attempted = False
 
+# P5b (2026-04-24): Gemini 503 peak-hour resilience — 连续 N 次 VLM HTTP 失败
+# 自动切 Ollama 本地 fallback (如可用)。每次 VLM call 完 caller 用 `_record_
+# vlm_result(vf)` 触发 check。一次 swap 后不再 flip-flop (避免来回抖)。
+_vlm_consecutive_failures = 0
+_vlm_provider_swapped = False
+_VLM_SWAP_THRESHOLD = 3  # 连续 N 次 VLM HTTP error 触发 swap
+
+
+def _try_ollama_vision_client():
+    """探测本地 Ollama 有无 vision model, 有则构造 LLMClient 用作 swap 目标。
+
+    Returns:
+        ``LLMClient`` on success, ``None`` if Ollama down / no vision model /
+        exception.
+    """
+    try:
+        import httpx as _httpx
+        probe = _httpx.get("http://localhost:11434/api/tags", timeout=3)
+        if probe.status_code != 200:
+            return None
+        models = probe.json().get("models", []) or []
+        names = [m.get("name", "") for m in models]
+        vision = [n for n in names
+                  if any(v in n for v in ("llava", "moondream",
+                                           "minicpm", "bakllava", "qwen2.5vl"))]
+        if not vision:
+            return None
+        from src.ai.llm_client import LLMClient, LLMConfig
+        return LLMClient(LLMConfig(
+            provider="ollama", vision_model=vision[0], model=vision[0],
+            timeout_sec=30.0, max_retries=1, cache_enabled=False))
+    except Exception as e:
+        log.debug("[vision] Ollama probe failed: %s", e)
+        return None
+
+
+def _record_vlm_result(vf) -> None:
+    """VLM call 完 caller 立即调, 统计 HTTP failure + 触发 provider swap。
+
+    Success (result.coordinates 非 None) 或 non-HTTP failure (e.g. parser
+    认不出 COORDINATES 格式, last_error_code is None) 不计入 failure count。
+
+    连续 ``_VLM_SWAP_THRESHOLD`` 次 HTTP error 且当前 provider 是 Gemini →
+    swap to Ollama (if available)。Ollama 不可用则保持 Gemini, fail-safe。
+
+    Args:
+        vf: VisionFallback instance 刚被 call 过 find_element。
+    """
+    global _vlm_consecutive_failures, _vlm_provider_swapped
+    global _vision_fallback_instance
+    if vf is None or getattr(vf, "_client", None) is None:
+        return
+    client = vf._client
+    err_code = getattr(client, "last_error_code", None)
+    err_body = getattr(client, "last_error_body", "") or ""
+    # 判定 "HTTP failure": 有 error code (5xx/429/4xx) 或 timeout
+    is_failure = err_code is not None or err_body == "timeout"
+    if not is_failure:
+        # 成功 call 或非 HTTP 层问题 → reset counter
+        _vlm_consecutive_failures = 0
+        return
+    _vlm_consecutive_failures += 1
+    log.debug(
+        "[vision] VLM HTTP failure #%d (code=%s, body=%s...)",
+        _vlm_consecutive_failures, err_code, err_body[:60])
+    if _vlm_consecutive_failures < _VLM_SWAP_THRESHOLD:
+        return
+    if _vlm_provider_swapped:
+        return  # 已 swap 过, 不 flip-flop
+    current_provider = (client.config.provider or "").lower()
+    if "gemini" not in current_provider:
+        return  # 非 Gemini 不 swap
+    ollama = _try_ollama_vision_client()
+    if ollama is None:
+        log.warning(
+            "[vision] Gemini 连续 %d 次 HTTP 失败 (last code=%s) 但 Ollama "
+            "不可用, 保持当前 provider",
+            _vlm_consecutive_failures, err_code)
+        return
+    log.warning(
+        "[vision] Gemini 连续 %d 次 HTTP 失败 (last code=%s), 切 Ollama "
+        "(model=%s)",
+        _vlm_consecutive_failures, err_code, ollama.config.vision_model)
+    with _vision_fallback_init_lock:
+        from src.ai.vision_fallback import VisionFallback
+        _vision_fallback_instance = VisionFallback(client=ollama)
+        _vlm_provider_swapped = True
+        _vlm_consecutive_failures = 0
+
 
 def _get_vision_fallback():
     """Lazy-init `VisionFallback` — 第 4 级 UI fallback, 无 provider 返 None。
@@ -375,6 +464,9 @@ def _get_vision_fallback():
     Double-checked-locking 懒加载; 一次 init 失败 (无免费 VLM provider) 后
     标记 ``_vision_fallback_init_attempted=True`` 不重试避免每次 call 都
     尝试 import + probe Ollama。真机场景下 init 结果稳定, 不需要动态重试。
+
+    2026-04-24 P5b: 连续 ``_VLM_SWAP_THRESHOLD`` 次 HTTP 失败后 caller 调
+    ``_record_vlm_result`` 可触发 Gemini → Ollama 运行时 swap (见该函数)。
 
     Returns:
         ``VisionFallback`` instance 如果 provider 可用, 否则 ``None``。
@@ -1382,6 +1474,8 @@ class FacebookAutomation(BaseAutomation):
             try:
                 result = vf.find_element(
                     device=d, target=vlm_target, context=vlm_context)
+                # P5b: 统计 HTTP failure + 触发 provider swap (如需要)
+                _record_vlm_result(vf)
                 if result and result.coordinates:
                     x, y = result.coordinates
                     d.click(x, y)
@@ -1453,6 +1547,8 @@ class FacebookAutomation(BaseAutomation):
                         "plane shape. Not emoji (middle-right) or camera "
                         "(left side). Typically x > 85% width."),
                 )
+                # P5b: 统计 HTTP failure + 触发 provider swap (如需要)
+                _record_vlm_result(vf)
                 if result and result.coordinates:
                     x, y = result.coordinates
                     d.click(x, y)
