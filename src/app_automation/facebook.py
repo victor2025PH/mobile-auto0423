@@ -2652,6 +2652,7 @@ class FacebookAutomation(BaseAutomation):
         if not greeting and use_ai:
             try:
                 from src.ai.chat_brain import ChatBrain, UserProfile
+                import re as _re_lang
                 brain = ChatBrain.get_instance()
                 prof = UserProfile(username=profile_name)
                 lead_id = f"fb:{profile_name}"
@@ -2664,11 +2665,18 @@ class FacebookAutomation(BaseAutomation):
                     source="add_friend_greet",
                     persist=False,          # 不污染 ConversationMemory
                 )
-                if result and getattr(result, "message", "").strip():
-                    greeting = result.message.strip()
+                ai_msg = (getattr(result, "message", "") or "").strip()
+                # 校验: 必须含日文假名(平假/片假), 否则 fallback 模板
+                # 避免 LLM 输出中文/英文混入发错语言
+                has_kana = bool(_re_lang.search(r"[぀-ヿ]", ai_msg))
+                if ai_msg and has_kana:
+                    greeting = ai_msg
                     template_id = "ai:chat_brain:ja"
-                    log.info("[send_greeting] AI 动态 greeting 生成 (%d chars): %s",
+                    log.info("[send_greeting] AI greeting OK (kana检验) (%d chars): %s",
                               len(greeting), profile_name)
+                elif ai_msg:
+                    log.warning("[send_greeting] AI greeting 无假名(可能中文/英文), fallback 模板: %r",
+                                 ai_msg[:60])
             except Exception as e:
                 log.warning("[send_greeting] AI greeting 生成失败, fallback 模板: %s", e)
         if not greeting:
