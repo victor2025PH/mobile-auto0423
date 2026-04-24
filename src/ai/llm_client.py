@@ -250,7 +250,7 @@ class LLMClient:
             return core_reply
 
         # 2. 本地LLM在线程池运行（不阻塞asyncio event loop）
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             self.chat_messages,
