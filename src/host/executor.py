@@ -1036,6 +1036,11 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_line_dispatch_from_reply":
             return _fb_line_dispatch_from_reply(resolved, params)
 
+        # Phase 12 Alpha (2026-04-25): A 自立消费 line_dispatch_planned → 用
+        # Messenger 直接把 referral 话术发给对方, 不等 B 协同就位.
+        if task_type == "facebook_send_referral_replies":
+            return _fb_send_referral_replies(fb, resolved, params)
+
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
     except Exception as e:
@@ -1257,6 +1262,161 @@ def _fb_line_dispatch_from_reply(resolved: str,
         "filtered_out": filtered_out,
         "no_account": no_account,
         "dispatches": dispatches,
+    }
+    return True, "", stats
+
+
+def _fb_send_referral_replies(fb, resolved: str,
+                               params: Dict[str, Any]) -> tuple:
+    """Phase 12 Alpha (2026-04-25): A 自立消费 line_dispatch_planned event.
+
+    为什么需要这个 task (而不仅仅是 dispatcher 写事件等 B 消费):
+      * B 机实装 line_dispatch_planned 消费逻辑需要协调, 不知何时就绪
+      * A 端已有 facebook.send_message, 能直接把 message_template 发出去
+      * 闭环立刻跑通, 不阻塞生产. B 将来就位后作为 fallback 路径
+
+    Flow:
+      1. 扫近 hours_window 小时 line_dispatch_planned events
+      2. 只处理 dispatch_mode=messenger_text 的 (line_direct_send 留 LINE auto)
+      3. strict_device_match=True 时: 只发 event 的 original_device_id 匹配
+         resolved device 的 (保 FB 账号一致, 避免不同号发同一会话撞风控)
+      4. 24h 去重: 若该 peer 已有 wa_referral_sent → skip
+      5. 调 facebook.send_message(peer_name, message_template)
+      6. 发成功 → 写 wa_referral_sent + mark_dispatch_outcome(sent)
+         发失败 → mark_dispatch_outcome(failed, note=<err>)
+      7. 返 {scanned, sent, failed, skipped_dedup, skipped_device}
+
+    Params:
+      hours_window: int = 2
+      dedupe_hours: int = 24
+      strict_device_match: bool = True
+      limit: int = 10
+    """
+    hours_window = int(params.get("hours_window", 2) or 2)
+    dedupe_hours = int(params.get("dedupe_hours", 24) or 24)
+    strict_device = bool(params.get("strict_device_match", True))
+    limit = max(1, min(int(params.get("limit", 10) or 10), 100))
+
+    from src.host.fb_store import (list_recent_contact_events_by_types,
+                                    record_contact_event,
+                                    count_contact_events,
+                                    CONTACT_EVT_LINE_DISPATCH_PLANNED,
+                                    CONTACT_EVT_WA_REFERRAL_SENT)
+    from src.host import line_pool as _lp
+    import json as _json
+
+    events = list_recent_contact_events_by_types(
+        [CONTACT_EVT_LINE_DISPATCH_PLANNED],
+        hours=hours_window, limit=limit * 5,
+    )
+
+    sent = 0
+    failed = 0
+    skipped_dedup = 0
+    skipped_device = 0
+    skipped_mode = 0
+    outcomes: List[Dict[str, Any]] = []
+
+    for ev in events:
+        if sent + failed >= limit:
+            break
+        try:
+            meta = _json.loads(ev.get("meta_json") or "{}") or {}
+        except Exception:
+            meta = {}
+
+        dispatch_mode = meta.get("dispatch_mode") or "messenger_text"
+        if dispatch_mode != "messenger_text":
+            skipped_mode += 1
+            continue
+
+        peer_name = ev.get("peer_name") or ""
+        message_template = meta.get("message_template") or ""
+        line_account_id = int(meta.get("line_account_id") or 0)
+        original_device_id = (meta.get("original_device_id")
+                                or ev.get("device_id") or "")
+
+        if not peer_name or not message_template:
+            skipped_mode += 1
+            continue
+
+        # 设备匹配: 只在同一台 FB 账号的设备上继续发, 避免串线
+        if strict_device and original_device_id and resolved != original_device_id:
+            skipped_device += 1
+            continue
+
+        # 24h 去重 peer 级 (可能多次 planned 但只发一次 referral)
+        try:
+            n_sent = count_contact_events(
+                device_id=resolved, peer_name=peer_name,
+                event_type=CONTACT_EVT_WA_REFERRAL_SENT,
+                hours=dedupe_hours,
+            )
+            if n_sent > 0:
+                skipped_dedup += 1
+                continue
+        except Exception:
+            pass
+
+        # 真机发消息
+        ok = False
+        err_note = ""
+        try:
+            ok = bool(fb.send_message(
+                recipient=peer_name, message=message_template,
+                device_id=resolved,
+            ))
+        except Exception as e:
+            err_note = f"send_message_exception:{type(e).__name__}:{str(e)[:80]}"
+            logger.warning("[referral.send] %s 异常: %s", peer_name, e)
+
+        if ok:
+            sent += 1
+            try:
+                record_contact_event(
+                    resolved, peer_name,
+                    CONTACT_EVT_WA_REFERRAL_SENT,
+                    preset_key=f"line_pool:{line_account_id}",
+                    meta={"line_id": meta.get("line_id"),
+                          "line_account_id": line_account_id,
+                          "sent_by": "agent_a_phase12_alpha",
+                          "source_event_id": str(ev.get("id") or ""),
+                          "source_planned_event_id": str(ev.get("id") or ""),
+                          "canonical_id": meta.get("canonical_id") or ""})
+            except Exception as e:
+                logger.debug("[referral.send] write wa_referral_sent 失败: %s", e)
+            if line_account_id:
+                try:
+                    _lp.mark_dispatch_outcome(
+                        line_account_id, status="sent",
+                        note=f"via=messenger peer={peer_name}")
+                except Exception:
+                    pass
+        else:
+            failed += 1
+            if line_account_id:
+                try:
+                    _lp.mark_dispatch_outcome(
+                        line_account_id, status="failed",
+                        note=err_note or "send_message_returned_false")
+                except Exception:
+                    pass
+
+        outcomes.append({
+            "peer_name": peer_name, "line_account_id": line_account_id,
+            "line_id": meta.get("line_id"),
+            "planned_event_id": ev.get("id"),
+            "sent": ok, "note": err_note,
+        })
+
+    stats = {
+        "scanned": len(events),
+        "sent": sent,
+        "failed": failed,
+        "skipped_dedup": skipped_dedup,
+        "skipped_device": skipped_device,
+        "skipped_mode": skipped_mode,
+        "outcomes": outcomes,
     }
     return True, "", stats
 

@@ -159,6 +159,54 @@ B 机发完 LINE 引流消息后回写 status:
 - 已经跑过的 L2 VLM 过的 lead (`tags LIKE '%l2_verified%'`) 直接可以被 dispatcher 消费.
 - 之前没 LINE pool 的环境: 派发 task 跑起来会 `no_account` 计数非 0, 运营在 UI 里补账号即可激活.
 
+## Phase 12 Alpha (2026-04-25 增): A 自立消费, B 不 block
+
+上面 Phase 11 的 `line_dispatch_planned` 原计划让 B 消费. 为避免 B 排期不就位
+堵闭环, A 端新增 `facebook_send_referral_replies` task 自己直接用 Messenger
+把 `message_template` 发给对方, 不等 B.
+
+### 任务调度
+
+`scheduled_jobs.json` 已加 `send_referral_replies_30min`:
+```json
+{
+  "id": "send_referral_replies_30min",
+  "cron": "10,40 * * * *",
+  "action": "facebook_send_referral_replies",
+  "params": {
+    "hours_window": 2, "dedupe_hours": 24,
+    "strict_device_match": true, "limit": 10
+  },
+  "enabled": false
+}
+```
+
+cron `10,40 * * * *` 错开 dispatch 10 分钟, 让 `line_dispatch_planned` 先积累
+再被消费. `strict_device_match=true` 严格要求 resolved device == original_device_id
+(同一 FB 账号继续发, 避免串线).
+
+### 消费流程
+
+1. 扫 `line_dispatch_planned` events (hours_window=2) filter `dispatch_mode=messenger_text`
+2. strict_device 下只处理 original device 匹配本机的
+3. 24h 去重: 该 peer 已有 `wa_referral_sent` → skip
+4. 调 `facebook.send_message(peer_name, message_template)` (现有 L1-L4 fallback)
+5. 成功 → 写 `wa_referral_sent` + `line_pool.mark_dispatch_outcome('sent')`
+6. 失败 → `mark_dispatch_outcome('failed', note=<错误>)`
+
+### B 并发不冲突
+
+A 消费 `line_dispatch_planned` 写 `wa_referral_sent` 是**最终结果**. B 若未来
+也实装消费 `line_dispatch_planned`:
+- A 已经写了 `wa_referral_sent` → B 的去重逻辑 (若 B 侧有) 会自然 skip
+- 或 B 消费 `line_dispatch_planned` 前先检查 `wa_referral_sent` 24h 去重
+
+**建议 B 如果想接管**: task param `strict_device_match=true` + B 机启动同名
+task 自己处理自己 device 的 events. A 侧把自己的 strict match 保持 true,
+天然按设备分治, 零协调冲突.
+
+---
+
 ## 下一步 (A 待 B 回复)
 
 1. B 确认 allocate API schema 合不合用 — 尤其 `source_event_id` 是 `fb_contact_events.id` 还是 B 自己的会话 id. 如果 B 有不同 convention, 让我知道, 字段可扩.

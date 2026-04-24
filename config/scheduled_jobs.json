@@ -219,5 +219,19 @@
     },
     "enabled": false,
     "last_run": ""
+  },
+  {
+    "id": "send_referral_replies_30min",
+    "name": "LINE 引流发送 (每 30 分钟, 错开 dispatch 10 分钟)",
+    "cron": "10,40 * * * *",
+    "action": "facebook_send_referral_replies",
+    "params": {
+      "hours_window": 2,
+      "dedupe_hours": 24,
+      "strict_device_match": true,
+      "limit": 10
+    },
+    "enabled": false,
+    "last_run": ""
   }
 ]
