@@ -389,6 +389,7 @@ def classify(
     l2_image_paths: Optional[List[str]] = None,  # L2 深判用（主页滚动截图）
     do_l2: bool = True,
     dry_run: bool = False,
+    force_reclassify: bool = False,  # Phase 10.2: True 时跳过 7 天去重缓存, 强制重判
 ) -> Dict[str, Any]:
     """对单个目标做 L1+L2 分级识别。
 
@@ -429,8 +430,9 @@ def classify(
 
     ctx = {"display_name": display_name, "bio": bio, "username": username, "locale": locale}
 
-    # 0) 去重：窗口内已判过 → 复用
-    cached = _db_get_recent(pk, target_key, dedup_h)
+    # 0) 去重：窗口内已判过 → 复用 (force_reclassify=True 时跳过, Phase 10.2)
+    # use case: peer 真改头像 / 上次 launcher 截图被 REJECT 想用真 profile 截图重判 / debug
+    cached = None if force_reclassify else _db_get_recent(pk, target_key, dedup_h)
     if cached and not dry_run:
         logger.info("[classifier] 命中去重缓存 target=%s persona=%s match=%s",
                     target_key, pk, cached["match"])
