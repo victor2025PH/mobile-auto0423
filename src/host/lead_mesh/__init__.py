@@ -23,6 +23,7 @@ from .canonical import (  # noqa
     resolve_identity,
     auto_merge_candidates,
     update_canonical_metadata,
+    list_l2_verified_leads,
 )
 from .journey import append_journey, get_journey, count_actions  # noqa
 from .dossier import get_dossier, search_leads  # noqa

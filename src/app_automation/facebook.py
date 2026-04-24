@@ -1945,8 +1945,15 @@ class FacebookAutomation(BaseAutomation):
                     )
                     _l2_i = r_i.get("l2") or {}
                     _ins_i = r_i.get("insights") or {}
+                    # Phase 10.3: 聚合优先级 —
+                    #   match=True shot: **覆盖写** (可信度高, 是 PASS 依据)
+                    #   match=False shot: 只填空字段 (避免 REJECT 图的错误值
+                    #     如 gender=male 污染后续 PASS shot 的正确值)
+                    _is_pass_shot = bool(r_i.get("match"))
                     for k, v in _ins_i.items():
-                        if v and not agg_insights.get(k):
+                        if not v:
+                            continue
+                        if _is_pass_shot or not agg_insights.get(k):
                             agg_insights[k] = v
                     log.info(
                         "[phase10_l2] shot #%d match=%s score=%.1f stage=%s",
@@ -2186,7 +2193,8 @@ class FacebookAutomation(BaseAutomation):
                              do_l2_gate: bool = False,
                              force: bool = False,
                              walk_candidates: bool = False,
-                             l2_gate_shots: int = 1) -> bool:
+                             l2_gate_shots: int = 1,
+                             max_l2_calls: int = 3) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -2325,7 +2333,8 @@ class FacebookAutomation(BaseAutomation):
                 from_current_profile=from_current_profile,
                 do_l2_gate=do_l2_gate, force=force,
                 walk_candidates=walk_candidates,
-                l2_gate_shots=l2_gate_shots)
+                l2_gate_shots=l2_gate_shots,
+                max_l2_calls=max_l2_calls)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
@@ -2335,7 +2344,8 @@ class FacebookAutomation(BaseAutomation):
                                      do_l2_gate: bool = False,
                                      force: bool = False,
                                      walk_candidates: bool = False,
-                                     l2_gate_shots: int = 1):
+                                     l2_gate_shots: int = 1,
+                                     max_l2_calls: int = 3):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
         # 2026-04-24 (A merge): force=True 跳过 cap 检查 (smoke/QA 显式 override).
@@ -2394,9 +2404,13 @@ class FacebookAutomation(BaseAutomation):
                     d, query_hint=profile_name, max_n=5)
                 if cands:
                     log.info(
-                        "[add_friend_with_note] walk 候选 %d: %s", len(cands),
+                        "[add_friend_with_note] walk 候选 %d (budget=%d): %s",
+                        len(cands), max_l2_calls,
                         [(c["name"][:20], "M" if c["male_hint"] else "?")
                          for c in cands])
+                    # Phase 10.3: L2 VLM quota 保护 — 每个进 profile 的候选消耗 1 call.
+                    # 过滤掉的 (male_hint / already_contacted) 不计数. 超 budget → 停.
+                    _l2_attempts = 0
                     for idx, cand in enumerate(cands):
                         cand_name = cand["name"] or profile_name
                         if cand["male_hint"]:
@@ -2408,6 +2422,12 @@ class FacebookAutomation(BaseAutomation):
                             log.info("[walk] #%d '%s' (%s), skip",
                                      idx + 1, cand_name[:30], reason)
                             continue
+                        if _l2_attempts >= max(1, int(max_l2_calls)):
+                            log.info(
+                                "[walk] budget=%d 已耗尽 (已试 %d), 停止剩余候选",
+                                max_l2_calls, _l2_attempts)
+                            break
+                        _l2_attempts += 1
                         bx = cand["bounds"]
                         cx = (bx[0] + bx[2]) // 2
                         cy = (bx[1] + bx[3]) // 2
@@ -3613,7 +3633,8 @@ class FacebookAutomation(BaseAutomation):
                              ai_dynamic_greeting: Optional[bool] = None,
                              force_send_greeting: Optional[bool] = None,
                              walk_candidates: bool = False,
-                             l2_gate_shots: int = 1) -> Dict[str, Any]:
+                             l2_gate_shots: int = 1,
+                             max_l2_calls: int = 3) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -3658,6 +3679,7 @@ class FacebookAutomation(BaseAutomation):
             force=force,
             walk_candidates=walk_candidates,
             l2_gate_shots=l2_gate_shots,
+            max_l2_calls=max_l2_calls,
         )
         out["add_friend_ok"] = bool(add_ok)
 

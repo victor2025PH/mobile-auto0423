@@ -496,3 +496,106 @@ def update_canonical_metadata(canonical_id: str,
     except Exception as e:
         logger.warning("[canonical] update_metadata 失败: %s", e)
         return False
+
+
+def list_l2_verified_leads(
+    *, age_band: Optional[str] = None,
+    gender: Optional[str] = None,
+    is_japanese: Optional[bool] = None,
+    persona_key: Optional[str] = None,
+    platform: Optional[str] = None,
+    min_score: float = 0,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Phase 10.3: 查询 L2 VLM 验证过的"精准画像用户".
+
+    逻辑:
+      - SQL 层按 ``tags LIKE '%l2_verified%'`` 预筛 (tag 写入时做了归一化).
+      - JSON metadata 字段 (age_band / gender / is_japanese / l2_persona_key /
+        l2_score) 由 Python 层过滤 — 避免依赖 SQLite JSON1 扩展 (老版本不带).
+      - 按 l2_score 降序返 + l2_verified_at 新 → 旧.
+
+    返回: [{canonical_id, display_name, platform, primary_account_id,
+            metadata (dict), tags (list), l2_score, l2_verified_at}, ...]
+    """
+    limit = max(1, min(int(limit or 50), 1000))
+    # SQL 预筛: tag 含 l2_verified + 未被合并. 其它过滤在 Python 层.
+    sql = (
+        "SELECT canonical_id, primary_name, tags, metadata_json, updated_at"
+        "  FROM leads_canonical"
+        " WHERE tags LIKE '%l2_verified%' AND merged_into IS NULL"
+        " ORDER BY updated_at DESC LIMIT ?"
+    )
+    args: List[Any] = [limit * 4]  # 多拉一些, Python 层再筛/切
+
+    out: List[Dict[str, Any]] = []
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+            # 平台 / account_id 在 lead_identities M:N 表, 取首个 identity 作为展示.
+            ident_cache: Dict[str, Dict[str, str]] = {}
+            if rows:
+                cids_tuple = tuple(r["canonical_id"] for r in rows)
+                placeholders = ",".join(["?"] * len(cids_tuple))
+                for ir in conn.execute(
+                    f"SELECT canonical_id, platform, account_id FROM lead_identities"
+                    f" WHERE canonical_id IN ({placeholders})"
+                    f" ORDER BY id ASC",
+                    cids_tuple,
+                ).fetchall():
+                    # 只保第一条 (首次发现)
+                    ident_cache.setdefault(
+                        ir["canonical_id"],
+                        {"platform": ir["platform"] or "",
+                         "account_id": ir["account_id"] or ""})
+    except Exception as e:
+        logger.warning("[canonical] list_l2_verified SQL 失败: %s", e)
+        return []
+
+    for row in rows:
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            meta = {}
+        tags_str = row["tags"] or ""
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+        if age_band and (meta.get("age_band") or "").lower() != age_band.lower():
+            continue
+        if gender and (meta.get("gender") or "").lower() != gender.lower():
+            continue
+        if is_japanese is not None:
+            _ij = meta.get("is_japanese")
+            if bool(_ij) is not bool(is_japanese):
+                continue
+        if persona_key and (meta.get("l2_persona_key") or "") != persona_key:
+            continue
+        try:
+            score_v = float(meta.get("l2_score", 0) or 0)
+        except (TypeError, ValueError):
+            score_v = 0.0
+        if score_v < float(min_score or 0):
+            continue
+
+        ident = ident_cache.get(row["canonical_id"], {})
+        _plat = (ident.get("platform") or "").lower()
+        if platform and _plat != platform.lower():
+            continue
+
+        out.append({
+            "canonical_id": row["canonical_id"],
+            "display_name": row["primary_name"] or "",
+            "platform": _plat,
+            "primary_account_id": ident.get("account_id") or "",
+            "tags": tags,
+            "metadata": meta,
+            "l2_score": score_v,
+            "l2_verified_at": meta.get("l2_verified_at") or "",
+        })
+        if len(out) >= limit:
+            break
+    # 排序: 先按 l2_verified_at 新 → 旧, 再按 l2_score 高 → 低 (主键); Python
+    # sort stable 保证同 score 下仍按 verified_at 新的在前.
+    out.sort(key=lambda x: x["l2_verified_at"], reverse=True)
+    out.sort(key=lambda x: x["l2_score"], reverse=True)
+    return out

@@ -199,6 +199,41 @@ class TestWalkCandidatesRouting:
         assert tapped == ["佐藤美咲"], \
             f"期望跳过已联系, 只点新候选. 实际: {tapped}"
 
+    def test_walk_max_l2_calls_budget_stops_early(self, tmp_db):
+        """Phase 10.3: walk 跑满 max_l2_calls=2 后 break, 剩下候选不试."""
+        fb = _stub_fb()
+        # 5 个女性候选, 全部无已联系记录 → 理论会全部试
+        fb._list_top_search_result_cards = lambda *a, **kw: [
+            {"name": f"女士{i}", "bounds": (0, 100 * i, 500, 100 * i + 80),
+             "male_hint": False} for i in range(1, 6)
+        ]
+        fb._peer_already_contacted = lambda n: (False, "")
+        fb.hb = MagicMock()
+        fb.hb.tap = MagicMock()
+        fb._is_likely_fb_profile_page_xml = lambda xml: True
+        fb.search_people = lambda *a, **kw: [{"name": "女"}]
+
+        tapped = []
+
+        def _spy(self, d, did, profile_name, note, **kw):
+            tapped.append(profile_name)
+            return False  # 每次 L2 REJECT, 触发 BACK 下一位
+
+        with patch.object(type(fb), "_add_friend_safe_interaction_on_profile",
+                          new=_spy), \
+             patch("src.host.fb_concurrency.device_section_lock") as ml:
+            ml.return_value.__enter__ = lambda *a: None
+            ml.return_value.__exit__ = lambda *a: None
+            fb._ensure_foreground = lambda *a, **kw: True
+            fb.add_friend_with_note(
+                "女", persona_key=None, phase="growth",
+                safe_mode=True, walk_candidates=True,
+                max_l2_calls=2,
+                device_id="D_p10_2",
+            )
+        assert len(tapped) == 2, \
+            f"budget=2 应只试 2 个候选, 实际试了 {len(tapped)}: {tapped}"
+
     def test_walk_empty_falls_back_to_single_result(self, tmp_db):
         """walk=True + _list_top_search_result_cards 返空 → 回退 _first_search_result_element."""
         fb = _stub_fb()
@@ -349,6 +384,59 @@ class TestPhase10L2MultiShot:
         assert any(e["data"].get("reason") == "l2_all_shots_failed"
                    for e in blocked_evts), \
             f"期望 l2_all_shots_failed event, 实际: {blocked_evts}"
+
+    def test_shots_multi_match_overrides_reject_insights(self, tmp_db):
+        """Phase 10.3: match=True shot 的 insights 覆盖先前 REJECT shot 的字段.
+
+        回归 bug: shot1 REJECT 误报 gender=male, shot2 PASS 给 gender=female —
+        旧"首次非空"策略会保留错的 male. 新策略: PASS shot 覆盖 REJECT shot.
+        """
+        fb = _stub_fb()
+        fb.capture_profile_snapshots = lambda *a, **kw: {
+            "image_paths": ["/tmp/a.png", "/tmp/b.png", "/tmp/c.png"],
+            "shot_count": 3, "save_dir": "/tmp",
+            "display_name": "", "bio_text": "",
+        }
+
+        results_iter = iter([
+            # shot1: REJECT 但没触发"明确 REJECT"早退 (没 male 也没 jp=False),
+            # 给了错误的 age_band
+            {"ok": True, "match": False, "stage_reached": "L2",
+             "score": 40,
+             "l2": {"pass": False, "score": 40, "reasons": ["不清楚"]},
+             "insights": {"age_band": "20s", "gender": ""}},
+            # shot2: PASS, 真正 age_band=40s + gender=female
+            {"ok": True, "match": True, "stage_reached": "L2",
+             "score": 88,
+             "l2": {"pass": True, "score": 88, "reasons": ["PASS"]},
+             "insights": {"age_band": "40s", "gender": "female",
+                          "is_japanese": True}},
+        ])
+
+        with patch("src.host.fb_profile_classifier.classify",
+                   side_effect=lambda **kw: next(results_iter)):
+            blocked = fb._phase10_l2_gate(
+                d=MagicMock(), did="D_p10_2",
+                profile_name="混图测试", persona_key="jp_female_midlife",
+                shots=3,
+            )
+        assert blocked is False, "shot2 PASS 应让 gate 放行"
+
+        from src.host.lead_mesh import resolve_identity
+        from src.host.lead_mesh.canonical import _connect
+        import json
+        cid = resolve_identity(platform="facebook",
+                                account_id="fb:混图测试",
+                                display_name="混图测试")
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json FROM leads_canonical WHERE canonical_id=?",
+                (cid,),
+            ).fetchone()
+        meta = json.loads((row["metadata_json"] if row else "") or "{}")
+        assert meta.get("age_band") == "40s", \
+            f"应以 PASS shot 的 age_band=40s 覆盖 REJECT shot 的 20s, 实际: {meta}"
+        assert meta.get("gender") == "female"
 
     def test_shots_4_pass_writes_canonical_metadata(self, tmp_db):
         """shots=4 + L2 PASS → leads_canonical.metadata_json 聚合 insights."""

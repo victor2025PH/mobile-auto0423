@@ -29,9 +29,10 @@ _project_root = PROJECT_ROOT
 
 
 def _phase10_task_extras(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Phase 10/10.2 opt-in kwargs 组装 (walk_candidates / l2_gate_shots / do_l2_gate).
+    """Phase 10/10.2/10.3 opt-in kwargs 组装 (walk_candidates / l2_gate_shots /
+    do_l2_gate / max_l2_calls).
 
-    只在显式 True/>1 时加 key, 避免未升级的 automation 分支撞 TypeError.
+    只在显式 True/>1/非默认 时加 key, 避免未升级的 automation 分支撞 TypeError.
     """
     out: Dict[str, Any] = {}
     if params.get("walk_candidates"):
@@ -41,6 +42,10 @@ def _phase10_task_extras(params: Dict[str, Any]) -> Dict[str, Any]:
         out["l2_gate_shots"] = shots
     if params.get("do_l2_gate"):
         out["do_l2_gate"] = True
+    budget = int(params.get("max_l2_calls", 0) or 0)
+    # walk 启用时才传 budget, 且非默认 3 才值得发 kwarg.
+    if out.get("walk_candidates") and budget and budget != 3:
+        out["max_l2_calls"] = budget
     return out
 
 
