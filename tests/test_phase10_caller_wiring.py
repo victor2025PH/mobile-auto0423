@@ -135,3 +135,44 @@ class TestDoL2GateWiringSearchPath:
                 )
         assert captured.get("do_l2_gate") is True, \
             "搜索 safe_mode 路径应透传 do_l2_gate=True"
+
+
+class TestDoL2GateWiringCombo:
+    """add_friend_and_greet 是 combo 入口, 也得透传 do_l2_gate 到 add_friend_with_note."""
+
+    def test_combo_propagates_to_add_friend_with_note(self, tmp_db):
+        fb = _stub_fb()
+        captured = {}
+
+        def _spy_afwn(*args, **kwargs):
+            captured["do_l2_gate"] = kwargs.get("do_l2_gate")
+            return False  # 短路: add_friend_failed → 不进 send_greeting
+
+        with patch.object(fb, "add_friend_with_note", side_effect=_spy_afwn):
+            fb.add_friend_and_greet(
+                "Anyone",
+                persona_key=None,
+                phase="growth",
+                do_l2_gate=True,
+                device_id="D_p10w",
+            )
+        assert captured.get("do_l2_gate") is True, \
+            f"add_friend_and_greet 应透传 do_l2_gate=True 到 add_friend_with_note, 实际: {captured}"
+
+    def test_combo_default_propagates_false(self, tmp_db):
+        fb = _stub_fb()
+        captured = {}
+
+        def _spy_afwn(*args, **kwargs):
+            captured["do_l2_gate"] = kwargs.get("do_l2_gate")
+            return False
+
+        with patch.object(fb, "add_friend_with_note", side_effect=_spy_afwn):
+            fb.add_friend_and_greet(
+                "Anyone",
+                persona_key=None,
+                phase="growth",
+                device_id="D_p10w",
+            )
+        assert captured.get("do_l2_gate") is False, \
+            "combo 默认应透传 do_l2_gate=False"

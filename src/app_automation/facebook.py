@@ -3024,7 +3024,8 @@ class FacebookAutomation(BaseAutomation):
                              phase: Optional[str] = None,
                              preset_key: str = "",
                              source: str = "",
-                             greet_on_failure: bool = False) -> Dict[str, Any]:
+                             greet_on_failure: bool = False,
+                             do_l2_gate: bool = False) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -3065,6 +3066,7 @@ class FacebookAutomation(BaseAutomation):
             phase=phase,
             source=source,
             preset_key=preset_key,
+            do_l2_gate=do_l2_gate,
         )
         out["add_friend_ok"] = bool(add_ok)
 
