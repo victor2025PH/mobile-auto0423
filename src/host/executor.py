@@ -1167,6 +1167,8 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = str(_tg[0])
                             elif isinstance(params.get("group_name"), str):
                                 _camp_src = params.get("group_name") or ""
+                        _ai_g = params.get("ai_dynamic_greeting")
+                        _fsg = params.get("force_send_greeting")
                         res = fb.add_friend_and_greet(
                             name,
                             note=note,
@@ -1177,6 +1179,8 @@ def _run_facebook_campaign(fb, resolved, params):
                             preset_key=_pr,
                             source=_camp_src,
                             force=bool(params.get("force_add_friend")),
+                            ai_dynamic_greeting=(bool(_ai_g) if _ai_g is not None else None),
+                            force_send_greeting=(bool(_fsg) if _fsg is not None else None),
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
                         if ok:

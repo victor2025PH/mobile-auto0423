@@ -2512,7 +2512,9 @@ class FacebookAutomation(BaseAutomation):
                                        phase: Optional[str] = None,
                                        assume_on_profile: bool = True,
                                        preset_key: str = "",
-                                       ai_decision: str = "greeting") -> bool:
+                                       ai_decision: str = "greeting",
+                                       ai_dynamic_greeting_override: Optional[bool] = None,
+                                       force_send_greeting_override: Optional[bool] = None) -> bool:
         """加好友之后在 profile 页点 "Message" 发一条打招呼消息(方案 A2)。
 
         本方法**假设调用之前已成功 add_friend_with_note** —— 实际流程:
@@ -2598,6 +2600,17 @@ class FacebookAutomation(BaseAutomation):
                 self._set_greet_reason("phase_blocked")
                 return False
 
+            # 2026-04-24: ai_dynamic_greeting_override 从 task params 覆盖 playbook
+            if ai_dynamic_greeting_override is not None:
+                sg_cfg = dict(sg_cfg or {})
+                sg_cfg["ai_dynamic_greeting"] = bool(ai_dynamic_greeting_override)
+                log.info("[send_greeting] params override ai_dynamic_greeting=%s",
+                         sg_cfg["ai_dynamic_greeting"])
+            # force_send_greeting 从 params 覆盖 (smoke 专用, 绕 daily_cap)
+            if force_send_greeting_override is not None:
+                sg_cfg = dict(sg_cfg or {})
+                sg_cfg["force_send_greeting"] = bool(force_send_greeting_override)
+
             # P3-1 2026-04-23: 和 add_friend 同思路, 把 cap 检查 → UI 操作 → 入库
             # 整段用 device+section 锁串行化。section="send_greeting",
             # 与 "add_friend" 锁独立, add_friend_and_greet 场景两把锁先后持有不冲突。
@@ -2628,8 +2641,11 @@ class FacebookAutomation(BaseAutomation):
             return False
 
         # 24h rolling 日上限（与 add_friend.daily_cap 独立计）
+        # 2026-04-24: force_send_greeting (从 params 传入) 跳过 cap 检查
+        #   smoke/QA 测试用, 与 add_friend.force 对齐
         daily_cap = int(sg_cfg.get("daily_cap_per_account") or 0)
-        if daily_cap > 0:
+        force_skip_cap = bool(sg_cfg.get("force_send_greeting"))
+        if daily_cap > 0 and not force_skip_cap:
             try:
                 from src.host.fb_store import count_outgoing_messages_since
                 n24 = count_outgoing_messages_since(did, hours=24,
@@ -2641,6 +2657,9 @@ class FacebookAutomation(BaseAutomation):
                     return False
             except Exception as e:
                 log.debug("[send_greeting] daily_cap 检查异常(继续): %s", e)
+        elif force_skip_cap and daily_cap > 0:
+            log.info("[send_greeting] force_send_greeting=True, 跳过 daily_cap=%s 检查",
+                     daily_cap)
 
         # 文案：
         # 1) 若 sg_cfg.ai_dynamic_greeting=True, 优先 ChatBrain AI 动态生成个性化日文 greeting
@@ -2918,7 +2937,9 @@ class FacebookAutomation(BaseAutomation):
                              preset_key: str = "",
                              source: str = "",
                              greet_on_failure: bool = False,
-                             force: bool = False) -> Dict[str, Any]:
+                             force: bool = False,
+                             ai_dynamic_greeting: Optional[bool] = None,
+                             force_send_greeting: Optional[bool] = None) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -2976,6 +2997,8 @@ class FacebookAutomation(BaseAutomation):
             assume_on_profile=True,
             preset_key=preset_key,
             ai_decision="greeting",
+            ai_dynamic_greeting_override=ai_dynamic_greeting,
+            force_send_greeting_override=force_send_greeting,
         )
         out["greet_ok"] = bool(greet_ok)
         # 细化原因: send_greeting_after_add_friend 已挂 _last_greet_skip_reason
