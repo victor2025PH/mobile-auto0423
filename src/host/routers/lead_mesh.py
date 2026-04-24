@@ -118,17 +118,27 @@ def api_list_l2_verified_leads(
         platform: Optional[str] = Query(default=None,
                                          description="'facebook' / ..."),
         min_score: float = Query(default=0, ge=0, le=100),
-        limit: int = Query(default=50, ge=1, le=1000)):
-    """Phase 10.3: 查 L2 VLM 验证过的精准用户 (供运营面板/CRM).
+        limit: int = Query(default=50, ge=1, le=1000),
+        include_tags: Optional[List[str]] = Query(
+            default=None,
+            description="tags 必须全部包含, 例 ['line_referred']"),
+        exclude_tags: Optional[List[str]] = Query(
+            default=None,
+            description="含任一此 tag 的 lead 排除, 例 ['referral_dead']")):
+    """Phase 10.3 + 12.2: 查 L2 VLM 验证过的精准用户.
 
-    只返回 leads_canonical.tags 里带 ``l2_verified`` 的 lead, 按 l2_score 降序.
-    其它过滤条件均 AND 组合. None / 缺省 = 不过滤该字段.
+    只返回 tags 里带 ``l2_verified`` 的 lead, 按 l2_score 降序. 所有过滤 AND.
+    Phase 12.2 新增 include/exclude tags: 例如查"已引流的":
+      /leads/l2-verified?include_tags=line_referred
+    查"L2 通过但 referral 已死不再骚扰的":
+      /leads/l2-verified?include_tags=referral_dead
     """
     from src.host.lead_mesh.canonical import list_l2_verified_leads
     rows = list_l2_verified_leads(
         age_band=age_band, gender=gender,
         is_japanese=is_japanese, persona_key=persona_key,
         platform=platform, min_score=min_score, limit=limit,
+        include_tags=include_tags, exclude_tags=exclude_tags,
     )
     return {"count": len(rows), "results": rows}
 

@@ -349,14 +349,26 @@ def allocate(*,
     return None
 
 
+# Phase 12.2: 账号封号自动 cooldown 阈值 (发生 failed 后查最近 N 条)
+_AUTO_COOLDOWN_WINDOW = 5      # 看最近 5 条非 skipped 结果
+_AUTO_COOLDOWN_FAIL_RATIO = 0.8  # failed / total >= 0.8 触发
+_AUTO_COOLDOWN_MIN_SAMPLES = 3  # 至少 3 条才判断, 防止前 2 条就封
+
+
 def mark_dispatch_outcome(line_account_id: int, *,
                             status: str = "sent",
                             note: str = "") -> bool:
-    """更新 dispatch_log 最近一条的 status (B 机/dispatcher 完成发送后回写)."""
+    """更新 dispatch_log 最近一条的 status (B 机/dispatcher 完成发送后回写).
+
+    Phase 12.2 (2026-04-25): status='failed' 触发 auto cooldown 检查 —
+    查该账号最近 ``_AUTO_COOLDOWN_WINDOW`` 条非 skipped 记录, 若 ≥
+    ``_AUTO_COOLDOWN_MIN_SAMPLES`` 条且 failed 比例 ≥ ``_AUTO_COOLDOWN_FAIL_RATIO``,
+    自动把 line_accounts.status 设为 'cooldown' + note='auto:fail_rate_high'.
+    运营可在 UI 里手动 toggle 回 active (不做自动恢复避免反复封解).
+    """
     if status not in {"sent", "failed", "skipped"}:
         raise ValueError(f"status 非法: {status}")
     with _connect() as conn:
-        # 找该 line_account 最近一条 planned
         row = conn.execute(
             "SELECT id FROM line_dispatch_log WHERE line_account_id=?"
             " AND status='planned' ORDER BY id DESC LIMIT 1",
@@ -368,7 +380,54 @@ def mark_dispatch_outcome(line_account_id: int, *,
             "UPDATE line_dispatch_log SET status=?, note=? WHERE id=?",
             (status, note, row["id"]),
         )
+        # Phase 12.2 auto cooldown: 刚记了 failed 才值得检查
+        if status == "failed":
+            _maybe_auto_cooldown(conn, line_account_id)
         return True
+
+
+def _maybe_auto_cooldown(conn, line_account_id: int) -> bool:
+    """内部: 检查最近 N 条 outcome 决定是否把账号转 cooldown. 返 True 表示
+    本次调用触发了转换 (状态从 active → cooldown). 已经 cooldown/disabled
+    /banned 的不动."""
+    try:
+        # 只有 active 账号才考虑 cooldown (已停用的无意义)
+        acc_row = conn.execute(
+            "SELECT status FROM line_accounts WHERE id=?",
+            (line_account_id,),
+        ).fetchone()
+        if not acc_row or acc_row["status"] != "active":
+            return False
+
+        recent = conn.execute(
+            "SELECT status FROM line_dispatch_log WHERE line_account_id=?"
+            " AND status != 'skipped'"
+            " ORDER BY id DESC LIMIT ?",
+            (line_account_id, _AUTO_COOLDOWN_WINDOW),
+        ).fetchall()
+        total = len(recent)
+        if total < _AUTO_COOLDOWN_MIN_SAMPLES:
+            return False
+        failed = sum(1 for r in recent if r["status"] == "failed")
+        ratio = failed / total if total else 0.0
+        if ratio < _AUTO_COOLDOWN_FAIL_RATIO:
+            return False
+        # 触发 cooldown
+        note = (f"auto:fail_rate_high {failed}/{total} "
+                f"(>= {_AUTO_COOLDOWN_FAIL_RATIO:.0%})")
+        conn.execute(
+            "UPDATE line_accounts SET status='cooldown', notes = "
+            " CASE WHEN COALESCE(notes,'')='' THEN ? "
+            " ELSE notes || char(10) || ? END, "
+            " updated_at=datetime('now') WHERE id=?",
+            (note, note, line_account_id),
+        )
+        logger.warning("[line_pool.auto_cooldown] account %d → cooldown (%s)",
+                         line_account_id, note)
+        return True
+    except Exception as e:
+        logger.debug("[line_pool.auto_cooldown] 异常(忽略): %s", e)
+        return False
 
 
 def seed_from_config(config_path: Optional[str] = None,

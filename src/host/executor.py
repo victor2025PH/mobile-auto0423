@@ -1182,6 +1182,10 @@ def _fb_line_dispatch_from_reply(resolved: str,
         if require_l2 and "l2_verified" not in tags_set:
             filtered_out += 1
             continue
+        # Phase 12.2: peer 被标 referral_dead 跳过 (永久 fail 过, 再试浪费)
+        if "referral_dead" in tags_set:
+            filtered_out += 1
+            continue
         try:
             if float(meta.get("l2_score", 0) or 0) < min_score:
                 filtered_out += 1
@@ -1284,6 +1288,68 @@ _REFERRAL_PERMANENT_CODES = frozenset({
     "recipient_not_found",       # peer 搜不到
     "send_blocked_by_content",   # 内容被 FB 挡
 })
+
+# Phase 12.2: peer 级失败阈值 — 达阈值给 canonical 打 referral_dead tag,
+# dispatcher 下次扫到会跳过. 按错误严重度分级:
+#   recipient_not_found: peer 账号不存在/改名 → 1 次即 dead (retry 永远搜不到)
+#   send_blocked_by_content: peer 过往封禁本文案 → 2 次 dead (换模板可能解)
+# risk_detected/xspace_blocked 是 device/global 问题不计 peer 账.
+_REFERRAL_PEER_FAIL_THRESHOLDS = {
+    "recipient_not_found": 1,
+    "send_blocked_by_content": 2,
+}
+
+
+def _referral_peer_fail_record(canonical_id: str,
+                                err_code: str,
+                                peer_name: str = "") -> bool:
+    """Phase 12.2: 累加 canonical.metadata.referral_fail_count, 达到该
+    err_code 对应阈值时打 referral_dead tag + 存 dead_reason/at.
+
+    返回 True 表示本次调用触发了 referral_dead (状态由"活"转"死").
+    """
+    if not canonical_id or err_code not in _REFERRAL_PEER_FAIL_THRESHOLDS:
+        return False
+    threshold = _REFERRAL_PEER_FAIL_THRESHOLDS[err_code]
+    try:
+        from src.host.lead_mesh import update_canonical_metadata
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        import json as _json
+        import time as _tt
+        with _lm_connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json, tags FROM leads_canonical"
+                " WHERE canonical_id=?", (canonical_id,),
+            ).fetchone()
+            if not row:
+                return False
+            try:
+                existing = _json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                existing = {}
+            existing_tags = {t.strip() for t in
+                              (row["tags"] or "").split(",") if t.strip()}
+            if "referral_dead" in existing_tags:
+                return False  # 已经 dead, 不重复
+        # 构造增量
+        counter_key = f"referral_fail_count_{err_code}"
+        prev_n = int(existing.get(counter_key, 0) or 0)
+        new_n = prev_n + 1
+        meta_patch = {counter_key: new_n}
+        tags = []
+        if new_n >= threshold:
+            meta_patch["referral_dead_reason"] = err_code
+            meta_patch["referral_dead_at"] = _tt.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", _tt.gmtime())
+            meta_patch["referral_dead_peer_name"] = peer_name or ""
+            tags.append("referral_dead")
+        update_canonical_metadata(canonical_id, meta_patch,
+                                   tags=tags or None)
+        return new_n >= threshold
+    except Exception as e:
+        logger.debug("[phase12.2.peer_fail] canonical=%s err=%s 异常: %s",
+                       canonical_id[:12] if canonical_id else "", err_code, e)
+        return False
 
 
 def _fb_send_referral_replies(fb, resolved: str,
@@ -1456,6 +1522,9 @@ def _fb_send_referral_replies(fb, resolved: str,
                                  peer_name, e)
                 break
 
+        canonical_id_of_peer = meta.get("canonical_id") or ""
+        became_dead = False
+
         if ok:
             sent += 1
             try:
@@ -1470,7 +1539,7 @@ def _fb_send_referral_replies(fb, resolved: str,
                           "original_mode": dispatch_mode,
                           "source_event_id": str(ev.get("id") or ""),
                           "source_planned_event_id": str(ev.get("id") or ""),
-                          "canonical_id": meta.get("canonical_id") or ""})
+                          "canonical_id": canonical_id_of_peer})
             except Exception as e:
                 logger.debug("[referral.send] write wa_referral_sent 失败: %s", e)
             if line_account_id:
@@ -1480,6 +1549,25 @@ def _fb_send_referral_replies(fb, resolved: str,
                         note=f"via=messenger peer={peer_name}")
                 except Exception:
                     pass
+            # Phase 12.2: success 写 canonical metadata + tag line_referred
+            if canonical_id_of_peer:
+                try:
+                    import time as _t_phase12
+                    from src.host.lead_mesh import update_canonical_metadata
+                    update_canonical_metadata(
+                        canonical_id_of_peer,
+                        {
+                            "line_referred_at": _t_phase12.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", _t_phase12.gmtime()),
+                            "line_id": meta.get("line_id"),
+                            "line_account_id": line_account_id,
+                            "referral_sent_via": effective_mode,
+                        },
+                        tags=["line_referred"],
+                    )
+                except Exception as e:
+                    logger.debug("[referral.send] canonical line_referred "
+                                   "写回失败: %s", e)
         else:
             failed += 1
             if line_account_id:
@@ -1489,6 +1577,15 @@ def _fb_send_referral_replies(fb, resolved: str,
                         note=err_note or "send_message_returned_false")
                 except Exception:
                     pass
+            # Phase 12.2: peer 级失败计数 + 达阈值 tag referral_dead.
+            # 只 PERMANENT code 计 peer 账 (transient/unknown 不算 peer 问题).
+            if (canonical_id_of_peer
+                    and err_code in _REFERRAL_PEER_FAIL_THRESHOLDS):
+                try:
+                    became_dead = _referral_peer_fail_record(
+                        canonical_id_of_peer, err_code, peer_name)
+                except Exception as e:
+                    logger.debug("[referral.send] peer fail 累计失败: %s", e)
 
         outcomes.append({
             "peer_name": peer_name, "line_account_id": line_account_id,
@@ -1496,6 +1593,7 @@ def _fb_send_referral_replies(fb, resolved: str,
             "planned_event_id": ev.get("id"),
             "sent": ok, "err_code": err_code, "note": err_note,
             "effective_mode": effective_mode,
+            "became_dead": became_dead,
         })
 
     stats = {

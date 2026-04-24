@@ -506,6 +506,8 @@ def list_l2_verified_leads(
     platform: Optional[str] = None,
     min_score: float = 0,
     limit: int = 50,
+    include_tags: Optional[List[str]] = None,
+    exclude_tags: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Phase 10.3: 查询 L2 VLM 验证过的"精准画像用户".
 
@@ -581,6 +583,13 @@ def list_l2_verified_leads(
         _plat = (ident.get("platform") or "").lower()
         if platform and _plat != platform.lower():
             continue
+        # Phase 12.2 tags include/exclude (含 referral_dead / line_referred 等)
+        if include_tags:
+            if not all(t in tags for t in include_tags):
+                continue
+        if exclude_tags:
+            if any(t in tags for t in exclude_tags):
+                continue
 
         out.append({
             "canonical_id": row["canonical_id"],
