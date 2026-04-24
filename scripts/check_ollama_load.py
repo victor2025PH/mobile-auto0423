@@ -86,6 +86,15 @@ def render_human(summary: Dict[str, Any], host: str) -> str:
 
 
 def main(argv: List[str] = None) -> int:
+    # Phase 10.3 (2026-04-24): Windows console (gbk/cp936) 默认 encoding 不能输出
+    # ✓/⚠️/✗ 等 unicode 字符. reconfigure stdout/stderr 为 utf-8 + errors='replace'.
+    # 仅 Python 3.7+ 有 reconfigure (我们要求 3.11+, 安全).
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass  # 非 TextIOWrapper (e.g. 重定向到 file 已是 utf-8) → 跳过
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default=DEFAULT_HOST,
