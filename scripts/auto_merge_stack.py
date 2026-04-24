@@ -104,7 +104,15 @@ def get_token() -> Optional[str]:
 
 def github_api(path: str, token: Optional[str],
                 method: str = "GET",
-                body: Optional[Dict[str, Any]] = None) -> Any:
+                body: Optional[Dict[str, Any]] = None,
+                *, max_retries: int = 3,
+                backoff_base: float = 2.0) -> Any:
+    """GitHub API 调用, HTTP 429 / 5xx 指数退避 retry (cron 自动化避免裸失败).
+
+    Retry-After header 优先, 否则用 backoff_base * 2^attempt, 单次 cap 30s。
+    max_retries=3 总 wait ≤ ~14s。非重试错误或用尽次数 → raise RuntimeError。
+    """
+    import time
     headers = {"Accept": "application/vnd.github+json",
                "User-Agent": "auto-merge-stack"}
     if token:
@@ -116,13 +124,25 @@ def github_api(path: str, token: Optional[str],
     req = urllib.request.Request(
         f"https://api.github.com{path}", headers=headers,
         method=method, data=data)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(
-            f"{method} {path}: {e.code} {e.read().decode()[:200]}")
+    for attempt in range(max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            status = e.code
+            retriable = status == 429 or 500 <= status < 600
+            if not retriable or attempt == max_retries:
+                raise RuntimeError(
+                    f"{method} {path}: {status} {e.read().decode()[:200]}")
+            retry_after_hdr = (e.headers.get("Retry-After")
+                                if e.headers else None)
+            try:
+                wait = (float(retry_after_hdr) if retry_after_hdr
+                        else backoff_base * (2 ** attempt))
+            except (TypeError, ValueError):
+                wait = backoff_base * (2 ** attempt)
+            time.sleep(min(wait, 30.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
