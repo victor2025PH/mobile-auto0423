@@ -406,7 +406,7 @@ class WebSocketHub:
     async def handle(self, ws: WebSocket):
         await ws.accept()
         client = WebSocketClient(ws)
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         self._ensure_bus_subscription()
         self._ensure_push_thread()
 
