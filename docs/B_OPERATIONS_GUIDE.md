@@ -408,13 +408,42 @@ curl -s http://localhost:8000/facebook/vlm/level4/status | jq
 #   "vision_model": "gemini-2.5-flash",
 #   "swapped": false,              # true = P5b 已切 Ollama
 #   "consecutive_failures": 0,      # 达 3 触发 swap
+#   "swap_events_total": 0,         # P16 累计 swap 次数 (单向, swapped=true 后不再增)
 #   "last_error_code": null,        # 503/429/...
 #   "last_error_body": "",          # 或 "timeout"
 #   "budget": {"hourly_used": 7, "hourly_budget": 20, "budget_remaining": 13, "cache_size": 4},
 #   "init_attempted": true
 # }
 ```
-Prometheus/Grafana scrape 友好; 可对 `consecutive_failures >= 2` 或 `swapped == true` 报警。
+
+**Prometheus 抓取 (P16 新增)**:
+
+`GET /observability/prometheus` 追加了 Level 4 VLM 指标 (自动追加，无需额外配置)。示例输出:
+```
+openclaw_vlm_level4_swapped 0
+openclaw_vlm_level4_consecutive_failures 0
+openclaw_vlm_level4_swap_events_total 0
+openclaw_vlm_level4_ready 1
+openclaw_vlm_level4_init_attempted 1
+openclaw_vlm_level4_budget_used 7
+openclaw_vlm_level4_budget_hourly 20
+openclaw_vlm_level4_budget_remaining 13
+openclaw_vlm_level4_cache_size 4
+openclaw_vlm_level4_last_error_code 0
+openclaw_vlm_level4_provider_info{provider="gemini",vision_model="gemini-2.5-flash"} 1
+```
+
+推荐 Grafana alert rules:
+| rule | 语义 |
+|---|---|
+| `vlm_level4_consecutive_failures >= 2 for 5m` | 即将 swap 预警 |
+| `increase(vlm_level4_swap_events_total[1h]) > 0` | 1h 内触发过 swap (Gemini 挂) |
+| `vlm_level4_budget_remaining < 3` | 小时 VLM 预算快耗尽 |
+| `vlm_level4_last_error_code == 429 for 2m` | Gemini rate limit 持续 |
+| `vlm_level4_last_error_code >= 500 for 2m` | provider 5xx 持续 |
+| `vlm_level4_ready == 0 and vlm_level4_init_attempted == 1` | 无 VLM provider 可用 (Gemini key 未设 + Ollama 没起) |
+
+按 `provider_info` label 分面板, 可分别看 Gemini / Ollama 时段的命中/失败分布。
 
 ### 12.6 日志诊断 checklist
 

@@ -374,6 +374,9 @@ _vision_fallback_init_attempted = False
 _vlm_consecutive_failures = 0
 _vlm_provider_swapped = False
 _VLM_SWAP_THRESHOLD = 3  # 连续 N 次 VLM HTTP error 触发 swap
+# P16 (2026-04-24): 累计 swap 触发次数给 Prometheus counter。`_vlm_provider_
+# swapped` 是单向 bool (已切 or 没), counter 更有用于 Grafana alert rate()。
+_vlm_swap_events_total = 0
 
 
 def _try_ollama_vision_client():
@@ -417,7 +420,7 @@ def _record_vlm_result(vf) -> None:
         vf: VisionFallback instance 刚被 call 过 find_element。
     """
     global _vlm_consecutive_failures, _vlm_provider_swapped
-    global _vision_fallback_instance
+    global _vision_fallback_instance, _vlm_swap_events_total
     if vf is None or getattr(vf, "_client", None) is None:
         return
     client = vf._client
@@ -456,6 +459,91 @@ def _record_vlm_result(vf) -> None:
         _vision_fallback_instance = VisionFallback(client=ollama)
         _vlm_provider_swapped = True
         _vlm_consecutive_failures = 0
+        _vlm_swap_events_total += 1  # P16 counter
+
+
+def vlm_level4_prometheus_text() -> str:
+    """P16 (2026-04-24): 将 Level 4 VLM fallback 状态导出 Prometheus text format,
+    供 ``GET /observability/prometheus`` 追加。Grafana alert rule 示例:
+
+      * ``vlm_level4_consecutive_failures >= 2 for 5m`` — 即将 swap 预警
+      * ``increase(vlm_level4_swap_events_total[1h]) > 0`` — 最近发生了 swap
+      * ``vlm_level4_budget_remaining < 3`` — 小时预算快耗尽
+      * ``vlm_level4_last_error_code == 429 for 2m`` — Gemini rate limit 持续
+      * ``vlm_level4_last_error_code >= 500 for 2m`` — provider 5xx 持续
+
+    ``provider`` / ``vision_model`` 作为 label, metric 值恒 1 (Prometheus label
+    pattern) 便于 Grafana 按 provider 分面板。
+    """
+    lines: List[str] = []
+
+    def _emit(name: str, help_zh: str, mtype: str,
+               val, labels: str = "") -> None:
+        lines.append(f"# HELP {name} {help_zh}")
+        lines.append(f"# TYPE {name} {mtype}")
+        if labels:
+            lines.append(f"{name}{{{labels}}} {val}")
+        else:
+            lines.append(f"{name} {val}")
+
+    # 读当前全局 (不持 lock — gauge 轻微不一致无所谓; counter 单调递增)
+    swapped = 1 if _vlm_provider_swapped else 0
+    _emit("openclaw_vlm_level4_swapped",
+           "1 if P5b swapped Gemini → Ollama (单向不 flip-flop)",
+           "gauge", swapped)
+    _emit("openclaw_vlm_level4_consecutive_failures",
+           "连续 HTTP failure count (达 3 触发 swap)",
+           "gauge", int(_vlm_consecutive_failures))
+    _emit("openclaw_vlm_level4_swap_events_total",
+           "Gemini → Ollama swap 累计发生次数 (rate() 能看最近频率)",
+           "counter", int(_vlm_swap_events_total))
+    _emit("openclaw_vlm_level4_init_attempted",
+           "1 if _get_vision_fallback 已被 lazy-init 过 (不论成败)",
+           "gauge", 1 if _vision_fallback_init_attempted else 0)
+
+    vf = _vision_fallback_instance
+    if vf is None:
+        _emit("openclaw_vlm_level4_ready",
+               "1 if VisionFallback instance exists (provider 可用)",
+               "gauge", 0)
+        return "\n".join(lines) + "\n"
+    _emit("openclaw_vlm_level4_ready", "同上", "gauge", 1)
+
+    # budget
+    try:
+        stats = vf.stats() or {}
+    except Exception:
+        stats = {}
+    _emit("openclaw_vlm_level4_budget_used",
+           "本小时 VLM call 数",
+           "gauge", int(stats.get("hourly_used", 0)))
+    _emit("openclaw_vlm_level4_budget_hourly",
+           "本小时 VLM 预算上限",
+           "gauge", int(stats.get("hourly_budget", 0)))
+    _emit("openclaw_vlm_level4_budget_remaining",
+           "本小时剩余 VLM 预算 (预算耗尽 = 0)",
+           "gauge", int(stats.get("budget_remaining", 0)))
+    _emit("openclaw_vlm_level4_cache_size",
+           "VisionFallback 坐标 cache 条目数 (5min TTL)",
+           "gauge", int(stats.get("cache_size", 0)))
+
+    # client state + provider label
+    client = getattr(vf, "_client", None)
+    if client is not None:
+        err_code = getattr(client, "last_error_code", None)
+        _emit("openclaw_vlm_level4_last_error_code",
+               "最近一次 HTTP 错误码 (0 = 无错 或 上次成功)",
+               "gauge", int(err_code or 0))
+        cfg = getattr(client, "config", None)
+        provider = (getattr(cfg, "provider", "") or "").replace('"', '')
+        vmodel = (getattr(cfg, "vision_model", "") or "").replace('"', '')
+        if provider or vmodel:
+            _emit("openclaw_vlm_level4_provider_info",
+                   "provider / vision_model label (值恒 1, Grafana 按 label 分面板)",
+                   "gauge", 1,
+                   labels=f'provider="{provider}",vision_model="{vmodel}"')
+
+    return "\n".join(lines) + "\n"
 
 
 def _get_vision_fallback():
