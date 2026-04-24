@@ -173,10 +173,20 @@ class TestExecutionStore:
             assert stats["failed"] == 1
 
     def test_cleanup(self):
+        """2026-04-24: Windows 的 `datetime.now(tz).isoformat()` 分辨率 ~15ms
+        (低于 Linux 的 us 级), 全套 pytest 跑到这时 Python/SQLite 都热了,
+        `save_run` 和 `cleanup(older_than_days=0)` 可能落在同一 isoformat()
+        字符串 → `started_at < cutoff` (严格 <) 为 False → 行不删除 → len>0 fail。
+        单独跑时 cold start 让 save/cleanup 跨毫秒所以 pass。
+
+        用 `older_than_days=-1` 让 cutoff = now + 1 day, started_at 永远 < cutoff,
+        无时钟竞争 (也避免 time.sleep 引入非确定性)。test 意图 "cleanup 能删全
+        部历史" 保持。
+        """
         with tempfile.TemporaryDirectory() as td:
             store = ExecutionStore(db_path=os.path.join(td, "test.db"))
             store.save_run(self._make_result("r1"))
-            store.cleanup(older_than_days=0)
+            store.cleanup(older_than_days=-1)
             runs = store.list_runs()
             assert len(runs) == 0
 

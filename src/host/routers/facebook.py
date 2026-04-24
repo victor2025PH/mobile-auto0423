@@ -1296,6 +1296,59 @@ def fb_vlm_health():
     return ollama_vlm.check_health()
 
 
+@router.get("/vlm/level4/status")
+def fb_vlm_level4_status():
+    """VLM Level 4 UI fallback 运行时状态 (P4 运维: B_OPERATIONS_GUIDE §12.5
+    的 REPL 查询脚本的 HTTP 版本). 不同于 `/vlm/health` (Ollama 分类服务),
+    本 endpoint 暴露 `_enter_messenger_search` / `_tap_first_search_result` /
+    `_tap_messenger_send` 共用的 `VisionFallback` instance + P5b provider
+    swap 状态 + 最后一次 HTTP error。
+
+    字段:
+      * provider: "gemini" | "ollama" | null (null=无 VLM provider)
+      * vision_model: e.g. "gemini-2.5-flash" | "llava:7b"
+      * swapped: P5b 是否已从 Gemini runtime 切到 Ollama (true 单向不回)
+      * consecutive_failures: 当前连续 HTTP 失败 count (阈值 3 触发 swap)
+      * last_error_code: int | null (Gemini 503/429 等; null = 上次成功)
+      * last_error_body: str (截 120 chars; "timeout" 字面值表 httpx timeout)
+      * budget: {hourly_used, hourly_budget, budget_remaining, cache_size}
+      * init_attempted: lazy init 是否跑过 (false = 还没 VLM call 需求)
+
+    对 ops 用: 早期 429 集群 → 看 consecutive_failures 接近 3; swap 已触发 →
+    看 swapped=true provider=ollama。
+    """
+    from src.app_automation import facebook as fb
+    out = {
+        "provider": None, "vision_model": None, "swapped": False,
+        "consecutive_failures": 0, "last_error_code": None,
+        "last_error_body": "",
+        "budget": {}, "init_attempted": False,
+    }
+    out["swapped"] = bool(getattr(fb, "_vlm_provider_swapped", False))
+    out["consecutive_failures"] = int(
+        getattr(fb, "_vlm_consecutive_failures", 0))
+    out["init_attempted"] = bool(
+        getattr(fb, "_vision_fallback_init_attempted", False))
+    vf = getattr(fb, "_vision_fallback_instance", None)
+    if vf is None:
+        return out
+    try:
+        out["budget"] = vf.stats()
+    except Exception:
+        pass
+    client = getattr(vf, "_client", None)
+    if client is None:
+        return out
+    cfg = getattr(client, "config", None)
+    if cfg is not None:
+        out["provider"] = getattr(cfg, "provider", None)
+        out["vision_model"] = getattr(cfg, "vision_model", None)
+    out["last_error_code"] = getattr(client, "last_error_code", None)
+    body = getattr(client, "last_error_body", "") or ""
+    out["last_error_body"] = body[:120]
+    return out
+
+
 @router.post("/classify/single")
 def fb_classify_single(body: dict = Body(default={})):
     """单样本分类接口（给前端/脚本调用）。
