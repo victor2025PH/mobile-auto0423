@@ -262,12 +262,17 @@ personas:
 
     # L2 VLM prompt：让模型以 JSON 返回
     # 占位符 {persona_name} 会自动替换
+    # Phase 10.1 (2026-04-24) 严化: 加 has_face/is_profile_page 字段, 防 launcher
+    # 等非 profile 截图被误判 PASS (2026-04-24 partial smoke 实测 launcher 95.5).
     vlm_prompt: |
       あなたはソーシャルメディアのプロフィール分析アシスタントです。
-      画像に写っている人物が「{persona_name}」に該当するかを判定し、
+      画像に写っている**プロフィール写真**を分析し、「{persona_name}」に
+      該当するかを判定してください。
       必ず以下の JSON のみを返してください（他の文章不要）:
 
       {
+        "has_face": true|false,
+        "is_profile_page": true|false,
         "age_band": "teen|20s|30s|40s|50s|60s|70s+|unknown",
         "gender": "female|male|nonbinary|unknown",
         "is_japanese": true|false,
@@ -277,13 +282,28 @@ personas:
         "reasons": ["短い根拠を2-3個、日本語で"]
       }
 
-      判定基準:
+      **重要な事前判定 (これに失敗したら他は unknown を返す)**:
+      - **has_face**: 画像に明確な人物の顔が写っていれば true。アプリホーム画面・
+        設定画面・ランチャー・空白画面・風景・物体だけ → false。
+      - **is_profile_page**: Facebook/Instagram などの**プロフィールページ典型 UI**
+        (プロフィール写真+自己紹介+投稿一覧 など) が写っていれば true。
+        他のアプリ画面 / ホーム / 設定 → false。
+
+      **has_face=false または is_profile_page=false の場合**:
+        age_band, gender, is_japanese は必ず "unknown" / false / 0.0 を返す。
+        overall_confidence は 0.0 とする。推測しない。
+
+      判定基準 (has_face=true かつ is_profile_page=true の場合のみ):
       - 37-60歳で女性なら age_band は 30s/40s/50s のいずれか + gender=female
       - 日本語の投稿・画像・文脈があれば is_japanese=true
-      - 確信が持てない場合は unknown を返す（推測しない）
+        (注意: ROM の中文/英文 UI 文字列だけでは is_japanese=true にしない)
+      - 確信が持てない場合は unknown を返す (推測しない)
 
     # 最终命中条件（VLM 返回后的 hard check）
+    # Phase 10.1: require_has_face / require_is_profile_page 早期门禁 (新加)
     match_criteria:
+      require_has_face: true                    # Phase 10.1: 没脸直接 REJECT
+      require_is_profile_page: true             # Phase 10.1: 不是 profile UI 直接 REJECT
       age_bands_allowed: [30s, 40s, 50s, 60s]   # 含边界，后面再用 age_min/max 细筛
       genders_allowed: [female]
       require_is_japanese: true
