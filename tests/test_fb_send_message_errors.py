@@ -834,3 +834,60 @@ class TestMessengerUIVLMLevel4:
         finally:
             fb_mod._vision_fallback_instance = None
             fb_mod._vision_fallback_init_attempted = False
+
+    # ── search Level 4 cache invalidation (2026-04-24 P2) ──────────
+
+    def test_enter_search_vlm_click_fail_invalidates_cache(self):
+        """VLM 返 coords 但 click 后 EditText 不出现 → invalidate cache + raise。
+
+        避免 5min TTL 内重试同一坏坐标 (offline eval 发现 Gemini 2.5 Flash
+        有 ~50% miss 把 logo 当 search bar, cache 坏结果会连锁失败)。
+        """
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import (
+            FacebookAutomation, MessengerError)
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        # 所有 selector 路径 miss + 所有 EditText check 都 miss (level 3 + 4)
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(coords=(100, 200))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._enter_messenger_search(d, "devA")
+        assert ei.value.code == "search_ui_missing"
+        mock_vf.find_element.assert_called_once()
+        # **关键断言**: invalidate 被 call, 清掉坏 cache
+        mock_vf.invalidate.assert_called_once()
+        # invalidate 的参数应是 find_element 的 target/context (一致)
+        inv_args = mock_vf.invalidate.call_args
+        fe_args = mock_vf.find_element.call_args
+        assert inv_args.args[0] == fe_args.kwargs["target"]
+        assert inv_args.args[1] == fe_args.kwargs["context"]
+
+    def test_enter_search_vlm_invalidate_exception_silenced(self):
+        """invalidate 抛异常不应 bubble (只是清 cache, 不影响主流程 raise)。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import (
+            FacebookAutomation, MessengerError)
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=False)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(coords=(100, 200))
+        mock_vf.invalidate = MagicMock(side_effect=RuntimeError("cache boom"))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._enter_messenger_search(d, "devA")
+        # 主流程仍 raise 正确 code
+        assert ei.value.code == "search_ui_missing"

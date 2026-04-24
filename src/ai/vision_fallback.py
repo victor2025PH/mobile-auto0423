@@ -229,3 +229,25 @@ class VisionFallback:
             if len(self._cache) > 100:
                 oldest = min(self._cache.items(), key=lambda x: x[1][1])
                 del self._cache[oldest[0]]
+
+    def invalidate(self, target: str, context: str = "") -> bool:
+        """Evict cached VLM result for ``(target, context)``.
+
+        Use when the caller verifies the VLM-returned coordinates didn't
+        actually work (e.g. click at returned (x,y) but expected UI state
+        change didn't happen). Without invalidation the wrong coordinates
+        would be re-used for up to ``cache_ttl_sec`` (default 300s).
+
+        Args:
+            target: same ``target`` string as in ``find_element``
+            context: same ``context`` string as in ``find_element``
+
+        Returns:
+            True if a cached entry was removed, False if none matched.
+        """
+        key = self._cache_key(target, context)
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+        return False
