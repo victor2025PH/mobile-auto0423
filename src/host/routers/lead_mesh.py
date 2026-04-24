@@ -386,3 +386,18 @@ def api_funnel_report(days: int = Query(default=7, ge=1, le=90),
     from src.host.lead_mesh.funnel_report import compute_funnel
     stats = compute_funnel(days=days, actor=actor or None)
     return stats.to_dict()
+
+
+# ── Phase 8d: 点击某 blocked reason 看具体 peer 列表 ────────────────
+@router.get("/funnel/blocked-peers")
+def api_blocked_peers(reason: str = Query(...),
+                       days: int = Query(default=7, ge=1, le=90),
+                       limit: int = Query(default=50, ge=1, le=200)):
+    """被某 greeting_blocked.reason 挡住的 peer 列表, 按最近时间倒序.
+
+    供 Dashboard 点击 top_blocked_reason 子 modal 展示, 帮运营定位个案.
+    """
+    from src.host.lead_mesh.funnel_report import list_blocked_peers
+    peers = list_blocked_peers(reason=reason, days=days, limit=limit)
+    return {"reason": reason, "days": days, "count": len(peers),
+             "peers": peers}

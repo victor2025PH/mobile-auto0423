@@ -141,6 +141,73 @@ class TestFunnelAggregation:
         assert stats_a.total_greeting_sent == 1
 
 
+class TestBlockedPeers:
+    """list_blocked_peers 按 reason 过滤 + 去重聚合 + 按最近倒序."""
+
+    def test_empty_returns_empty(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import list_blocked_peers
+        assert list_blocked_peers("no_message_button", days=7) == []
+
+    def test_filters_by_reason(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import list_blocked_peers
+
+        cid_a = resolve_identity(platform="facebook",
+                                   account_id="fb:BA", display_name="BA")
+        cid_b = resolve_identity(platform="facebook",
+                                   account_id="fb:BB", display_name="BB")
+        # cid_a: 2 次 no_message_button
+        for _ in range(2):
+            append_journey(cid_a, actor="agent_a", action="greeting_blocked",
+                             data={"reason": "no_message_button"})
+        # cid_b: 1 次 phase_blocked (不同 reason, 不该匹)
+        append_journey(cid_b, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "phase_blocked"})
+
+        peers = list_blocked_peers("no_message_button", days=7)
+        assert len(peers) == 1
+        assert peers[0]["canonical_id"] == cid_a
+        assert peers[0]["n_blocked"] == 2
+
+    def test_multiple_peers_sorted_by_last_at(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import list_blocked_peers
+        import time as _t
+
+        cid_old = resolve_identity(platform="facebook",
+                                     account_id="fb:Old", display_name="Old")
+        cid_new = resolve_identity(platform="facebook",
+                                     account_id="fb:New", display_name="New")
+
+        append_journey(cid_old, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "cap_hit"})
+        _t.sleep(1.1)  # 确保秒级区别
+        append_journey(cid_new, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "cap_hit"})
+
+        peers = list_blocked_peers("cap_hit", days=7)
+        # 最近的排前
+        assert peers[0]["canonical_id"] == cid_new
+        assert peers[1]["canonical_id"] == cid_old
+
+    def test_persona_key_in_output(self, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        from src.host.lead_mesh.funnel_report import list_blocked_peers
+
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:P", display_name="P")
+        append_journey(cid, actor="agent_a", action="greeting_blocked",
+                         data={"reason": "template_empty",
+                               "persona_key": "jp_female_midlife"})
+        peers = list_blocked_peers("template_empty", days=7)
+        assert len(peers) == 1
+        assert peers[0]["persona_key"] == "jp_female_midlife"
+
+    def test_empty_reason_returns_empty(self, tmp_db):
+        from src.host.lead_mesh.funnel_report import list_blocked_peers
+        assert list_blocked_peers("", days=7) == []
+
+
 class TestTextReport:
     def test_format_text_empty(self, tmp_db):
         from src.host.lead_mesh.funnel_report import (compute_funnel,
