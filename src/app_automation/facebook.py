@@ -1145,12 +1145,10 @@ class FacebookAutomation(BaseAutomation):
                     f"Messenger 撞风控: {risk_msg}",
                     hint=risk_msg or "phase 应切 cooldown")
 
-            # ── 4. Messenger 搜索入口 ──────────────────────────────────
-            if not self.smart_tap("Search in Messenger", device_id=did):
-                raise MessengerError(
-                    "search_ui_missing",
-                    "Messenger 里搜索按钮未找到",
-                    hint="可能是 cold start/UI 变更,建议 A 稍后重试")
+            # ── 4. Messenger 搜索入口 (2026-04-24 改: 三级 fallback) ─────
+            # smart_tap → multi-locale selector (_MESSENGER_SEARCH_SELECTORS)
+            # → coordinate (top 20%)。详见 _enter_messenger_search docstring。
+            self._enter_messenger_search(d, did)
             time.sleep(0.5)
             self.hb.type_text(d, recipient)
             time.sleep(1.5)
@@ -1164,15 +1162,17 @@ class FacebookAutomation(BaseAutomation):
                     hint="peer 未加好友/昵称变更/索引延迟,A 可 5-15s 后重试")
 
             time.sleep(1)
+            # 2026-04-24 safety: 显式 tap composer 确保 focus — 真机观察到
+            # 某些 Messenger 版本打开对话后 composer 未自动 focus, 直接
+            # hb.type_text 会打到错地方 (e.g. stale search box)。
+            self._focus_messenger_composer(d)
             self.hb.type_text(d, rewritten)
             self.hb.wait_think(0.5)
 
-            # ── 6. 发送 ─────────────────────────────────────────────────
-            if not self.smart_tap("Send message button", device_id=did):
-                raise MessengerError(
-                    "send_button_missing",
-                    "Messenger Send 按钮点不到",
-                    hint="可能被键盘遮挡/文案违禁被灰出,A 可降级走 FB 个人页 DM")
+            # ── 6. 发送 (2026-04-24 改: 三级 fallback) ──────────────────
+            # smart_tap → multi-locale (_MESSENGER_SEND_SELECTORS) →
+            # coordinate (0.93w, 0.91h)。详见 _tap_messenger_send docstring。
+            self._tap_messenger_send(d, did)
 
             # ── 7. F4: 检测 FB 点 Send 后的"内容违禁"弹窗 ─────────────
             # A→B review Q6 建议的新 code。UI 出现 "This message can't be
@@ -1203,6 +1203,159 @@ class FacebookAutomation(BaseAutomation):
         # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
         return False  # pragma: no cover
+
+    # ── Messenger UI multi-locale selectors (2026-04-24 实测真机新增) ──
+    # `smart_tap(target_desc)` 走 AutoSelector engine (自学习式 UI 定位), 对
+    # 2026 版 Messenger 中文化 UI 命中率低 ("Search in Messenger" 过时成了
+    # "问问 Meta AI 或自行搜索", "Message" 成了 desc="输入消息"), 真机跑
+    # send_message 触发 MessengerError(code='search_ui_missing')。
+    #
+    # 下列常量在 smart_tap MISS 时作 fallback — 按顺序尝试多语言 content-desc
+    # 和 text, 配合 coordinate fallback, 形成"smart_tap → multi-locale
+    # selector → coordinate"三级降级, 不改 AutoSelector 共享 engine 避免跨
+    # bot 影响。维护建议: 真机跑时发现 locale 没覆盖 → 追加到对应 tuple。
+
+    _MESSENGER_SEARCH_SELECTORS = (
+        # uiautomator2 d(**kwargs).exists() — 按优先级 try, 第一个 hit 返回
+        {"description": "搜索"},           # zh 简 content-desc
+        {"description": "搜尋"},           # zh 繁
+        {"description": "Search"},         # en
+        {"description": "検索"},           # ja
+        {"descriptionContains": "Meta AI"},  # 2026 "问问 Meta AI 或自行搜索"
+        {"textContains": "Meta AI"},
+        {"textContains": "问问"},          # zh 2026 search bar text 前缀
+        {"textContains": "Ask Meta AI"},   # en 2026
+        {"textContains": "Search in Messenger"},  # en 老版
+    )
+
+    _MESSENGER_COMPOSER_SELECTORS = (
+        {"description": "输入消息"},       # zh 2026 content-desc (实测)
+        {"description": "Message"},        # en
+        {"description": "メッセージ"},     # ja
+        {"text": "发消息"},               # zh placeholder
+        {"text": "Message..."},           # en placeholder
+        {"text": "メッセージを入力"},      # ja placeholder
+        {"textContains": "发消息"},
+        {"textContains": "Message"},
+    )
+
+    _MESSENGER_SEND_SELECTORS = (
+        {"description": "Send"},           # en
+        {"description": "发送"},           # zh
+        {"description": "送信"},           # ja
+        {"descriptionContains": "Send"},
+        {"descriptionContains": "发送"},
+        {"descriptionContains": "送信"},
+    )
+
+    def _find_messenger_ui_fallback(self, d, selectors, timeout_total: float = 3.0):
+        """Smart_tap MISS 时的 multi-locale selector fallback。
+
+        按 ``selectors`` 顺序尝试 ``d(**kwargs).exists(timeout=...)``, 第一个
+        hit 的返回 UiObject; 都 miss 返回 ``None``。每个 selector 最少分
+        0.3s, 均分 ``timeout_total``, 早退。
+
+        调用方配合 coordinate fallback 形成 3 级降级。
+        """
+        per_timeout = max(0.3, timeout_total / max(1, len(selectors)))
+        for kwargs in selectors:
+            try:
+                obj = d(**kwargs)
+                if obj.exists(timeout=per_timeout):
+                    return obj
+            except Exception:
+                continue
+        return None
+
+    def _enter_messenger_search(self, d, device_id: str) -> None:
+        """Open Messenger search UI — smart_tap → multi-locale → coordinate
+        三级 fallback。三路都失败抛 ``MessengerError(code='search_ui_missing')``。
+
+        修 2026-04-24 真机观察到的 "search_ui_missing" (中文 Messenger 的
+        search bar 是 "问问 Meta AI 或自行搜索", 不在 smart_tap 知识库)。
+        """
+        if self.smart_tap("Search in Messenger", device_id=device_id):
+            return
+        obj = self._find_messenger_ui_fallback(
+            d, self._MESSENGER_SEARCH_SELECTORS)
+        if obj is not None:
+            try:
+                obj.click()
+                time.sleep(0.4)
+                return
+            except Exception as e:
+                log.debug(
+                    "[_enter_messenger_search] multi-locale click 失败: %s", e)
+        # coordinate fallback: search bar 在顶部 (y ≈ 0.20 * height)
+        try:
+            w, h = d.window_size()
+            d.click(w // 2, int(h * 0.20))
+            time.sleep(0.8)
+            # 验证 search EditText 出现了
+            if d(className="android.widget.EditText").exists(timeout=2):
+                return
+        except Exception as e:
+            log.debug(
+                "[_enter_messenger_search] coordinate click 异常: %s", e)
+        raise MessengerError(
+            "search_ui_missing",
+            "Messenger 搜索入口三路 fallback 都失败",
+            hint=("smart_tap + multi-locale (_MESSENGER_SEARCH_SELECTORS) + "
+                  "coordinate (top 20%) 全 miss; UI 改版需维护常量 或 "
+                  "config/apps/facebook.yaml 的 smart_tap 规则"))
+
+    def _tap_messenger_send(self, d, device_id: str) -> None:
+        """Tap Messenger Send button — smart_tap → multi-locale → coordinate
+        右下 三级 fallback。三路都失败抛 ``MessengerError(code=
+        'send_button_missing')``。
+
+        coordinate 兜底 position: ``(width*0.93, height*0.91)`` — Send button
+        通常在 composer 右端, 该比例对 720x1600 (Redmi 13C) 实测 ≈ (670, 1456),
+        对更大屏幕也按比例缩放。
+        """
+        if self.smart_tap("Send message button", device_id=device_id):
+            return
+        obj = self._find_messenger_ui_fallback(
+            d, self._MESSENGER_SEND_SELECTORS)
+        if obj is not None:
+            try:
+                obj.click()
+                return
+            except Exception as e:
+                log.debug(
+                    "[_tap_messenger_send] multi-locale click 失败: %s", e)
+        # coordinate fallback: send button 在 composer 右端底部
+        try:
+            w, h = d.window_size()
+            d.click(int(w * 0.93), int(h * 0.91))
+            return
+        except Exception as e:
+            log.debug(
+                "[_tap_messenger_send] coordinate click 异常: %s", e)
+        raise MessengerError(
+            "send_button_missing",
+            "Messenger Send 按钮三路 fallback 都失败",
+            hint=("smart_tap + multi-locale (_MESSENGER_SEND_SELECTORS) + "
+                  "coordinate (0.93w, 0.91h) 全 miss; 可能 composer focus "
+                  "丢或 UI 改版"))
+
+    def _focus_messenger_composer(self, d) -> bool:
+        """2026-04-24 真机 safety: 在 ``hb.type_text`` 之前显式 tap composer
+        确保 focus。返回是否成功找到并 tap。失败不抛, 让后续 type_text 自生自灭
+        (保持向后兼容老流程 — 老代码没这步 type_text 仍能工作)。
+        """
+        obj = self._find_messenger_ui_fallback(
+            d, self._MESSENGER_COMPOSER_SELECTORS, timeout_total=1.5)
+        if obj is None:
+            return False
+        try:
+            obj.click()
+            time.sleep(0.3)
+            return True
+        except Exception as e:
+            log.debug(
+                "[_focus_messenger_composer] click 失败 (继续走 type_text): %s", e)
+            return False
 
     # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (en/zh/ja/it/es 对齐
     # persona)。要改请同步改 src/host/fb_store.py::_RISK_KIND_RULES 的
