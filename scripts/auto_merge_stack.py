@@ -338,6 +338,13 @@ def check_readiness(plan: MergePlan, token: Optional[str],
         plan.status = "blocked"
         plan.error = "未 APPROVED (或未带 approve-equivalent marker)"
         return
+    # base 安全性: base 非 main 且不在本 run 已合 head 里 → 对应 PR 仍 open,
+    # 直接 PUT /merge 会合进栈分支而不是 main (2026-04-24 PR #10 踩坑)。
+    # 等 base PR 合了再回头处理。
+    if plan.base != "main" and plan.base not in merged_branches:
+        plan.status = "blocked"
+        plan.error = f"等 base PR 先合 (base={plan.base})"
+        return
     # mergeable_state: clean / stable = 绿灯; blocked / dirty / behind = 问题
     if plan.mergeable_state in ("dirty", "blocked"):
         plan.status = "blocked"
