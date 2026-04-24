@@ -4921,6 +4921,16 @@ class FacebookAutomation(BaseAutomation):
                     "intent": intent_tag,  # P4 意图信号
                 },
             )
+
+        # P10b L3 结构化记忆 — LLM 抽取 extracted_facts 写 fb_contact_events。
+        # 默认 config.enabled=False, 不激活则 zero cost (gate 首行就 skip,
+        # 不触发 LLM client 初始化)。真机跑一段时间观察后通过 config 开。
+        try:
+            from src.ai.chat_facts_extractor import run_facts_extraction
+            run_facts_extraction(did, peer_name, preset_key=preset_key)
+        except Exception as e:
+            log.debug("[ai_reply] facts_extractor 失败(降级): %s", e)
+
         return reply, decision
 
     def _open_message_requests_fallback(self, d) -> bool:
