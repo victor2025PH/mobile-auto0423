@@ -241,3 +241,71 @@ class TestBoundsCheck:
         vf.find_element(
             device=None, target="x", context="c", screenshot_bytes=png)
         assert vf._get_cache(vf._cache_key("x", "c")) is None
+
+
+# ─── P13 (2026-04-24): _parse_response 负坐标正则 bug fix ────────────
+
+class TestParseResponseNegativeCoords:
+    """原 regex `(\\d+)` 吞掉负号 — `COORDINATES: -10, 20` 被解为 `(10, 20)`
+    绕过 find_element 的 img bounds check (`x < 0` 永远不 trigger)。现改
+    `(-?\\d+)` 保负号 + 下游 bounds check 正常 reject。"""
+
+    def test_primary_parses_negative_x(self):
+        from src.ai.vision_fallback import VisionFallback
+        r = VisionFallback._parse_response("COORDINATES: -10, 20")
+        assert r.coordinates == (-10, 20)
+        assert r.confidence == "high"
+
+    def test_primary_parses_negative_y(self):
+        from src.ai.vision_fallback import VisionFallback
+        r = VisionFallback._parse_response("COORDINATES: 100, -5")
+        assert r.coordinates == (100, -5)
+
+    def test_primary_parses_both_negative(self):
+        from src.ai.vision_fallback import VisionFallback
+        r = VisionFallback._parse_response("COORDINATES: -10, -20")
+        assert r.coordinates == (-10, -20)
+
+    def test_primary_parses_positive_unchanged(self):
+        """正常正数解析不变 (向后兼容 regression guard)。"""
+        from src.ai.vision_fallback import VisionFallback
+        r = VisionFallback._parse_response("COORDINATES: 500, 300")
+        assert r.coordinates == (500, 300)
+
+    def test_secondary_negative_rejected_by_range_check(self):
+        """secondary fallback (no 'COORDINATES:' prefix) 捕到负数 → 被
+        `0 < x < 2000` range check 拒, 不返 coords (降级 description)。"""
+        from src.ai.vision_fallback import VisionFallback
+        r = VisionFallback._parse_response("看点 -10, 200 附近")
+        # range check rejects negative → no coordinates set
+        assert r.coordinates is None
+
+    def test_secondary_positive_in_text_still_works(self):
+        """secondary 正常 `宽数字, 宽数字` 匹配不变 (regression)。"""
+        from src.ai.vision_fallback import VisionFallback
+        r = VisionFallback._parse_response("元素位于 540, 438 处")
+        assert r.coordinates == (540, 438)
+        assert r.confidence == "medium"
+
+    def test_bounds_check_catches_negative_from_primary(self):
+        """端到端: primary 解析 `-10, 20`, find_element 的 img bounds check
+        reject (x < 0), 不入 cache, retry 下次。"""
+        from src.ai.vision_fallback import VisionFallback, VisionConfig
+        client = MagicMock()
+        # 3 次 retry: 第 1 次返 neg, 第 2 次返 valid
+        client.chat_vision = MagicMock(side_effect=[
+            "COORDINATES: -10, 20",
+            "COORDINATES: 300, 400",
+        ])
+        vf = VisionFallback(
+            client=client,
+            config=VisionConfig(hourly_budget=20, max_retries=3))
+        png_bytes = (b"\x89PNG\r\n\x1a\n"
+                      + (13).to_bytes(4, "big") + b"IHDR"
+                      + (720).to_bytes(4, "big") + (1600).to_bytes(4, "big"))
+        r = vf.find_element(
+            device=None, target="t", context="c",
+            screenshot_bytes=png_bytes)
+        # 第 1 次 (-10, 20) 被 bounds check reject, 第 2 次 (300, 400) HIT
+        assert r and r.coordinates == (300, 400)
+        assert client.chat_vision.call_count == 2

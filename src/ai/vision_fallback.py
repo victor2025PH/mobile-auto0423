@@ -221,15 +221,29 @@ class VisionFallback:
 
     @staticmethod
     def _parse_response(response: str) -> VisionResult:
+        """Parse VLM text response → (x, y) coords。
+
+        2026-04-24 bugfix: 原 regex `(\\d+)` 吞掉前导 `-` — 比如 VLM 返
+        `COORDINATES: -10, 20` 会被解成 `(10, 20)`, 绕过 ``find_element`` 的
+        img-size bounds check (`x < 0` 条件永远不触发)。改 `(-?\\d+)` 保留
+        负号; 后续 bounds check (caller) 自然 reject 负坐标。
+
+        Secondary fallback (`\\d{2,4}, \\d{2,4}`) 原用 `\\b` word boundary
+        也有同 bug (`-` 是非 word char → `\\b` 命中 `-|10` 中间, 数字部分被
+        单独捕获)。现同样改 `(-?\\d{1,4})` + 去 `\\b` 依靠数字长度 + 上下文
+        避免误匹配。
+        """
         result = VisionResult(raw_response=response)
 
-        coord_match = re.search(r'COORDINATES:\s*(\d+)\s*,\s*(\d+)', response)
+        coord_match = re.search(
+            r'COORDINATES:\s*(-?\d+)\s*,\s*(-?\d+)', response)
         if coord_match:
-            result.coordinates = (int(coord_match.group(1)), int(coord_match.group(2)))
+            result.coordinates = (
+                int(coord_match.group(1)), int(coord_match.group(2)))
             result.confidence = "high"
             return result
 
-        num_match = re.findall(r'\b(\d{2,4})\s*,\s*(\d{2,4})\b', response)
+        num_match = re.findall(r'(-?\d{2,4})\s*,\s*(-?\d{2,4})', response)
         if num_match:
             x, y = int(num_match[0][0]), int(num_match[0][1])
             if 0 < x < 2000 and 0 < y < 3000:
