@@ -199,6 +199,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="输出 JSON (供 CI / before-after 对比)")
     parser.add_argument(
         "--no-color", action="store_true", help="(保留 — 当前输出无 color)")
+    parser.add_argument(
+        "--throttle-sec", type=float, default=0.0,
+        help=("每 case 间 sleep 秒数, 避 free-tier RPM (default 0). "
+              "Gemini 2.5 Flash 免费 ~60 RPM, 14 cases 背靠背会打爆限额 "
+              "导致 MISS latency 飙到 ~32s (429 retry cycle 耗尽) 而非 "
+              "真 prompt 问题。建议 Gemini: 30s; Ollama/付费: 0"))
+    parser.add_argument(
+        "--progress", action="store_true",
+        help="每 case 结束时往 stderr 打一行 status — 长跑时观察进度")
     args = parser.parse_args(argv)
 
     cases_path = Path(args.cases).resolve()
@@ -234,7 +243,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: no cases in dataset {cases_path}", file=sys.stderr)
         return 2
 
-    results = [run_one(vf, c, base_dir) for c in cases]
+    results: List[EvalResult] = []
+    for i, c in enumerate(cases):
+        if i > 0 and args.throttle_sec > 0:
+            time.sleep(args.throttle_sec)
+        r = run_one(vf, c, base_dir)
+        results.append(r)
+        if args.progress:
+            coord = r.coordinates if r.coordinates else "---"
+            print(
+                f"  [{i + 1:2d}/{len(cases)}] {r.status:5s} "
+                f"{c.screenshot:26s} | {c.target[:35]:35s} "
+                f"coords={coord} lat={r.latency_sec:.1f}s",
+                file=sys.stderr, flush=True)
 
     if args.json:
         print(json.dumps(

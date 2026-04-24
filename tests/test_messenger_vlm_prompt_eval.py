@@ -294,3 +294,140 @@ class TestMain:
         assert "provider" in data
         assert data["provider"] == "gemini"
         assert data["results"][0]["status"] == "HIT"
+
+
+# ─── P7 (2026-04-24): --throttle-sec / --progress ───────────────────
+
+def _cases_file(tmp_path, n=3):
+    """Write n cases + n .png stubs, return path to cases yaml."""
+    lines = []
+    for i in range(n):
+        (tmp_path / f"case{i}.png").write_bytes(b"fake")
+        lines.append(f"- screenshot: case{i}.png")
+        lines.append(f"  target: t{i}")
+        lines.append(f"  ground_truth_bbox: [0, 0, 1000, 1000]")
+    cases = tmp_path / "c.yaml"
+    cases.write_text("\n".join(lines), encoding="utf-8")
+    return cases
+
+
+def _mock_vlm(coords=(100, 200)):
+    """Fake vision fallback result fixture."""
+    r = MagicMock()
+    r.coordinates = coords
+    r.raw_response = ""
+    return r
+
+
+class TestThrottle:
+    """--throttle-sec 2026-04-24: 背靠背 Gemini 打爆 free tier RPM, 加 sleep
+    让 eval 真反映 prompt 质量而非 429 backoff。"""
+
+    def test_default_no_sleep(self, eval_mod, tmp_path):
+        """无 --throttle-sec → 不 sleep (向后兼容)。"""
+        cases = _cases_file(tmp_path, n=3)
+        fake_client = MagicMock()
+        fake_client.config.provider = "gemini"
+        fake_client.config.vision_model = "gemini-2.5-flash"
+        fake_vf = MagicMock()
+        fake_vf.find_element = MagicMock(return_value=_mock_vlm())
+        with patch("src.ai.llm_client.get_free_vision_client",
+                   return_value=fake_client), \
+             patch("src.ai.vision_fallback.VisionFallback",
+                   return_value=fake_vf), \
+             patch(f"{eval_mod.__name__}.time.sleep") as sleep:
+            rc = eval_mod.main(["--cases", str(cases)])
+        assert rc == 0
+        sleep.assert_not_called()
+
+    def test_throttle_sleeps_between_not_before_or_after(self, eval_mod,
+                                                          tmp_path):
+        """--throttle-sec 5 + 4 cases → 3 次 sleep(5), 不在首 case 前或末 case 后。"""
+        cases = _cases_file(tmp_path, n=4)
+        fake_client = MagicMock()
+        fake_client.config.provider = "gemini"
+        fake_client.config.vision_model = "gemini-2.5-flash"
+        fake_vf = MagicMock()
+        fake_vf.find_element = MagicMock(return_value=_mock_vlm())
+        with patch("src.ai.llm_client.get_free_vision_client",
+                   return_value=fake_client), \
+             patch("src.ai.vision_fallback.VisionFallback",
+                   return_value=fake_vf), \
+             patch(f"{eval_mod.__name__}.time.sleep") as sleep:
+            eval_mod.main(["--cases", str(cases), "--throttle-sec", "5"])
+        # 4 cases → 3 gaps (between cases). 首 case 前不 sleep, 末 case 后也不。
+        assert sleep.call_count == 3
+        # 每次 sleep 都是 5s
+        for c in sleep.call_args_list:
+            assert c.args[0] == 5.0
+
+    def test_throttle_single_case_no_sleep(self, eval_mod, tmp_path):
+        """只有 1 case → 不 sleep (无 gap)。"""
+        cases = _cases_file(tmp_path, n=1)
+        fake_client = MagicMock()
+        fake_client.config.provider = "gemini"
+        fake_client.config.vision_model = "gemini-2.5-flash"
+        fake_vf = MagicMock()
+        fake_vf.find_element = MagicMock(return_value=_mock_vlm())
+        with patch("src.ai.llm_client.get_free_vision_client",
+                   return_value=fake_client), \
+             patch("src.ai.vision_fallback.VisionFallback",
+                   return_value=fake_vf), \
+             patch(f"{eval_mod.__name__}.time.sleep") as sleep:
+            eval_mod.main(["--cases", str(cases), "--throttle-sec", "30"])
+        sleep.assert_not_called()
+
+    def test_throttle_zero_no_sleep(self, eval_mod, tmp_path):
+        """显式 --throttle-sec 0 也不 sleep。"""
+        cases = _cases_file(tmp_path, n=3)
+        fake_client = MagicMock()
+        fake_client.config.provider = "gemini"
+        fake_client.config.vision_model = "gemini-2.5-flash"
+        fake_vf = MagicMock()
+        fake_vf.find_element = MagicMock(return_value=_mock_vlm())
+        with patch("src.ai.llm_client.get_free_vision_client",
+                   return_value=fake_client), \
+             patch("src.ai.vision_fallback.VisionFallback",
+                   return_value=fake_vf), \
+             patch(f"{eval_mod.__name__}.time.sleep") as sleep:
+            eval_mod.main(["--cases", str(cases), "--throttle-sec", "0"])
+        sleep.assert_not_called()
+
+
+class TestProgress:
+    """--progress 让长跑能被观察 (back-to-back 14 cases throttled 7min)。"""
+
+    def test_progress_writes_stderr_per_case(self, eval_mod, tmp_path, capsys):
+        cases = _cases_file(tmp_path, n=2)
+        fake_client = MagicMock()
+        fake_client.config.provider = "gemini"
+        fake_client.config.vision_model = "gemini-2.5-flash"
+        fake_vf = MagicMock()
+        fake_vf.find_element = MagicMock(return_value=_mock_vlm())
+        with patch("src.ai.llm_client.get_free_vision_client",
+                   return_value=fake_client), \
+             patch("src.ai.vision_fallback.VisionFallback",
+                   return_value=fake_vf):
+            eval_mod.main(["--cases", str(cases), "--progress"])
+        err = capsys.readouterr().err
+        # 2 cases → 2 progress 行
+        assert err.count("[ 1/2]") == 1
+        assert err.count("[ 2/2]") == 1
+        assert "HIT" in err
+
+    def test_no_progress_silent_stderr(self, eval_mod, tmp_path, capsys):
+        cases = _cases_file(tmp_path, n=2)
+        fake_client = MagicMock()
+        fake_client.config.provider = "gemini"
+        fake_client.config.vision_model = "gemini-2.5-flash"
+        fake_vf = MagicMock()
+        fake_vf.find_element = MagicMock(return_value=_mock_vlm())
+        with patch("src.ai.llm_client.get_free_vision_client",
+                   return_value=fake_client), \
+             patch("src.ai.vision_fallback.VisionFallback",
+                   return_value=fake_vf):
+            eval_mod.main(["--cases", str(cases)])
+        err = capsys.readouterr().err
+        # 无 progress 应 stderr 干净 (不含 case 行)
+        assert "[ 1/2]" not in err
+        assert "[ 2/2]" not in err
