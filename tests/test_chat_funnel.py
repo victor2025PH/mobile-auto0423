@@ -121,12 +121,21 @@ class TestStrangerConversionRate:
 # ─── gate_block_distribution ─────────────────────────────────────────────────
 
 class TestGateBlockDistribution:
-    def test_phase5_not_merged_returns_empty(self, tmp_db):
+    def test_returns_empty_shell_when_table_missing(self, tmp_db):
+        """Graceful-degradation: `fb_contact_events` 表不存在 (或 SELECT 抛) →
+        返含 `note` 键的 empty shell, 不抛。原 "phase5 未 merge" 场景 —
+        init_db 现在会建表, 本测试显式 DROP 表模拟"DB 未迁移" case 以覆盖
+        `except Exception` 分支。"""
         from src.analytics.chat_funnel import gate_block_distribution
+        from src.host.fb_store import _connect
+        with _connect() as conn:
+            conn.execute("DROP TABLE IF EXISTS fb_contact_events")
+            conn.commit()
         r = gate_block_distribution()
-        # tmp_db 没建 fb_contact_events 表 → 应返 empty shell
         assert r.get("by_channel") == {}
-        assert "note" in r
+        assert r.get("by_peer_type") == {}
+        assert r.get("by_intent_at_referral") == {}
+        assert "note" in r  # graceful-degradation 标志位
 
     def test_with_fake_contact_events_table(self, tmp_db):
         """手建 fb_contact_events 表 + 种数据, 验聚合正确。"""

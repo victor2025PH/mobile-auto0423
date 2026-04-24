@@ -244,11 +244,17 @@ class TestRunFactsExtraction:
 # ─── _persist_extraction ─────────────────────────────────────────────────────
 
 class TestPersistExtraction:
-    def test_phase5_not_merged_returns_false(self, tmp_db):
-        from src.ai.chat_facts_extractor import _persist_extraction
-        # fb_contact_events 表不存在 → record_contact_event 未导入
-        assert _persist_extraction("d1", "Alice", {"occupation": "x"},
-                                    "reason") is False
+    def test_returns_false_when_record_contact_event_unavailable(self, tmp_db):
+        """Graceful-degradation: `record_contact_event` ImportError → return
+        False 不抛。原 "phase5 未 merge" 场景 — phase5 merge 后 import 总能成功,
+        本测试用 import 层 patch 模拟"infra 缺失" case 以覆盖 except ImportError
+        分支 (生产里理论上不触发, 但 defensive code 值得有 test)。"""
+        from src.ai import chat_facts_extractor
+        # 模拟 src.host.fb_store.record_contact_event 导入失败
+        import sys
+        with patch.dict(sys.modules, {"src.host.fb_store": None}):
+            assert chat_facts_extractor._persist_extraction(
+                "d1", "Alice", {"occupation": "x"}, "reason") is False
 
     def test_persists_when_record_contact_event_available(self, tmp_db,
                                                            monkeypatch):
