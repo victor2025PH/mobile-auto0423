@@ -97,22 +97,65 @@ class VisionFallback:
 
         img_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
 
+        # 2026-04-24 P5a: 解析 image 维度供 bounds validation
+        # (eval 发现 Gemini 2.5 Flash 常返超屏 coord e.g. (980, 2020) on
+        # 720x1600 image, d.click() 打屏外无效)。
+        img_w, img_h = self._png_dimensions(screenshot_bytes)
+
         prompt = self._build_prompt(target, context)
 
         for attempt in range(self.config.max_retries):
             response = self._client.chat_vision(prompt, img_b64, max_tokens=200)
-            if response:
-                result = self._parse_response(response)
-                self._record_call()
-                if result.coordinates:
-                    self._set_cache(cache_key, result)
-                    log.info("VisionFallback found '%s' at %s", target, result.coordinates)
-                    return result
-                log.debug("VisionFallback no coordinates in response (attempt %d)", attempt + 1)
+            if not response:
+                continue
+            result = self._parse_response(response)
+            self._record_call()
+            if not result.coordinates:
+                log.debug(
+                    "VisionFallback no coordinates (attempt %d)", attempt + 1)
+                continue
+            # P5a bounds check: 超屏 VLM 返值 treated as miss, retry
+            x, y = result.coordinates
+            if img_w and img_h and (
+                    x < 0 or x >= img_w or y < 0 or y >= img_h):
+                log.warning(
+                    "VisionFallback out-of-bounds coords (%d, %d) for image "
+                    "%dx%d, rejecting (attempt %d)",
+                    x, y, img_w, img_h, attempt + 1)
+                continue
+            self._set_cache(cache_key, result)
+            log.info(
+                "VisionFallback found '%s' at %s", target, result.coordinates)
+            return result
 
-        log.warning("VisionFallback failed to find '%s' after %d attempts", target, self.config.max_retries)
-        self._record_call()
+        log.warning(
+            "VisionFallback failed to find '%s' after %d attempts",
+            target, self.config.max_retries)
         return None
+
+    @staticmethod
+    def _png_dimensions(png_bytes):
+        """解析 PNG bytes 前 24 字节拿 (width, height)。
+
+        PNG spec: 8-byte signature + 4-byte chunk length + 4-byte 'IHDR' +
+        4-byte width + 4-byte height。malformed/non-PNG/太短 返 (None, None)。
+        零依赖 (无 PIL), 最小开销。
+
+        Returns:
+            Tuple[Optional[int], Optional[int]] — (width, height) 或 (None, None)
+        """
+        if not png_bytes or len(png_bytes) < 24:
+            return None, None
+        if png_bytes[:8] != b"\x89PNG\r\n\x1a\n":
+            return None, None
+        try:
+            w = int.from_bytes(png_bytes[16:20], "big")
+            h = int.from_bytes(png_bytes[20:24], "big")
+            if 0 < w <= 100000 and 0 < h <= 100000:  # sanity
+                return w, h
+        except Exception:
+            pass
+        return None, None
 
     def identify_screen(self, device, context: str = "") -> str:
         """Identify what screen/state the app is currently showing."""
