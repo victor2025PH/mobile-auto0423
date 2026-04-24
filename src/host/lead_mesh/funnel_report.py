@@ -1,0 +1,218 @@
+# -*- coding: utf-8 -*-
+"""Phase 8 准备: lead_journey 漏斗分析 library (2026-04-24).
+
+从 ``lead_journey`` 表汇总 add_friend → greeting 漏斗, 按 persona_key / via /
+reason 分组, 计算转化率.
+
+单独成 lib 是因为:
+  * 单测友好 (不依赖 CLI)
+  * 可被 Dashboard API / scheduled job 复用
+
+核心事件 (2026-04-23 Phase 6.A 后的 schema):
+  * friend_requested         data: {source, preset_key, note_len, persona_key}
+  * friend_request_risk      data: {source, ...}
+  * greeting_sent            data: {via: inline_profile_message | messenger_fallback,
+                                    template_id, persona_key}
+  * greeting_blocked         data: {reason: no_message_button / peer_already_handed_off /
+                                           cap_hit / phase_blocked / template_empty /
+                                           messenger_not_installed / search_miss / ...}
+  * handoff_created          data: {channel, receiver_account_key}
+  * handoff_blocked          data: {reason: peer_cooldown}
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from src.host.database import _connect
+
+
+@dataclass
+class FunnelStats:
+    """一个时间窗口的 A 端漏斗统计."""
+    window_days: int = 0
+    since_iso: str = ""
+
+    # 计数
+    total_extracted: int = 0
+    total_friend_requested: int = 0
+    total_friend_request_risk: int = 0
+    total_greeting_sent: int = 0
+    total_greeting_blocked: int = 0
+
+    # greeting_sent.via 分布
+    greeting_via_inline: int = 0
+    greeting_via_fallback: int = 0
+    greeting_via_unknown: int = 0
+
+    # greeting_blocked.reason 分布 (Top N)
+    blocked_reasons: Dict[str, int] = field(default_factory=dict)
+
+    # 按 persona 分组的 friend_requested 数 (帮运营看哪类 persona 贡献多)
+    per_persona_friend_requested: Dict[str, int] = field(default_factory=dict)
+
+    # handoff 相关 (Lead Mesh 视角)
+    total_handoff_created: int = 0
+    total_handoff_blocked: int = 0
+
+    # ── 衍生 rate ─────────────────────────────────────────────────
+    @property
+    def rate_greet_after_friend(self) -> float:
+        """已发好友请求中, 有 greeting_sent 的占比."""
+        if self.total_friend_requested == 0:
+            return 0.0
+        return self.total_greeting_sent / self.total_friend_requested
+
+    @property
+    def rate_inline_vs_fallback(self) -> float:
+        """greeting 里 inline 路径占比 (剩下的是 fallback / unknown)."""
+        total = (self.greeting_via_inline + self.greeting_via_fallback
+                    + self.greeting_via_unknown)
+        if total == 0:
+            return 0.0
+        return self.greeting_via_inline / total
+
+    @property
+    def top_blocked_reason(self) -> str:
+        """被挡最多的原因 (帮运营看瓶颈在哪)."""
+        if not self.blocked_reasons:
+            return ""
+        return max(self.blocked_reasons.items(), key=lambda kv: kv[1])[0]
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {
+            "window_days": self.window_days,
+            "since_iso": self.since_iso,
+            "total_extracted": self.total_extracted,
+            "total_friend_requested": self.total_friend_requested,
+            "total_friend_request_risk": self.total_friend_request_risk,
+            "total_greeting_sent": self.total_greeting_sent,
+            "total_greeting_blocked": self.total_greeting_blocked,
+            "greeting_via_inline": self.greeting_via_inline,
+            "greeting_via_fallback": self.greeting_via_fallback,
+            "greeting_via_unknown": self.greeting_via_unknown,
+            "blocked_reasons": dict(self.blocked_reasons),
+            "per_persona_friend_requested": dict(self.per_persona_friend_requested),
+            "total_handoff_created": self.total_handoff_created,
+            "total_handoff_blocked": self.total_handoff_blocked,
+            "rate_greet_after_friend": round(self.rate_greet_after_friend, 3),
+            "rate_inline_vs_fallback": round(self.rate_inline_vs_fallback, 3),
+            "top_blocked_reason": self.top_blocked_reason,
+        }
+        return d
+
+
+def _iso_since(days: int) -> str:
+    dt = _dt.datetime.utcnow() - _dt.timedelta(days=int(days))
+    # lead_journey.at 格式 "YYYY-MM-DD HH:MM:SS" (SQLite datetime('now'))
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def compute_funnel(days: int = 7,
+                    actor: Optional[str] = None) -> FunnelStats:
+    """从 lead_journey 表汇总近 N 天的漏斗. actor 过滤 agent_a/agent_b, 空则不限.
+
+    所有 A 端关心的事件 1 次 SQL 全部拿完, 再在 Python 分桶. 原则: 扫表只 1 次,
+    其他都是内存聚合. 表规模小 (<10k rows) 时远比多次 SQL 快.
+    """
+    stats = FunnelStats(window_days=int(days), since_iso=_iso_since(days))
+
+    sql = ("SELECT actor, action, data_json FROM lead_journey"
+            " WHERE at >= ?")
+    params: list = [stats.since_iso]
+    if actor:
+        sql += " AND actor = ?"
+        params.append(actor)
+
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception:
+        return stats
+
+    for row in rows:
+        # sqlite3 默认 row 是 tuple: (actor, action, data_json)
+        act = row[1] or ""
+        data_raw = row[2] or "{}"
+        try:
+            data = json.loads(data_raw)
+        except Exception:
+            data = {}
+
+        if act == "extracted":
+            stats.total_extracted += 1
+        elif act == "friend_requested":
+            stats.total_friend_requested += 1
+            persona = str(data.get("persona_key") or "(unknown)")
+            stats.per_persona_friend_requested[persona] = (
+                stats.per_persona_friend_requested.get(persona, 0) + 1)
+        elif act == "friend_request_risk":
+            stats.total_friend_request_risk += 1
+        elif act == "greeting_sent":
+            stats.total_greeting_sent += 1
+            via = str(data.get("via") or "").lower()
+            if via == "inline_profile_message":
+                stats.greeting_via_inline += 1
+            elif via == "messenger_fallback":
+                stats.greeting_via_fallback += 1
+            else:
+                stats.greeting_via_unknown += 1
+        elif act == "greeting_blocked":
+            stats.total_greeting_blocked += 1
+            reason = str(data.get("reason") or "unknown")
+            stats.blocked_reasons[reason] = (
+                stats.blocked_reasons.get(reason, 0) + 1)
+        elif act == "handoff_created":
+            stats.total_handoff_created += 1
+        elif act == "handoff_blocked":
+            stats.total_handoff_blocked += 1
+
+    return stats
+
+
+def format_text_report(stats: FunnelStats) -> str:
+    """人类友好的控制台输出. 多行 markdown-ish 格式."""
+    lines = [
+        f"# A 端漏斗报告 (近 {stats.window_days} 天)",
+        f"- since: {stats.since_iso}",
+        f"- total extracted: {stats.total_extracted}",
+        f"- friend_requested: {stats.total_friend_requested}"
+        f"  (+{stats.total_friend_request_risk} risk)",
+        f"- greeting_sent: {stats.total_greeting_sent}"
+        f" (inline={stats.greeting_via_inline}"
+        f" fallback={stats.greeting_via_fallback}"
+        f" unknown={stats.greeting_via_unknown})",
+        f"- greeting_blocked: {stats.total_greeting_blocked}",
+        "",
+        f"## Conversion",
+        f"- rate_greet_after_friend: {stats.rate_greet_after_friend:.1%}",
+        f"- rate_inline_vs_fallback: {stats.rate_inline_vs_fallback:.1%}",
+        "",
+        f"## greeting_blocked 分布 (top reasons)",
+    ]
+    if not stats.blocked_reasons:
+        lines.append("  (无)")
+    else:
+        ranked = sorted(stats.blocked_reasons.items(),
+                          key=lambda kv: -kv[1])
+        for r, n in ranked[:8]:
+            lines.append(f"  - {r}: {n}")
+
+    lines += ["",
+              f"## per-persona friend_requested"]
+    if not stats.per_persona_friend_requested:
+        lines.append("  (无)")
+    else:
+        ranked = sorted(stats.per_persona_friend_requested.items(),
+                          key=lambda kv: -kv[1])
+        for p, n in ranked[:8]:
+            lines.append(f"  - {p}: {n}")
+
+    lines += ["",
+              f"## Handoff (Lead Mesh)",
+              f"- handoff_created: {stats.total_handoff_created}",
+              f"- handoff_blocked: {stats.total_handoff_blocked}"]
+
+    return "\n".join(lines)
