@@ -1726,7 +1726,8 @@ class FacebookAutomation(BaseAutomation):
                              phase: Optional[str] = None,
                              source: str = "",
                              preset_key: str = "",
-                             from_current_profile: bool = False) -> bool:
+                             from_current_profile: bool = False,
+                             do_l2_gate: bool = False) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -1749,6 +1750,10 @@ class FacebookAutomation(BaseAutomation):
             phase: 显式覆盖 phase；为空走 fb_account_phase.get_phase
             from_current_profile: True 时跳过 search_people/点首条,假定已在资料页
                 (获客任务 navigate 后加友,避免二次搜索误点)
+            do_l2_gate: Phase 10 prep — True 时在进入资料页后跑 L2 VLM gate
+                (头像/bio 视觉判断 persona match). 默认 False (向后兼容).
+                透传到 ``_add_friend_safe_interaction_on_profile``。
+                真机激活: caller 设 True (需 ollama qwen2.5vl:7b 可达).
         """
         did = self._did(device_id)
         d = self._u2(did)
@@ -1833,13 +1838,15 @@ class FacebookAutomation(BaseAutomation):
                 ab_cfg, daily_cap=int(ab_cfg.get("daily_cap_per_account") or 0),
                 persona_key=persona_key, eff_phase=eff_phase,
                 source=source, preset_key=preset_key,
-                from_current_profile=from_current_profile)
+                from_current_profile=from_current_profile,
+                do_l2_gate=do_l2_gate)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
                                      persona_key, eff_phase,
                                      source: str = "", preset_key: str = "",
-                                     from_current_profile: bool = False):
+                                     from_current_profile: bool = False,
+                                     do_l2_gate: bool = False):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
         if daily_cap > 0:
@@ -1875,7 +1882,8 @@ class FacebookAutomation(BaseAutomation):
                     return False
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
-                    persona_key=persona_key, source=source, preset_key=preset_key)
+                    persona_key=persona_key, source=source, preset_key=preset_key,
+                    do_l2_gate=do_l2_gate)
 
             results = self.search_people(profile_name, did, max_results=3)
             if not results:
@@ -1919,7 +1927,8 @@ class FacebookAutomation(BaseAutomation):
 
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
-                    persona_key=persona_key, source=source, preset_key=preset_key)
+                    persona_key=persona_key, source=source, preset_key=preset_key,
+                    do_l2_gate=do_l2_gate)
             if not self.smart_tap("Add Friend button", device_id=did):
                 return False
             time.sleep(1)
