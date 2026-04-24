@@ -344,10 +344,16 @@ class ComplianceGuard:
         return result
 
     def cleanup_old(self, days: int = 7):
-        """Purge records older than N days."""
+        """Purge records older than N days (inclusive boundary).
+
+        用 `ts <= cutoff` 而非 `<`: Windows `time.time()` 精度约 15.6ms, 刚插的
+        record 和随后 cleanup 的 `cutoff = time.time() - days*86400` 可能落在
+        同一 tick 值相等, `<` 会漏删; 改 `<=` 让 days=0 "清全部" 语义可靠。
+        对 days>0 只影响边界 1 microsecond, 无实质差异。
+        """
         cutoff = time.time() - days * 86400
         with self._conn() as conn:
-            cur = conn.execute("DELETE FROM action_log WHERE ts < ?", (cutoff,))
+            cur = conn.execute("DELETE FROM action_log WHERE ts <= ?", (cutoff,))
             log.info("ComplianceGuard cleanup: removed %d old records", cur.rowcount)
 
     # -- Internal -----------------------------------------------------------
