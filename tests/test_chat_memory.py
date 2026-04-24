@@ -421,3 +421,175 @@ class TestBuildContextBlock:
         assert len(ctx["history"]) == 3
         # profile 聚合用的是全量,不受 limit 影响
         assert ctx["profile"]["peer_reply_count"] == 8
+
+
+# ─── P10 L3: extracted_facts 读侧 ────────────────────────────────────────────
+
+class TestGetPeerExtractedFacts:
+    def test_phase5_not_merged_returns_empty(self, tmp_db):
+        """list_contact_events_by_peer 不存在时返 {}。"""
+        from src.ai.chat_memory import get_peer_extracted_facts
+        # tmp_db 没建 fb_contact_events, 也不在 fb_store 里 — 返 {}
+        # (fb_store 里可能有该函数, 但表不存在, 执行会失败被 catch)
+        result = get_peer_extracted_facts("devA", "Alice")
+        assert result == {}
+
+    def test_empty_args_return_empty(self, tmp_db):
+        from src.ai.chat_memory import get_peer_extracted_facts
+        assert get_peer_extracted_facts("", "Alice") == {}
+        assert get_peer_extracted_facts("devA", "") == {}
+
+    def test_merges_facts_across_events(self, tmp_db, monkeypatch):
+        """多个 event 里有 extracted_facts 应按时序合并, 新覆盖旧。"""
+        from src.ai import chat_memory
+        from src.host import fb_store
+        fake_events = [
+            {"id": 1, "event_type": "message_received",
+             "detected_at": "2026-04-20T10:00:00Z",
+             "meta_json": '{"extracted_facts": {"occupation": "学生", "interests": ["摄影"]}}'},
+            {"id": 2, "event_type": "wa_referral_sent",
+             "detected_at": "2026-04-22T10:00:00Z",
+             "meta_json": '{"extracted_facts": {"occupation": "设计师", "interests": ["旅游"], "location": "Tokyo"}}'},
+        ]
+        monkeypatch.setattr(fb_store, "list_contact_events_by_peer",
+                            lambda did, peer, limit=200: fake_events,
+                            raising=False)
+        facts = chat_memory.get_peer_extracted_facts("devA", "Alice")
+        # occupation 新(设计师)覆盖旧(学生)
+        assert facts["occupation"] == "设计师"
+        # interests 列表合并去重
+        assert "摄影" in facts["interests"]
+        assert "旅游" in facts["interests"]
+        # location 只在新事件里有
+        assert facts["location"] == "Tokyo"
+
+    def test_list_type_merge_preserves_new_first(self, tmp_db, monkeypatch):
+        from src.ai import chat_memory
+        from src.host import fb_store
+        fake_events = [
+            {"id": 1, "meta_json": '{"extracted_facts": {"pain_points": ["失眠"]}}'},
+            {"id": 2, "meta_json": '{"extracted_facts": {"pain_points": ["肩颈痛", "失眠"]}}'},
+        ]
+        monkeypatch.setattr(fb_store, "list_contact_events_by_peer",
+                            lambda did, peer, limit=200: fake_events,
+                            raising=False)
+        facts = chat_memory.get_peer_extracted_facts("devA", "Alice")
+        # 新列表的新元素 (肩颈痛) 排在前, 旧元素 (失眠) 合并不重复
+        assert facts["pain_points"][0] == "肩颈痛"
+        assert "失眠" in facts["pain_points"]
+        assert facts["pain_points"].count("失眠") == 1
+
+    def test_dict_type_merge_shallow(self, tmp_db, monkeypatch):
+        from src.ai import chat_memory
+        from src.host import fb_store
+        fake_events = [
+            {"id": 1, "meta_json": '{"extracted_facts": {"family": {"status": "married"}}}'},
+            {"id": 2, "meta_json": '{"extracted_facts": {"family": {"kids": 2}}}'},
+        ]
+        monkeypatch.setattr(fb_store, "list_contact_events_by_peer",
+                            lambda did, peer, limit=200: fake_events,
+                            raising=False)
+        facts = chat_memory.get_peer_extracted_facts("devA", "Alice")
+        # dict 浅合并
+        assert facts["family"]["status"] == "married"
+        assert facts["family"]["kids"] == 2
+
+    def test_malformed_meta_skipped(self, tmp_db, monkeypatch):
+        from src.ai import chat_memory
+        from src.host import fb_store
+        fake_events = [
+            {"id": 1, "meta_json": "not valid json"},  # skip
+            {"id": 2, "meta_json": '{"not_facts": "something"}'},  # 无 extracted_facts
+            {"id": 3, "meta_json": '{"extracted_facts": "not a dict"}'},  # 类型错
+            {"id": 4, "meta_json": '{"extracted_facts": {"ok": "yes"}}'},
+        ]
+        monkeypatch.setattr(fb_store, "list_contact_events_by_peer",
+                            lambda did, peer, limit=200: fake_events,
+                            raising=False)
+        facts = chat_memory.get_peer_extracted_facts("devA", "Alice")
+        # 只剩 id=4 的有效
+        assert facts == {"ok": "yes"}
+
+
+class TestFormatExtractedFactsForLlm:
+    def test_empty_returns_empty(self):
+        from src.ai.chat_memory import format_extracted_facts_for_llm
+        assert format_extracted_facts_for_llm({}) == ""
+        assert format_extracted_facts_for_llm(None) == ""
+
+    def test_chinese_labels(self):
+        from src.ai.chat_memory import format_extracted_facts_for_llm
+        facts = {
+            "birthday": "1988-05",
+            "occupation": "设计师",
+            "interests": ["摄影", "旅游"],
+            "location": "Tokyo",
+        }
+        txt = format_extracted_facts_for_llm(facts)
+        assert "生日" in txt
+        assert "1988-05" in txt
+        assert "职业" in txt
+        assert "设计师" in txt
+        assert "摄影, 旅游" in txt  # 列表 join
+        assert "Tokyo" in txt
+
+    def test_unknown_key_prints_as_is(self):
+        from src.ai.chat_memory import format_extracted_facts_for_llm
+        facts = {"custom_field": "custom value"}
+        txt = format_extracted_facts_for_llm(facts)
+        assert "custom_field" in txt
+        assert "custom value" in txt
+
+    def test_empty_values_filtered(self):
+        from src.ai.chat_memory import format_extracted_facts_for_llm
+        facts = {"occupation": "", "interests": [], "location": "Tokyo"}
+        txt = format_extracted_facts_for_llm(facts)
+        assert "Tokyo" in txt
+        assert "职业" not in txt
+        assert "兴趣" not in txt
+
+
+class TestBuildContextBlockL3Integration:
+    def test_build_context_has_facts_keys(self, tmp_db):
+        from src.ai.chat_memory import build_context_block
+        ctx = build_context_block("devA", "Alice")
+        # P10 后新字段
+        assert "facts" in ctx
+        assert "facts_text" in ctx
+        # Phase 5 未 merge → facts 空, facts_text 空
+        assert ctx["facts"] == {}
+        assert ctx["facts_text"] == ""
+
+    def test_facts_merged_into_hint_text(self, tmp_db, monkeypatch):
+        from src.host.fb_store import record_inbox_message
+        from src.ai import chat_memory
+        from src.host import fb_store
+        # 种一些历史
+        record_inbox_message("devA", "Alice", direction="incoming",
+                             message_text="hi")
+        record_inbox_message("devA", "Alice", direction="outgoing",
+                             message_text="hello", ai_decision="reply")
+        # 注入 L3 facts
+        fake_events = [
+            {"id": 1, "meta_json": '{"extracted_facts": {"occupation": "设计师"}}'},
+        ]
+        monkeypatch.setattr(fb_store, "list_contact_events_by_peer",
+                            lambda did, peer, limit=200: fake_events,
+                            raising=False)
+        ctx = chat_memory.build_context_block("devA", "Alice")
+        assert "设计师" in ctx["hint_text"]
+        assert "L3 结构化记忆" in ctx["hint_text"]
+        assert ctx["facts"]["occupation"] == "设计师"
+
+    def test_include_l3_flag_can_disable(self, tmp_db, monkeypatch):
+        from src.ai import chat_memory
+        from src.host import fb_store
+        monkeypatch.setattr(fb_store, "list_contact_events_by_peer",
+                            lambda did, peer, limit=200: [
+                                {"id": 1, "meta_json":
+                                 '{"extracted_facts": {"x": "y"}}'}],
+                            raising=False)
+        ctx = chat_memory.build_context_block("devA", "Alice",
+                                               include_l3_facts=False)
+        assert ctx["facts"] == {}
+        assert ctx["facts_text"] == ""
