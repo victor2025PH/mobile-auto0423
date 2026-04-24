@@ -28,6 +28,22 @@ logger = logging.getLogger(__name__)
 _project_root = PROJECT_ROOT
 
 
+def _phase10_task_extras(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase 10/10.2 opt-in kwargs 组装 (walk_candidates / l2_gate_shots / do_l2_gate).
+
+    只在显式 True/>1 时加 key, 避免未升级的 automation 分支撞 TypeError.
+    """
+    out: Dict[str, Any] = {}
+    if params.get("walk_candidates"):
+        out["walk_candidates"] = True
+    shots = int(params.get("l2_gate_shots", 0) or 0)
+    if shots > 1:
+        out["l2_gate_shots"] = shots
+    if params.get("do_l2_gate"):
+        out["do_l2_gate"] = True
+    return out
+
+
 def _vpn_required() -> bool:
     """读取 config/devices.yaml 中 connection.vpn_required (默认 True)。"""
     try:
@@ -713,16 +729,7 @@ def _execute_facebook(manager, resolved, task_type, params):
             _persona_key = params.get("persona_key") or ""
             _phase_override = params.get("phase") or params.get("phase_override") or ""
             if hasattr(fb, "add_friend_with_note"):
-                # 2026-04-24 Phase 10.2: walk_candidates/l2_gate_shots 为 opt-in 任务参数,
-                # 只在调用方显式传时才 thread 进去 (避免 automation 未升级时 kwarg 错).
-                _extra = {}
-                if params.get("walk_candidates"):
-                    _extra["walk_candidates"] = True
-                _shots = int(params.get("l2_gate_shots", 0) or 0)
-                if _shots > 1:
-                    _extra["l2_gate_shots"] = _shots
-                if params.get("do_l2_gate"):
-                    _extra["do_l2_gate"] = True
+                _extra = _phase10_task_extras(params)
                 ok = fb.add_friend_with_note(target, note=note,
                                              safe_mode=safe_mode,
                                              device_id=resolved,
@@ -775,14 +782,7 @@ def _execute_facebook(manager, resolved, task_type, params):
                 return False, "facebook.add_friend_and_greet 尚未实现", None
             # 把 source / preset_key 下推,automation 层锁内 record 时用
             _src_val = params.get("source", "") or params.get("group_name", "")
-            _extra = {}
-            if params.get("walk_candidates"):
-                _extra["walk_candidates"] = True
-            _shots = int(params.get("l2_gate_shots", 0) or 0)
-            if _shots > 1:
-                _extra["l2_gate_shots"] = _shots
-            if params.get("do_l2_gate"):
-                _extra["do_l2_gate"] = True
+            _extra = _phase10_task_extras(params)
             if params.get("force_add_friend"):
                 _extra["force"] = True
             if params.get("ai_dynamic_greeting") is not None:
@@ -1195,15 +1195,7 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = params.get("group_name") or ""
                         _ai_g = params.get("ai_dynamic_greeting")
                         _fsg = params.get("force_send_greeting")
-                        # Phase 10.2 opt-in: walk_candidates + l2_gate_shots.
-                        _p10_extra: Dict[str, Any] = {}
-                        if params.get("walk_candidates"):
-                            _p10_extra["walk_candidates"] = True
-                        _shots2 = int(params.get("l2_gate_shots", 0) or 0)
-                        if _shots2 > 1:
-                            _p10_extra["l2_gate_shots"] = _shots2
-                        if params.get("do_l2_gate"):
-                            _p10_extra["do_l2_gate"] = True
+                        _p10_extra = _phase10_task_extras(params)
                         res = fb.add_friend_and_greet(
                             name,
                             note=note,
@@ -1238,14 +1230,7 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = str(_tg[0])
                             elif isinstance(params.get("group_name"), str):
                                 _camp_src = params.get("group_name") or ""
-                        _p10_extra2: Dict[str, Any] = {}
-                        if params.get("walk_candidates"):
-                            _p10_extra2["walk_candidates"] = True
-                        _shots3 = int(params.get("l2_gate_shots", 0) or 0)
-                        if _shots3 > 1:
-                            _p10_extra2["l2_gate_shots"] = _shots3
-                        if params.get("do_l2_gate"):
-                            _p10_extra2["do_l2_gate"] = True
+                        _p10_extra2 = _phase10_task_extras(params)
                         ok = fb.add_friend_with_note(name, note=note,
                                                      safe_mode=True,
                                                      device_id=resolved,
