@@ -181,6 +181,11 @@ phases:
       daily_cap_per_account: 4      # 每日硬上限 4
       inter_greeting_sec: [360, 720]
       enabled_probability: 0.8      # 20% 不发保持多样性
+      # 2026-04-24 v4: growth AI 动态 greeting 默认启用
+      # F2 由紀子 2026-04-24 真机 PASS: ChatBrain→kana→Messenger 发送成功,
+      # 每条 greeting LLM 独生, 100% 唯一, 大幅降 FB content_blocked 风险.
+      # LLM 失败自动 fallback 到静态 8 模板, 主流程不阻断.
+      ai_dynamic_greeting: true
     group_engage:
       max_posts: 4
       comment_probability: 0.08
@@ -211,6 +216,7 @@ phases:
       daily_cap_per_account: 8      # 日硬上限 8（仍低于 add_friend 的 15，保留余量）
       inter_greeting_sec: [240, 600]
       enabled_probability: 1.0
+      ai_dynamic_greeting: true     # 2026-04-24 v4: 成熟号也 AI 动态 greeting
     group_engage:
       max_posts: 6
       comment_probability: 0.18
