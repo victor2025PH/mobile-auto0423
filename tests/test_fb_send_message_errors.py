@@ -105,10 +105,23 @@ def fb_env():
                 "send_button_missing", "fixture-mock three-tier miss",
                 hint="mocked fixture — 真实 fallback 路径见 TestMessengerUIFallback")
 
+    def _tap_first_result_mock(_d, _did, recipient):
+        # 2026-04-24 P1: 新 helper 同 smart_tap 语义对齐以维持向后兼容
+        # (knobs['smart_tap_results']['First matching contact']=False →
+        # raise recipient_not_found)。真实 4 级 fallback 见 TestFirstContactFallback。
+        if not _smart_tap("First matching contact", device_id=_did):
+            from src.app_automation.facebook import MessengerError
+            raise MessengerError(
+                "recipient_not_found",
+                f"Messenger 搜索 '{recipient}' 无匹配联系人",
+                hint="mocked fixture — 真实 fallback 路径见 TestFirstContactFallback")
+
     stack.enter_context(patch.object(fb, "_enter_messenger_search",
                                      side_effect=_enter_search_mock))
     stack.enter_context(patch.object(fb, "_tap_messenger_send",
                                      side_effect=_tap_send_mock))
+    stack.enter_context(patch.object(fb, "_tap_first_search_result",
+                                     side_effect=_tap_first_result_mock))
     stack.enter_context(patch.object(fb, "_focus_messenger_composer",
                                      return_value=False))
     stack.enter_context(patch.object(fb, "_dismiss_dialogs"))
@@ -891,3 +904,274 @@ class TestMessengerUIVLMLevel4:
                 fb._enter_messenger_search(d, "devA")
         # 主流程仍 raise 正确 code
         assert ei.value.code == "search_ui_missing"
+
+
+# ─── P1 (2026-04-24): _tap_first_search_result 4 级 fallback ─────────
+
+class TestFirstContactFallback:
+    """``_tap_first_search_result`` — send_message 里原来是单点 smart_tap,
+    现在 smart_tap → `_first_search_result_element` (XML semantic, query
+    plausible-match) → coordinate (w*0.5, h*0.26) → VLM vision。"""
+
+    def _mk_fb_unmocked(self):
+        """造真实 FacebookAutomation (无 fixture 级 mock), 这样能 exercise
+        真 _tap_first_search_result 方法。"""
+        from src.app_automation.facebook import FacebookAutomation
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.hb = MagicMock()
+        return fb
+
+    def _mk_vf(self, coords=None, raises=False, returns_none=False):
+        vf = MagicMock()
+        if raises:
+            vf.find_element = MagicMock(side_effect=RuntimeError("vlm boom"))
+        elif returns_none or coords is None:
+            vf.find_element = MagicMock(return_value=None)
+        else:
+            from src.ai.vision_fallback import VisionResult
+            vf.find_element = MagicMock(
+                return_value=VisionResult(coordinates=coords,
+                                           confidence="high"))
+        return vf
+
+    # ── L1 smart_tap hit ───────────────────────────────────────────
+
+    def test_l1_smart_tap_hit_returns(self):
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=True)
+        fb._tap_first_search_result(MagicMock(), "devA", "Alice")
+        fb.smart_tap.assert_called_once_with(
+            "First matching contact", device_id="devA")
+
+    # ── L2 XML semantic hit ────────────────────────────────────────
+
+    def test_l2_xml_element_hit(self):
+        """smart_tap miss → _first_search_result_element 返 el → click center."""
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        # Fake element with .info.bounds — mimic _first_search_result_element
+        # 返回格式 (inline-class wrapper)
+        fake_el = type("E", (), {"info": {"bounds": {
+            "left": 40, "top": 300, "right": 680, "bottom": 400}}})()
+        fb._first_search_result_element = MagicMock(return_value=fake_el)
+        d = MagicMock()
+        fb._tap_first_search_result(d, "devA", "Alice")
+        d.click.assert_called_once_with(360, 350)  # center of (40,300)-(680,400)
+        fb._first_search_result_element.assert_called_once_with(
+            d, query_hint="Alice")
+
+    def test_l2_xml_exception_falls_to_l3(self):
+        """L2 xml 抛异常 → 走 L3 坐标, 不传染失败。"""
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(
+            side_effect=RuntimeError("xml boom"))
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        fb._tap_first_search_result(d, "devA", "Alice")
+        d.click.assert_called_once_with(int(720 * 0.5), int(1600 * 0.26))
+
+    def test_l2_element_click_exception_falls_to_l3(self):
+        """L2 拿到 el 但 click 抛 → 走 L3。"""
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fake_el = type("E", (), {"info": {"bounds": {
+            "left": 40, "top": 300, "right": 680, "bottom": 400}}})()
+        fb._first_search_result_element = MagicMock(return_value=fake_el)
+        d = MagicMock()
+
+        # 第一次 click (L2) 抛, 第二次 (L3) 成功
+        call_count = {"n": 0}
+        def _click(*a):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("click boom")
+        d.click = MagicMock(side_effect=_click)
+        d.window_size = MagicMock(return_value=(720, 1600))
+        fb._tap_first_search_result(d, "devA", "Alice")
+        assert d.click.call_count == 2
+        # 第 2 次 click 是 L3 坐标
+        assert d.click.call_args_list[1].args == (360, 416)
+
+    # ── L3 coordinate fallback ──────────────────────────────────────
+
+    def test_l3_coordinate_fallback(self):
+        """smart_tap + XML 都 miss → coord click (w*0.5, h*0.26) → 返回。"""
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(return_value=(720, 1600))
+        fb._tap_first_search_result(d, "devA", "Alice")
+        d.click.assert_called_once_with(360, 416)  # 0.5w, 0.26h
+
+    # ── L4 VLM ──────────────────────────────────────────────────────
+
+    def test_l4_vlm_hit_post_verify_pass(self):
+        """前 3 级 miss + VLM 返 coords + click 后 composer EditText 出现 → return."""
+        from src.app_automation import facebook as fb_mod
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("no window size"))
+
+        def _sel(**kw):
+            obj = MagicMock()
+            if kw.get("className") == "android.widget.EditText":
+                obj.exists = MagicMock(return_value=True)
+            else:
+                obj.exists = MagicMock(return_value=False)
+            return obj
+        d.side_effect = _sel
+
+        mock_vf = self._mk_vf(coords=(300, 420))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch.object(fb_mod, "_record_vlm_result") as rec, \
+             patch("src.app_automation.facebook.time.sleep"):
+            fb._tap_first_search_result(d, "devA", "Alice")
+        d.click.assert_called_with(300, 420)
+        mock_vf.invalidate.assert_not_called()  # post-verify pass, don't evict
+        rec.assert_called_once_with(mock_vf)  # P5b counter 接入
+
+    def test_l4_vlm_miss_raises(self):
+        """前 3 级 miss + VLM 返 None → raise recipient_not_found, hint 含 4 级。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import MessengerError
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+
+        mock_vf = self._mk_vf(returns_none=True)
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._tap_first_search_result(d, "devA", "Alice")
+        assert ei.value.code == "recipient_not_found"
+        assert "VLM" in ei.value.hint
+        mock_vf.find_element.assert_called_once()
+
+    def test_l4_vlm_post_verify_fail_invalidates_cache(self):
+        """VLM 返 coords 但点完 composer 没出现 → invalidate cache + raise。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import MessengerError
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(coords=(300, 420))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._tap_first_search_result(d, "devA", "Alice")
+        assert ei.value.code == "recipient_not_found"
+        mock_vf.invalidate.assert_called_once()
+        inv = mock_vf.invalidate.call_args
+        fe = mock_vf.find_element.call_args
+        assert inv.args[0] == fe.kwargs["target"]
+        assert inv.args[1] == fe.kwargs["context"]
+
+    def test_l4_no_vlm_provider_raises(self):
+        """无 VLM provider → Level 4 跳过 → raise recipient_not_found。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import MessengerError
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=None), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._tap_first_search_result(d, "devA", "Alice")
+        assert ei.value.code == "recipient_not_found"
+
+    def test_l4_vlm_exception_raises(self):
+        """VLM find_element 抛异常 → 不 bubble, 降为 recipient_not_found。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import MessengerError
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+
+        mock_vf = self._mk_vf(raises=True)
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._tap_first_search_result(d, "devA", "Alice")
+        assert ei.value.code == "recipient_not_found"
+
+    def test_l4_invalidate_exception_silenced(self):
+        """invalidate 抛不影响主 raise."""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import MessengerError
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+        miss = MagicMock(); miss.exists = MagicMock(return_value=False)
+        d.return_value = miss
+
+        mock_vf = self._mk_vf(coords=(300, 420))
+        mock_vf.invalidate = MagicMock(
+            side_effect=RuntimeError("cache boom"))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError) as ei:
+                fb._tap_first_search_result(d, "devA", "Alice")
+        assert ei.value.code == "recipient_not_found"
+
+    def test_l4_vlm_recipient_in_context(self):
+        """VLM context 应包含 recipient name (帮 VLM 过 plausible-match)。"""
+        from src.app_automation import facebook as fb_mod
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+        edit = MagicMock(); edit.exists = MagicMock(return_value=True)
+        d.return_value = edit
+
+        mock_vf = self._mk_vf(coords=(300, 420))
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch("src.app_automation.facebook.time.sleep"):
+            fb._tap_first_search_result(d, "devA", "Kim Joy")
+        ctx = mock_vf.find_element.call_args.kwargs["context"]
+        assert "Kim Joy" in ctx
+
+    def test_l4_record_vlm_result_called_on_miss(self):
+        """VLM miss (无 coords) 也应 call _record_vlm_result — counter 能追
+        HTTP 失败以触发 provider swap。"""
+        from src.app_automation import facebook as fb_mod
+        from src.app_automation.facebook import MessengerError
+        fb = self._mk_fb_unmocked()
+        fb.smart_tap = MagicMock(return_value=False)
+        fb._first_search_result_element = MagicMock(return_value=None)
+        d = MagicMock()
+        d.window_size = MagicMock(side_effect=RuntimeError("boom"))
+
+        mock_vf = self._mk_vf(returns_none=True)
+        with patch.object(fb_mod, "_get_vision_fallback",
+                          return_value=mock_vf), \
+             patch.object(fb_mod, "_record_vlm_result") as rec, \
+             patch("src.app_automation.facebook.time.sleep"):
+            with pytest.raises(MessengerError):
+                fb._tap_first_search_result(d, "devA", "Alice")
+        rec.assert_called_once_with(mock_vf)

@@ -1304,13 +1304,11 @@ class FacebookAutomation(BaseAutomation):
             self.hb.type_text(d, recipient)
             time.sleep(1.5)
 
-            # ── 5. 选中搜索结果第一条 ──────────────────────────────────
-            if not self.smart_tap("First matching contact", device_id=did):
-                log.warning("Recipient not found: %s", recipient)
-                raise MessengerError(
-                    "recipient_not_found",
-                    f"Messenger 搜索 '{recipient}' 无匹配联系人",
-                    hint="peer 未加好友/昵称变更/索引延迟,A 可 5-15s 后重试")
+            # ── 5. 选中搜索结果第一条 (2026-04-24: 4 级 fallback) ────────
+            # smart_tap → _first_search_result_element (XML, semantic, query
+            # plausible-match) → coordinate (w*0.5, h*0.26) → VLM vision。
+            # 详见 _tap_first_search_result docstring。
+            self._tap_first_search_result(d, did, recipient)
 
             time.sleep(1)
             # 2026-04-24 safety: 显式 tap composer 确保 focus — 真机观察到
@@ -1563,6 +1561,96 @@ class FacebookAutomation(BaseAutomation):
             hint=("smart_tap + multi-locale + coordinate + VLM (Gemini/"
                   "Ollama) 全 miss; 可能 composer focus 丢/UI 改版/VLM "
                   "预算耗尽/无免费 VLM provider"))
+
+    def _tap_first_search_result(self, d, device_id: str,
+                                  recipient: str) -> None:
+        """Tap first matching search result in Messenger — smart_tap → XML
+        semantic (``_first_search_result_element`` 按 query_hint 匹配) →
+        coordinate (w*0.5, h*0.26) → VLM vision 四级 fallback。四路都失败抛
+        ``MessengerError(code='recipient_not_found')``。
+
+        2026-04-24 P1 添加: send_message 流程里原来只走 ``smart_tap("First
+        matching contact")``, 是整条链路最后一个没上 4 级 fallback 的节点。
+        Messenger 2026 Compose UI 下搜索结果行也是 SDUI 渲染, smart_tap 选择器
+        偶尔 miss。L2 用 `_first_search_result_element` 的 XML 语义扫描 (按
+        query plausible match, 避免相似名误点); L3 坐标 dead-reckoning (720x1600
+        上 ≈ (360, 416)); L4 VLM + post-verify 检查 composer EditText 是否出现,
+        未出现 invalidate cache 防 5min 复发坏坐标。
+
+        Args:
+            d: u2 device
+            device_id: adb device ID (for smart_tap knowledge base)
+            recipient: 目标联系人名 (用于 L2 query match + L4 VLM context)
+        """
+        # L1: smart_tap (AutoSelector 学习库命中率最高)
+        if self.smart_tap("First matching contact", device_id=device_id):
+            return
+        # L2: XML 语义扫描 — 对 query_hint plausible-match, 最高 confidence
+        # 在 smart_tap miss 之后 (semantic, 非坐标猜测)
+        try:
+            el = self._first_search_result_element(d, query_hint=recipient)
+            if el is not None:
+                cx, cy = self._el_center(el)
+                d.click(cx, cy)
+                return
+        except Exception as e:
+            log.debug(
+                "[_tap_first_search_result] L2 XML element click 失败: %s", e)
+        # L3: coordinate dead-reckoning — 第一条搜索结果通常在顶部 0.26h 左右
+        # (Messenger: search bar ~0.09h + possible "Recent" header ~0.18h +
+        # first row height ~0.08h → center ≈ 0.26h)。XML dump 完全失败时的兜底。
+        try:
+            w, h = d.window_size()
+            d.click(int(w * 0.5), int(h * 0.26))
+            return
+        except Exception as e:
+            log.debug(
+                "[_tap_first_search_result] L3 coordinate click 异常: %s", e)
+        # L4: VLM vision — Compose UI 下搜索结果行不在 AccessibilityNode tree
+        # 时的最后兜底。Post-verify: 点击后 composer EditText 应出现 (成功进聊天
+        # 页); 未出现 invalidate cache 防 5min 复发。
+        vf = _get_vision_fallback()
+        if vf is not None:
+            vlm_target = "first search result contact card"
+            vlm_context = (
+                f"Looking for contact '{recipient}'. Tap the first contact "
+                "row in the search results list below the search bar. "
+                "Full-width row with a circular profile avatar on the LEFT "
+                "and the contact name text on the RIGHT. NOT the search "
+                "bar at top, NOT a 'Recent searches' header, NOT a filter "
+                "chip row. Typically near y ≈ 25-35% of screen height.")
+            try:
+                result = vf.find_element(
+                    device=d, target=vlm_target, context=vlm_context)
+                # P5b: 统计 HTTP failure + 触发 provider swap (如需要)
+                _record_vlm_result(vf)
+                if result and result.coordinates:
+                    x, y = result.coordinates
+                    d.click(x, y)
+                    time.sleep(1.0)
+                    # Post-verify: 进入聊天页后 composer EditText 应出现
+                    if d(className="android.widget.EditText").exists(timeout=2):
+                        log.info(
+                            "[_tap_first_search_result] VLM hit @ (%d, %d)",
+                            x, y)
+                        return
+                    log.debug(
+                        "[vision] VLM click (%d, %d) 后 composer 未出现, "
+                        "invalidate cache 下次重算", x, y)
+                    try:
+                        vf.invalidate(vlm_target, vlm_context)
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.debug(
+                    "[vision] Level 4 first-contact fallback 异常: %s", e)
+        log.warning("Recipient not found: %s", recipient)
+        raise MessengerError(
+            "recipient_not_found",
+            f"Messenger 搜索 '{recipient}' 无匹配联系人",
+            hint=("smart_tap + XML + coordinate + VLM (Gemini/Ollama) 全 "
+                  "miss; peer 未加好友/昵称变更/索引延迟/UI 大改版, A 可 "
+                  "5-15s 后重试"))
 
     def _focus_messenger_composer(self, d) -> bool:
         """2026-04-24 真机 safety: 在 ``hb.type_text`` 之前显式 tap composer
