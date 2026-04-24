@@ -107,6 +107,18 @@ class TestAllocate:
         lp.update(aid, status="disabled")
         assert lp.allocate(region="jp", canonical_id="c") is None
 
+    def test_cas_concurrent_dont_overcount(self, tmp_db):
+        """Phase 11.1 CAS 打磨: 同一 account 并发 2 次 allocate, times_used 只 +2
+        (每次恰好 +1, 不会出现 race 导致 +1 +1 但 last_used 一样的幽灵状态).
+        真并发测试难写, 这里至少保证 sequential CAS 不会失效."""
+        from src.host import line_pool as lp
+        lp.add("@cas", region="jp", daily_cap=100)
+        r1 = lp.allocate(region="jp", canonical_id="c1")
+        r2 = lp.allocate(region="jp", canonical_id="c2")
+        assert r1 and r2
+        assert r1["line_id"] == r2["line_id"] == "@cas"
+        assert r2["times_used"] == 2
+
     def test_owner_device_match_or_universal(self, tmp_db):
         """owner_device_id 非空 → 只匹配本机 + 通用池 (owner 为空); 其它机
         owner 账号不返."""
@@ -141,7 +153,9 @@ class TestBulkImport:
 
 class TestLinePoolApi:
     @pytest.fixture
-    def client(self, tmp_db):
+    def client(self, tmp_db, monkeypatch):
+        # Phase 11.1: lifespan 里会 seed along2026 污染测试, 用 env 跳过.
+        monkeypatch.setenv("OPENCLAW_LINE_POOL_SEED_SKIP", "1")
         from src.host.api import app
         from fastapi.testclient import TestClient
         with TestClient(app) as c:
@@ -209,6 +223,17 @@ class TestLinePoolApi:
         data = r.json()
         assert data["allocated"] is True
         assert data["account"]["line_id"] == "@alloc"
+
+    def test_api_list_with_24h_stats(self, tmp_db, client):
+        client.post("/line-pool", json={"line_id": "@s1", "region": "jp"})
+        client.post("/line-pool/allocate",
+                     json={"region": "jp", "canonical_id": "C"})
+        client.post("/line-pool/allocate",
+                     json={"region": "jp", "canonical_id": "C2"})
+        r = client.get("/line-pool?includes_24h_stats=true")
+        assert r.status_code == 200
+        rows = r.json()["results"]
+        assert rows[0]["used_24h"] == 2
 
     def test_api_allocate_no_match(self, tmp_db, client):
         r = client.post("/line-pool/allocate",
@@ -315,7 +340,7 @@ class TestDispatcher:
         assert stats["no_account"] == 1
 
     def test_write_contact_event_opt_in(self, tmp_db):
-        """write_contact_event=True 时应写 wa_referral_sent event."""
+        """write_contact_event=True + 默认 event_type=line_dispatch_planned."""
         from src.host import line_pool as lp
         from src.host.executor import _fb_line_dispatch_from_reply
         from src.host.fb_store import count_contact_events
@@ -328,9 +353,51 @@ class TestDispatcher:
             "hours_window": 6, "region": "jp",
             "persona_key": "jp_female_midlife",
             "write_contact_event": True})
-        n = count_contact_events(device_id="DEV1", peer_name="由美",
-                                   event_type="wa_referral_sent", hours=6)
+        n = count_contact_events(
+            device_id="DEV1", peer_name="由美",
+            event_type="line_dispatch_planned", hours=6)
         assert n == 1
+
+    def test_write_contact_event_legacy_type(self, tmp_db):
+        """event_type='wa_referral_sent' 保兼容老 B 机消费逻辑."""
+        from src.host import line_pool as lp
+        from src.host.executor import _fb_line_dispatch_from_reply
+        from src.host.fb_store import count_contact_events
+        lp.add("@jp1", region="jp", persona_key="jp_female_midlife",
+                daily_cap=5)
+        _seed_l2_lead("裕子")
+        _seed_reply_event("DEV1", "裕子", "greeting_replied")
+
+        _fb_line_dispatch_from_reply("DEV1", {
+            "hours_window": 6, "region": "jp",
+            "persona_key": "jp_female_midlife",
+            "write_contact_event": True,
+            "event_type": "wa_referral_sent"})
+        n = count_contact_events(
+            device_id="DEV1", peer_name="裕子",
+            event_type="wa_referral_sent", hours=6)
+        assert n == 1
+
+    def test_dispatch_includes_message_template(self, tmp_db):
+        """dispatch_mode=messenger_text 时 dispatches 里应有 message_template."""
+        from src.host import line_pool as lp
+        from src.host.executor import _fb_line_dispatch_from_reply
+        lp.add("along2026", region="jp",
+                persona_key="jp_female_midlife", daily_cap=5)
+        _seed_l2_lead("花子")
+        _seed_reply_event("DEV1", "花子", "greeting_replied")
+
+        _ok, _m, stats = _fb_line_dispatch_from_reply("DEV1", {
+            "hours_window": 6, "region": "jp",
+            "persona_key": "jp_female_midlife",
+            "dispatch_mode": "messenger_text"})
+        assert stats["dispatched"] == 1
+        d = stats["dispatches"][0]
+        assert d["dispatch_mode"] == "messenger_text"
+        # get_referral_snippet 可能因 persona yaml 缺失返 fallback, 但至少非空
+        assert d["message_template"], "messenger_text 模式应生成 template"
+        # template 里应该含 line_id
+        assert "along2026" in d["message_template"]
 
     def test_limit_caps_output(self, tmp_db):
         from src.host import line_pool as lp

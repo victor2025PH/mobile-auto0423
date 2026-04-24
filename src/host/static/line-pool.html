@@ -182,6 +182,7 @@ async function reload() {
   if ($("q_persona").value) params.set("persona_key", $("q_persona").value);
   if ($("q_owner").value) params.set("owner_device_id", $("q_owner").value);
   params.set("limit", "500");
+  params.set("includes_24h_stats", "true");
   try {
     const data = await api("/line-pool?" + params);
     render(data.results || []);
@@ -204,7 +205,7 @@ function render(rows) {
       <td>${escapeHtml(r.owner_device_id) || '<span class="muted">—</span>'}</td>
       <td><span class="pill ${r.status}">${r.status}</span></td>
       <td>${r.daily_cap}</td>
-      <td>? / ${r.times_used}</td>
+      <td>${r.used_24h != null ? r.used_24h : "?"} / ${r.times_used}</td>
       <td class="muted">${r.last_used_at || "—"}</td>
       <td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.notes || "")}</td>
       <td>

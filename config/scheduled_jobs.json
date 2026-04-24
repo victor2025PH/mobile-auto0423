@@ -199,5 +199,25 @@
     },
     "enabled": false,
     "last_run": "2026-04-05 20:00:03"
+  },
+  {
+    "id": "line_dispatch_30min",
+    "name": "LINE 派发 (每 30 分钟扫 greeting_replied 合格线索)",
+    "cron": "*/30 * * * *",
+    "action": "facebook_line_dispatch_from_reply",
+    "params": {
+      "hours_window": 6,
+      "dedupe_hours": 24,
+      "require_l2_verified": true,
+      "persona_key": "jp_female_midlife",
+      "region": "jp",
+      "min_score": 70,
+      "limit": 20,
+      "dispatch_mode": "messenger_text",
+      "write_contact_event": true,
+      "event_type": "line_dispatch_planned"
+    },
+    "enabled": false,
+    "last_run": ""
   }
 ]

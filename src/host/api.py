@@ -116,6 +116,16 @@ async def lifespan(application: FastAPI):
     from src.utils.log_config import setup_logging
     setup_logging()
     init_db()
+    # Phase 11 (2026-04-25): LINE pool seed — 空池时注入 config/line_pool_seed.yaml 默认账号
+    try:
+        from src.host.line_pool import seed_from_config
+        res = seed_from_config()
+        if not res.get("skipped"):
+            logger.info("[line_pool.seed] inserted=%s duplicate=%s invalid=%s",
+                         res.get("inserted"), res.get("duplicate"),
+                         res.get("invalid"))
+    except Exception as e:
+        logger.debug("[line_pool.seed] 失败 (忽略): %s", e)
     get_worker_pool()
     try:
         from src.host.task_policy import load_task_execution_policy, policy_blocks_db_scheduler

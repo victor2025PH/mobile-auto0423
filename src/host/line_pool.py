@@ -116,7 +116,9 @@ def list_accounts(*,
                   region: Optional[str] = None,
                   persona_key: Optional[str] = None,
                   owner_device_id: Optional[str] = None,
-                  limit: int = 200) -> List[Dict[str, Any]]:
+                  limit: int = 200,
+                  includes_24h_stats: bool = False
+                  ) -> List[Dict[str, Any]]:
     where = []
     args: List[Any] = []
     if status:
@@ -137,7 +139,24 @@ def list_accounts(*,
     sql += " ORDER BY id DESC LIMIT ?"
     args.append(max(1, min(int(limit or 200), 2000)))
     with _connect() as conn:
-        return [_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
+        out = [_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
+        # Phase 11.1: 可选 24h 使用次数 (供 UI 显示真实 cap 余量)
+        if includes_24h_stats and out:
+            ids_tuple = tuple(a["id"] for a in out)
+            placeholders = ",".join(["?"] * len(ids_tuple))
+            counts = {}
+            for r in conn.execute(
+                f"SELECT line_account_id, COUNT(*) AS n FROM line_dispatch_log"
+                f" WHERE line_account_id IN ({placeholders})"
+                f" AND status != 'skipped'"
+                f" AND created_at >= datetime('now', '-24 hours')"
+                f" GROUP BY line_account_id",
+                ids_tuple,
+            ).fetchall():
+                counts[r["line_account_id"]] = int(r["n"])
+            for a in out:
+                a["used_24h"] = counts.get(a["id"], 0)
+        return out
 
 
 def get_by_id(account_id: int) -> Optional[Dict[str, Any]]:
@@ -237,39 +256,53 @@ def allocate(*,
         args.append(owner_device_id)
     sql = ("SELECT * FROM line_accounts WHERE " + " AND ".join(where)
            + " ORDER BY (last_used_at = '') DESC, last_used_at ASC, id ASC")
-    with _connect() as conn:
-        rows = conn.execute(sql, args).fetchall()
-        if not rows:
-            return None
-        # 逐个尝试: 选第一个 24h usage < daily_cap 的
-        picked = None
-        for row in rows:
-            used = _count_recent_usage(conn, row["id"], hours=24)
-            if used < int(row["daily_cap"] or 20):
-                picked = row
-                break
-        if picked is None:
-            logger.info("[line_pool.allocate] %d accounts matched 全超 cap",
-                         len(rows))
-            return None
-        # 预留: 原子 UPDATE + INSERT 审计
-        conn.execute(
-            "UPDATE line_accounts SET last_used_at=?, times_used=times_used+1,"
-            " updated_at=datetime('now') WHERE id=?",
-            (_now_iso(), picked["id"]),
-        )
-        conn.execute(
-            "INSERT INTO line_dispatch_log (line_account_id, line_id,"
-            " canonical_id, peer_name, source_device_id, source_event_id,"
-            " status) VALUES (?,?,?,?,?,?,'planned')",
-            (picked["id"], picked["line_id"], canonical_id, peer_name,
-             source_device_id, source_event_id),
-        )
-        # fetch 最新行返回
-        fresh = conn.execute(
-            "SELECT * FROM line_accounts WHERE id=?", (picked["id"],),
-        ).fetchone()
-        return _row_to_dict(fresh)
+    # Phase 11.1 CAS: UPDATE ... WHERE last_used_at=<prev> 保并发严格原子.
+    # 最多 retry 3 次 (覆盖 "被另一进程抢先更新" 的罕见 race).
+    MAX_ATTEMPTS = 3
+    for attempt in range(MAX_ATTEMPTS):
+        with _connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+            if not rows:
+                return None
+            picked = None
+            prev_last_used = None
+            for row in rows:
+                used = _count_recent_usage(conn, row["id"], hours=24)
+                if used < int(row["daily_cap"] or 20):
+                    picked = row
+                    prev_last_used = row["last_used_at"] or ""
+                    break
+            if picked is None:
+                logger.info("[line_pool.allocate] %d accounts matched 全超 cap",
+                             len(rows))
+                return None
+            # CAS: 如果 last_used_at 被别人改了, UPDATE 影响 0 行, retry.
+            new_last = _now_iso()
+            cur = conn.execute(
+                "UPDATE line_accounts SET last_used_at=?,"
+                " times_used=times_used+1, updated_at=datetime('now')"
+                " WHERE id=? AND COALESCE(last_used_at,'') = ?",
+                (new_last, picked["id"], prev_last_used),
+            )
+            if cur.rowcount == 0:
+                logger.debug("[line_pool.allocate] CAS 冲突 attempt=%d, retry",
+                             attempt + 1)
+                continue
+            # CAS 成功 → 写 dispatch_log + 返
+            conn.execute(
+                "INSERT INTO line_dispatch_log (line_account_id, line_id,"
+                " canonical_id, peer_name, source_device_id, source_event_id,"
+                " status) VALUES (?,?,?,?,?,?,'planned')",
+                (picked["id"], picked["line_id"], canonical_id, peer_name,
+                 source_device_id, source_event_id),
+            )
+            fresh = conn.execute(
+                "SELECT * FROM line_accounts WHERE id=?", (picked["id"],),
+            ).fetchone()
+            return _row_to_dict(fresh)
+    # 3 次 CAS 都冲突 — 极罕见, 放弃本轮让上游 retry/fallback
+    logger.warning("[line_pool.allocate] CAS 连续 %d 次冲突, 放弃", MAX_ATTEMPTS)
+    return None
 
 
 def mark_dispatch_outcome(line_account_id: int, *,
@@ -292,6 +325,61 @@ def mark_dispatch_outcome(line_account_id: int, *,
             (status, note, row["id"]),
         )
         return True
+
+
+def seed_from_config(config_path: Optional[str] = None,
+                      *, only_if_empty: bool = True) -> Dict[str, Any]:
+    """启动时从 YAML 注入默认 LINE 账号 (Phase 11).
+
+    ``only_if_empty=True`` (默认): 池子非空 → 不做任何事 (避免覆盖运营在 UI 改过
+    的状态). 空池才 seed.
+
+    ``only_if_empty=False``: 强制调 add_many (重复 line_id 会被 add_many 计入
+    duplicate, 不报错). 运维脚本用.
+
+    返: {skipped: bool, total, inserted, duplicate, invalid, errors}
+    """
+    import os
+    import pathlib
+    import yaml
+
+    # 测试/CI 可以设 OPENCLAW_LINE_POOL_SEED_SKIP=1 跳过
+    if os.environ.get("OPENCLAW_LINE_POOL_SEED_SKIP"):
+        return {"skipped": True, "reason": "env_skip"}
+
+    if config_path is None:
+        # 项目根目录/config/line_pool_seed.yaml
+        here = pathlib.Path(__file__).resolve().parent.parent.parent
+        config_path = str(here / "config" / "line_pool_seed.yaml")
+
+    path = pathlib.Path(config_path)
+    if not path.exists():
+        return {"skipped": True, "reason": "seed_file_not_found"}
+
+    if only_if_empty:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM line_accounts"
+            ).fetchone()
+            if int(row["n"] if row else 0) > 0:
+                return {"skipped": True, "reason": "pool_not_empty"}
+
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        return {"skipped": True, "reason": f"yaml_parse_failed: {e}"}
+
+    accounts = data.get("accounts") or []
+    if not isinstance(accounts, list):
+        return {"skipped": True, "reason": "accounts_not_list"}
+
+    result = add_many(accounts)
+    result["skipped"] = False
+    logger.info("[line_pool.seed] from %s → %d inserted, %d duplicate, "
+                 "%d invalid", path, result.get("inserted", 0),
+                 result.get("duplicate", 0), result.get("invalid", 0))
+    return result
 
 
 def recent_dispatch_log(limit: int = 100) -> List[Dict[str, Any]]:

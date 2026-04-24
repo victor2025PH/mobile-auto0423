@@ -677,7 +677,9 @@ CONTACT_EVT_GREETING_SENT = "greeting_sent"
 CONTACT_EVT_GREETING_FALLBACK = "greeting_fallback"
 CONTACT_EVT_GREETING_REPLIED = "greeting_replied"          # B 写,对方回了我们的 greeting
 CONTACT_EVT_MESSAGE_RECEIVED = "message_received"          # B 写,对方主动 DM
-CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写
+CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写 (实发)
+# Phase 11 (2026-04-25): A 写 — dispatcher 计划层, B 按 meta.dispatch_mode 执行
+CONTACT_EVT_LINE_DISPATCH_PLANNED = "line_dispatch_planned"
 
 VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_ADD_FRIEND_SENT,
@@ -689,6 +691,7 @@ VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_GREETING_REPLIED,
     CONTACT_EVT_MESSAGE_RECEIVED,
     CONTACT_EVT_WA_REFERRAL_SENT,
+    CONTACT_EVT_LINE_DISPATCH_PLANNED,
 })
 
 

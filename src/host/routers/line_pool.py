@@ -33,11 +33,13 @@ def api_list_line_pool(
         region: Optional[str] = Query(default=None),
         persona_key: Optional[str] = Query(default=None),
         owner_device_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=200, ge=1, le=2000)):
+        limit: int = Query(default=200, ge=1, le=2000),
+        includes_24h_stats: bool = Query(default=False)):
     rows = lp.list_accounts(status=status, region=region,
                               persona_key=persona_key,
                               owner_device_id=owner_device_id,
-                              limit=limit)
+                              limit=limit,
+                              includes_24h_stats=includes_24h_stats)
     return {"count": len(rows), "results": rows}
 
 

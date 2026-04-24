@@ -1052,10 +1052,11 @@ def _fb_line_dispatch_from_reply(resolved: str,
       1. 扫 hours_window 内 greeting_replied + message_received events
       2. 去重: 每个 canonical_id 在 dedupe_hours 内最多派发一次
       3. 按 persona / l2_verified / is_japanese / min_score 过滤
-         (仅当 require_l2_verified=True)
       4. line_pool.allocate(region, persona_key, canonical_id, peer_name, ...)
-      5. 写 line_dispatch_log (planned) + 可选 wa_referral_sent contact_event
-      6. 返 stats {scanned, filtered_out, dispatched, no_account, dispatches}
+      5. 组装 referral 话术 (chat_messages.yaml referral_line[] 模板 + {line_id})
+      6. 写 line_dispatch_log (planned) + 可选 contact_event (line_dispatch_planned
+         / wa_referral_sent, 可配)
+      7. 返 stats {scanned, filtered_out, dispatched, no_account, dispatches}
 
     Params:
       hours_window: int = 6           # 扫近几小时事件
@@ -1065,7 +1066,9 @@ def _fb_line_dispatch_from_reply(resolved: str,
       region: str = ""                # 按区域过滤 line pool
       min_score: float = 0
       limit: int = 20                 # 单次最多派发几条
-      write_contact_event: bool = False  # True 时写 wa_referral_sent 供 B 看
+      dispatch_mode: str = "messenger_text"  # messenger_text | line_direct_send
+      write_contact_event: bool = False  # True 写 event 供 B 消费
+      event_type: str = "line_dispatch_planned"  # 或 "wa_referral_sent" 保兼容
     """
     hours_window = int(params.get("hours_window", 6) or 6)
     dedupe_hours = int(params.get("dedupe_hours", 24) or 24)
@@ -1075,6 +1078,11 @@ def _fb_line_dispatch_from_reply(resolved: str,
     min_score = float(params.get("min_score", 0) or 0)
     limit = max(1, min(int(params.get("limit", 20) or 20), 200))
     write_ce = bool(params.get("write_contact_event", False))
+    dispatch_mode = (params.get("dispatch_mode") or "messenger_text").strip()
+    if dispatch_mode not in {"messenger_text", "line_direct_send"}:
+        dispatch_mode = "messenger_text"
+    event_type = (params.get("event_type")
+                   or "line_dispatch_planned").strip()
 
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     CONTACT_EVT_GREETING_REPLIED,
@@ -1084,6 +1092,10 @@ def _fb_line_dispatch_from_reply(resolved: str,
         from src.host.fb_store import record_contact_event
     except Exception:
         record_contact_event = None  # type: ignore
+    try:
+        from src.app_automation.fb_content_assets import get_referral_snippet
+    except Exception:
+        get_referral_snippet = None  # type: ignore
 
     events = list_recent_contact_events_by_types(
         [CONTACT_EVT_GREETING_REPLIED, CONTACT_EVT_MESSAGE_RECEIVED],
@@ -1189,6 +1201,20 @@ def _fb_line_dispatch_from_reply(resolved: str,
             continue
 
         seen_canonical.add(cid)
+
+        # Phase 11.2: 组装 messenger 引流话术 (dispatch_mode=messenger_text)
+        # line_direct_send 模式下 B 机/LINE automation 用自己的话术, 这里只传 line_id.
+        message_template = ""
+        if dispatch_mode == "messenger_text" and get_referral_snippet:
+            try:
+                message_template = get_referral_snippet(
+                    channel="line",
+                    value=acc["line_id"],
+                    persona_key=(persona_key or meta.get("l2_persona_key") or ""),
+                )
+            except Exception as e:
+                logger.debug("[phase11] referral_snippet 失败: %s", e)
+
         dispatch = {
             "canonical_id": cid,
             "peer_name": peer_name,
@@ -1197,6 +1223,8 @@ def _fb_line_dispatch_from_reply(resolved: str,
             "source_event_type": ev.get("event_type"),
             "line_account_id": acc["id"],
             "line_id": acc["line_id"],
+            "dispatch_mode": dispatch_mode,
+            "message_template": message_template,
             "metadata": {
                 "age_band": meta.get("age_band"),
                 "gender": meta.get("gender"),
@@ -1210,14 +1238,18 @@ def _fb_line_dispatch_from_reply(resolved: str,
             try:
                 record_contact_event(
                     device_id or resolved, peer_name,
-                    "wa_referral_sent",
+                    event_type,
                     preset_key=f"line_pool:{acc['id']}",
                     meta={"line_id": acc["line_id"],
+                          "line_account_id": acc["id"],
+                          "dispatch_mode": dispatch_mode,
+                          "message_template": message_template,
                           "dispatched_by": "agent_a_phase11",
                           "source_event_id": event_id,
+                          "original_device_id": device_id,  # Phase 11.1 溯源
                           "canonical_id": cid})
             except Exception as e:
-                logger.debug("[phase11] write wa_referral_sent 失败: %s", e)
+                logger.debug("[phase11] write %s 失败: %s", event_type, e)
 
     stats = {
         "scanned": len(events),
