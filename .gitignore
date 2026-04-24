@@ -81,3 +81,8 @@ config/referral_receivers.yaml
 
 # 本地真机调试产物 (截图 + hierarchy dump)
 debug/
+
+# VLM eval dataset — screenshots 目录含真实对话截图, 隐私不入库
+# (cases.yaml 的 metadata 入库, 截图 开发者本地按需 populate)
+scripts/vlm_eval_dataset/screenshots/*
+!scripts/vlm_eval_dataset/screenshots/.gitkeep
