@@ -103,6 +103,44 @@ class TestFunnelApi:
         assert body["blocked_reasons"]["no_message_button"] == 3
 
 
+class TestTimeseriesApi:
+    """Phase 8e: GET /lead-mesh/funnel/timeseries."""
+
+    def test_api_empty_returns_days_entries(self, api_client, tmp_db):
+        r = api_client.get("/lead-mesh/funnel/timeseries?days=5")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["days"] == 5
+        assert len(body["series"]) == 5
+        for p in body["series"]:
+            assert p["friend_req"] == 0
+            assert p["greeting_sent"] == 0
+            assert p["blocked"] == 0
+
+    def test_api_counts_today(self, api_client, tmp_db):
+        from src.host.lead_mesh import resolve_identity, append_journey
+        cid = resolve_identity(platform="facebook",
+                                 account_id="fb:TSA", display_name="TSA")
+        append_journey(cid, actor="agent_a", action="friend_requested",
+                         data={})
+        append_journey(cid, actor="agent_a", action="greeting_sent",
+                         data={"via": "inline_profile_message"})
+
+        r = api_client.get("/lead-mesh/funnel/timeseries?days=3&actor=agent_a")
+        body = r.json()
+        assert len(body["series"]) == 3
+        # 最后一天 = 今天有 counts
+        today_pt = body["series"][-1]
+        assert today_pt["friend_req"] == 1
+        assert today_pt["greeting_sent"] == 1
+
+    def test_api_rejects_invalid_days(self, api_client, tmp_db):
+        r = api_client.get("/lead-mesh/funnel/timeseries?days=0")
+        assert r.status_code == 422
+        r = api_client.get("/lead-mesh/funnel/timeseries?days=365")
+        assert r.status_code == 422
+
+
 class TestBlockedPeersApi:
     """Phase 8d: GET /lead-mesh/funnel/blocked-peers."""
 

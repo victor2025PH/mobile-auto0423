@@ -172,6 +172,64 @@ def compute_funnel(days: int = 7,
     return stats
 
 
+def compute_funnel_timeseries(days: int = 7,
+                                actor: Optional[str] = None
+                                ) -> List[Dict[str, Any]]:
+    """近 N 天按日分桶的漏斗时序 (Phase 8e sparkline 用).
+
+    Returns:
+        list 按 date 升序, 每项 {date: YYYY-MM-DD, friend_req, greeting_sent, blocked}.
+        **缺失日填 0** (避免 sparkline 断线).
+
+    实现: 1 次 SQL 按 substr(at, 1, 10) + action 分组 COUNT,
+          Python 侧填 0 + 按 date 对齐.
+    """
+    days = max(1, min(90, int(days)))
+    today = _dt.datetime.utcnow().date()
+    # 近 N 天: 包括今天, 所以起点是 today - (days-1)
+    start_date = today - _dt.timedelta(days=days - 1)
+    date_list = [(start_date + _dt.timedelta(days=i)).isoformat()
+                  for i in range(days)]
+    # 预填 0
+    by_date: Dict[str, Dict[str, Any]] = {
+        d: {"date": d, "friend_req": 0, "greeting_sent": 0, "blocked": 0}
+        for d in date_list
+    }
+
+    since_iso = start_date.strftime("%Y-%m-%d 00:00:00")
+    sql = ("SELECT substr(at, 1, 10) as day, action, COUNT(*) as n"
+            " FROM lead_journey"
+            " WHERE at >= ?"
+            "   AND action IN ('friend_requested', 'greeting_sent',"
+            "                  'greeting_blocked')")
+    params: list = [since_iso]
+    if actor:
+        sql += " AND actor = ?"
+        params.append(actor)
+    sql += " GROUP BY day, action ORDER BY day ASC"
+
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+    except Exception:
+        rows = []
+
+    for row in rows:
+        day = (row[0] or "")[:10]
+        action = row[1] or ""
+        n = int(row[2] or 0)
+        if day not in by_date:
+            continue
+        if action == "friend_requested":
+            by_date[day]["friend_req"] = n
+        elif action == "greeting_sent":
+            by_date[day]["greeting_sent"] = n
+        elif action == "greeting_blocked":
+            by_date[day]["blocked"] = n
+
+    return [by_date[d] for d in date_list]
+
+
 def list_blocked_peers(reason: str,
                          days: int = 7,
                          limit: int = 50) -> List[Dict[str, Any]]:
