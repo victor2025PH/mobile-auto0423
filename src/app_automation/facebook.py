@@ -378,6 +378,16 @@ _VLM_SWAP_THRESHOLD = 3  # 连续 N 次 VLM HTTP error 触发 swap
 # swapped` 是单向 bool (已切 or 没), counter 更有用于 Grafana alert rate()。
 _vlm_swap_events_total = 0
 
+# P18 (2026-04-24): VLM call latency histogram — 让 Grafana 看 P50/P95/P99,
+# 区分 HIT (~8s 单次 API + parsing) vs MISS-with-retry (~32s, LLMClient 429
+# 退避 5+10+16). bucket 边界照顾到真实眼球数据分布 (见 eval tool baseline)。
+_VLM_LATENCY_BUCKETS = (0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0)
+# 累计 bucket count (Prometheus le="..." 的 cumulative 语义 — bucket[k] 是
+# ≤ BUCKETS[k] 的累计数, 含所有更小 bucket)
+_vlm_latency_bucket_counts = [0] * (len(_VLM_LATENCY_BUCKETS) + 1)  # +1 = +Inf
+_vlm_latency_sum = 0.0
+_vlm_latency_count = 0
+
 
 def _try_ollama_vision_client():
     """探测本地 Ollama 有无 vision model, 有则构造 LLMClient 用作 swap 目标。
@@ -462,6 +472,28 @@ def _record_vlm_result(vf) -> None:
         _vlm_swap_events_total += 1  # P16 counter
 
 
+def _observe_vlm_latency(duration_sec: float) -> None:
+    """P18 (2026-04-24): 记录一次 VLM call latency 到 cumulative histogram。
+
+    Args:
+        duration_sec: 从 caller 发起到 find_element 返回 (含 retry + parsing)。
+            典型分布:
+              * HIT: 4-10s (一次 API call + 解析)
+              * WRONG: 类似 HIT (坐标返了, 只是 bbox 外)
+              * MISS w/ 429 retry: ~20-35s (LLMClient 2 次 retry 指数退避)
+              * MISS 无网络: 近 timeout (httpx timeout 30s) 约 30s
+    """
+    global _vlm_latency_sum, _vlm_latency_count
+    _vlm_latency_sum += float(duration_sec)
+    _vlm_latency_count += 1
+    # cumulative: duration ≤ bucket_upper_bound 的都累加该 bucket 和以上所有
+    for i, upper in enumerate(_VLM_LATENCY_BUCKETS):
+        if duration_sec <= upper:
+            _vlm_latency_bucket_counts[i] += 1
+    # +Inf bucket 每次必加 (Prometheus histogram spec)
+    _vlm_latency_bucket_counts[-1] += 1
+
+
 def vlm_level4_prometheus_text() -> str:
     """P16 (2026-04-24): 将 Level 4 VLM fallback 状态导出 Prometheus text format,
     供 ``GET /observability/prometheus`` 追加。Grafana alert rule 示例:
@@ -502,10 +534,27 @@ def vlm_level4_prometheus_text() -> str:
            "gauge", 1 if _vision_fallback_init_attempted else 0)
 
     vf = _vision_fallback_instance
+
+    def _emit_histogram():
+        """P18: histogram 独立于 vf 是否 init (latency 可能有累计历史)。"""
+        hist_name = "openclaw_vlm_level4_call_duration_seconds"
+        lines.append(f"# HELP {hist_name} VLM find_element duration 秒, 含 retry")
+        lines.append(f"# TYPE {hist_name} histogram")
+        for i, upper in enumerate(_VLM_LATENCY_BUCKETS):
+            lines.append(
+                f'{hist_name}_bucket{{le="{upper}"}} '
+                f'{_vlm_latency_bucket_counts[i]}')
+        lines.append(
+            f'{hist_name}_bucket{{le="+Inf"}} '
+            f'{_vlm_latency_bucket_counts[-1]}')
+        lines.append(f"{hist_name}_sum {_vlm_latency_sum:.3f}")
+        lines.append(f"{hist_name}_count {_vlm_latency_count}")
+
     if vf is None:
         _emit("openclaw_vlm_level4_ready",
                "1 if VisionFallback instance exists (provider 可用)",
                "gauge", 0)
+        _emit_histogram()
         return "\n".join(lines) + "\n"
     _emit("openclaw_vlm_level4_ready", "同上", "gauge", 1)
 
@@ -542,6 +591,10 @@ def vlm_level4_prometheus_text() -> str:
                    "provider / vision_model label (值恒 1, Grafana 按 label 分面板)",
                    "gauge", 1,
                    labels=f'provider="{provider}",vision_model="{vmodel}"')
+
+    # P18: VLM call latency histogram — 放最后, Prometheus
+    # histogram_quantile(0.95, rate(..._bucket[5m])) 可算 P95。
+    _emit_histogram()
 
     return "\n".join(lines) + "\n"
 
@@ -1558,10 +1611,12 @@ class FacebookAutomation(BaseAutomation):
                 "Placeholder text '问问 Meta AI' (Chinese) or 'Ask Meta AI' "
                 "/ 'Search in Messenger' (English).")
             try:
+                _vlm_t0 = time.perf_counter()
                 result = vf.find_element(
                     device=d, target=vlm_target, context=vlm_context)
-                # P5b: 统计 HTTP failure + 触发 provider swap (如需要)
+                # P5b + P18: HTTP failure 统计 + swap 决策 + latency histogram
                 _record_vlm_result(vf)
+                _observe_vlm_latency(time.perf_counter() - _vlm_t0)
                 if result and result.coordinates:
                     x, y = result.coordinates
                     d.click(x, y)
@@ -1624,6 +1679,7 @@ class FacebookAutomation(BaseAutomation):
         vf = _get_vision_fallback()
         if vf is not None:
             try:
+                _vlm_t0 = time.perf_counter()
                 result = vf.find_element(
                     device=d,
                     target="Send message button (blue paper-plane icon)",
@@ -1633,8 +1689,9 @@ class FacebookAutomation(BaseAutomation):
                         "plane shape. Not emoji (middle-right) or camera "
                         "(left side). Typically x > 85% width."),
                 )
-                # P5b: 统计 HTTP failure + 触发 provider swap (如需要)
+                # P5b + P18: HTTP failure 统计 + swap 决策 + latency histogram
                 _record_vlm_result(vf)
+                _observe_vlm_latency(time.perf_counter() - _vlm_t0)
                 if result and result.coordinates:
                     x, y = result.coordinates
                     d.click(x, y)
@@ -1708,10 +1765,12 @@ class FacebookAutomation(BaseAutomation):
                 "bar at top, NOT a 'Recent searches' header, NOT a filter "
                 "chip row. Typically near y ≈ 25-35% of screen height.")
             try:
+                _vlm_t0 = time.perf_counter()
                 result = vf.find_element(
                     device=d, target=vlm_target, context=vlm_context)
-                # P5b: 统计 HTTP failure + 触发 provider swap (如需要)
+                # P5b + P18: HTTP failure 统计 + swap 决策 + latency histogram
                 _record_vlm_result(vf)
+                _observe_vlm_latency(time.perf_counter() - _vlm_t0)
                 if result and result.coordinates:
                     x, y = result.coordinates
                     d.click(x, y)
