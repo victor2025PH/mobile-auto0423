@@ -1209,13 +1209,19 @@ def _fb_line_dispatch_from_reply(resolved: str,
 
         # Phase 11.2: 组装 messenger 引流话术 (dispatch_mode=messenger_text)
         # line_direct_send 模式下 B 机/LINE automation 用自己的话术, 这里只传 line_id.
+        # Phase 12.1: persona fallback 优先级反转 — lead.metadata 优先于 task.persona_key
+        # (lead 自身 L2 分类的 persona 比 task-level 全局 persona 更贴 lead 真实画像).
+        effective_persona = (meta.get("l2_persona_key") or persona_key or "")
         message_template = ""
         if dispatch_mode == "messenger_text" and get_referral_snippet:
             try:
                 message_template = get_referral_snippet(
                     channel="line",
                     value=acc["line_id"],
-                    persona_key=(persona_key or meta.get("l2_persona_key") or ""),
+                    persona_key=effective_persona,
+                    peer_name=peer_name,
+                    age_band=meta.get("age_band") or "",
+                    gender=meta.get("gender") or "",
                 )
             except Exception as e:
                 logger.debug("[phase11] referral_snippet 失败: %s", e)
@@ -1266,6 +1272,20 @@ def _fb_line_dispatch_from_reply(resolved: str,
     return True, "", stats
 
 
+# Phase 12.0.1: MessengerError code 分类 — 哪些值得 retry
+_REFERRAL_TRANSIENT_CODES = frozenset({
+    "messenger_unavailable",    # app 启动中
+    "search_ui_missing",         # UI 加载慢
+    "send_button_missing",       # UI glitch
+})
+_REFERRAL_PERMANENT_CODES = frozenset({
+    "risk_detected",             # 风控
+    "xspace_blocked",            # MIUI 双开
+    "recipient_not_found",       # peer 搜不到
+    "send_blocked_by_content",   # 内容被 FB 挡
+})
+
+
 def _fb_send_referral_replies(fb, resolved: str,
                                params: Dict[str, Any]) -> tuple:
     """Phase 12 Alpha (2026-04-25): A 自立消费 line_dispatch_planned event.
@@ -1277,25 +1297,42 @@ def _fb_send_referral_replies(fb, resolved: str,
 
     Flow:
       1. 扫近 hours_window 小时 line_dispatch_planned events
-      2. 只处理 dispatch_mode=messenger_text 的 (line_direct_send 留 LINE auto)
-      3. strict_device_match=True 时: 只发 event 的 original_device_id 匹配
-         resolved device 的 (保 FB 账号一致, 避免不同号发同一会话撞风控)
+      2. dispatch_mode=messenger_text 直发; line_direct_send 若 LINE auto 未就位,
+         fallback 为 messenger_text (Phase 12.0.1)
+      3. strict_device_match=True: 只发 original_device_id 匹配本机
       4. 24h 去重: 若该 peer 已有 wa_referral_sent → skip
-      5. 调 facebook.send_message(peer_name, message_template)
-      6. 发成功 → 写 wa_referral_sent + mark_dispatch_outcome(sent)
-         发失败 → mark_dispatch_outcome(failed, note=<err>)
-      7. 返 {scanned, sent, failed, skipped_dedup, skipped_device}
+      5. 发送前 random.uniform(min, max) sleep 做速率平滑 (防风控)
+      6. 调 facebook.send_message(raise_on_error=True), 按 MessengerError.code
+         分瞬时/永久: 瞬时 retry max_retry 次 interval retry_interval_sec
+      7. 成功 → 写 wa_referral_sent + mark_dispatch_outcome(sent)
+         失败 → mark_dispatch_outcome(failed, note=<err_code>)
 
     Params:
       hours_window: int = 2
       dedupe_hours: int = 24
       strict_device_match: bool = True
       limit: int = 10
+      min_interval_sec: float = 30   # 两条 send 之间最短 sleep
+      max_interval_sec: float = 90   # 最长 sleep (random 0-1 混合)
+      max_retry: int = 2             # 瞬时错误 retry 次数 (不含首发)
+      retry_interval_sec: float = 10
+      fallback_line_direct_send: bool = True  # True 时 line_direct_send 降级为
+                                                # messenger_text 发 (避免死信)
     """
+    import random as _r
+    import time as _time
+
     hours_window = int(params.get("hours_window", 2) or 2)
     dedupe_hours = int(params.get("dedupe_hours", 24) or 24)
     strict_device = bool(params.get("strict_device_match", True))
     limit = max(1, min(int(params.get("limit", 10) or 10), 100))
+    min_iv = float(params.get("min_interval_sec", 30) or 0)
+    max_iv = float(params.get("max_interval_sec", 90) or 0)
+    if max_iv < min_iv:
+        max_iv = min_iv
+    max_retry = max(0, int(params.get("max_retry", 2) or 0))
+    retry_iv = float(params.get("retry_interval_sec", 10) or 0)
+    fallback_direct_send = bool(params.get("fallback_line_direct_send", True))
 
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     record_contact_event,
@@ -1303,6 +1340,10 @@ def _fb_send_referral_replies(fb, resolved: str,
                                     CONTACT_EVT_LINE_DISPATCH_PLANNED,
                                     CONTACT_EVT_WA_REFERRAL_SENT)
     from src.host import line_pool as _lp
+    try:
+        from src.app_automation.facebook import MessengerError
+    except Exception:
+        MessengerError = Exception  # 兜底, 不应命中
     import json as _json
 
     events = list_recent_contact_events_by_types(
@@ -1317,6 +1358,8 @@ def _fb_send_referral_replies(fb, resolved: str,
     skipped_mode = 0
     outcomes: List[Dict[str, Any]] = []
 
+    processed_count = 0  # 已真正尝试发送的条数 (用于速率平滑间隔判断)
+
     for ev in events:
         if sent + failed >= limit:
             break
@@ -1326,7 +1369,16 @@ def _fb_send_referral_replies(fb, resolved: str,
             meta = {}
 
         dispatch_mode = meta.get("dispatch_mode") or "messenger_text"
-        if dispatch_mode != "messenger_text":
+        # Phase 12.0.1: line_direct_send 若无 LINE auto 消费者会成死信,
+        # fallback 为 messenger_text 直发 LINE ID 文本.
+        effective_mode = dispatch_mode
+        if dispatch_mode == "line_direct_send":
+            if fallback_direct_send:
+                effective_mode = "messenger_text"
+            else:
+                skipped_mode += 1
+                continue
+        if effective_mode != "messenger_text":
             skipped_mode += 1
             continue
 
@@ -1358,17 +1410,51 @@ def _fb_send_referral_replies(fb, resolved: str,
         except Exception:
             pass
 
-        # 真机发消息
+        # Phase 12.0.1 速率平滑: 第二条起 random sleep [min, max]
+        if processed_count > 0 and max_iv > 0:
+            sleep_for = _r.uniform(min_iv, max_iv)
+            logger.debug("[referral.send] rate-limit sleep %.1fs", sleep_for)
+            _time.sleep(sleep_for)
+        processed_count += 1
+
+        # Phase 12.0.1 in-task retry: 瞬时错误 retry 最多 max_retry 次,
+        # 永久错误立即 failed. raise_on_error=True 拿到 MessengerError.code.
         ok = False
         err_note = ""
-        try:
-            ok = bool(fb.send_message(
-                recipient=peer_name, message=message_template,
-                device_id=resolved,
-            ))
-        except Exception as e:
-            err_note = f"send_message_exception:{type(e).__name__}:{str(e)[:80]}"
-            logger.warning("[referral.send] %s 异常: %s", peer_name, e)
+        err_code = ""
+        attempts = max_retry + 1
+        for attempt in range(attempts):
+            try:
+                ok = bool(fb.send_message(
+                    recipient=peer_name, message=message_template,
+                    device_id=resolved, raise_on_error=True,
+                ))
+                err_code = ""
+                break
+            except MessengerError as me:
+                err_code = getattr(me, "code", "") or ""
+                err_note = f"code={err_code}|{str(me)[:80]}"
+                if err_code in _REFERRAL_PERMANENT_CODES:
+                    logger.info("[referral.send] %s 永久错误 %s, 不 retry",
+                                 peer_name, err_code)
+                    break
+                # 瞬时错误 / 未分类 → retry
+                if attempt + 1 < attempts:
+                    logger.info("[referral.send] %s 瞬时错误 %s, retry %d/%d",
+                                 peer_name, err_code, attempt + 1,
+                                 max_retry)
+                    _time.sleep(retry_iv)
+                    continue
+                # 耗尽 retry
+                logger.info("[referral.send] %s 瞬时错误 %s retry 耗尽",
+                             peer_name, err_code)
+                break
+            except Exception as e:
+                err_note = f"send_message_exception:{type(e).__name__}:{str(e)[:80]}"
+                err_code = "unknown_exception"
+                logger.warning("[referral.send] %s 未知异常: %s",
+                                 peer_name, e)
+                break
 
         if ok:
             sent += 1
@@ -1380,6 +1466,8 @@ def _fb_send_referral_replies(fb, resolved: str,
                     meta={"line_id": meta.get("line_id"),
                           "line_account_id": line_account_id,
                           "sent_by": "agent_a_phase12_alpha",
+                          "effective_mode": effective_mode,
+                          "original_mode": dispatch_mode,
                           "source_event_id": str(ev.get("id") or ""),
                           "source_planned_event_id": str(ev.get("id") or ""),
                           "canonical_id": meta.get("canonical_id") or ""})
@@ -1406,7 +1494,8 @@ def _fb_send_referral_replies(fb, resolved: str,
             "peer_name": peer_name, "line_account_id": line_account_id,
             "line_id": meta.get("line_id"),
             "planned_event_id": ev.get("id"),
-            "sent": ok, "note": err_note,
+            "sent": ok, "err_code": err_code, "note": err_note,
+            "effective_mode": effective_mode,
         })
 
     stats = {

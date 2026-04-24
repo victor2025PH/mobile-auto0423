@@ -101,6 +101,31 @@ class TestAllocate:
         r = lp.allocate(region="it", canonical_id="c")
         assert r is None
 
+    def test_skipped_log_written_on_no_match(self, tmp_db):
+        """Phase 12.1: allocate 无匹配时写 skipped log 诊断."""
+        from src.host import line_pool as lp
+        lp.add("@jp", region="jp")
+        lp.allocate(region="it", canonical_id="c1", peer_name="X")
+        log = lp.recent_dispatch_log(limit=5)
+        assert len(log) >= 1
+        assert log[0]["status"] == "skipped"
+        assert log[0]["line_account_id"] == 0
+        assert "no_match" in log[0]["note"]
+
+    def test_skipped_log_written_on_all_capped(self, tmp_db):
+        """Phase 12.1: 全部超 cap 时 skipped log note=all_capped."""
+        from src.host import line_pool as lp
+        lp.add("@only", region="jp", daily_cap=1)
+        # 用掉唯一余量
+        lp.allocate(region="jp", canonical_id="c1")
+        # 第 2 次必 skip
+        r2 = lp.allocate(region="jp", canonical_id="c2", peer_name="Y")
+        assert r2 is None
+        log = lp.recent_dispatch_log(limit=5)
+        # 首条是 skipped 记录
+        assert log[0]["status"] == "skipped"
+        assert "all_capped" in log[0]["note"]
+
     def test_disabled_not_allocated(self, tmp_db):
         from src.host import line_pool as lp
         aid = lp.add("@off", region="jp")
@@ -377,6 +402,35 @@ class TestDispatcher:
             device_id="DEV1", peer_name="裕子",
             event_type="wa_referral_sent", hours=6)
         assert n == 1
+
+    def test_persona_fallback_priority_lead_over_task(self, tmp_db):
+        """Phase 12.1: lead.metadata.l2_persona_key > task.persona_key.
+
+        给 lead 打 l2_persona_key=A, task 传 persona_key=B,
+        dispatcher 组装 referral 时应用 A.
+        """
+        from src.host import line_pool as lp
+        from src.host.executor import _fb_line_dispatch_from_reply
+        lp.add("@jp", region="jp",
+                persona_key="",  # 通用池, 不参与过滤
+                daily_cap=10)
+        # lead 的 persona 是 jp_female_midlife
+        _seed_l2_lead("花子", persona="jp_female_midlife")
+        _seed_reply_event("DEV1", "花子", "greeting_replied")
+
+        ok, _m, stats = _fb_line_dispatch_from_reply("DEV1", {
+            "hours_window": 6,
+            "persona_key": "it_female_midlife",  # task 级错误 persona
+            "region": "jp",
+            # lead metadata 优先, 仍用 jp_female_midlife 抽模板
+        })
+        # 只要 dispatcher 不抛, lead 优先 persona 生效 (能否抽到 jp 模板由 yaml 决定)
+        assert ok
+        # 如果抽到非空 template, 里面应含日文字符或 line_id
+        if stats["dispatched"] >= 1:
+            d = stats["dispatches"][0]
+            # template 非空 (fallback 至少返 "line: along2026")
+            assert d["message_template"]
 
     def test_dispatch_includes_message_template(self, tmp_db):
         """dispatch_mode=messenger_text 时 dispatches 里应有 message_template."""

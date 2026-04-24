@@ -144,7 +144,8 @@
     <table>
       <thead><tr>
         <th>ID</th><th>time</th><th>line_id</th>
-        <th>canonical</th><th>peer</th><th>source</th><th>status</th>
+        <th>canonical</th><th>peer</th><th>source</th>
+        <th>status</th><th>note</th>
       </tr></thead>
       <tbody id="log_tbl"></tbody>
     </table>
@@ -293,14 +294,18 @@ async function reloadLog() {
     body.innerHTML = "";
     for (const r of data.results || []) {
       const tr = document.createElement("tr");
+      const lineDisplay = r.line_id
+        ? `<code>${escapeHtml(r.line_id)}</code>`
+        : `<span class="muted">(skipped·no-acct)</span>`;
       tr.innerHTML = `
         <td>${r.id}</td>
         <td class="muted">${r.created_at}</td>
-        <td><code>${escapeHtml(r.line_id)}</code></td>
+        <td>${lineDisplay}</td>
         <td class="muted" style="font-family:ui-monospace">${escapeHtml(r.canonical_id.slice(0,12))}</td>
         <td>${escapeHtml(r.peer_name || "")}</td>
         <td class="muted">${escapeHtml(r.source_device_id || "")}</td>
         <td><span class="pill ${r.status === 'sent' ? 'active' : (r.status === 'failed' ? 'banned' : 'cooldown')}">${r.status}</span></td>
+        <td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;font-size:11px">${escapeHtml(r.note || "")}</td>
       `;
       body.appendChild(tr);
     }

@@ -208,6 +208,34 @@ def delete(account_id: int) -> bool:
 
 # ─── 轮循分配 ───────────────────────────────────────────────────────────
 
+def _write_skipped_log(conn, *, reason: str, canonical_id: str = "",
+                         peer_name: str = "", source_device_id: str = "",
+                         source_event_id: str = "",
+                         filters: Optional[Dict[str, Any]] = None) -> None:
+    """Phase 12.1: allocate 失败时写一条 skipped log 供 UI 诊断.
+
+    line_account_id=0 表示"无账号被选", line_id='' 清晰标记这是 allocation-miss,
+    不是发送失败. note 里带 reason + filter 组合帮运营判断该加账号还是调 cap.
+    """
+    try:
+        note_dict = {"reason": reason}
+        if filters:
+            note_dict["filters"] = {k: v for k, v in filters.items() if v}
+        import json as _json
+        note = _json.dumps(note_dict, ensure_ascii=False)[:500]
+    except Exception:
+        note = reason
+    try:
+        conn.execute(
+            "INSERT INTO line_dispatch_log (line_account_id, line_id,"
+            " canonical_id, peer_name, source_device_id, source_event_id,"
+            " status, note) VALUES (0, '', ?, ?, ?, ?, 'skipped', ?)",
+            (canonical_id, peer_name, source_device_id, source_event_id, note),
+        )
+    except Exception as e:
+        logger.debug("[line_pool] write skipped log 失败: %s", e)
+
+
 def _count_recent_usage(conn, line_account_id: int, hours: int = 24) -> int:
     """近 N 小时 line_dispatch_log 记录数 (status != skipped)."""
     row = conn.execute(
@@ -263,6 +291,14 @@ def allocate(*,
         with _connect() as conn:
             rows = conn.execute(sql, args).fetchall()
             if not rows:
+                # Phase 12.1: 写 skipped log 供 UI 诊断 "为什么没分配"
+                _write_skipped_log(
+                    conn, reason="no_match",
+                    canonical_id=canonical_id, peer_name=peer_name,
+                    source_device_id=source_device_id,
+                    source_event_id=source_event_id,
+                    filters={"region": region, "persona_key": persona_key,
+                             "owner_device_id": owner_device_id})
                 return None
             picked = None
             prev_last_used = None
@@ -275,6 +311,14 @@ def allocate(*,
             if picked is None:
                 logger.info("[line_pool.allocate] %d accounts matched 全超 cap",
                              len(rows))
+                _write_skipped_log(
+                    conn, reason="all_capped",
+                    canonical_id=canonical_id, peer_name=peer_name,
+                    source_device_id=source_device_id,
+                    source_event_id=source_event_id,
+                    filters={"region": region, "persona_key": persona_key,
+                             "owner_device_id": owner_device_id,
+                             "candidates": len(rows)})
                 return None
             # CAS: 如果 last_used_at 被别人改了, UPDATE 影响 0 行, retry.
             new_last = _now_iso()

@@ -18,7 +18,16 @@ from __future__ import annotations
 import json
 
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+
+@pytest.fixture(autouse=True)
+def _fast_mode():
+    """防 rate-limit sleep 拖慢测试. Executor 内部 import random/time 都被
+    替换成零开销; 实际 sleep 被调的次数测试里用 _sleep_spy 单独检查."""
+    with patch("random.uniform", return_value=0), \
+         patch("time.sleep") as _slp:
+        yield _slp
 
 
 def _seed_planned_event(device_id: str, peer_name: str, *,
@@ -165,19 +174,106 @@ class TestSendReferralReplies:
         out = stats["outcomes"][0]
         assert "send_message_exception" in (out.get("note") or "")
 
-    def test_line_direct_send_mode_skipped(self, tmp_db):
-        """dispatch_mode=line_direct_send 留给 LINE automation 处理, 本 task
-        不动 → skipped_mode."""
+    def test_line_direct_send_mode_fallback_to_messenger(self, tmp_db):
+        """Phase 12.0.1: line_direct_send 无 LINE auto 时默认 fallback 为
+        messenger_text 直发 (防死信)."""
+        from src.host.executor import _fb_send_referral_replies
+        from src.host import line_pool as lp
+        aid = lp.add("along2026", region="jp")
+        _seed_planned_event("DEV1", "真理子",
+                             dispatch_mode="line_direct_send",
+                             line_account_id=aid,
+                             original_device_id="DEV1")
+        fb = _make_fb_stub(send_return=True)
+        ok, _, stats = _fb_send_referral_replies(fb, "DEV1", {})
+        assert stats["sent"] == 1, "fallback_line_direct_send=True (默认) 应发出"
+        assert stats["outcomes"][0]["effective_mode"] == "messenger_text"
+
+    def test_line_direct_send_mode_strict_skip(self, tmp_db):
+        """fallback_line_direct_send=False → line_direct_send skip (旧行为)."""
         from src.host.executor import _fb_send_referral_replies
         _seed_planned_event("DEV1", "真理子",
                              dispatch_mode="line_direct_send",
                              line_account_id=1,
                              original_device_id="DEV1")
         fb = _make_fb_stub()
-        ok, _, stats = _fb_send_referral_replies(fb, "DEV1", {})
+        ok, _, stats = _fb_send_referral_replies(fb, "DEV1",
+            {"fallback_line_direct_send": False})
         assert stats["skipped_mode"] == 1
         assert stats["sent"] == 0
         fb.send_message.assert_not_called()
+
+    def test_transient_error_retried(self, tmp_db):
+        """Phase 12.0.1: 瞬时错误 (messenger_unavailable) 重试 max_retry 次."""
+        from src.host.executor import _fb_send_referral_replies
+        from src.app_automation.facebook import MessengerError
+        from src.host import line_pool as lp
+        aid = lp.add("along2026", region="jp")
+        _seed_planned_event("DEV1", "花子",
+                             line_account_id=aid,
+                             original_device_id="DEV1")
+        fb = MagicMock()
+        # 第 1-2 次抛瞬时错误, 第 3 次成功
+        fb.send_message.side_effect = [
+            MessengerError("messenger_unavailable", "启动中"),
+            MessengerError("search_ui_missing", "UI 加载慢"),
+            True,
+        ]
+        ok, _, stats = _fb_send_referral_replies(fb, "DEV1",
+            {"max_retry": 2, "retry_interval_sec": 0})
+        assert stats["sent"] == 1
+        assert fb.send_message.call_count == 3  # 2 retry + 1 成功
+
+    def test_permanent_error_no_retry(self, tmp_db):
+        """永久错误 (risk_detected) 不 retry 直接 failed."""
+        from src.host.executor import _fb_send_referral_replies
+        from src.app_automation.facebook import MessengerError
+        from src.host import line_pool as lp
+        aid = lp.add("along2026", region="jp")
+        _seed_planned_event("DEV1", "美咲",
+                             line_account_id=aid,
+                             original_device_id="DEV1")
+        fb = MagicMock()
+        fb.send_message.side_effect = MessengerError("risk_detected", "风控")
+        ok, _, stats = _fb_send_referral_replies(fb, "DEV1",
+            {"max_retry": 3, "retry_interval_sec": 0})
+        assert stats["failed"] == 1
+        assert fb.send_message.call_count == 1, \
+            "永久错误只应调 1 次, 不 retry"
+        assert "risk_detected" in stats["outcomes"][0]["err_code"]
+
+    def test_retry_exhausted_marks_failed(self, tmp_db):
+        """瞬时错误连续失败 → retry 耗尽 failed."""
+        from src.host.executor import _fb_send_referral_replies
+        from src.app_automation.facebook import MessengerError
+        from src.host import line_pool as lp
+        aid = lp.add("along2026", region="jp")
+        _seed_planned_event("DEV1", "裕子",
+                             line_account_id=aid,
+                             original_device_id="DEV1")
+        fb = MagicMock()
+        fb.send_message.side_effect = MessengerError("send_button_missing", "UI")
+        ok, _, stats = _fb_send_referral_replies(fb, "DEV1",
+            {"max_retry": 2, "retry_interval_sec": 0})
+        assert stats["failed"] == 1
+        assert fb.send_message.call_count == 3  # 初次 + 2 retry
+
+    def test_rate_limit_sleep_between_sends(self, tmp_db, _fast_mode):
+        """Phase 12.0.1: 第 2 条起 time.sleep(random.uniform(min, max))."""
+        from src.host.executor import _fb_send_referral_replies
+        from src.host import line_pool as lp
+        aid = lp.add("along2026", region="jp", daily_cap=100)
+        for i in range(3):
+            _seed_planned_event("DEV1", f"P{i}",
+                                 line_account_id=aid,
+                                 original_device_id="DEV1")
+        fb = _make_fb_stub(send_return=True)
+        _fb_send_referral_replies(fb, "DEV1",
+            {"min_interval_sec": 30, "max_interval_sec": 90,
+             "retry_interval_sec": 0, "max_retry": 0})
+        # 第 1 条不 sleep, 第 2/3 条各 sleep 一次 → time.sleep 被调 >= 2 次
+        # _fast_mode 已把 sleep patch 成 MagicMock, 检查 call_count
+        assert _fast_mode.call_count >= 2
 
     def test_limit_caps_send_count(self, tmp_db):
         from src.host.executor import _fb_send_referral_replies

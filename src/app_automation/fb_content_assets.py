@@ -320,43 +320,49 @@ def get_referral_snippet(channel: str,
                          value: str,
                          persona_key: Optional[str] = None,
                          country_code: Optional[str] = None,
-                         language: Optional[str] = None) -> str:
+                         language: Optional[str] = None,
+                         peer_name: str = "",
+                         age_band: str = "",
+                         gender: str = "") -> str:
     """引流切换话术（在 DM 里发 LINE ID / WA 号等场景用）。
 
     channel 可以是 ``line`` / ``instagram`` / ``whatsapp`` / ``telegram``。
     value 是要发送的 ID/号码。返回拼好的完整句子。
+
+    Phase 12.1 (2026-04-25): 支持 {peer_name} / {age_band} / {gender} 占位符,
+    让引流话术个性化 (例 "{peer_name}さん、LINE で繋がりませんか: {line}").
+    上层 dispatcher 可把 canonical.metadata 传入. 占位符缺失用空串不报错.
     """
     channel = (channel or "").lower().strip()
     if not value:
         return ""
     ctx = _resolve_context(persona_key, country_code=country_code, language=language)
-    # 先找 countries[cc].message_variants[*].referral_{channel}
-    # 或 countries[cc].referral_{channel}_templates
     cb = _country_bundle(ctx["country_code"])
     tpls: List[str] = []
-    # 1) message_variants 里按 weight 取第一个含 referral_{channel} 的变体
     for mv in cb.get("message_variants") or []:
         ref = mv.get(f"referral_{channel}") if isinstance(mv, dict) else None
         if ref:
             tpls.extend(ref)
-    # 2) countries[cc].referral_{channel}_templates（平级配置）
     direct = cb.get(f"referral_{channel}") or cb.get(f"referral_{channel}_templates")
     if direct:
         tpls.extend(direct)
-    # 3) 语种兜底
     if not tpls:
         tpls = _fallback_for_lang(ctx["language"]).get(f"referral_{channel}") or []
-    # 4) 完全没有 → 最裸兜底
     if not tpls:
         return f"{channel}: {value}"
     template = random.choice(tpls)
-    # 模板里占位符可能是 {value} / {line} / {whatsapp} 等
+    # 模板占位符: {value} / {line}/{whatsapp}/... (channel 自身), 以及
+    # {peer_name}/{age_band}/{gender}/{name} (Phase 12.1 个性化)
     return _safe_format(template,
                         value=value,
                         line=value if channel == "line" else "",
                         whatsapp=value if channel == "whatsapp" else "",
                         instagram=value if channel == "instagram" else "",
-                        telegram=value if channel == "telegram" else "")
+                        telegram=value if channel == "telegram" else "",
+                        peer_name=peer_name or "",
+                        name=peer_name or "",  # alias
+                        age_band=age_band or "",
+                        gender=gender or "")
 
 
 # ── 诊断辅助（供 /facebook/content-assets/debug 接口或单测使用）──────
