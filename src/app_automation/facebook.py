@@ -2655,28 +2655,40 @@ class FacebookAutomation(BaseAutomation):
                 import re as _re_lang
                 brain = ChatBrain.get_instance()
                 prof = UserProfile(username=profile_name)
-                lead_id = f"fb:{profile_name}"
-                result = brain.generate_reply(
-                    lead_id=lead_id,
-                    incoming_message="",   # 空 = 破冰首次开场
-                    profile=prof,
-                    platform="facebook",
-                    target_language="ja",   # 日本客群锁日文
-                    source="add_friend_greet",
-                    persist=False,          # 不污染 ConversationMemory
+                lead_id_base = f"fb:{profile_name}"
+                # 强化日文约束的 style hint (LLM soft instruction)
+                jp_strict_hint = (
+                    "必须使用日文 (日本語). 严禁中文、英文、其他语言.\n"
+                    "必须包含平假名(hiragana) 或片假名(katakana). "
+                    "纯汉字/英文=不合格.\n"
+                    "风格: 日本 40-50 岁女性自然口语, 首次见面敬语, 简短 (1-2 句)."
                 )
-                ai_msg = (getattr(result, "message", "") or "").strip()
-                # 校验: 必须含日文假名(平假/片假), 否则 fallback 模板
-                # 避免 LLM 输出中文/英文混入发错语言
-                has_kana = bool(_re_lang.search(r"[぀-ヿ]", ai_msg))
-                if ai_msg and has_kana:
-                    greeting = ai_msg
-                    template_id = "ai:chat_brain:ja"
-                    log.info("[send_greeting] AI greeting OK (kana检验) (%d chars): %s",
-                              len(greeting), profile_name)
-                elif ai_msg:
-                    log.warning("[send_greeting] AI greeting 无假名(可能中文/英文), fallback 模板: %r",
-                                 ai_msg[:60])
+                # 最多 3 次尝试 (retry on non-Japanese output)
+                for _try in range(3):
+                    # 每次用不同 lead_id 后缀绕 ConversationMemory 缓存
+                    lead_id = f"{lead_id_base}:try_{int(time.time())}_{_try}"
+                    result = brain.generate_reply(
+                        lead_id=lead_id,
+                        incoming_message="",
+                        profile=prof,
+                        platform="facebook",
+                        target_language="ja",
+                        source="add_friend_greet",
+                        ab_style_hint=jp_strict_hint,
+                        persist=False,
+                    )
+                    ai_msg = (getattr(result, "message", "") or "").strip()
+                    has_kana = bool(_re_lang.search(r"[぀-ヿ]", ai_msg))
+                    if ai_msg and has_kana:
+                        greeting = ai_msg
+                        template_id = f"ai:chat_brain:ja:t{_try+1}"
+                        log.info("[send_greeting] AI greeting OK try=%d (%d chars): %s",
+                                  _try+1, len(greeting), profile_name)
+                        break
+                    log.info("[send_greeting] AI try=%d 无假名, 重试: %r",
+                              _try+1, ai_msg[:60])
+                if not greeting:
+                    log.warning("[send_greeting] AI greeting 3 retry 全非日文, fallback 模板")
             except Exception as e:
                 log.warning("[send_greeting] AI greeting 生成失败, fallback 模板: %s", e)
         if not greeting:
