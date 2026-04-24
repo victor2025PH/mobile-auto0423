@@ -123,3 +123,121 @@ class TestBudget:
         assert s["hourly_budget"] == 10
         assert s["budget_remaining"] == 9
         assert "cache_size" in s
+
+
+# ─── P5a: _png_dimensions + bounds check (2026-04-24) ───────────────
+
+
+def _make_png_header(width: int, height: int) -> bytes:
+    """合成 PNG 前 24 字节 (signature + IHDR length + type + w + h), 够
+    `_png_dimensions` 读取。不生成完整有效 PNG。"""
+    import struct
+    return (
+        b"\x89PNG\r\n\x1a\n"           # 8-byte signature
+        + struct.pack(">I", 13)        # IHDR length (BE uint32)
+        + b"IHDR"                      # chunk type
+        + struct.pack(">II", width, height)  # width + height (BE uint32 each)
+    )
+
+
+class TestPngDimensions:
+    """`VisionFallback._png_dimensions` — 零依赖解析 PNG 尺寸。"""
+
+    def test_valid_720x1600(self):
+        from src.ai.vision_fallback import VisionFallback
+        png = _make_png_header(720, 1600)
+        assert VisionFallback._png_dimensions(png) == (720, 1600)
+
+    def test_valid_1080x2400(self):
+        from src.ai.vision_fallback import VisionFallback
+        png = _make_png_header(1080, 2400)
+        assert VisionFallback._png_dimensions(png) == (1080, 2400)
+
+    def test_truncated_returns_none(self):
+        from src.ai.vision_fallback import VisionFallback
+        assert VisionFallback._png_dimensions(b"\x89PNG") == (None, None)
+
+    def test_non_png_returns_none(self):
+        from src.ai.vision_fallback import VisionFallback
+        # JPEG header 开头
+        assert VisionFallback._png_dimensions(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"\x00" * 20
+        ) == (None, None)
+
+    def test_empty_returns_none(self):
+        from src.ai.vision_fallback import VisionFallback
+        assert VisionFallback._png_dimensions(b"") == (None, None)
+        assert VisionFallback._png_dimensions(None) == (None, None)
+
+    def test_zero_size_rejected(self):
+        """宽高 = 0 不合法 (sanity check)。"""
+        from src.ai.vision_fallback import VisionFallback
+        png = _make_png_header(0, 0)
+        assert VisionFallback._png_dimensions(png) == (None, None)
+
+
+class TestBoundsCheck:
+    """`find_element` 对 VLM 返超屏坐标的处理 — eval 发现 Gemini 常返 upscaled
+    coords, 需 reject 避免 d.click() 打屏外无效。"""
+
+    def _vf(self, response_coords_list):
+        """造 VisionFallback, 可控 chat_vision 每次返 'COORDINATES: x, y'."""
+        from src.ai.vision_fallback import VisionFallback, VisionConfig
+        client = MagicMock()
+        responses = [f"COORDINATES: {x}, {y}"
+                     for (x, y) in response_coords_list]
+        client.chat_vision = MagicMock(side_effect=responses)
+        return VisionFallback(
+            client=client,
+            config=VisionConfig(hourly_budget=20, max_retries=3)), client
+
+    def test_in_bounds_accepted(self):
+        """VLM 返屏内坐标 → 正常 cache + return。"""
+        vf, client = self._vf([(500, 300)])
+        png = _make_png_header(720, 1600)
+        r = vf.find_element(
+            device=None, target="x", context="c", screenshot_bytes=png)
+        assert r and r.coordinates == (500, 300)
+        assert client.chat_vision.call_count == 1
+
+    def test_out_of_bounds_x_rejected_retries(self):
+        """VLM 返 x 超屏 → reject, retry 下一次 (返 valid 则 HIT)。"""
+        vf, client = self._vf([(9999, 300), (500, 300)])
+        png = _make_png_header(720, 1600)
+        r = vf.find_element(
+            device=None, target="x", context="c", screenshot_bytes=png)
+        assert r and r.coordinates == (500, 300)
+        assert client.chat_vision.call_count == 2
+
+    def test_out_of_bounds_y_rejected_retries(self):
+        vf, client = self._vf([(500, 9999), (500, 300)])
+        png = _make_png_header(720, 1600)
+        r = vf.find_element(
+            device=None, target="x", context="c", screenshot_bytes=png)
+        assert r and r.coordinates == (500, 300)
+
+    def test_all_retries_out_of_bounds_returns_none(self):
+        """所有 retry 都超屏 → 最终返 None (treated as miss)。"""
+        vf, client = self._vf([(9999, 9999), (8888, 8888), (7777, 7777)])
+        png = _make_png_header(720, 1600)
+        r = vf.find_element(
+            device=None, target="x", context="c", screenshot_bytes=png)
+        assert r is None
+        assert client.chat_vision.call_count == 3
+
+    def test_no_png_header_skips_bounds_check(self):
+        """无法解析 image 维度 → bounds check 跳过, VLM 返值原样 accept
+        (向后兼容, 不因为 screenshot 格式未知就把所有结果拒掉)。"""
+        vf, client = self._vf([(9999, 9999)])
+        not_png = b"not-a-png-at-all" + b"\x00" * 20
+        r = vf.find_element(
+            device=None, target="x", context="c", screenshot_bytes=not_png)
+        assert r and r.coordinates == (9999, 9999)  # no rejection w/o img size
+
+    def test_out_of_bounds_not_cached(self):
+        """超屏坐标不应入 cache (下次 call 不复发坏结果)。"""
+        vf, client = self._vf([(9999, 9999), (9999, 9999), (9999, 9999)])
+        png = _make_png_header(720, 1600)
+        vf.find_element(
+            device=None, target="x", context="c", screenshot_bytes=png)
+        assert vf._get_cache(vf._cache_key("x", "c")) is None
