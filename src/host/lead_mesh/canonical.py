@@ -448,3 +448,51 @@ def revert_merge(merge_id: int,
         logger.warning("[canonical] revert merge 失败: %s", e)
         return False
     return True
+
+
+def update_canonical_metadata(canonical_id: str,
+                              metadata_patch: Dict[str, Any],
+                              tags: Optional[List[str]] = None) -> bool:
+    """合并 metadata_patch 到 leads_canonical.metadata_json (shallow merge).
+
+    用于 L2 VLM PASS 后把 age_band/gender/is_japanese/overall_confidence
+    等精准画像字段存入用户画像 DB, 供运营面板 / CRM 查询.
+
+    Args:
+        canonical_id: leads_canonical.canonical_id
+        metadata_patch: 要合并的字段 (覆盖同 key)
+        tags: 可选, append 到 tags 列 (逗号分隔)
+
+    Returns True if updated, False otherwise.
+    """
+    if not canonical_id or not metadata_patch:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json, tags FROM leads_canonical WHERE canonical_id=?",
+                (canonical_id,),
+            ).fetchone()
+            if not row:
+                logger.warning("[canonical] update_metadata: %s 不存在",
+                               canonical_id[:12])
+                return False
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            meta.update({k: v for k, v in metadata_patch.items() if v is not None})
+            new_tags = row["tags"] or ""
+            if tags:
+                existing = {t.strip() for t in new_tags.split(",") if t.strip()}
+                existing.update(t.strip() for t in tags if t)
+                new_tags = ",".join(sorted(existing))
+            conn.execute(
+                "UPDATE leads_canonical SET metadata_json=?, tags=?,"
+                " updated_at=datetime('now') WHERE canonical_id=?",
+                (json.dumps(meta, ensure_ascii=False), new_tags, canonical_id),
+            )
+            return True
+    except Exception as e:
+        logger.warning("[canonical] update_metadata 失败: %s", e)
+        return False

@@ -1251,6 +1251,39 @@ class FacebookAutomation(BaseAutomation):
                         })
                 except Exception:
                     pass
+                # 2026-04-24 v4: L2 PASS 后把 VLM insights 聚合到 leads_canonical.metadata_json
+                # 形成"精准用户画像 DB"供运营面板/CRM 一键查询
+                try:
+                    from src.host.lead_mesh import (resolve_identity,
+                                                     update_canonical_metadata)
+                    cid = resolve_identity(platform="facebook",
+                                            account_id=f"fb:{profile_name}",
+                                            display_name=profile_name)
+                    meta_patch = {
+                        "age_band": insights.get("age_band"),
+                        "gender": insights.get("gender"),
+                        "is_japanese": insights.get("is_japanese"),
+                        "is_japanese_confidence": insights.get("is_japanese_confidence"),
+                        "overall_confidence": insights.get("overall_confidence"),
+                        "topics": insights.get("topics"),
+                        "l2_score": score,
+                        "l2_verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                         time.gmtime()),
+                        "l2_persona_key": persona_key,
+                    }
+                    tags = ["l2_verified", f"age:{insights.get('age_band','')}",
+                            f"gender:{insights.get('gender','')}"]
+                    if insights.get("is_japanese"):
+                        tags.append("is_japanese")
+                    ok_meta = update_canonical_metadata(cid, meta_patch, tags=tags)
+                    log.info("[l2_gate] canonical metadata updated cid=%s ok=%s "
+                              "age=%s gender=%s ja=%s",
+                              cid[:8], ok_meta,
+                              insights.get("age_band"),
+                              insights.get("gender"),
+                              insights.get("is_japanese"))
+                except Exception as e:
+                    log.debug("[l2_gate] update_canonical_metadata 失败: %s", e)
             except Exception as e:
                 # L2 代码异常: 保守拦 + 写 journey (用户要求 L2 必走)
                 log.warning("[l2_gate] 异常, persona_l2_rejected 拦截: %s", e)
