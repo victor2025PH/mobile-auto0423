@@ -1361,18 +1361,27 @@ class FacebookAutomation(BaseAutomation):
         # Level 4 (2026-04-24): VLM vision fallback — 对抗 Messenger 2026
         # Compose UI。VisionFallback 自带 20/h budget + 5min cache, 用
         # Gemini (免费 1500/day) 或 Ollama 本地 (免费无限) 作 provider, 零成本。
+        #
+        # 2026-04-24 Offline 测试发现 Gemini 2.5 Flash 命中 Messenger search
+        # bar 率 ~50%, 常误把 messenger logo header 当 search bar。Prompt 加
+        # spatial disambiguation (below logo / above conversations) 提命中率。
+        # Click-verify 失败时 invalidate cache 避免 5min 复发同坏坐标。
         vf = _get_vision_fallback()
         if vf is not None:
+            # 2026-04-24 offline eval 经验: Gemini 2.5 Flash 对 verbose
+            # prompt (>500 chars) 会 exhaust retries; 精简到 ~250 chars 且
+            # 保留关键 spatial hint (BELOW logo / ABOVE stories) 防误判
+            # logo header 当 search bar。
+            vlm_target = (
+                "Messenger search bar (input field with magnifying glass icon)")
+            vlm_context = (
+                "Horizontal rounded rectangle at top of inbox, BELOW the "
+                "messenger logo row and ABOVE the stories avatars row. "
+                "Placeholder text '问问 Meta AI' (Chinese) or 'Ask Meta AI' "
+                "/ 'Search in Messenger' (English).")
             try:
                 result = vf.find_element(
-                    device=d,
-                    target="Messenger search bar",
-                    context=(
-                        "at top of Messenger inbox page, contains Chinese "
-                        "text '问问 Meta AI 或自行搜索' or English "
-                        "'Ask Meta AI' / 'Search in Messenger'; typically "
-                        "y≈200-350 pixels"),
-                )
+                    device=d, target=vlm_target, context=vlm_context)
                 if result and result.coordinates:
                     x, y = result.coordinates
                     d.click(x, y)
@@ -1382,8 +1391,14 @@ class FacebookAutomation(BaseAutomation):
                             "[_enter_messenger_search] VLM hit @ (%d, %d)",
                             x, y)
                         return
+                    # Click 位置无效 → invalidate cache 避免 5min 复发同坏坐标
                     log.debug(
-                        "[vision] VLM click (%d, %d) 后 EditText 未出现", x, y)
+                        "[vision] VLM click (%d, %d) 后 EditText 未出现, "
+                        "invalidate cache 下次重算", x, y)
+                    try:
+                        vf.invalidate(vlm_target, vlm_context)
+                    except Exception:
+                        pass
             except Exception as e:
                 log.debug("[vision] Level 4 search fallback 异常: %s", e)
         raise MessengerError(
@@ -1423,16 +1438,20 @@ class FacebookAutomation(BaseAutomation):
             log.debug(
                 "[_tap_messenger_send] coordinate click 异常: %s", e)
         # Level 4 (2026-04-24): VLM vision fallback
+        # Prompt 加 spatial disambiguation 防 VLM 误把 emoji/camera 当 send。
+        # send 没 post-verify 路径 (点了就算 done), 不做 cache invalidate;
+        # 如果 VLM 误判, 靠 5min TTL 自然回收。
         vf = _get_vision_fallback()
         if vf is not None:
             try:
                 result = vf.find_element(
                     device=d,
-                    target="Send button",
+                    target="Send message button (blue paper-plane icon)",
                     context=(
-                        "blue paper-plane icon at right-bottom of Messenger "
-                        "conversation composer, appears after message text "
-                        "is typed; usually x > 0.85 * width, y > 0.85 * height"),
+                        "At RIGHT end of composer bar at bottom of screen, "
+                        "right of the text input field. Blue arrow/paper-"
+                        "plane shape. Not emoji (middle-right) or camera "
+                        "(left side). Typically x > 85% width."),
                 )
                 if result and result.coordinates:
                     x, y = result.coordinates
