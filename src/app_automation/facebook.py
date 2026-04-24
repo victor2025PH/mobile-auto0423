@@ -4101,11 +4101,24 @@ class FacebookAutomation(BaseAutomation):
                                preset_key: str = "",
                                device_id: Optional[str] = None,
                                persona_key: Optional[str] = None,
-                               phase: Optional[str] = None) -> Dict[str, Any]:
-        """陌生人 Message Requests 收件箱 — Sprint 2 完整实现 + 2026-04-22 persona 改造。
+                               phase: Optional[str] = None,
+                               auto_reply: bool = True,
+                               referral_contact: str = "") -> Dict[str, Any]:
+        """陌生人 Message Requests 收件箱 — Sprint 2 骨架 + 2026-04-22 persona + P6 auto_reply。
 
-        策略:Message Requests 是潜在线索富矿,但风险也大;
-        默认只"读不回",把内容写入 fb_inbox_messages 让人或后续 AI 判断。
+        P6 (2026-04-23): ``auto_reply=True`` 时在 Message Requests 文件夹
+        内直接回复陌生人,走与主 inbox 相同的 ``_ai_reply_and_send`` 链路,
+        但 ``peer_type='stranger'`` 让内部 referral_gate 使用更保守的阈值
+        (min_turns 5 / min_peer_replies 3 / score_threshold 4 / cooldown 6h),
+        防止陌生人场景触发 spam 式引流被 Meta 反垃圾。
+
+        策略:Message Requests 是潜在线索富矿,但风险也大;P6 开启后仍遵循
+        "intent=opening/smalltalk 不引流"的 soft gate,首轮只破冰不推销。
+
+        Args:
+          auto_review: 历史参数 (尚未实现接受/审核动作,保留占位)
+          auto_reply:  True 时直接回复;False 维持 Sprint 2 的"读不回"行为
+          referral_contact: WhatsApp/LINE 等引流渠道 ID (gate 打分 + hard_allow)
 
         2026-04-22:``max_requests`` 未显式覆盖时按 phase 从
         ``facebook_playbook.yaml.check_inbox.max_requests`` 取。
@@ -4119,12 +4132,20 @@ class FacebookAutomation(BaseAutomation):
                                                    phase_override=phase)
         if ab_cfg and max_requests == 20 and "max_requests" in ab_cfg:
             max_requests = int(ab_cfg.get("max_requests") or max_requests)
+        # P6: playbook 也可配 auto_reply (覆盖默认 True)
+        if ab_cfg and "auto_reply_stranger" in ab_cfg:
+            auto_reply = bool(ab_cfg.get("auto_reply_stranger"))
 
-        stats = {"opened": False, "requests_seen": 0,
-                 "messages_collected": 0,
-                 "persona_key": persona_key or "",
-                 "phase": eff_phase,
-                 "max_requests": max_requests}
+        stats: Dict[str, Any] = {
+            "opened": False, "requests_seen": 0,
+            "messages_collected": 0,
+            "replies_sent": 0, "wa_referrals": 0, "reply_skipped": 0,
+            "errors": 0,
+            "auto_reply": auto_reply,
+            "persona_key": persona_key or "",
+            "phase": eff_phase,
+            "max_requests": max_requests,
+        }
 
         try:
             d.app_start(MESSENGER_PACKAGE)
@@ -4154,9 +4175,31 @@ class FacebookAutomation(BaseAutomation):
                                                               preset_key=preset_key)
                     if detail and detail.get("incoming_text"):
                         stats["messages_collected"] += 1
+
+                        # P6: 陌生人场景自动回复 (peer_type='stranger' 触发
+                        # referral_gate 保守配置)
+                        if auto_reply and not detail.get("risk"):
+                            reply, decision = self._ai_reply_and_send(
+                                d, did,
+                                peer_name=c["name"],
+                                incoming_text=detail["incoming_text"],
+                                referral_contact=referral_contact,
+                                preset_key=preset_key,
+                                persona_key=persona_key,
+                                peer_type="stranger",
+                            )
+                            if reply:
+                                stats["replies_sent"] += 1
+                                if decision == "wa_referral":
+                                    stats["wa_referrals"] += 1
+                            else:
+                                stats["reply_skipped"] += 1
+
                     d.press("back")
                     time.sleep(random.uniform(0.8, 1.5))
-                except Exception:
+                except Exception as e:
+                    log.debug("[check_message_requests] 单对话失败: %s", e)
+                    stats["errors"] += 1
                     try:
                         d.press("back")
                     except Exception:
@@ -4495,16 +4538,21 @@ class FacebookAutomation(BaseAutomation):
                            incoming_text: str,
                            referral_contact: str = "",
                            preset_key: str = "",
-                           persona_key: Optional[str] = None) -> Tuple[Optional[str], str]:
-        """调 ChatBrain 生成回复并发出;P1 接入 persona 语言 + 引流话术;P3 接入长久记忆。
+                           persona_key: Optional[str] = None,
+                           peer_type: str = "friend") -> Tuple[Optional[str], str]:
+        """调 ChatBrain 生成回复并发出;P1 接入 persona 语言 + 引流话术;
+        P3 接入长久记忆;P4 意图分类;P5 统一引流决策闸;P6 peer_type 感知。
 
         * ``target_language`` 来自 ``fb_target_personas.get_persona_display``,
           日本客群强制 ``ja``,避免英文破冰。
         * 引流阶段(referral_score>0.5)且配置了 contact 时,**出站消息**
           以 ``fb_content_assets.get_referral_snippet`` 为主渠道话术为准。
         * **P3 长久记忆**: 同 peer 历史消息 + 派生画像通过 ``chat_memory.build_context_block``
-          实时拼进 ``ab_style_hint``,让 LLM 看得到前 5 轮对话 + 对方语言偏好 + 引流历史;
-          若上一轮引流对方未回,本轮强制降级为 reply (不再重复引流)。
+          实时拼进 ``ab_style_hint``。
+        * **P4 意图**: ``classify_intent`` 结果影响 ab_style_hint + referral_gate 判断。
+        * **P5 引流闸**: ``should_refer`` 统一决定 wa_referral vs reply。
+        * **P6 peer_type**: ``'stranger'`` 触发更保守的 referral_gate 配置
+          (min_turns/score_threshold/cooldown 都上浮),防陌生人场景 spam 感引流。
         """
         reply = None
         decision = "skip"
@@ -4663,12 +4711,22 @@ class FacebookAutomation(BaseAutomation):
                                 lead_score_val = 0
                     except Exception:
                         lead_score_val = 0
+                    # P6: 陌生人场景使用更保守 gate 配置
+                    _gate_cfg = None
+                    if peer_type == "stranger":
+                        _gate_cfg = {
+                            "min_turns": 5,
+                            "min_peer_replies": 3,
+                            "score_threshold": 4,
+                            "refer_cooldown_hours": 6,
+                        }
                     gate = should_refer(
                         intent=intent_tag,
                         ref_score=ref_score,
                         memory_ctx=memory_ctx,
                         lead_score=lead_score_val,
                         has_contact=has_contact,
+                        config=_gate_cfg,
                     )
                     decision = "wa_referral" if gate.refer else "reply"
                     log.info(
@@ -4718,7 +4776,7 @@ class FacebookAutomation(BaseAutomation):
             from src.host.fb_store import record_inbox_message
             record_inbox_message(
                 did, peer_name,
-                peer_type="friend",
+                peer_type=peer_type,  # P6: 'friend'/'stranger'/'friend_request' 等
                 message_text=reply,
                 direction="outgoing",
                 ai_decision=decision,
