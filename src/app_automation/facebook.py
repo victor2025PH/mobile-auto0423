@@ -1407,14 +1407,102 @@ class FacebookAutomation(BaseAutomation):
         except Exception:
             return False
 
+    def _phase10_l2_gate(self, d, did: str, profile_name: str,
+                         persona_key: str) -> bool:
+        """Phase 10 prep: L2 VLM gate (截图 → classify do_l2=True → 判 match).
+
+        返回 True 表示**应阻止**继续 add_friend (L2 不命中, 已写 journey).
+        返回 False 表示**通过 / 异常放行**(主流程继续).
+
+        异常 / 无 persona / VLM 不可达 → fail-open (保守, 与 L1 gate 一致行为).
+        """
+        try:
+            from src.host.fb_profile_classifier import classify as _persona_classify
+        except Exception as e:
+            log.debug("[phase10_l2] import classifier 失败, 放行: %s", e)
+            return False
+        try:
+            snap = self.capture_profile_snapshots(
+                shot_count=1, device_id=did, tag="phase10_l2_gate")
+        except Exception as e:
+            log.debug("[phase10_l2] capture_profile_snapshots 失败, 放行: %s", e)
+            return False
+        try:
+            l2_cls = _persona_classify(
+                device_id=did,
+                persona_key=persona_key,
+                target_key=f"fb:{profile_name}",
+                display_name=profile_name,
+                image_paths=snap.get("image_paths") or [],
+                l2_image_paths=snap.get("image_paths") or [],
+                do_l2=True,
+                dry_run=False,
+            )
+        except Exception as e:
+            log.debug("[phase10_l2] classify 异常, 放行: %s", e)
+            return False
+
+        l2 = l2_cls.get("l2") or {}
+        l2_pass = l2.get("pass", True)  # 缺 'pass' 字段时保守放行
+        l2_score = l2.get("score", 0)
+        l2_reasons = l2.get("reasons") or []
+
+        if not l2_pass:
+            log.info(
+                "[add_friend_safe] persona L2 不命中 peer=%s score=%.0f "
+                "reasons=%s, skip",
+                profile_name, l2_score, l2_reasons[:3])
+            try:
+                self._append_journey_for_action(
+                    profile_name, "add_friend_blocked",
+                    did=did, persona_key=persona_key,
+                    data={
+                        "reason": "persona_l2_rejected",
+                        "l2_score": l2_score,
+                        "top_reasons": l2_reasons[:3],
+                    })
+            except Exception:
+                pass
+            return True  # 阻止
+
+        # L2 PASS — log persona_classified for funnel
+        try:
+            self._append_journey_for_action(
+                profile_name, "persona_classified",
+                did=did, persona_key=persona_key,
+                data={
+                    "stage": "L2",
+                    "match": True,
+                    "score": l2_score,
+                    "reasons": l2_reasons[:3],
+                })
+        except Exception:
+            pass
+        return False  # 通过
+
     def _add_friend_safe_interaction_on_profile(
             self, d, did: str, profile_name: str, note: str,
-            *, persona_key: Optional[str], source: str, preset_key: str) -> bool:
-        """已在对方资料页：风控 → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。"""
+            *, persona_key: Optional[str], source: str, preset_key: str,
+            do_l2_gate: bool = False) -> bool:
+        """已在对方资料页：风控 → (Phase 10 prep: 可选 L2 VLM gate) → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。
+
+        ``do_l2_gate`` (Phase 10 prep, 默认 OFF 保向后兼容):
+          True 时, 在 risk check 之后跑 L2 VLM gate (截图 → ollama qwen2.5vl 看头像+bio).
+          L2 不命中 → 写 add_friend_blocked{persona_l2_rejected} journey + return False.
+          L2 异常 / 无 persona → 保守放行 (与 L1 gate 行为一致, 见 add_friend_with_note 入口).
+        """
         is_risk, msg = self._detect_risk_dialog(d)
         if is_risk:
             log.warning("[add_friend_with_note] 检测到风控提示: %s", msg)
             return False
+
+        # Phase 10 prep (2026-04-24): 可选 L2 VLM gate. 默认 OFF, 真机验证后由 caller
+        # 透传 do_l2_gate=True 激活. 与 add_friend_with_note 入口的 L1 gate 配套
+        # (L1 = 名字启发式, L2 = 视觉判断头像/bio).
+        if do_l2_gate and persona_key:
+            l2_blocked = self._phase10_l2_gate(d, did, profile_name, persona_key)
+            if l2_blocked:
+                return False
 
         for _ in range(random.randint(1, 2)):
             self.hb.scroll_down(d)
