@@ -1868,44 +1868,125 @@ class FacebookAutomation(BaseAutomation):
             return False
 
     def _phase10_l2_gate(self, d, did: str, profile_name: str,
-                         persona_key: str) -> bool:
+                         persona_key: str, *,
+                         shots: int = 1) -> bool:
         """Phase 10 prep: L2 VLM gate (截图 → classify do_l2=True → 判 match).
 
         返回 True 表示**应阻止**继续 add_friend (L2 不命中, 已写 journey).
         返回 False 表示**通过 / 异常放行**(主流程继续).
 
         异常 / 无 persona / VLM 不可达 → fail-open (保守, 与 L1 gate 一致行为).
+
+        Phase 10.2 (2026-04-24 additive):
+          ``shots > 1`` 启用 A 的多图投票模式 — 首屏 + scroll N-1 次抓 post 图,
+          sequential classify (qwen2.5vl:7b context_length=4096 限制一次一张),
+          命中 match=True 立即停; 全部失败 → 返 True (保守阻止). 默认 shots=1
+          保 B 现行单图行为 + 测试契约.
+
+          L2 PASS 时把 insights (age_band / gender / is_japanese ...) 聚合到
+          leads_canonical.metadata_json, 供运营 CRM 一键过滤"精准用户".
         """
         try:
             from src.host.fb_profile_classifier import classify as _persona_classify
         except Exception as e:
             log.debug("[phase10_l2] import classifier 失败, 放行: %s", e)
             return False
+        shots = max(1, int(shots or 1))
         try:
             snap = self.capture_profile_snapshots(
-                shot_count=1, device_id=did, tag="phase10_l2_gate")
+                shot_count=shots, device_id=did, tag="phase10_l2_gate")
         except Exception as e:
             log.debug("[phase10_l2] capture_profile_snapshots 失败, 放行: %s", e)
             return False
-        try:
-            l2_cls = _persona_classify(
-                device_id=did,
-                persona_key=persona_key,
-                target_key=f"fb:{profile_name}",
-                display_name=profile_name,
-                image_paths=snap.get("image_paths") or [],
-                l2_image_paths=snap.get("image_paths") or [],
-                do_l2=True,
-                dry_run=False,
-            )
-        except Exception as e:
-            log.debug("[phase10_l2] classify 异常, 放行: %s", e)
-            return False
 
-        l2 = l2_cls.get("l2") or {}
-        l2_pass = l2.get("pass", True)  # 缺 'pass' 字段时保守放行
-        l2_score = l2.get("score", 0)
-        l2_reasons = l2.get("reasons") or []
+        image_paths = snap.get("image_paths") or []
+        bio = (snap.get("bio_text") or "")[:400]
+
+        if shots == 1:
+            # B 的原路径 (单图一次 classify), 保测试契约.
+            try:
+                l2_cls = _persona_classify(
+                    device_id=did,
+                    persona_key=persona_key,
+                    target_key=f"fb:{profile_name}",
+                    display_name=profile_name,
+                    image_paths=image_paths,
+                    l2_image_paths=image_paths,
+                    do_l2=True,
+                    dry_run=False,
+                )
+            except Exception as e:
+                log.debug("[phase10_l2] classify 异常, 放行: %s", e)
+                return False
+            l2 = l2_cls.get("l2") or {}
+            l2_pass = l2.get("pass", True)
+            l2_score = l2.get("score", 0)
+            l2_reasons = l2.get("reasons") or []
+            insights = l2_cls.get("insights") or {}
+        else:
+            # Phase 10.2 multi-shot: sequential classify, 命中即停, 明确 REJECT 也停.
+            import time as _t
+            _ts = int(_t.time())
+            picked = None
+            agg_insights: Dict[str, Any] = {}
+            for idx, img in enumerate(image_paths[:shots], 1):
+                try:
+                    rk = f"fb:{profile_name}:shot_{_ts}_{idx}"
+                    r_i = _persona_classify(
+                        device_id=did,
+                        persona_key=persona_key,
+                        target_key=rk,
+                        display_name=profile_name,
+                        bio=bio,
+                        image_paths=[img],
+                        l2_image_paths=[img],
+                        do_l2=True,
+                        dry_run=False,
+                    )
+                    _l2_i = r_i.get("l2") or {}
+                    _ins_i = r_i.get("insights") or {}
+                    for k, v in _ins_i.items():
+                        if v and not agg_insights.get(k):
+                            agg_insights[k] = v
+                    log.info(
+                        "[phase10_l2] shot #%d match=%s score=%.1f stage=%s",
+                        idx, r_i.get("match"), r_i.get("score", 0),
+                        r_i.get("stage_reached"))
+                    # 命中 → 停
+                    if r_i.get("stage_reached") == "L2" and r_i.get("match"):
+                        picked = r_i
+                        break
+                    # 明确 REJECT (gender=male 或 is_japanese=False 高置信) → 停
+                    if r_i.get("stage_reached") == "L2" and not r_i.get("match"):
+                        g = (_ins_i.get("gender") or "").lower()
+                        jp = _ins_i.get("is_japanese")
+                        jp_conf = float(_ins_i.get("is_japanese_confidence", 0) or 0)
+                        if g == "male" or (jp is False and jp_conf > 0.7):
+                            picked = r_i
+                            log.info("[phase10_l2] shot #%d 明确 REJECT, 停", idx)
+                            break
+                    picked = r_i  # 保留最后一次
+                except Exception as e:
+                    log.warning("[phase10_l2] shot #%d 异常: %s", idx, e)
+                    continue
+            if picked is None:
+                log.warning("[phase10_l2] 全部 shots classify 失败, 保守阻止")
+                try:
+                    self._append_journey_for_action(
+                        profile_name, "add_friend_blocked",
+                        did=did, persona_key=persona_key,
+                        data={"reason": "l2_all_shots_failed",
+                              "shots": shots})
+                except Exception:
+                    pass
+                return True
+            _l2 = picked.get("l2") or {}
+            l2_pass = bool(picked.get("match"))
+            l2_score = float(picked.get("score", 0) or 0)
+            l2_reasons = _l2.get("reasons") or []
+            insights = agg_insights or (picked.get("insights") or {})
+            # 阶段有效性检查: 多 shot 要求至少一次真跑到 L2
+            l2_cls = picked  # 用于下方 metadata 逻辑复用
 
         if not l2_pass:
             log.info(
@@ -1920,6 +2001,7 @@ class FacebookAutomation(BaseAutomation):
                         "reason": "persona_l2_rejected",
                         "l2_score": l2_score,
                         "top_reasons": l2_reasons[:3],
+                        "shots": shots,
                     })
             except Exception:
                 pass
@@ -1935,21 +2017,62 @@ class FacebookAutomation(BaseAutomation):
                     "match": True,
                     "score": l2_score,
                     "reasons": l2_reasons[:3],
+                    "shots": shots,
+                    "age_band": insights.get("age_band"),
+                    "gender": insights.get("gender"),
+                    "is_japanese": insights.get("is_japanese"),
                 })
         except Exception:
             pass
+
+        # Phase 10.2 additive: L2 PASS 聚合 insights 到 leads_canonical.metadata_json
+        # 供运营/CRM 一键过滤"精准目标用户".
+        try:
+            from src.host.lead_mesh import (resolve_identity,
+                                             update_canonical_metadata)
+            cid = resolve_identity(platform="facebook",
+                                    account_id=f"fb:{profile_name}",
+                                    display_name=profile_name)
+            meta_patch = {
+                "age_band": insights.get("age_band"),
+                "gender": insights.get("gender"),
+                "is_japanese": insights.get("is_japanese"),
+                "is_japanese_confidence": insights.get("is_japanese_confidence"),
+                "overall_confidence": insights.get("overall_confidence"),
+                "topics": insights.get("topics"),
+                "l2_score": l2_score,
+                "l2_verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                  time.gmtime()),
+                "l2_persona_key": persona_key,
+                "l2_shots": shots,
+            }
+            tags = ["l2_verified"]
+            if insights.get("age_band"):
+                tags.append(f"age:{insights['age_band']}")
+            if insights.get("gender"):
+                tags.append(f"gender:{insights['gender']}")
+            if insights.get("is_japanese"):
+                tags.append("is_japanese")
+            update_canonical_metadata(cid, meta_patch, tags=tags)
+        except Exception as e:
+            log.debug("[phase10_l2] canonical metadata 写失败(放行): %s", e)
+
         return False  # 通过
 
     def _add_friend_safe_interaction_on_profile(
             self, d, did: str, profile_name: str, note: str,
             *, persona_key: Optional[str], source: str, preset_key: str,
-            do_l2_gate: bool = False) -> bool:
+            do_l2_gate: bool = False,
+            l2_gate_shots: int = 1) -> bool:
         """已在对方资料页：风控 → (Phase 10 prep: 可选 L2 VLM gate) → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。
 
         ``do_l2_gate`` (Phase 10 prep, 默认 OFF 保向后兼容):
           True 时, 在 risk check 之后跑 L2 VLM gate (截图 → ollama qwen2.5vl 看头像+bio).
           L2 不命中 → 写 add_friend_blocked{persona_l2_rejected} journey + return False.
-          L2 异常 / 无 persona → 保守放行 (与 L1 gate 行为一致, 见 add_friend_with_note 入口).
+
+        ``l2_gate_shots`` (Phase 10.2 additive, 默认 1 保 B 契约):
+          >1 时启用多图 sequential classify (命中即停, 明确 REJECT 早退).
+          仅 ``do_l2_gate=True`` 时生效. qwen2.5vl:7b context 限制 4096, 单图最稳.
         """
         is_risk, msg = self._detect_risk_dialog(d)
         if is_risk:
@@ -1960,7 +2083,9 @@ class FacebookAutomation(BaseAutomation):
         # 透传 do_l2_gate=True 激活. 与 add_friend_with_note 入口的 L1 gate 配套
         # (L1 = 名字启发式, L2 = 视觉判断头像/bio).
         if do_l2_gate and persona_key:
-            l2_blocked = self._phase10_l2_gate(d, did, profile_name, persona_key)
+            l2_blocked = self._phase10_l2_gate(
+                d, did, profile_name, persona_key,
+                shots=l2_gate_shots)
             if l2_blocked:
                 return False
 
@@ -2059,7 +2184,9 @@ class FacebookAutomation(BaseAutomation):
                              preset_key: str = "",
                              from_current_profile: bool = False,
                              do_l2_gate: bool = False,
-                             force: bool = False) -> bool:
+                             force: bool = False,
+                             walk_candidates: bool = False,
+                             l2_gate_shots: int = 1) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -2196,7 +2323,9 @@ class FacebookAutomation(BaseAutomation):
                 persona_key=persona_key, eff_phase=eff_phase,
                 source=source, preset_key=preset_key,
                 from_current_profile=from_current_profile,
-                do_l2_gate=do_l2_gate, force=force)
+                do_l2_gate=do_l2_gate, force=force,
+                walk_candidates=walk_candidates,
+                l2_gate_shots=l2_gate_shots)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
@@ -2204,7 +2333,9 @@ class FacebookAutomation(BaseAutomation):
                                      source: str = "", preset_key: str = "",
                                      from_current_profile: bool = False,
                                      do_l2_gate: bool = False,
-                                     force: bool = False):
+                                     force: bool = False,
+                                     walk_candidates: bool = False,
+                                     l2_gate_shots: int = 1):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
         # 2026-04-24 (A merge): force=True 跳过 cap 检查 (smoke/QA 显式 override).
@@ -2239,10 +2370,13 @@ class FacebookAutomation(BaseAutomation):
                 if not self._is_likely_fb_profile_page(d):
                     log.warning("[add_friend_with_note] from_current_profile=True 但当前不像资料页, 中止")
                     return False
+                # 2026-04-24 (Phase 10.2): l2_gate_shots 仅在非默认时透传, 保旧 spy 签名兼容.
+                _shot_kw = ({"l2_gate_shots": l2_gate_shots}
+                            if l2_gate_shots and l2_gate_shots != 1 else {})
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
                     persona_key=persona_key, source=source, preset_key=preset_key,
-                    do_l2_gate=do_l2_gate)
+                    do_l2_gate=do_l2_gate, **_shot_kw)
 
             results = self.search_people(profile_name, did, max_results=3)
             if not results:
@@ -2250,6 +2384,94 @@ class FacebookAutomation(BaseAutomation):
                 return False
 
             time.sleep(1)
+
+            if safe_mode and walk_candidates:
+                # Phase 10.2 additive (2026-04-24): walk top 5 候选, 快速跳过明显男性/已联系,
+                # L2 VLM 精筛. 姓搜(如 '田中')会返回混合性别候选; 默认单结果路径常撞
+                # 男性/已联系候选浪费 quota. 男性名启发式 → 跳; peer_already_contacted → 跳;
+                # L2 REJECT 后 BACK 返搜索页 → 下一个; L2 PASS 继续. 若 walk 空 → 回退单结果.
+                cands = self._list_top_search_result_cards(
+                    d, query_hint=profile_name, max_n=5)
+                if cands:
+                    log.info(
+                        "[add_friend_with_note] walk 候选 %d: %s", len(cands),
+                        [(c["name"][:20], "M" if c["male_hint"] else "?")
+                         for c in cands])
+                    for idx, cand in enumerate(cands):
+                        cand_name = cand["name"] or profile_name
+                        if cand["male_hint"]:
+                            log.info("[walk] #%d '%s' 男性名, skip",
+                                     idx + 1, cand_name[:30])
+                            continue
+                        contacted, reason = self._peer_already_contacted(cand_name)
+                        if contacted:
+                            log.info("[walk] #%d '%s' (%s), skip",
+                                     idx + 1, cand_name[:30], reason)
+                            continue
+                        bx = cand["bounds"]
+                        cx = (bx[0] + bx[2]) // 2
+                        cy = (bx[1] + bx[3]) // 2
+                        try:
+                            self.hb.tap(d, cx, cy)
+                        except Exception as e:
+                            log.warning("[walk] tap #%d 失败: %s", idx + 1, e)
+                            continue
+                        loaded = False
+                        xml_chk = ""
+                        for _ in range(6):
+                            time.sleep(2.0)
+                            try:
+                                xml_chk = d.dump_hierarchy() or ""
+                            except Exception:
+                                xml_chk = ""
+                            if self._is_likely_fb_profile_page_xml(xml_chk):
+                                loaded = True
+                                break
+                        if not loaded and cand_name:
+                            try:
+                                el = d(text=cand_name)
+                                if el.exists(timeout=1.5):
+                                    el.click()
+                                    time.sleep(random.uniform(3.5, 5.0))
+                                    xml_chk = d.dump_hierarchy() or ""
+                                    loaded = self._is_likely_fb_profile_page_xml(xml_chk)
+                            except Exception:
+                                pass
+                        if not loaded:
+                            log.info("[walk] #%d 未进资料页, BACK 下一个", idx + 1)
+                            try:
+                                d.press("back")
+                            except Exception:
+                                pass
+                            time.sleep(1.5)
+                            continue
+                        _shot_kw = ({"l2_gate_shots": l2_gate_shots}
+                                     if l2_gate_shots and l2_gate_shots != 1 else {})
+                        res = self._add_friend_safe_interaction_on_profile(
+                            d, did, cand_name, note,
+                            persona_key=persona_key,
+                            source=source, preset_key=preset_key,
+                            do_l2_gate=do_l2_gate, **_shot_kw)
+                        if res:
+                            log.info("[walk] #%d '%s' 成功", idx + 1, cand_name[:30])
+                            return True
+                        log.info("[walk] #%d '%s' 失败, BACK 下一个",
+                                 idx + 1, cand_name[:30])
+                        try:
+                            d.press("back")
+                        except Exception:
+                            pass
+                        time.sleep(random.uniform(1.5, 2.5))
+                        try:
+                            _chk = d.dump_hierarchy() or ""
+                            if self._is_likely_fb_profile_page_xml(_chk):
+                                d.press("back")
+                                time.sleep(1.2)
+                        except Exception:
+                            pass
+                    log.info("[walk] 候选 %d 个全部失败", len(cands))
+                    return False
+                log.info("[add_friend_with_note] walk 无候选, 回退单结果路径")
 
             if safe_mode:
                 # 安全路径: 点击第一个搜索结果进主页 → 停留 → 找主页内的 Add Friend
@@ -2284,10 +2506,12 @@ class FacebookAutomation(BaseAutomation):
                     self._adb(f"shell input tap {int(w * 0.5)} {int(620)}", device_id=did)
                     time.sleep(random.uniform(3.0, 5.0))
 
+                _shot_kw = ({"l2_gate_shots": l2_gate_shots}
+                            if l2_gate_shots and l2_gate_shots != 1 else {})
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
                     persona_key=persona_key, source=source, preset_key=preset_key,
-                    do_l2_gate=do_l2_gate)
+                    do_l2_gate=do_l2_gate, **_shot_kw)
             if not self.smart_tap("Add Friend button", device_id=did):
                 return False
             time.sleep(1)
@@ -3387,7 +3611,9 @@ class FacebookAutomation(BaseAutomation):
                              do_l2_gate: bool = False,
                              force: bool = False,
                              ai_dynamic_greeting: Optional[bool] = None,
-                             force_send_greeting: Optional[bool] = None) -> Dict[str, Any]:
+                             force_send_greeting: Optional[bool] = None,
+                             walk_candidates: bool = False,
+                             l2_gate_shots: int = 1) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -3430,6 +3656,8 @@ class FacebookAutomation(BaseAutomation):
             preset_key=preset_key,
             do_l2_gate=do_l2_gate,
             force=force,
+            walk_candidates=walk_candidates,
+            l2_gate_shots=l2_gate_shots,
         )
         out["add_friend_ok"] = bool(add_ok)
 

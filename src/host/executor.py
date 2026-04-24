@@ -713,6 +713,16 @@ def _execute_facebook(manager, resolved, task_type, params):
             _persona_key = params.get("persona_key") or ""
             _phase_override = params.get("phase") or params.get("phase_override") or ""
             if hasattr(fb, "add_friend_with_note"):
+                # 2026-04-24 Phase 10.2: walk_candidates/l2_gate_shots 为 opt-in 任务参数,
+                # 只在调用方显式传时才 thread 进去 (避免 automation 未升级时 kwarg 错).
+                _extra = {}
+                if params.get("walk_candidates"):
+                    _extra["walk_candidates"] = True
+                _shots = int(params.get("l2_gate_shots", 0) or 0)
+                if _shots > 1:
+                    _extra["l2_gate_shots"] = _shots
+                if params.get("do_l2_gate"):
+                    _extra["do_l2_gate"] = True
                 ok = fb.add_friend_with_note(target, note=note,
                                              safe_mode=safe_mode,
                                              device_id=resolved,
@@ -720,7 +730,8 @@ def _execute_facebook(manager, resolved, task_type, params):
                                              phase=_phase_override or None,
                                              source=params.get("source", "") or params.get("group_name", ""),
                                              preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")),
-                                             force=bool(params.get("force_add_friend")))
+                                             force=bool(params.get("force_add_friend")),
+                                             **_extra)
             else:
                 ok = fb.add_friend(target, device_id=resolved)
 
@@ -764,6 +775,20 @@ def _execute_facebook(manager, resolved, task_type, params):
                 return False, "facebook.add_friend_and_greet 尚未实现", None
             # 把 source / preset_key 下推,automation 层锁内 record 时用
             _src_val = params.get("source", "") or params.get("group_name", "")
+            _extra = {}
+            if params.get("walk_candidates"):
+                _extra["walk_candidates"] = True
+            _shots = int(params.get("l2_gate_shots", 0) or 0)
+            if _shots > 1:
+                _extra["l2_gate_shots"] = _shots
+            if params.get("do_l2_gate"):
+                _extra["do_l2_gate"] = True
+            if params.get("force_add_friend"):
+                _extra["force"] = True
+            if params.get("ai_dynamic_greeting") is not None:
+                _extra["ai_dynamic_greeting"] = bool(params.get("ai_dynamic_greeting"))
+            if params.get("force_send_greeting") is not None:
+                _extra["force_send_greeting"] = bool(params.get("force_send_greeting"))
             res = fb.add_friend_and_greet(
                 target,
                 note=note,
@@ -774,6 +799,7 @@ def _execute_facebook(manager, resolved, task_type, params):
                 preset_key=_preset_key,
                 source=_src_val,
                 greet_on_failure=bool(params.get("greet_on_failure", False)),
+                **_extra,
             ) or {}
             # 2026-04-23 P3-1: automation 层已在锁内 record(ok 时 sent;
             # 不 ok 时不写)。这里仅补 risk 标记, 便于失败漏斗分析。
@@ -1169,6 +1195,15 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = params.get("group_name") or ""
                         _ai_g = params.get("ai_dynamic_greeting")
                         _fsg = params.get("force_send_greeting")
+                        # Phase 10.2 opt-in: walk_candidates + l2_gate_shots.
+                        _p10_extra: Dict[str, Any] = {}
+                        if params.get("walk_candidates"):
+                            _p10_extra["walk_candidates"] = True
+                        _shots2 = int(params.get("l2_gate_shots", 0) or 0)
+                        if _shots2 > 1:
+                            _p10_extra["l2_gate_shots"] = _shots2
+                        if params.get("do_l2_gate"):
+                            _p10_extra["do_l2_gate"] = True
                         res = fb.add_friend_and_greet(
                             name,
                             note=note,
@@ -1181,6 +1216,7 @@ def _run_facebook_campaign(fb, resolved, params):
                             force=bool(params.get("force_add_friend")),
                             ai_dynamic_greeting=(bool(_ai_g) if _ai_g is not None else None),
                             force_send_greeting=(bool(_fsg) if _fsg is not None else None),
+                            **_p10_extra,
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
                         if ok:
@@ -1202,6 +1238,14 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = str(_tg[0])
                             elif isinstance(params.get("group_name"), str):
                                 _camp_src = params.get("group_name") or ""
+                        _p10_extra2: Dict[str, Any] = {}
+                        if params.get("walk_candidates"):
+                            _p10_extra2["walk_candidates"] = True
+                        _shots3 = int(params.get("l2_gate_shots", 0) or 0)
+                        if _shots3 > 1:
+                            _p10_extra2["l2_gate_shots"] = _shots3
+                        if params.get("do_l2_gate"):
+                            _p10_extra2["do_l2_gate"] = True
                         ok = fb.add_friend_with_note(name, note=note,
                                                      safe_mode=True,
                                                      device_id=resolved,
@@ -1209,7 +1253,8 @@ def _run_facebook_campaign(fb, resolved, params):
                                                      phase=_ph,
                                                      source=_camp_src,
                                                      preset_key=_pr,
-                                                     force=bool(params.get("force_add_friend")))
+                                                     force=bool(params.get("force_add_friend")),
+                                                     **_p10_extra2)
                         if ok:
                             sent += 1
                     else:
