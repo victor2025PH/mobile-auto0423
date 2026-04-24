@@ -67,7 +67,12 @@ _REFERRAL_RE = re.compile(
     r"signal(?![a-z])|skype|wechat|qq号?)\b"
     r"|微信|\b(加|换|给我)你的?|联系方式|联系(方式|电话)|"
     r"(LINE|ライン|連絡先)|"
+    # 2026-04-24 batch_dryrun 矩阵跑发现意大利语覆盖不足,扩充:
+    # - 原 "numero di telefono" 不覆盖 "qual è il tuo numero" / "il tuo numero"
+    # - contatt[io] 已覆盖 "contatto"
     r"contatt[io]|numero di (telefono|cellulare)|"
+    r"\b(qual|dammi|dimmi)\b[^.?!]{0,20}\b(numero|contatto)\b|"
+    r"\b(il tuo|tuo) (numero|contatto|whatsapp|telefono)\b|"
     r"swap contact|exchange contact",
     re.IGNORECASE,
 )
