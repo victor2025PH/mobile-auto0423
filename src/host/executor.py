@@ -1122,6 +1122,24 @@ def _run_facebook_campaign(fb, resolved, params):
                 targets = params.get("add_friend_targets") \
                           or result.get("last_extracted_members") \
                           or []
+                # 2026-04-24 P0 fail-fast: 上游 extract 步骤返回 0 人且没有手工
+                # add_friend_targets 时, 后续 add_friends 空 loop 会让 result
+                # 欺骗性地显示 success=True. 明确标记 skipped + 原因.
+                if not targets:
+                    _skip_meta = {
+                        "extracted_members": result.get("extracted_members", 0),
+                        "has_manual_targets": bool(params.get("add_friend_targets")),
+                    }
+                    result["steps_failed"].append({
+                        "step": step,
+                        "error": "no_targets_upstream_zero_members",
+                        "meta": _skip_meta,
+                    })
+                    logger.warning("[FB Campaign] add_friends skip — 0 targets "
+                                    "(extracted=%s, manual=%s)",
+                                    _skip_meta["extracted_members"],
+                                    _skip_meta["has_manual_targets"])
+                    continue
                 note = params.get("verification_note") or ""
                 greeting = params.get("greeting") or params.get("greeting_message") or ""
                 max_n = int(params.get("max_friends_per_run", 5))
