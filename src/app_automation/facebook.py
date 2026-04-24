@@ -5839,7 +5839,16 @@ class FacebookAutomation(BaseAutomation):
                 time.sleep(0.4)
                 self.hb.type_text(d, reply)
                 time.sleep(random.uniform(0.6, 1.2))
-                if not self.smart_tap("Send message button", device_id=did):
+                # 2026-04-24 P19: 用 `_tap_messenger_send` 4 级 fallback (smart_tap
+                # → multi-locale → coordinate → VLM) 替代裸 smart_tap。对 Messenger
+                # 2026 Compose UI 下 send button 不在 AccessibilityNode 的场景, 有
+                # VLM 兜底命中率大幅高。原 Enter-key 降为 L5 ultimate backstop,
+                # _tap_messenger_send 真抛 MessengerError 再用它保交付。
+                try:
+                    self._tap_messenger_send(d, did)
+                except MessengerError as mex:
+                    log.warning(
+                        "[ai_reply] 4 级 fallback 全 miss (%s), 降级 Enter-key", mex.code)
                     d.send_keys("\n")
                     time.sleep(0.5)
         except Exception as e:
