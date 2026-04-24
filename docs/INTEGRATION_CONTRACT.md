@@ -3,6 +3,25 @@
 > 两台电脑，两个 Claude，一个 monorepo。
 > **本文件是唯一的真实边界定义，任何跨边界修改必须先 PR 改本文件再 PR 改代码。**
 
+## 零、非本 repo 范围（防混淆）
+
+本 repo = **Facebook / Messenger 移动端自动化 bot**（A greeting + B messenger chat）。下列内容**不属于本 repo**，去对应 repo 提需求：
+
+| 内容 | 实际归属 |
+|---|---|
+| contacts / handoff 跨平台 Contact / HandoffToken 子系统 | `github.com/victor2025PH/telegram-mtproto-ai` |
+| Telegram / LINE RPA runner | `telegram-mtproto-ai` |
+| **Android Messenger RPA runner**（adb + UIAutomator 驱动手机 Messenger App） | `telegram-mtproto-ai/src/integrations/messenger_rpa/` |
+| skill_manager / KB / trigger / 回复生成的主体 | `telegram-mtproto-ai` |
+
+**"Messenger"歧义说明**：
+- **本 repo 的 Messenger** = 通过 **FB App / Messenger App 的 UI 自动化**（`facebook.py::send_message` / `check_messenger_inbox` 等），走 mobile-auto0423 自己的 VLM Level 4 fallback 栈。
+- **telegram-mtproto-ai 的 Messenger** = 一个**完全独立的** Android RPA runner，走 adb + UIAutomator + combined_vision。
+
+两套实现**代码不共享、运行时互相独立**。只是通过 `contacts` 子系统在业务语义层衔接（Messenger→LINE 引流主线）。
+
+---
+
 ## 一、协同模型
 
 ```
