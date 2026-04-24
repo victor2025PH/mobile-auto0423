@@ -406,6 +406,10 @@ def _sync_greeting_replied_contact_event(conn, device_id: str, peer_name: str,
     if "record_contact_event" not in globals():
         return
     try:
+        # M2.1 (A Round 3 review): 本 SELECT 依赖 mark_greeting_replied_back
+        # 的 UPDATE 行 `set replied_at=?` 用了同一个 ts 参数, 故 WHERE replied_at=ts
+        # 一定命中刚更新那行。如果未来把 UPDATE 改成 replied_at=now() 或其他 ts,
+        # 本 SELECT 会 miss — 需同步调整两侧, 或改用 RETURNING 子句 (SQLite 3.35+)。
         row = conn.execute(
             "SELECT template_id, preset_key FROM facebook_inbox_messages"
             " WHERE device_id=? AND peer_name=? AND direction='outgoing'"

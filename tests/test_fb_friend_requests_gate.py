@@ -576,6 +576,29 @@ class TestAddFriendAcceptedEvent:
                 min_mutual_friends=1, max_requests=4)
         assert events == []
 
+    def test_accepted_writes_contact_event_quota_path(self, fb_env):
+        """M4.2 (A Round 3 review): accept_all=True 走 quota 路径时,
+        add_friend_accepted 事件 meta.accept_key='quota' (对齐 P1 gate 4 档)。"""
+        fb, set_reqs = fb_env
+        set_reqs([{"name": "Alice", "mutual_friends": 0}])
+        events = []
+        fake_fb_store_mod = MagicMock()
+        fake_fb_store_mod.record_contact_event = lambda *a, **kw: (
+            events.append({"args": a, "kw": kw}) or 1)
+        fake_fb_store_mod.update_friend_request_status = MagicMock()
+        with patch.object(fb, "_lookup_lead_score") as mocked_lookup, \
+             patch.dict("sys.modules",
+                        {"src.host.fb_store": fake_fb_store_mod}):
+            stats = fb.check_friend_requests_inbox(
+                accept_all=True, min_mutual_friends=10,
+                min_lead_score=99, max_requests=4)
+        mocked_lookup.assert_not_called()
+        assert stats["accepted"] == 1
+        accepted = [e for e in events
+                     if e["args"][2] == "add_friend_accepted"]
+        assert len(accepted) == 1
+        assert accepted[0]["kw"]["meta"]["accept_key"] == "quota"
+
     def test_phase5_not_merged_graceful(self, fb_env):
         """record_contact_event 不存在 → 不抛异常, stats.accepted 仍正常。"""
         fb, set_reqs = fb_env
