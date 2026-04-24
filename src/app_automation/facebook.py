@@ -538,8 +538,65 @@ class FacebookAutomation(BaseAutomation):
         except Exception:
             pass
 
+        # 2026-04-24 v4: 尝试点"以后再说"/"Later"/"Not Now"/"Skip" dismiss 按钮
+        # 用户诉求: 遇账号验证时不阻断, 先 dismiss 继续业务 (点"以后再说" +
+        # BACK 回 profile 页继续 Message 发送). 若 dismiss 成功, 视作非 risk.
+        dismiss_ok = self._try_dismiss_verify_dialog(d)
+        if dismiss_ok:
+            log.info("[risk] '%s' 已 dismiss (点'以后再说'类按钮), 继续业务", hit_kw)
+            return False, ""
+
         self._report_risk(hit_kw, device_id_hint=getattr(d, "serial", "") or getattr(d, "_serial", ""))
         return True, hit_kw
+
+    def _try_dismiss_verify_dialog(self, d) -> bool:
+        """尝试点击"以后再说"类按钮 dismiss 账号验证/checkpoint 弹窗.
+
+        Returns True if 找到并点了 dismiss 按钮, False 否则.
+
+        dismiss 后:
+          - 对话框关闭 → 账号可继续正常使用 (FB 通常允许推迟验证 N 次)
+          - 业务流程不中断 (后续 Add Friend / Message 继续)
+        """
+        dismiss_texts = (
+            # zh-CN
+            "以后再说", "稍后", "稍后再说", "跳过", "不再显示", "取消",
+            # en
+            "Later", "Not Now", "Not now", "Skip", "Dismiss",
+            "Maybe Later", "Remind Me Later",
+            # ja
+            "あとで", "スキップ", "後で", "今はしない",
+        )
+        for txt in dismiss_texts:
+            try:
+                # 精确 text 优先
+                el = d(text=txt, clickable=True)
+                if el.exists(timeout=0.4):
+                    el.click()
+                    log.info("[risk/dismiss] 点击 '%s' 成功", txt)
+                    time.sleep(1.2)
+                    return True
+                # fallback: 不带 clickable 限制
+                el = d(text=txt)
+                if el.exists(timeout=0.3):
+                    el.click()
+                    log.info("[risk/dismiss] 点击 '%s' (非 clickable) 成功", txt)
+                    time.sleep(1.2)
+                    return True
+            except Exception:
+                continue
+        # descriptionContains fallback
+        for desc in ("Later", "Skip", "Not Now", "以后", "稍后", "あとで"):
+            try:
+                el = d(descriptionContains=desc, clickable=True)
+                if el.exists(timeout=0.3):
+                    el.click()
+                    log.info("[risk/dismiss] 点击 desc='%s' 成功", desc)
+                    time.sleep(1.2)
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _report_risk(self, message: str, device_id_hint: str = ""):
         """上报风控事件 + 标记设备状态。

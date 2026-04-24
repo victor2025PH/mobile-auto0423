@@ -258,6 +258,46 @@ class TestPersonaL1Gate:
         assert "friend_already" in actions, \
             f"应写 friend_already journey, 实际 actions={actions}"
 
+    def test_try_dismiss_verify_dialog_finds_later_button(self, tmp_db):
+        """遇 '以后再说' 按钮能 dismiss, 返 True."""
+        fb = _stub_fb()
+
+        class FakeEl:
+            def __init__(self, found=False):
+                self._found = found
+                self.clicked = False
+            def exists(self, timeout=0.3):
+                return self._found
+            def click(self):
+                self.clicked = True
+
+        clicks: list = []
+
+        class FakeD:
+            def __call__(self, **kwargs):
+                # 只对 text='以后再说' 返 found
+                if kwargs.get("text") == "以后再说":
+                    el = FakeEl(True)
+                    clicks.append(kwargs)
+                    return el
+                return FakeEl(False)
+
+        ok = fb._try_dismiss_verify_dialog(FakeD())
+        assert ok is True
+        assert any(c.get("text") == "以后再说" for c in clicks)
+
+    def test_try_dismiss_verify_dialog_no_button_returns_false(self, tmp_db):
+        """无任何 dismiss 按钮, 返 False (走原 _report_risk 路径)."""
+        fb = _stub_fb()
+        class FakeEl:
+            def exists(self, timeout=0.3): return False
+            def click(self): pass
+        class FakeD:
+            def __call__(self, **kwargs):
+                return FakeEl()
+        ok = fb._try_dismiss_verify_dialog(FakeD())
+        assert ok is False
+
     def test_is_likely_male_jp_name(self, tmp_db):
         """末字启发式 - male 日文名快速识别."""
         fb = _stub_fb()
