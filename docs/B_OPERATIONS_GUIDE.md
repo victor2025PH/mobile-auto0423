@@ -102,7 +102,8 @@ docker run -p 8000:8000 \
 
 | Endpoint | 用途 |
 |---|---|
-| `GET /facebook/vlm/health` | VLM 服务健康 |
+| `GET /facebook/vlm/health` | Ollama VLM (persona 分类) 服务健康 |
+| `GET /facebook/vlm/level4/status` | **Level 4 UI fallback** 运行时状态 (provider / P5b swap / 失败 counter / last_error / budget) — 详见 §12.5 |
 | `POST /facebook/vlm/warmup` | 预热 (首次 VLM 调用慢) |
 | `POST /facebook/classify/single` | 手工单次 L1+L2 分类 |
 
@@ -397,6 +398,23 @@ c = fb._vision_fallback_instance._client
 c.last_error_code    # 最后一次 HTTP 状态码 (None = 上次是 success or non-HTTP 层错)
 c.last_error_body    # 最后一次 error 响应 body[:500] 或 "timeout"
 ```
+
+**HTTP 查询 (无 Python REPL 的场景, P15 新增)**:
+```bash
+# 等价于上面所有字段, 直接 curl / jq 可读
+curl -s http://localhost:8000/facebook/vlm/level4/status | jq
+# {
+#   "provider": "gemini",
+#   "vision_model": "gemini-2.5-flash",
+#   "swapped": false,              # true = P5b 已切 Ollama
+#   "consecutive_failures": 0,      # 达 3 触发 swap
+#   "last_error_code": null,        # 503/429/...
+#   "last_error_body": "",          # 或 "timeout"
+#   "budget": {"hourly_used": 7, "hourly_budget": 20, "budget_remaining": 13, "cache_size": 4},
+#   "init_attempted": true
+# }
+```
+Prometheus/Grafana scrape 友好; 可对 `consecutive_failures >= 2` 或 `swapped == true` 报警。
 
 ### 12.6 日志诊断 checklist
 
