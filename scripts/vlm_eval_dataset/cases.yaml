@@ -1,0 +1,65 @@
+# VLM prompt quality regression dataset
+#
+# 每个 case: screenshot 文件名 + VLM target/context + ground truth bbox.
+# bbox 格式: [x1, y1, x2, y2] (left-top + right-bottom pixel coords).
+#
+# Screenshot 文件存放位置 (优先级):
+#   1. scripts/vlm_eval_dataset/screenshots/<name>
+#   2. scripts/vlm_eval_dataset/<name>
+#   3. cwd/<name>
+#   4. 绝对路径
+#
+# **screenshots/ 目录 gitignored** — 含真实对话截图的隐私图片不 commit,
+# 开发者本地跑 eval 时自行 populate (可从 real_inbox.png 等 repo 根的测试
+# 截图 copy 过去: `cp real_inbox.png scripts/vlm_eval_dataset/screenshots/`)。
+#
+# 跑: `python scripts/messenger_vlm_prompt_eval.py`
+# JSON: `python scripts/messenger_vlm_prompt_eval.py --json`
+
+- screenshot: real_inbox.png
+  target: "Messenger search bar (input field with magnifying glass icon)"
+  context: |
+    Horizontal rounded rectangle at top of inbox, BELOW the messenger
+    logo row and ABOVE the stories avatars row. Placeholder text
+    '问问 Meta AI' (Chinese) or 'Ask Meta AI' / 'Search in Messenger' (English).
+  ground_truth_bbox: [32, 277, 688, 357]
+  note: >
+    Key case — VLM must distinguish from logo header above. 2026-04-24
+    baseline eval: Gemini 2.5 Flash 初版 prompt (no BELOW/ABOVE) 命中率 50%
+    (常返 y≈205 打 logo header)。精确化 prompt 后待验证。
+
+- screenshot: real_inbox.png
+  target: "Kim Joy conversation row (list item)"
+  context: |
+    Conversation list item in Messenger inbox, showing peer name Kim Joy
+    with avatar on the left and 'you: [TEST]...' preview text. Below
+    the stories avatars row.
+  ground_truth_bbox: [0, 380, 720, 470]
+  note: >
+    Baseline — VLM can handle list rows with peer names. 2026-04-24
+    baseline eval: Gemini 2.5 Flash 命中 (540, 438) 在 bbox 内。
+
+- screenshot: screen_typed.png
+  target: "Send message button (blue paper-plane icon)"
+  context: |
+    At RIGHT end of composer bar at bottom of screen, right of the text
+    input field. Blue arrow/paper-plane shape. Distinguish from:
+    (a) emoji/smiley button (middle-right, inside text area); (b)
+    camera/gallery/microphone icons on LEFT side of composer;
+    (c) the '>' collapse arrow on far-left.
+    Typically x > 85% width, y > 88% height.
+  ground_truth_bbox: [640, 1430, 700, 1490]
+  note: >
+    Compose UI — send button often Compose-rendered, not in
+    AccessibilityNode tree. VLM is primary means to locate.
+
+- screenshot: screen_typed.png
+  target: "Messenger message composer (text input field)"
+  context: |
+    Bottom bar of conversation, horizontal rounded input area with
+    placeholder text '发消息' (Chinese) or 'Message...' (English).
+    Between mic icon on left and emoji/send icons on right.
+  ground_truth_bbox: [320, 1404, 560, 1488]
+  note: >
+    Composer focus verification — needed BEFORE type_text to ensure
+    focused widget for set_text Unicode path.
