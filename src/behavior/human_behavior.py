@@ -23,6 +23,74 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _type_text_unicode_safe(d, text: str) -> bool:
+    """Unicode-safe text input — 2 级 fallback, 修 2026-04-24 真机 blocker。
+
+    原 ``d.send_keys(text)`` 依赖 ADBKeyboard IME APK, MIUI/HyperOS 拒装
+    (``INSTALL_FAILED_USER_RESTRICTED``); 且即便装成功, ASCII fallback 路
+    径 (``adb shell input text``) 对中日韩等非 ASCII 字符**乱码或丢失**,
+    导致 zh/ja 客群 B bot 完全不可用。
+
+    **2 级 fallback**:
+
+    1. ``d(focused=True).set_text(text)`` — uiautomator2 的 AccessibilityNode
+       接口直接写 focused widget 的 text 属性。Unicode safe (zh/ja/en 全支持),
+       不依赖 IME / APK 安装 / 剪贴板权限 / Clipper 广播。**主路径**。
+       要求 widget 当前是 focused (调用方应在 ``type_text`` 前 tap 确保)。
+
+    2. ``d.shell(['input', 'text', escaped])`` — 老的 ASCII-only fallback。
+       仅当 Path 1 miss **且** ``text`` 全 ASCII 时尝试。非 ASCII 跳过该
+       fallback 并返回 False (而不是字符乱码/丢失)。
+
+    Returns:
+        ``True`` — 任一路径写入成功
+        ``False`` — Path 1 miss/异常 + (Path 2 跳过 [非 ASCII] 或 shell 异常)
+
+    Note:
+        不抛异常, 失败静默返 False, 调用方自行决定降级策略 (e.g. smart_tap
+        Send 之前 read UI 验证 composer 是否有内容, 空则不发)。
+    """
+    # Path 1: AccessibilityNode set_text on focused widget (Unicode-safe)
+    try:
+        focused = d(focused=True)
+        if focused.exists(timeout=0.8):
+            focused.set_text(text)
+            return True
+    except Exception as e:
+        log.debug(
+            "[_type_text_unicode_safe] focused.set_text failed: %s", e)
+
+    # Path 2: adb shell input text — ASCII 专用, 非 ASCII 直接跳过避免乱码
+    if any(ord(c) > 127 for c in text):
+        log.warning(
+            "[_type_text_unicode_safe] Path 1 miss 且 text 含非 ASCII "
+            "(zh/ja/ko), 拒绝 adb input text 避免字符丢失: %r",
+            text[:30])
+        return False
+
+    try:
+        # adb input 对空格/&/引号需转义
+        escaped = text.replace(' ', '%s').replace('&', r'\&')
+        if hasattr(d, 'shell'):
+            d.shell(['input', 'text', escaped])
+            return True
+        # u2 老版/非 u2 Device: 走 subprocess adb 兜底
+        import subprocess
+        serial = getattr(d, 'serial', None)
+        cmd = ['adb'] + (['-s', serial] if serial else []) + \
+              ['shell', 'input', 'text', escaped]
+        subprocess.run(cmd, capture_output=True, timeout=5)
+        return True
+    except Exception as e:
+        log.debug(
+            "[_type_text_unicode_safe] adb input text failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -387,17 +455,33 @@ class HumanBehavior:
         """
         Type text character-by-character with Gaussian-distributed intervals.
 
-        Uses d.set_text() for the full string (u2 limitation), but adds
-        realistic delay before typing to simulate the human "read field → move
-        fingers → start typing" pattern.  For platforms that support per-char
-        input via shell, we use the char-by-char path.
+        2026-04-24: 核心打字调用从 `d.send_keys()` 改为
+        `_type_text_unicode_safe(d, text)`。
+
+        **原因**: `d.send_keys()` 依赖 ADBKeyboard IME APK, MIUI/HyperOS 常拒
+        装 (``INSTALL_FAILED_USER_RESTRICTED``), 整条 type_text 挂。真机实测
+        2026-04-24 Redmi 13C (``IJ8HZLORS485PJWW``) 撞此问题, 导致
+        ``FacebookAutomation.send_message`` 对 zh/ja 客群完全不可用。
+
+        新实现 2 级 fallback (见 ``_type_text_unicode_safe``):
+          1. ``d(focused=True).set_text(text)`` — AccessibilityNode 直接写
+             widget text 属性, Unicode safe (zh/ja/en 全支持), 不依赖
+             IME/APK/剪贴板
+          2. ``d.shell(['input', 'text', escaped])`` — 老 ASCII-only fallback
+
+        Signature / behavior 保持不变 (think time + clear_first + 模拟输入
+        时长 sleep), 只换核心打字调用, 老 caller 零改动。
         """
         tp = self.profile.typing
         think_time = self._reading_time_for_length(len(text) * 2) * 0.3
         time.sleep(max(0.3, think_time))
 
         if clear_first:
-            d.clear_text()
+            try:
+                d.clear_text()
+            except Exception as e:
+                # 某些 widget 未 focused / 不支持 clear_text → 不阻塞, 继续
+                log.debug("[type_text] clear_text failed (continue): %s", e)
             time.sleep(random.uniform(0.1, 0.3))
 
         total_type_time = 0.0
@@ -413,7 +497,7 @@ class HumanBehavior:
             total_type_time += base
 
         simulated_sec = total_type_time / 1000.0 / self._warmup_multiplier
-        d.send_keys(text, clear=clear_first)
+        _type_text_unicode_safe(d, text)
         remaining = simulated_sec - 0.05
         if remaining > 0:
             time.sleep(min(remaining, 8.0))

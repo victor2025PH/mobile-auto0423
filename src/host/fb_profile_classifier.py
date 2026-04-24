@@ -135,10 +135,24 @@ def _build_vlm_prompt(persona: Dict[str, Any], ctx: Dict[str, str]) -> str:
 
 
 def _evaluate_match(persona: Dict[str, Any], insights: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """用 persona.match_criteria 判断 VLM 结果是否命中。"""
+    """用 persona.match_criteria 判断 VLM 结果是否命中。
+
+    Phase 10.1 (2026-04-24): 加 ``require_has_face`` / ``require_is_profile_page``
+    早期 reject — 防 VLM 在 launcher / 设置 / 空白 / 非 profile 截图上瞎猜
+    age/gender 误判 PASS (partial smoke 实测 launcher 截图也判 95.5).
+    """
     crit = persona.get("match_criteria") or {}
     reasons: List[str] = []
     ok = True
+
+    # Phase 10.1: 早期 face / profile page 门禁 (默认 backward-compat)
+    # 如果 persona 没设 require_has_face 字段, 跳过此检查 (现有 persona 不变行为)
+    if crit.get("require_has_face"):
+        if not insights.get("has_face"):
+            return False, ["VLM 判定 has_face=false (没看到清晰人脸 / 非 profile 截图)"]
+    if crit.get("require_is_profile_page"):
+        if not insights.get("is_profile_page"):
+            return False, ["VLM 判定 is_profile_page=false (不是 FB/IG profile UI)"]
 
     age_band = (insights.get("age_band") or "").lower()
     allowed_bands = [b.lower() for b in (crit.get("age_bands_allowed") or [])]
@@ -381,6 +395,7 @@ def classify(
     l2_image_paths: Optional[List[str]] = None,  # L2 深判用（主页滚动截图）
     do_l2: bool = True,
     dry_run: bool = False,
+    force_reclassify: bool = False,  # Phase 10.2: True 时跳过 7 天去重缓存, 强制重判
 ) -> Dict[str, Any]:
     """对单个目标做 L1+L2 分级识别。
 
@@ -421,8 +436,9 @@ def classify(
 
     ctx = {"display_name": display_name, "bio": bio, "username": username, "locale": locale}
 
-    # 0) 去重：窗口内已判过 → 复用
-    cached = _db_get_recent(pk, target_key, dedup_h)
+    # 0) 去重：窗口内已判过 → 复用 (force_reclassify=True 时跳过, Phase 10.2)
+    # use case: peer 真改头像 / 上次 launcher 截图被 REJECT 想用真 profile 截图重判 / debug
+    cached = None if force_reclassify else _db_get_recent(pk, target_key, dedup_h)
     if cached and not dry_run:
         logger.info("[classifier] 命中去重缓存 target=%s persona=%s match=%s",
                     target_key, pk, cached["match"])

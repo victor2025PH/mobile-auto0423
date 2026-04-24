@@ -328,7 +328,16 @@ def obs_prometheus():
     from src.host.health_monitor import health_monitor_launch_prometheus_text
     from fastapi.responses import PlainTextResponse
 
-    body = get_metrics_collector().prometheus() + health_monitor_launch_prometheus_text()
+    body = (get_metrics_collector().prometheus()
+            + health_monitor_launch_prometheus_text())
+    # P16 (2026-04-24): 追加 Level 4 VLM fallback 状态 (P5b swap 状态 + budget
+    # + last_error_code + swap_events counter)。fail-safe: 读 app_automation
+    # 失败不应让整个 /observability/prometheus 挂。
+    try:
+        from src.app_automation.facebook import vlm_level4_prometheus_text
+        body += vlm_level4_prometheus_text()
+    except Exception:  # pragma: no cover — fail-safe defensive
+        pass
     return PlainTextResponse(
         content=body,
         media_type="text/plain; version=0.0.4",
