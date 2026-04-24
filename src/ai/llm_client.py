@@ -172,6 +172,11 @@ class LLMClient:
             headers={"Authorization": f"Bearer {self.config.api_key}"},
         )
         self._cache_lock = threading.Lock()
+        # P5c (2026-04-24): 失败时记最后一次 HTTP error code + body 给 caller
+        # 做 provider swap 决策 (e.g. VLM Gemini 503 → Ollama fallback)。
+        # 成功 call 会清为 None/""; 只保留最后一次 retry 的 error 信息。
+        self.last_error_code: Optional[int] = None
+        self.last_error_body: str = ""
         if self.config.cache_enabled:
             self._init_cache()
 
@@ -312,6 +317,13 @@ class LLMClient:
     # -- HTTP with retry ----------------------------------------------------
 
     def _call_api(self, payload: dict) -> str:
+        """HTTP call with retry. 2026-04-24 P5c: 失败时保留 last_error_code
+        / last_error_body 供 caller debug + provider swap 决策 (e.g. VLM
+        Gemini 503 → Ollama fallback 判定)。
+
+        成功时 reset to None/""; 失败时写入最后一次 error 信息。返 "" 表示
+        所有 retry 用完, caller 应看 last_error_code 判断根因。
+        """
         url = f"{self.config.base_url.rstrip('/')}/chat/completions"
 
         for attempt in range(self.config.max_retries):
@@ -325,7 +337,14 @@ class LLMClient:
                         usage.get("prompt_tokens", 0),
                         usage.get("completion_tokens", 0),
                     )
+                    # 成功 — 清 error state
+                    self.last_error_code = None
+                    self.last_error_body = ""
                     return text
+
+                # 记 error (每次 retry 覆盖, 最终保留最后一次)
+                self.last_error_code = resp.status_code
+                self.last_error_body = resp.text[:500] if resp.text else ""
 
                 if resp.status_code == 429:
                     wait = min(2 ** attempt * 5, 60)
@@ -341,9 +360,13 @@ class LLMClient:
                 return ""
 
             except httpx.TimeoutException:
+                self.last_error_code = None
+                self.last_error_body = "timeout"
                 log.warning("LLM timeout (attempt %d/%d)", attempt + 1, self.config.max_retries)
                 time.sleep(2 ** attempt)
             except Exception as e:
+                self.last_error_code = None
+                self.last_error_body = str(e)[:500]
                 log.error("LLM call failed: %s", e)
                 self.stats.record_error()
                 time.sleep(2 ** attempt)
