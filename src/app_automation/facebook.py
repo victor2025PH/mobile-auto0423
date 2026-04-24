@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading as _b_threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -348,6 +349,64 @@ def _with_fb_foreground(method):
                         method.__name__, e)
         return method(self, *args, **kwargs)
     return _wrapper
+
+
+# ── VLM vision fallback lazy-init (2026-04-24 Level 4) ─────────────────────
+# Messenger 2026 Compose UI 下 AccessibilityNode 查不到 search bar /
+# conversation list / send button, smart_tap + multi-locale selector +
+# coordinate 三级 fallback 全 miss。Level 4 用 VLM 图像识别兜底。
+#
+# 复用 `src/ai/vision_fallback.py::VisionFallback` 已有 infra:
+#   - hourly_budget 20, cache TTL 5min (自动控成本 + 避免重复 call)
+#   - `get_free_vision_client()` 优先 Gemini (免费 1500/day), fallback
+#     Ollama 本地 (免费无限), 无 provider 时返 None
+#   - `find_element(device, target, context) → VisionResult.coordinates`
+#
+# 零成本 (免费 VLM provider + cache)。无 provider 时自动 degrade 到 3 级。
+
+_vision_fallback_instance = None
+_vision_fallback_init_lock = _b_threading.Lock()
+_vision_fallback_init_attempted = False
+
+
+def _get_vision_fallback():
+    """Lazy-init `VisionFallback` — 第 4 级 UI fallback, 无 provider 返 None。
+
+    Double-checked-locking 懒加载; 一次 init 失败 (无免费 VLM provider) 后
+    标记 ``_vision_fallback_init_attempted=True`` 不重试避免每次 call 都
+    尝试 import + probe Ollama。真机场景下 init 结果稳定, 不需要动态重试。
+
+    Returns:
+        ``VisionFallback`` instance 如果 provider 可用, 否则 ``None``。
+    """
+    global _vision_fallback_instance, _vision_fallback_init_attempted
+    if _vision_fallback_instance is not None:
+        return _vision_fallback_instance
+    if _vision_fallback_init_attempted:
+        return None
+    with _vision_fallback_init_lock:
+        if _vision_fallback_instance is not None:
+            return _vision_fallback_instance
+        if _vision_fallback_init_attempted:
+            return None
+        _vision_fallback_init_attempted = True
+        try:
+            from src.ai.vision_fallback import VisionFallback
+            from src.ai.llm_client import get_free_vision_client
+            client = get_free_vision_client()
+            if client is None:
+                log.debug(
+                    "[vision] 无免费 VLM provider (需设 GEMINI_API_KEY 或 "
+                    "启 Ollama+vision model), Level 4 fallback 禁用")
+                return None
+            _vision_fallback_instance = VisionFallback(client=client)
+            log.info(
+                "[vision] VisionFallback ready (Level 4 UI fallback, "
+                "免费 provider)")
+            return _vision_fallback_instance
+        except Exception as e:
+            log.debug("[vision] VisionFallback 初始化失败 (跳过 Level 4): %s", e)
+            return None
 
 
 class FacebookAutomation(BaseAutomation):
@@ -1269,10 +1328,13 @@ class FacebookAutomation(BaseAutomation):
 
     def _enter_messenger_search(self, d, device_id: str) -> None:
         """Open Messenger search UI — smart_tap → multi-locale → coordinate
-        三级 fallback。三路都失败抛 ``MessengerError(code='search_ui_missing')``。
+        → **VLM vision** 四级 fallback。四路都失败抛 ``MessengerError(code=
+        'search_ui_missing')``。
 
         修 2026-04-24 真机观察到的 "search_ui_missing" (中文 Messenger 的
         search bar 是 "问问 Meta AI 或自行搜索", 不在 smart_tap 知识库)。
+        Level 4 VLM 是为 Messenger 2026 Compose UI 加的 — search bar 不在
+        AccessibilityNode tree, 前 3 级全 miss 时用图像识别兜底。
         """
         if self.smart_tap("Search in Messenger", device_id=device_id):
             return
@@ -1286,32 +1348,60 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug(
                     "[_enter_messenger_search] multi-locale click 失败: %s", e)
-        # coordinate fallback: search bar 在顶部 (y ≈ 0.20 * height)
+        # Level 3: coordinate fallback (search bar 在顶部 y ≈ 0.20 * height)
         try:
             w, h = d.window_size()
             d.click(w // 2, int(h * 0.20))
             time.sleep(0.8)
-            # 验证 search EditText 出现了
             if d(className="android.widget.EditText").exists(timeout=2):
                 return
         except Exception as e:
             log.debug(
                 "[_enter_messenger_search] coordinate click 异常: %s", e)
+        # Level 4 (2026-04-24): VLM vision fallback — 对抗 Messenger 2026
+        # Compose UI。VisionFallback 自带 20/h budget + 5min cache, 用
+        # Gemini (免费 1500/day) 或 Ollama 本地 (免费无限) 作 provider, 零成本。
+        vf = _get_vision_fallback()
+        if vf is not None:
+            try:
+                result = vf.find_element(
+                    device=d,
+                    target="Messenger search bar",
+                    context=(
+                        "at top of Messenger inbox page, contains Chinese "
+                        "text '问问 Meta AI 或自行搜索' or English "
+                        "'Ask Meta AI' / 'Search in Messenger'; typically "
+                        "y≈200-350 pixels"),
+                )
+                if result and result.coordinates:
+                    x, y = result.coordinates
+                    d.click(x, y)
+                    time.sleep(0.8)
+                    if d(className="android.widget.EditText").exists(timeout=2):
+                        log.info(
+                            "[_enter_messenger_search] VLM hit @ (%d, %d)",
+                            x, y)
+                        return
+                    log.debug(
+                        "[vision] VLM click (%d, %d) 后 EditText 未出现", x, y)
+            except Exception as e:
+                log.debug("[vision] Level 4 search fallback 异常: %s", e)
         raise MessengerError(
             "search_ui_missing",
-            "Messenger 搜索入口三路 fallback 都失败",
-            hint=("smart_tap + multi-locale (_MESSENGER_SEARCH_SELECTORS) + "
-                  "coordinate (top 20%) 全 miss; UI 改版需维护常量 或 "
-                  "config/apps/facebook.yaml 的 smart_tap 规则"))
+            "Messenger 搜索入口 4 级 fallback 都失败",
+            hint=("smart_tap + multi-locale + coordinate + VLM (Gemini/"
+                  "Ollama) 全 miss; Messenger UI 大改版 / VLM 预算耗尽 / "
+                  "无免费 VLM provider (设 GEMINI_API_KEY 或 Ollama)"))
 
     def _tap_messenger_send(self, d, device_id: str) -> None:
         """Tap Messenger Send button — smart_tap → multi-locale → coordinate
-        右下 三级 fallback。三路都失败抛 ``MessengerError(code=
+        → **VLM vision** 四级 fallback。四路都失败抛 ``MessengerError(code=
         'send_button_missing')``。
 
         coordinate 兜底 position: ``(width*0.93, height*0.91)`` — Send button
         通常在 composer 右端, 该比例对 720x1600 (Redmi 13C) 实测 ≈ (670, 1456),
-        对更大屏幕也按比例缩放。
+        对更大屏幕也按比例缩放。Level 4 VLM 应对 Compose UI 下 AccessibilityNode
+        查不到 send button 的情况。
         """
         if self.smart_tap("Send message button", device_id=device_id):
             return
@@ -1324,7 +1414,7 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug(
                     "[_tap_messenger_send] multi-locale click 失败: %s", e)
-        # coordinate fallback: send button 在 composer 右端底部
+        # Level 3: coordinate fallback (send button 在 composer 右端底部)
         try:
             w, h = d.window_size()
             d.click(int(w * 0.93), int(h * 0.91))
@@ -1332,12 +1422,32 @@ class FacebookAutomation(BaseAutomation):
         except Exception as e:
             log.debug(
                 "[_tap_messenger_send] coordinate click 异常: %s", e)
+        # Level 4 (2026-04-24): VLM vision fallback
+        vf = _get_vision_fallback()
+        if vf is not None:
+            try:
+                result = vf.find_element(
+                    device=d,
+                    target="Send button",
+                    context=(
+                        "blue paper-plane icon at right-bottom of Messenger "
+                        "conversation composer, appears after message text "
+                        "is typed; usually x > 0.85 * width, y > 0.85 * height"),
+                )
+                if result and result.coordinates:
+                    x, y = result.coordinates
+                    d.click(x, y)
+                    log.info(
+                        "[_tap_messenger_send] VLM hit @ (%d, %d)", x, y)
+                    return
+            except Exception as e:
+                log.debug("[vision] Level 4 send fallback 异常: %s", e)
         raise MessengerError(
             "send_button_missing",
-            "Messenger Send 按钮三路 fallback 都失败",
-            hint=("smart_tap + multi-locale (_MESSENGER_SEND_SELECTORS) + "
-                  "coordinate (0.93w, 0.91h) 全 miss; 可能 composer focus "
-                  "丢或 UI 改版"))
+            "Messenger Send 按钮 4 级 fallback 都失败",
+            hint=("smart_tap + multi-locale + coordinate + VLM (Gemini/"
+                  "Ollama) 全 miss; 可能 composer focus 丢/UI 改版/VLM "
+                  "预算耗尽/无免费 VLM provider"))
 
     def _focus_messenger_composer(self, d) -> bool:
         """2026-04-24 真机 safety: 在 ``hb.type_text`` 之前显式 tap composer
