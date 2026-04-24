@@ -273,6 +273,57 @@ def count_outgoing_messages_since(device_id: str,
         return 0
 
 
+def count_unreplied_greetings_to_peer(device_id: str,
+                                      peer_name: str) -> int:
+    """同 peer 最后一次 incoming 之后 B 机发出的 greeting 条数。
+
+    语义说明 (F6, 来自 B→A 协作约定, 为 A 的 send_greeting_after_add_friend
+    per-peer 5 次硬顶提供数据源):
+
+      * "对方一旦回过就算关系建立,重置计数" — 用最后一次 incoming 的 id
+        作为分界,只数它之后的 greetings
+      * 对方从未发过 → 数所有历史 greetings (分界为 0)
+      * 不依赖 ``replied_at`` 字段 (那个只在 B 回复时被设,若 auto_reply 关
+        就漏设;按 incoming 时序更稳)
+
+    典型用法 (A 机 send_greeting_after_add_friend 开头):
+
+    .. code-block:: python
+
+        if count_unreplied_greetings_to_peer(did, profile_name) >= 5:
+            self._set_greet_reason("peer_cap_5x")
+            return False
+
+    Args:
+        device_id: 设备 ID
+        peer_name: 目标 peer 姓名 (与 ``facebook_inbox_messages.peer_name``
+            精确匹配; 如果 A 机 normalize_name 未处理全角/变音,这里也不会处理)
+
+    Returns:
+        未回复 greeting 条数 (包含 ``peer_type`` 为 friend/friend_request 等所有类型);
+        空参数/DB 异常返回 0。
+    """
+    if not device_id or not peer_name:
+        return 0
+    try:
+        with _connect() as conn:
+            # id 而非 seen_at/sent_at 做分界 — 高并发同秒写入时严格单调
+            row = conn.execute(
+                "SELECT COUNT(*) FROM facebook_inbox_messages"
+                " WHERE device_id=? AND peer_name=?"
+                " AND direction='outgoing' AND ai_decision='greeting'"
+                " AND id > COALESCE("
+                "   (SELECT MAX(id) FROM facebook_inbox_messages"
+                "    WHERE device_id=? AND peer_name=? AND direction='incoming'),"
+                "   0)",
+                (device_id, peer_name, device_id, peer_name),
+            ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.debug("count_unreplied_greetings_to_peer 失败: %s", e)
+        return 0
+
+
 def list_inbox_messages(device_id: Optional[str] = None,
                         since_iso: Optional[str] = None,
                         limit: int = 200,
@@ -559,6 +610,13 @@ _RISK_KIND_RULES = [
     (("disabled", "account is locked", "account has been"), "account_review"),
     (("suspicious", "unusual login"), "identity_verify"),
     (("can't use this feature", "cannot use this feature"), "policy_warning"),
+    # F4 (来自 A→B review Q6): Messenger 发送文案被 FB 拒绝
+    # (多语言,ja/zh/en/it 对齐 persona)
+    (("can't be sent", "cannot be sent", "couldn't send", "unable to send",
+      "message can't be sent", "message wasn't sent",
+      "不能发送此消息", "发送失败", "无法发送", "訊息無法傳送",
+      "送信できませんでした", "メッセージを送信できません",
+      "non inviabile", "messaggio non inviato"), "content_blocked"),
 ]
 
 

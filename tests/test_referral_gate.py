@@ -134,13 +134,30 @@ class TestSoftScore:
     def test_all_five_signals_pass(self):
         from src.ai.referral_gate import should_refer
         ctx = {"profile": {"total_turns": 5, "peer_reply_count": 3}}
+        # 显式 override min_lead_score=60 激活 lead_score 信号 (A 反馈后
+        # DEFAULT=0 禁用,需手动打开才数 5 档)
         d = should_refer(
             intent="interest", has_contact=True,
             ref_score=0.8, lead_score=75, memory_ctx=ctx,
+            config={"min_lead_score": 60},
         )
         assert d.refer is True
         assert d.level == "soft_pass"
         assert d.score == 5
+
+    def test_default_min_lead_score_disabled(self):
+        """DEFAULT_CONFIG.min_lead_score=0 时 lead_score 信号应被禁用。"""
+        from src.ai.referral_gate import should_refer, DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["min_lead_score"] == 0
+        ctx = {"profile": {"total_turns": 5, "peer_reply_count": 3}}
+        d = should_refer(
+            intent="interest", has_contact=True,
+            ref_score=0.8, lead_score=99, memory_ctx=ctx,
+        )
+        # 4 个信号命中 (turns/intent/ref/replies),lead_score 被禁用不算
+        assert d.score == 4
+        assert not any("lead_score" in r for r in d.reasons)
+        assert d.refer is True  # 4 ≥ threshold=3
 
     def test_exact_threshold_passes(self):
         """score == threshold 应通过。"""
@@ -187,7 +204,8 @@ class TestSoftScore:
         d = should_refer(
             intent="interest", has_contact=True, memory_ctx=ctx,
             ref_score=0.6, lead_score=65,
-            config={"min_turns": 10},  # 2 < 10 → no bump
+            config={"min_turns": 10, "min_lead_score": 60},
+            # min_turns=10 → total_turns=2 不中; min_lead_score=60 激活
         )
         # interest +1, ref +1, lead +1 = 3 (total_turns 不中,peer_reply_count=0)
         assert d.score == 3
