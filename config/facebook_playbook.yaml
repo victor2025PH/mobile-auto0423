@@ -93,6 +93,14 @@ defaults:
     enabled_probability: 1.0
     # 文案为空时是否强制走 persona 本地化模板（关闭则跳过发送，防发错语言）
     require_persona_template: true
+    # 2026-04-24 v3: AI 动态生成个性化 greeting (ChatBrain + qwen)
+    #   true: 每次调 ChatBrain 按 peer_name + persona 生成不重复的日文 greeting
+    #         (降重复率, 避 FB content_blocked 撞 text_hash)
+    #   false: 从 chat_messages.yaml.jp.greeting_messages 8 条模板随机选
+    #          (速度快, 无 LLM 成本, 但多次发会撞同 text_hash)
+    #   默认 false 先稳定. 真机环境确认 ChatBrain 稳定后再 opt-in.
+    ai_dynamic_greeting: false
+
     # 2026-04-23: profile 页无 Message 按钮时,是否降级 Messenger App 路径
     #   - false: 直接放弃,记录 reason=no_message_button
     #   - true(Phase 7 起默认): 调 send_message() 切 Messenger + 搜名字 + 发消息

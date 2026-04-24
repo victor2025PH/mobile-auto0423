@@ -2642,9 +2642,35 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug("[send_greeting] daily_cap 检查异常(继续): %s", e)
 
-        # 文案：空则按 persona 从 chat_messages.yaml 抽(并记录 template_id 供 A/B)
+        # 文案：
+        # 1) 若 sg_cfg.ai_dynamic_greeting=True, 优先 ChatBrain AI 动态生成个性化日文 greeting
+        # 2) 否则从 chat_messages.yaml 模板池抽 (8 条日文随机, template_id 供 A/B)
+        # 3) 空 → 英文兜底 (仅当 require_persona_template=False)
         require_template = bool(sg_cfg.get("require_persona_template", True))
+        use_ai = bool(sg_cfg.get("ai_dynamic_greeting", False))
         template_id = ""  # 显式传入 greeting 时 tid 留空(运营自定义的不参与 A/B 统计)
+        if not greeting and use_ai:
+            try:
+                from src.ai.chat_brain import ChatBrain, UserProfile
+                brain = ChatBrain.get_instance()
+                prof = UserProfile(username=profile_name)
+                lead_id = f"fb:{profile_name}"
+                result = brain.generate_reply(
+                    lead_id=lead_id,
+                    incoming_message="",   # 空 = 破冰首次开场
+                    profile=prof,
+                    platform="facebook",
+                    target_language="ja",   # 日本客群锁日文
+                    source="add_friend_greet",
+                    persist=False,          # 不污染 ConversationMemory
+                )
+                if result and getattr(result, "message", "").strip():
+                    greeting = result.message.strip()
+                    template_id = "ai:chat_brain:ja"
+                    log.info("[send_greeting] AI 动态 greeting 生成 (%d chars): %s",
+                              len(greeting), profile_name)
+            except Exception as e:
+                log.warning("[send_greeting] AI greeting 生成失败, fallback 模板: %s", e)
         if not greeting:
             try:
                 from .fb_content_assets import get_greeting_message_with_id
