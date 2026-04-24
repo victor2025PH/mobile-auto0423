@@ -1309,6 +1309,7 @@ def fb_vlm_level4_status():
       * vision_model: e.g. "gemini-2.5-flash" | "llava:7b"
       * swapped: P5b 是否已从 Gemini runtime 切到 Ollama (true 单向不回)
       * consecutive_failures: 当前连续 HTTP 失败 count (阈值 3 触发 swap)
+      * swap_events_total: 累计 swap 触发次数 (P16; Prometheus 同源 counter)
       * last_error_code: int | null (Gemini 503/429 等; null = 上次成功)
       * last_error_body: str (截 120 chars; "timeout" 字面值表 httpx timeout)
       * budget: {hourly_used, hourly_budget, budget_remaining, cache_size}
@@ -1320,13 +1321,15 @@ def fb_vlm_level4_status():
     from src.app_automation import facebook as fb
     out = {
         "provider": None, "vision_model": None, "swapped": False,
-        "consecutive_failures": 0, "last_error_code": None,
-        "last_error_body": "",
+        "consecutive_failures": 0, "swap_events_total": 0,
+        "last_error_code": None, "last_error_body": "",
         "budget": {}, "init_attempted": False,
     }
     out["swapped"] = bool(getattr(fb, "_vlm_provider_swapped", False))
     out["consecutive_failures"] = int(
         getattr(fb, "_vlm_consecutive_failures", 0))
+    out["swap_events_total"] = int(
+        getattr(fb, "_vlm_swap_events_total", 0))
     out["init_attempted"] = bool(
         getattr(fb, "_vision_fallback_init_attempted", False))
     vf = getattr(fb, "_vision_fallback_instance", None)
