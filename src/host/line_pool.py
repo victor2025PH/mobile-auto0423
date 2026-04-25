@@ -488,15 +488,18 @@ def seed_from_config(config_path: Optional[str] = None,
 def referral_funnel(*, hours_window: int = 168,
                       region: Optional[str] = None,
                       persona_key: Optional[str] = None) -> Dict[str, Any]:
-    """Phase 13: referral 漏斗聚合 4 层统计.
+    """Phase 13 / 19.3: referral 漏斗聚合 4 层 + region/persona 真过滤.
 
     planned    = line_dispatch_planned contact_events 独立 peer 数
     sent       = wa_referral_sent contact_events 独立 peer 数
-    replied    = wa_referral_replied contact_events 独立 peer 数 (B 写, 当前应为 0)
-    conversion_rate = replied / sent
-    send_rate       = sent / planned
+    replied    = wa_referral_replied contact_events 独立 peer 数
 
-    region/persona_key 精细过滤留 Phase 13.1 (当前 peer→canonical 反查成本高).
+    Phase 19.3: region/persona_key 通过 leads_canonical metadata JOIN 实现.
+      peer_name → resolve_identity (硬匹配) → canonical → metadata.l2_persona_key
+      / region (从 line_account 缓存反查比直 metadata 简单).
+
+    简化策略: 用 ``meta_json LIKE '%"l2_persona_key": "<key>"%'`` 字符串匹配,
+    避免复杂 JOIN. 性能 OK (canonical 表小, leads_canonical 通常 < 几千).
     """
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     CONTACT_EVT_LINE_DISPATCH_PLANNED,
@@ -512,11 +515,75 @@ def referral_funnel(*, hours_window: int = 168,
     replied_rows = list_recent_contact_events_by_types(
         [CONTACT_EVT_WA_REFERRAL_REPLIED],
         hours=hours_window, limit=10000)
-    planned_peers = {r.get("peer_name") for r in planned_rows
+
+    # Phase 19.3: region/persona 过滤 — 反查 canonical 看 metadata
+    eligible_peers: Optional[set] = None
+    if region or persona_key:
+        try:
+            from src.host.lead_mesh.canonical import _connect as _lm_connect
+            import json as _json
+            # 收集 candidate peer names
+            cand = set()
+            for evs in (planned_rows, sent_rows, replied_rows):
+                for r in evs:
+                    pn = r.get("peer_name")
+                    if pn:
+                        cand.add(pn)
+            if cand:
+                # 预查 leads_canonical 这些 peer (主键索引快)
+                with _lm_connect() as conn:
+                    placeholders = ",".join(["?"] * len(cand))
+                    # account_id 格式 fb:peer_name (与 dispatcher resolve_identity 一致)
+                    fb_keys = [f"fb:{n}" for n in cand]
+                    q = ("SELECT li.account_id, lc.metadata_json"
+                         " FROM lead_identities li"
+                         " JOIN leads_canonical lc"
+                         " ON li.canonical_id = lc.canonical_id"
+                         f" WHERE li.platform='facebook' AND li.account_id IN ({placeholders})")
+                    cur = conn.execute(q, fb_keys)
+                    eligible_peers = set()
+                    for row in cur.fetchall():
+                        try:
+                            meta = _json.loads(row["metadata_json"] or "{}")
+                        except Exception:
+                            meta = {}
+                        # persona 检查
+                        if persona_key:
+                            if meta.get("l2_persona_key") != persona_key:
+                                continue
+                        # region: leads_canonical metadata 没存 region (line_account
+                        # 才有). 这里我们用 persona_key 推 region:
+                        # jp_female_midlife → jp; it_female_midlife → it
+                        if region:
+                            pk = meta.get("l2_persona_key", "") or ""
+                            inferred_region = ""
+                            if pk.startswith("jp_"):
+                                inferred_region = "jp"
+                            elif pk.startswith("it_"):
+                                inferred_region = "it"
+                            if inferred_region != region:
+                                continue
+                        # 反推 peer_name (account_id = fb:NAME)
+                        aid = row["account_id"] or ""
+                        if aid.startswith("fb:"):
+                            eligible_peers.add(aid[3:])
+        except Exception:
+            eligible_peers = None  # 异常时不过滤, 退化为 overall
+
+    def _filter(rows):
+        if eligible_peers is None:
+            return rows
+        return [r for r in rows if r.get("peer_name") in eligible_peers]
+
+    planned_rows_f = _filter(planned_rows)
+    sent_rows_f = _filter(sent_rows)
+    replied_rows_f = _filter(replied_rows)
+
+    planned_peers = {r.get("peer_name") for r in planned_rows_f
                       if r.get("peer_name")}
-    sent_peers = {r.get("peer_name") for r in sent_rows
+    sent_peers = {r.get("peer_name") for r in sent_rows_f
                     if r.get("peer_name")}
-    replied_peers = {r.get("peer_name") for r in replied_rows
+    replied_peers = {r.get("peer_name") for r in replied_rows_f
                        if r.get("peer_name")}
 
     n_planned = len(planned_peers)
@@ -535,9 +602,13 @@ def referral_funnel(*, hours_window: int = 168,
             "planned_events": len(planned_rows),
             "sent_events": len(sent_rows),
             "replied_events": len(replied_rows),
+            "filtered_planned": len(planned_rows_f),
+            "filtered_sent": len(sent_rows_f),
+            "filtered_replied": len(replied_rows_f),
         },
         "region": region or "",
         "persona_key": persona_key or "",
+        "filter_applied": eligible_peers is not None,
     }
 
 

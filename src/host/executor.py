@@ -1062,23 +1062,20 @@ def _execute_facebook(manager, resolved, task_type, params):
 
 
 def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
-    """Phase 18 (2026-04-25): 每日 referral 闭环健康摘要.
+    """Phase 18 / 19 (2026-04-25): 每日 referral 闭环健康摘要 + 趋势 + 告警.
 
-    组装:
-      - funnel (planned/sent/replied)
-      - account_ranking top 5
-      - peer_name reject metrics (by_event_type + by_day)
-      - dispatch_log 最近 24h 计数 by status
-
-    输出:
-      1. logs/daily_summary_YYYYMMDD.json
-      2. 可选 Slack webhook (env OPENCLAW_SLACK_WEBHOOK_URL)
-      3. 返 stats dict
+    Phase 19 新增:
+      - trend: vs 昨天 daily_summary_*.json diff (planned/sent/replied 增减)
+      - alerts: send_rate < 30% (planned >= 5) / reject_rate > 20% (rejects >= 10)
+      - by_region: jp / it 分别跑一次 funnel 拿 per-region 数字
 
     Params:
       hours_window: int = 24
       write_file: bool = True
-      send_webhook: bool = True (但需 env var 才真发)
+      send_webhook: bool = True
+      regions: list[str] = ["jp", "it"]   # Phase 19.3: per-region funnel
+      alert_send_rate_threshold: float = 0.3
+      alert_reject_threshold: int = 10
     """
     import datetime as _dt
     import json as _json
@@ -1087,6 +1084,13 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
     hours_window = int(params.get("hours_window", 24) or 24)
     write_file = bool(params.get("write_file", True))
     send_webhook = bool(params.get("send_webhook", True))
+    regions = params.get("regions", ["jp", "it"])
+    if not isinstance(regions, list):
+        regions = ["jp", "it"]
+    alert_send_threshold = float(
+        params.get("alert_send_rate_threshold", 0.3) or 0.3)
+    alert_reject_threshold = int(
+        params.get("alert_reject_threshold", 10) or 10)
 
     from src.host.line_pool import (referral_funnel, account_ranking,
                                       recent_dispatch_log)
@@ -1104,21 +1108,79 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         st = r.get("status") or "?"
         log_status_count[st] = log_status_count.get(st, 0) + 1
 
+    # Phase 19.3: per-region funnel
+    by_region: Dict[str, Dict[str, Any]] = {}
+    for rg in regions:
+        try:
+            by_region[rg] = referral_funnel(
+                hours_window=hours_window, region=rg)
+        except Exception as e:
+            logger.debug("[daily_summary] per-region %s 失败: %s", rg, e)
+            by_region[rg] = {}
+
+    # Phase 19.2: alerts 阈值
+    alerts: List[Dict[str, Any]] = []
+    if funnel.get("planned", 0) >= 5 and funnel.get("send_rate", 0) < alert_send_threshold:
+        alerts.append({
+            "type": "send_rate_low",
+            "severity": "warning",
+            "message": f"send_rate={funnel['send_rate']*100:.1f}% < {alert_send_threshold*100:.0f}% (planned={funnel['planned']})",
+        })
+    rej_history_total = rej_history.get("total", 0)
+    if rej_history_total >= alert_reject_threshold:
+        alerts.append({
+            "type": "reject_rate_high",
+            "severity": "warning",
+            "message": f"reject_history={rej_history_total} (24h阈值={alert_reject_threshold})",
+        })
+    if funnel.get("planned", 0) >= 5 and funnel.get("sent", 0) == 0:
+        alerts.append({
+            "type": "no_dispatched",
+            "severity": "critical",
+            "message": f"planned={funnel['planned']} 但 sent=0, 检查 send_referral_replies 任务/账号",
+        })
+
     summary: Dict[str, Any] = {
         "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "hours_window": hours_window,
         "funnel": funnel,
+        "by_region": by_region,
         "top_5_accounts": ranking,
         "peer_name_rejects": {
             "live_total": rej_live.get("total", 0),
             "live_by_event_type": rej_live.get("by_event_type", {}),
-            "history_total": rej_history.get("total", 0),
+            "history_total": rej_history_total,
             "history_by_day": rej_history.get("by_day", {}),
             "history_by_event": rej_history.get("by_event_type", {}),
         },
         "dispatch_log_status": log_status_count,
         "dispatch_log_total_24h": len(log_recent),
+        "alerts": alerts,
     }
+
+    # Phase 19.1: trend vs 昨天
+    trend: Optional[Dict[str, Any]] = None
+    try:
+        yest_str = (_dt.datetime.utcnow() - _dt.timedelta(days=1)).strftime("%Y%m%d")
+        yest_path = _Path("logs") / f"daily_summary_{yest_str}.json"
+        if yest_path.exists():
+            with yest_path.open(encoding="utf-8") as f:
+                yest_data = _json.load(f)
+            yest_funnel = yest_data.get("funnel", {})
+            trend = {
+                "yesterday_date": yest_str,
+                "planned_delta": funnel.get("planned", 0) - yest_funnel.get("planned", 0),
+                "sent_delta": funnel.get("sent", 0) - yest_funnel.get("sent", 0),
+                "replied_delta": funnel.get("replied", 0) - yest_funnel.get("replied", 0),
+                "send_rate_delta": round(
+                    funnel.get("send_rate", 0) - yest_funnel.get("send_rate", 0), 4),
+                "yesterday_planned": yest_funnel.get("planned", 0),
+                "yesterday_sent": yest_funnel.get("sent", 0),
+                "yesterday_replied": yest_funnel.get("replied", 0),
+            }
+    except Exception as e:
+        logger.debug("[daily_summary] trend 计算失败: %s", e)
+    summary["trend"] = trend
 
     written_to = ""
     if write_file:
@@ -1141,18 +1203,44 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         if webhook_url:
             try:
                 import urllib.request
-                import urllib.error
-                # 简短文本格式给 Slack/通知
+                # 标题: 有 alerts 加 🚨
+                title_prefix = "🚨 " if alerts else ""
                 lines = [
-                    f"*Referral 闭环 24h 摘要* ({summary['generated_at']})",
+                    f"{title_prefix}*Referral 闭环 24h 摘要* ({summary['generated_at']})",
                     f"funnel: planned={funnel['planned']} sent={funnel['sent']} replied={funnel['replied']}",
                     f"send_rate={funnel['send_rate']*100:.1f}% conv_rate={funnel['conversion_rate']*100:.1f}%",
-                    f"reject_24h: total={rej_history.get('total', 0)} (live={rej_live.get('total', 0)})",
-                    f"top accounts: " + ", ".join(
-                        f"{a['line_id']}={a['success_rate']*100:.0f}%"
-                        for a in ranking[:3]),
-                    f"dispatch_log_status: {log_status_count}",
                 ]
+                # Phase 19.1: trend
+                if trend:
+                    arrow = lambda v: ("+" if v > 0 else "") + str(v)
+                    lines.append(
+                        f"vs 昨天 ({trend['yesterday_date']}): "
+                        f"planned {arrow(trend['planned_delta'])}, "
+                        f"sent {arrow(trend['sent_delta'])}, "
+                        f"replied {arrow(trend['replied_delta'])}")
+                # Phase 19.3: per-region
+                if by_region:
+                    rg_parts = []
+                    for rg, rf in by_region.items():
+                        if rf:
+                            rg_parts.append(
+                                f"{rg}={rf.get('planned',0)}/{rf.get('sent',0)}")
+                    if rg_parts:
+                        lines.append("by_region (planned/sent): " + ", ".join(rg_parts))
+                lines.append(
+                    f"reject_24h: history={rej_history_total} (live={rej_live.get('total', 0)})")
+                lines.append(
+                    "top accounts: " + ", ".join(
+                        f"{a['line_id']}={a['success_rate']*100:.0f}%"
+                        for a in ranking[:3]))
+                lines.append(f"dispatch_log_status: {log_status_count}")
+                # Phase 19.2: alerts
+                if alerts:
+                    lines.append("")
+                    lines.append("⚠ *ALERTS:*")
+                    for a in alerts:
+                        lines.append(f"  - [{a['severity']}] {a['type']}: {a['message']}")
+
                 req = urllib.request.Request(
                     webhook_url,
                     data=_json.dumps({"text": "\n".join(lines)}).encode("utf-8"),
@@ -1160,7 +1248,8 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                     method="POST")
                 urllib.request.urlopen(req, timeout=10)
                 webhook_sent = True
-                logger.info("[daily_summary] webhook 发送成功")
+                logger.info("[daily_summary] webhook 发送成功 (alerts=%d)",
+                              len(alerts))
             except Exception as e:
                 logger.warning("[daily_summary] webhook 发送失败: %s", e)
 

@@ -256,7 +256,7 @@
       "write_file": true,
       "send_webhook": true
     },
-    "enabled": false,
+    "enabled": true,
     "last_run": ""
   }
 ]
