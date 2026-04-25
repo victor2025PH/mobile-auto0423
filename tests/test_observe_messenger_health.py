@@ -21,10 +21,13 @@ class TestCli:
         """一次性跑不应崩 + 输出包含核心 section 标题。"""
         # 让 logs 目录指向 tmp 避免污染真实 logs/
         monkeypatch.setenv("LOGS_DIR_TEST", str(tmp_path))
+        # 2026-04-24 (Phase 10.3): 脚本输出 UTF-8 (含 🔴/🟢 emoji),
+        # Windows 上 text=True 默认按 gbk 解码会崩 → 显式 utf-8.
         r = subprocess.run(
             [sys.executable, str(SCRIPT),
              "--since-hours", "1", "--no-archive"],
             capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
         )
         assert r.returncode == 0
         assert "Messenger Health Snapshot" in r.stdout

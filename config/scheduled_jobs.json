@@ -199,5 +199,104 @@
     },
     "enabled": false,
     "last_run": "2026-04-05 20:00:03"
+  },
+  {
+    "id": "line_dispatch_30min",
+    "name": "LINE 派发 (每 30 分钟扫 greeting_replied 合格线索)",
+    "cron": "*/30 * * * *",
+    "action": "facebook_line_dispatch_from_reply",
+    "params": {
+      "hours_window": 6,
+      "dedupe_hours": 24,
+      "require_l2_verified": true,
+      "persona_key": "jp_female_midlife",
+      "region": "jp",
+      "min_score": 70,
+      "limit": 20,
+      "dispatch_mode": "messenger_text",
+      "write_contact_event": true,
+      "event_type": "line_dispatch_planned"
+    },
+    "enabled": true,
+    "last_run": ""
+  },
+  {
+    "id": "send_referral_replies_30min",
+    "name": "LINE 引流发送 (每 30 分钟, 错开 dispatch 10 分钟)",
+    "cron": "10,40 * * * *",
+    "action": "facebook_send_referral_replies",
+    "params": {
+      "hours_window": 2,
+      "dedupe_hours": 24,
+      "strict_device_match": true,
+      "limit": 10
+    },
+    "enabled": true,
+    "last_run": ""
+  },
+  {
+    "id": "recycle_dead_peers_daily",
+    "name": "Referral dead peer 7 天后自动复活 (daily 04:17)",
+    "cron": "17 4 * * *",
+    "action": "facebook_recycle_dead_peers",
+    "params": {
+      "days": 7,
+      "limit": 500
+    },
+    "enabled": true,
+    "last_run": ""
+  },
+  {
+    "id": "daily_referral_summary_2355",
+    "name": "Referral 闭环每日摘要 (23:55, 写 logs/daily_summary + 可选 Slack)",
+    "cron": "55 23 * * *",
+    "action": "facebook_daily_referral_summary",
+    "params": {
+      "hours_window": 24,
+      "write_file": true,
+      "send_webhook": true
+    },
+    "enabled": true,
+    "last_run": ""
+  },
+  {
+    "id": "alert_check_hourly",
+    "name": "Referral hourly alert 检测 (24h 抑制重复, 仅严重时 Slack)",
+    "cron": "5 * * * *",
+    "action": "facebook_alert_check_hourly",
+    "params": {
+      "hours_window": 24,
+      "cooldown_hours": 24,
+      "alert_send_rate_threshold": 0.3,
+      "alert_reject_threshold": 10
+    },
+    "enabled": false,
+    "last_run": ""
+  },
+  {
+    "id": "check_referral_replies_15min",
+    "name": "Phase 20.1 Messenger inbox 找 referral 回复 (B 侧实装后启用)",
+    "cron": "*/15 * * * *",
+    "action": "facebook_check_referral_replies",
+    "params": {
+      "hours_back": 48,
+      "limit": 50,
+      "max_messages_per_peer": 5
+    },
+    "enabled": false,
+    "last_run": ""
+  },
+  {
+    "id": "mark_stale_referrals_daily",
+    "name": "Phase 20.2 SLA 死信回收 (每天 04:30, sent 48h 未 replied → stale, 7d → dead)",
+    "cron": "30 4 * * *",
+    "action": "facebook_mark_stale_referrals",
+    "params": {
+      "stale_hours": 48,
+      "escalate_to_dead_days": 7,
+      "limit": 500
+    },
+    "enabled": false,
+    "last_run": ""
   }
 ]

@@ -610,6 +610,76 @@ _MIGRATIONS = [
     " created_by TEXT DEFAULT ''"          # agent_a/operator 等
     ")",
     "CREATE INDEX IF NOT EXISTS idx_blocklist_created ON lead_blocklist(created_at DESC)",
+
+    # ── Phase 11 (2026-04-25): LINE account pool ─────────────────────
+    # 运营在后台管理可用于引流的 LINE 账号, 按轮循 (last_used_at ASC + daily cap)
+    # 分配给 dispatcher / B 机 messenger 回复. region/persona_key 可做分群.
+    "CREATE TABLE IF NOT EXISTS line_accounts ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " line_id TEXT NOT NULL UNIQUE,"              # @xxx / URL / phone
+    " owner_device_id TEXT DEFAULT '',"            # 绑定设备 (可空 = 通用池)
+    " persona_key TEXT DEFAULT '',"                # 限定 persona (可空 = 通用)
+    " region TEXT DEFAULT '',"                     # 'jp' / 'it' / ...
+    " status TEXT NOT NULL DEFAULT 'active',"      # active / cooldown / banned / disabled
+    " last_used_at TEXT DEFAULT '',"
+    " times_used INTEGER NOT NULL DEFAULT 0,"
+    " daily_cap INTEGER NOT NULL DEFAULT 20,"      # 24h 分发上限
+    " notes TEXT DEFAULT '',"
+    " created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+    " updated_at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_line_accounts_status_lastused"
+    " ON line_accounts(status, last_used_at)",
+    "CREATE INDEX IF NOT EXISTS idx_line_accounts_region_persona"
+    " ON line_accounts(region, persona_key)",
+
+    # Phase 11: 分发日志, 用于 24h 内 daily_cap 统计 + 审计
+    "CREATE TABLE IF NOT EXISTS line_dispatch_log ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " line_account_id INTEGER NOT NULL,"
+    " line_id TEXT NOT NULL,"
+    " canonical_id TEXT NOT NULL DEFAULT '',"      # 引流给哪个 lead
+    " peer_name TEXT DEFAULT '',"
+    " source_device_id TEXT DEFAULT '',"            # 谁触发的 dispatch (A/B/operator)
+    " source_event_id TEXT DEFAULT '',"             # fb_contact_events.id 或其它
+    " status TEXT NOT NULL DEFAULT 'planned',"      # planned / sent / failed / skipped
+    " note TEXT DEFAULT '',"
+    " created_at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_line_dispatch_account_time"
+    " ON line_dispatch_log(line_account_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_line_dispatch_canonical"
+    " ON line_dispatch_log(canonical_id, created_at DESC)",
+
+    # ── Phase 18 (2026-04-25): peer_name reject 持久化日志 ──
+    # 跨进程重启可查的 reject 历史 (上一阶段进程内 ring buffer 重启清零).
+    # 用于 daily summary + 趋势分析 + 调 sanitize 规则.
+    "CREATE TABLE IF NOT EXISTS peer_name_reject_log ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " peer_name TEXT NOT NULL DEFAULT '',"          # 被拦的 peer (前 40 字符)
+    " event_type TEXT NOT NULL DEFAULT '',"
+    " device_id TEXT NOT NULL DEFAULT '',"
+    " at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_peer_reject_at"
+    " ON peer_name_reject_log(at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_peer_reject_event"
+    " ON peer_name_reject_log(event_type, at DESC)",
+    # Phase 20.1.9.1 (2026-04-25): alert 触发历史 — 跨进程持久化, 用于
+    # 回顾 7-30d alert 频率 / 分布 / 是否反复同一 type.
+    "CREATE TABLE IF NOT EXISTS fb_alert_history ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " alert_type TEXT NOT NULL DEFAULT '',"
+    " severity TEXT NOT NULL DEFAULT '',"
+    " message TEXT NOT NULL DEFAULT '',"
+    " region TEXT NOT NULL DEFAULT '',"        # per-region alert 用 (Phase 20.1.9.2)
+    " context_json TEXT NOT NULL DEFAULT '{}',"
+    " fired_at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_alert_fired_at"
+    " ON fb_alert_history(fired_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_alert_type_fired"
+    " ON fb_alert_history(alert_type, fired_at DESC)",
 ]
 
 

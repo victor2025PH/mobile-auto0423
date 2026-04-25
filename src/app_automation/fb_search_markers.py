@@ -14,6 +14,8 @@ from typing import Final, Tuple
 FB_WHATS_ON_MIND: Final[str] = "What's on your mind?"
 FB_HOME_TAB_MARKER: Final[str] = "Home, tab 1 of"
 FB_FEED_LIST_MARKER: Final[str] = "id/feed_list"
+# 2026-04-24 中文 katana bottom tab content-desc: '首页，第1/6个选项卡'
+FB_HOME_TAB_MARKER_ZH: Final[str] = "首页，第1"
 
 # 发帖框提示语（多语言 katana 常见文案，与英文逻辑并列；按需再扩）
 FB_HOME_COMPOSER_I18N_SUBSTRINGS: Tuple[str, ...] = (
@@ -21,6 +23,7 @@ FB_HOME_COMPOSER_I18N_SUBSTRINGS: Tuple[str, ...] = (
     "\u00bfEn qu\u00e9 est\u00e1s pensando?",  # ES: ¿En qué estás pensando?
     "\u4eca\u306a\u306b\u3057\u3066\u308b\uff1f",  # JP: 今なにしてる？
     "\u4f60\u5728\u60f3\u4ec0\u4e48\uff1f",       # zh-Hans: 你在想什么？
+    "\u5728\u60f3\u4e9b\u4ec0\u4e48\uff1f",        # zh-Hans alt
 )
 
 # ── 搜索页（顶栏搜索：无发帖框 + 存在 EditText）────────────────────────
@@ -46,6 +49,7 @@ def hierarchy_looks_like_fb_home(xml: str) -> bool:
     if (
         FB_WHATS_ON_MIND in xml
         or FB_HOME_TAB_MARKER in xml
+        or FB_HOME_TAB_MARKER_ZH in xml
         or FB_FEED_LIST_MARKER in xml
     ):
         return True

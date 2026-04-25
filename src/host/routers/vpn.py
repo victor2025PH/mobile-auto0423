@@ -1780,14 +1780,13 @@ def _vpn_install_v2rayng_impl(body):
     results = {}
 
     def _install_one(did):
+        # 用 push + pm install 绕开 MIUI 14+ 的 securitycenter/AdbInstallActivity 拦截
+        from src.utils.safe_apk_install import safe_install_apk
         try:
-            r = _sp_run_text(
-                [_adb_exe, "-s", did, "install", "-r", "-t", str(v2rayng_apk)],
-                capture_output=True, timeout=120,
-            )
-            output = (r.stdout + r.stderr).strip()
-            if r.returncode == 0 and "Success" in output:
-                # 授予悬浮窗权限（避免 VPN 权限对话框问题）
+            success, output = safe_install_apk(
+                _adb_exe, did, str(v2rayng_apk),
+                replace=True, test=True, timeout=120)
+            if success:
                 _sp_run_text(
                     [_adb_exe, "-s", did, "shell",
                      "appops", "set", "com.v2ray.ang",
@@ -1796,8 +1795,6 @@ def _vpn_install_v2rayng_impl(body):
                 )
                 return True, "安装成功"
             return False, output[:200] or "安装失败（未知错误）"
-        except subprocess.TimeoutExpired:
-            return False, "安装超时 (>120s)"
         except Exception as e:
             return False, str(e)
 

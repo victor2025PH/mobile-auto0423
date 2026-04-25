@@ -365,10 +365,16 @@ def _db_insert_content_exposure(
 
 
 def _recent_risk_hours(device_id: str, hours: int) -> int:
-    """最近 N 小时的风控事件数，用于 pause_l2 判断。"""
+    """最近 N 小时的 **CRITICAL 级** 风控事件数, 用于 pause_l2 判断.
+
+    2026-04-24 v2: 之前查所有 risk events (包含 content_blocked 'other' 类),
+    导致一次 greeting 被 FB 拒发就 pause L2 12 小时, 过严.
+    改为只查 CRITICAL (identity_verify / captcha / checkpoint / account_review /
+    policy_warning) — 这些才真正意味着账号有长期风险, 需要冷却.
+    """
     try:
         from src.host import fb_store
-        return int(fb_store.count_risk_events_recent(device_id, hours))
+        return int(fb_store.count_critical_risk_events_recent(device_id, hours))
     except Exception:
         return 0
 
@@ -477,12 +483,16 @@ def classify(
     }
 
     # L1 未过或显式跳过 L2 → 落 L1 记录返回
+    # 2026-04-24 修: match 要跟随 l1_pass. 之前固定 match=False, 导致 do_l2=False
+    #   时即使 L1 通过, DB 也存了 match=False, 下次缓存命中误拦截后续 add_friend.
     if not l1_pass or not do_l2:
+        result_match = bool(l1_pass) if (l1_pass and not do_l2) else False
+        result["match"] = result_match
         if not dry_run:
             _db_insert_insight(
                 device_id=device_id, task_id=task_id, persona_key=pk,
                 target_key=target_key, display_name=display_name,
-                stage="L1", match=False, score=l1_score, confidence=0.0,
+                stage="L1", match=result_match, score=l1_score, confidence=0.0,
                 insights={"l1_reasons": l1_reasons}, image_paths=image_paths,
                 vlm_model="", latency_ms=0,
             )

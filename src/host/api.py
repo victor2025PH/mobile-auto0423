@@ -116,6 +116,16 @@ async def lifespan(application: FastAPI):
     from src.utils.log_config import setup_logging
     setup_logging()
     init_db()
+    # Phase 11 (2026-04-25): LINE pool seed — 空池时注入 config/line_pool_seed.yaml 默认账号
+    try:
+        from src.host.line_pool import seed_from_config
+        res = seed_from_config()
+        if not res.get("skipped"):
+            logger.info("[line_pool.seed] inserted=%s duplicate=%s invalid=%s",
+                         res.get("inserted"), res.get("duplicate"),
+                         res.get("invalid"))
+    except Exception as e:
+        logger.debug("[line_pool.seed] 失败 (忽略): %s", e)
     get_worker_pool()
     try:
         from src.host.task_policy import load_task_execution_policy, policy_blocks_db_scheduler
@@ -481,6 +491,7 @@ from .routers.leads import router as _leads_router
 from .routers.campaigns import router as campaigns_router
 from .routers.crm_sync import router as _crm_sync_router
 from .routers.lead_mesh import router as _lead_mesh_router  # 2026-04-23 Phase 5
+from .routers.line_pool import router as _line_pool_router  # 2026-04-25 Phase 11
 
 app.include_router(_notif_router, dependencies=[Depends(verify_api_key)])
 app.include_router(_notify_center_router, dependencies=[Depends(verify_api_key)])
@@ -504,6 +515,7 @@ app.include_router(_leads_router, dependencies=[Depends(verify_api_key)])
 app.include_router(campaigns_router)
 app.include_router(_crm_sync_router)
 app.include_router(_lead_mesh_router, dependencies=[Depends(verify_api_key)])
+app.include_router(_line_pool_router, dependencies=[Depends(verify_api_key)])
 
 # ---------------------------------------------------------------------------
 # Router registration — new routers (extracted from api.py)

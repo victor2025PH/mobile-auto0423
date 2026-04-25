@@ -84,13 +84,23 @@ defaults:
     # 两条打招呼之间的间隔 [sec_lo, sec_hi]
     inter_greeting_sec: [240, 600]
     # 加好友成功后先等待多久再点 Message（模拟"看了下资料再想起打个招呼"）
-    post_add_friend_wait_sec: [8, 18]
+    # 2026-04-24 v2: 砍 [8,18] → [3,6], L2 VLM 阶段已占 50-90s 足够模拟真人阅读
+    post_add_friend_wait_sec: [3, 6]
     # 进入对话页后停留多久再输入（像真人打字前的停顿）
-    think_before_type_sec: [3, 7]
+    # 2026-04-24 v2: 砍 [3,7] → [1,3]
+    think_before_type_sec: [1, 3]
     # 触发概率（1.0 = 必发；降低可做 A/B 实验，如 0.7 只对 70% 样本发）
     enabled_probability: 1.0
     # 文案为空时是否强制走 persona 本地化模板（关闭则跳过发送，防发错语言）
     require_persona_template: true
+    # 2026-04-24 v3: AI 动态生成个性化 greeting (ChatBrain + qwen)
+    #   true: 每次调 ChatBrain 按 peer_name + persona 生成不重复的日文 greeting
+    #         (降重复率, 避 FB content_blocked 撞 text_hash)
+    #   false: 从 chat_messages.yaml.jp.greeting_messages 8 条模板随机选
+    #          (速度快, 无 LLM 成本, 但多次发会撞同 text_hash)
+    #   默认 false 先稳定. 真机环境确认 ChatBrain 稳定后再 opt-in.
+    ai_dynamic_greeting: false
+
     # 2026-04-23: profile 页无 Message 按钮时,是否降级 Messenger App 路径
     #   - false: 直接放弃,记录 reason=no_message_button
     #   - true(Phase 7 起默认): 调 send_message() 切 Messenger + 搜名字 + 发消息
@@ -171,6 +181,11 @@ phases:
       daily_cap_per_account: 4      # 每日硬上限 4
       inter_greeting_sec: [360, 720]
       enabled_probability: 0.8      # 20% 不发保持多样性
+      # 2026-04-24 v4: growth AI 动态 greeting 默认启用
+      # F2 由紀子 2026-04-24 真机 PASS: ChatBrain→kana→Messenger 发送成功,
+      # 每条 greeting LLM 独生, 100% 唯一, 大幅降 FB content_blocked 风险.
+      # LLM 失败自动 fallback 到静态 8 模板, 主流程不阻断.
+      ai_dynamic_greeting: true
     group_engage:
       max_posts: 4
       comment_probability: 0.08
@@ -201,6 +216,7 @@ phases:
       daily_cap_per_account: 8      # 日硬上限 8（仍低于 add_friend 的 15，保留余量）
       inter_greeting_sec: [240, 600]
       enabled_probability: 1.0
+      ai_dynamic_greeting: true     # 2026-04-24 v4: 成熟号也 AI 动态 greeting
     group_engage:
       max_posts: 6
       comment_probability: 0.18

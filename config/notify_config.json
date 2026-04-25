@@ -12,46 +12,6 @@
   },
   "history": [
     {
-      "ts": "2026-04-14 13:29:19",
-      "type": "device.disconnected",
-      "title": "device.disconnected",
-      "message": "设备: 192.168.0.121:5555",
-      "level": "warning",
-      "sent": false
-    },
-    {
-      "ts": "2026-04-14 13:29:19",
-      "type": "device.disconnected",
-      "title": "device.disconnected",
-      "message": "设备: 192.168.0.101:5555",
-      "level": "warning",
-      "sent": false
-    },
-    {
-      "ts": "2026-04-14 13:39:50",
-      "type": "device.disconnected",
-      "title": "device.disconnected",
-      "message": "设备: 192.168.0.121:5555",
-      "level": "warning",
-      "sent": false
-    },
-    {
-      "ts": "2026-04-14 13:42:02",
-      "type": "device.disconnected",
-      "title": "device.disconnected",
-      "message": "设备: QSVSMRXOXWCYFIX4",
-      "level": "warning",
-      "sent": false
-    },
-    {
-      "ts": "2026-04-14 13:48:17",
-      "type": "device.disconnected",
-      "title": "device.disconnected",
-      "message": "设备: QSVSMRXOXWCYFIX4",
-      "level": "warning",
-      "sent": false
-    },
-    {
       "ts": "2026-04-14 13:48:31",
       "type": "device.disconnected",
       "title": "device.disconnected",
@@ -1640,6 +1600,46 @@
       "type": "device.disconnected",
       "title": "device.disconnected",
       "message": "设备: CACAVKLNU8SGO74D",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-24 19:56:26",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: CACAVKLNU8SGO74D",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-25 13:33:07",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: CACAVKLNU8SGO74D",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-25 13:40:05",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: CACAVKLNU8SGO74D",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-25 13:59:57",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: CACAVKLNU8SGO74D",
+      "level": "warning",
+      "sent": false
+    },
+    {
+      "ts": "2026-04-25 15:19:44",
+      "type": "device.disconnected",
+      "title": "device.disconnected",
+      "message": "设备: 8DWOF6CYY5R8YHX8",
       "level": "warning",
       "sent": false
     }

@@ -60,13 +60,12 @@ async def batch_install_apk(request: Request):
     results = {}
 
     def _install(did):
+        # 用 push + pm install 绕开 MIUI 14+ 的 securitycenter/AdbInstallActivity 拦截
+        from src.utils.safe_apk_install import safe_install_apk
         try:
-            r = _sp_run_text(
-                ["adb", "-s", did, "install", "-r", str(apk_path)],
-                capture_output=True,
-                timeout=300,
-            )
-            return r.returncode == 0, r.stdout + r.stderr
+            success, msg = safe_install_apk(
+                "adb", did, str(apk_path), replace=True, timeout=300)
+            return success, msg
         except Exception as e:
             return False, str(e)
 

@@ -41,6 +41,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# 2026-04-24 (Phase 10.3): Windows 默认 cp936/gbk 撞 unicode emoji (🔴/🟢) 崩溃,
+# 强制 stdout/stderr UTF-8 (Python 3.7+ reconfigure; 项目要求 >=3.9).
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

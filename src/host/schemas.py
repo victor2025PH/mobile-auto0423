@@ -61,6 +61,16 @@ class TaskType(str, Enum):
     FACEBOOK_CHECK_MESSAGE_REQUESTS = "facebook_check_message_requests"
     FACEBOOK_CHECK_FRIEND_REQUESTS = "facebook_check_friend_requests"
     FACEBOOK_CAMPAIGN_RUN = "facebook_campaign_run"
+    # Phase 11+12 LINE referral 闭环 (2026-04-25)
+    FACEBOOK_LINE_DISPATCH_FROM_REPLY = "facebook_line_dispatch_from_reply"
+    FACEBOOK_SEND_REFERRAL_REPLIES = "facebook_send_referral_replies"
+    FACEBOOK_RECYCLE_DEAD_PEERS = "facebook_recycle_dead_peers"
+    FACEBOOK_DAILY_REFERRAL_SUMMARY = "facebook_daily_referral_summary"
+    FACEBOOK_ALERT_CHECK_HOURLY = "facebook_alert_check_hourly"
+    # Phase 20.1 (2026-04-25): B 侧 inbox 检测 referral 回复
+    FACEBOOK_CHECK_REFERRAL_REPLIES = "facebook_check_referral_replies"
+    # Phase 20.2 (2026-04-25): SLA 死信回收 — 标 stale + 升级 dead
+    FACEBOOK_MARK_STALE_REFERRALS = "facebook_mark_stale_referrals"
     # Instagram
     INSTAGRAM_BROWSE_FEED = "instagram_browse_feed"
     INSTAGRAM_SEARCH_LEADS = "instagram_search_leads"

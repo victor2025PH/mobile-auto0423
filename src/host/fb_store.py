@@ -677,7 +677,13 @@ CONTACT_EVT_GREETING_SENT = "greeting_sent"
 CONTACT_EVT_GREETING_FALLBACK = "greeting_fallback"
 CONTACT_EVT_GREETING_REPLIED = "greeting_replied"          # B 写,对方回了我们的 greeting
 CONTACT_EVT_MESSAGE_RECEIVED = "message_received"          # B 写,对方主动 DM
-CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写
+CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写 (实发)
+# Phase 11 (2026-04-25): A 写 — dispatcher 计划层, B 按 meta.dispatch_mode 执行
+CONTACT_EVT_LINE_DISPATCH_PLANNED = "line_dispatch_planned"
+# Phase 20.1 (2026-04-25): B 写 — Messenger inbox 检测到 referral 反馈关键词
+CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"  # A 写 (executor 关键词匹配后)
+# Phase 20.2.1 (2026-04-25): A 写 — sent 后超 N 小时仍未 replied 自动打标
+CONTACT_EVT_REFERRAL_STALE = "referral_stale"
 
 VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_ADD_FRIEND_SENT,
@@ -689,25 +695,286 @@ VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_GREETING_REPLIED,
     CONTACT_EVT_MESSAGE_RECEIVED,
     CONTACT_EVT_WA_REFERRAL_SENT,
+    CONTACT_EVT_LINE_DISPATCH_PLANNED,
+    CONTACT_EVT_WA_REFERRAL_REPLIED,
+    CONTACT_EVT_REFERRAL_STALE,
 })
+
+
+# Phase 16 / 17.1 (2026-04-25): record_contact_event 入口 peer_name sanitize
+# 计数器 + by-reason / by-event_type 细分 (轻量监控, 进程内存活).
+_PEER_NAME_REJECT_COUNTER = {"count": 0}
+_PEER_NAME_REJECT_BY_EVENT: Dict[str, int] = {}
+_PEER_NAME_REJECT_RECENT: List[Dict[str, Any]] = []  # 最近 50 条样本
+_PEER_NAME_REJECT_RECENT_CAP = 50
+
+
+def get_peer_name_reject_count() -> int:
+    """Phase 16 metrics: 累计 peer_name reject 数."""
+    return int(_PEER_NAME_REJECT_COUNTER.get("count", 0) or 0)
+
+
+def get_peer_name_reject_metrics() -> Dict[str, Any]:
+    """Phase 17.1 metrics: by-event_type 细分 + 最近 50 条 reject 样本."""
+    return {
+        "total": get_peer_name_reject_count(),
+        "by_event_type": dict(_PEER_NAME_REJECT_BY_EVENT),
+        "recent": list(_PEER_NAME_REJECT_RECENT),
+    }
+
+
+def reset_peer_name_reject_count() -> None:
+    """测试 / 运维 reset (清所有 reject 计数 + 样本)."""
+    _PEER_NAME_REJECT_COUNTER["count"] = 0
+    _PEER_NAME_REJECT_BY_EVENT.clear()
+    _PEER_NAME_REJECT_RECENT.clear()
+
+
+def _record_peer_name_reject(peer_name: str, event_type: str,
+                                device_id: str = "") -> None:
+    """Phase 17.1 / 18: 记 reject 一条 (内存 ring buffer + DB 持久化)."""
+    _PEER_NAME_REJECT_COUNTER["count"] = \
+        _PEER_NAME_REJECT_COUNTER.get("count", 0) + 1
+    _PEER_NAME_REJECT_BY_EVENT[event_type] = \
+        _PEER_NAME_REJECT_BY_EVENT.get(event_type, 0) + 1
+    # ring buffer 最近 N 条 (进程内, 重启清零)
+    sample = {
+        "peer_name": peer_name[:40],
+        "event_type": event_type,
+        "device_id": device_id[:12],
+        "ts": _now_iso(),
+    }
+    _PEER_NAME_REJECT_RECENT.append(sample)
+    if len(_PEER_NAME_REJECT_RECENT) > _PEER_NAME_REJECT_RECENT_CAP:
+        _PEER_NAME_REJECT_RECENT.pop(0)
+    # Phase 18: DB 持久化 (异常不阻塞 caller)
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO peer_name_reject_log"
+                " (peer_name, event_type, device_id) VALUES (?,?,?)",
+                (peer_name[:40], event_type, device_id[:24]),
+            )
+    except Exception as e:
+        logger.debug("[peer_name_reject] DB 写失败 (忽略): %s", e)
+
+
+def get_peer_name_reject_history(*, hours_window: int = 168,
+                                    limit: int = 1000,
+                                    by_day: bool = False
+                                    ) -> Dict[str, Any]:
+    """Phase 18: 跨进程重启可查 reject 历史.
+
+    返回 {total, by_day?: {date: count}, by_event_type: {evt: count}, samples: [...]}.
+
+    by_day=True 时多带 by_day dict (供 daily summary task 用).
+    """
+    if hours_window <= 0:
+        return {"total": 0, "by_event_type": {}, "samples": []}
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            offset = f"-{int(hours_window)} hours"
+            # 总数
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM peer_name_reject_log"
+                " WHERE at >= datetime('now', ?)",
+                (offset,),
+            ).fetchone()
+            total_n = int(total["n"] if total else 0)
+            # by event_type
+            by_evt = {
+                r["event_type"]: int(r["n"])
+                for r in conn.execute(
+                    "SELECT event_type, COUNT(*) AS n FROM peer_name_reject_log"
+                    " WHERE at >= datetime('now', ?)"
+                    " GROUP BY event_type ORDER BY n DESC",
+                    (offset,),
+                ).fetchall()
+            }
+            # 样本
+            samples = [dict(r) for r in conn.execute(
+                "SELECT peer_name, event_type, device_id, at"
+                " FROM peer_name_reject_log"
+                " WHERE at >= datetime('now', ?)"
+                " ORDER BY id DESC LIMIT ?",
+                (offset, max(1, min(int(limit or 1000), 5000))),
+            ).fetchall()]
+            out: Dict[str, Any] = {
+                "total": total_n,
+                "by_event_type": by_evt,
+                "samples": samples,
+                "hours_window": hours_window,
+            }
+            if by_day:
+                out["by_day"] = {
+                    r["d"]: int(r["n"])
+                    for r in conn.execute(
+                        "SELECT date(at) AS d, COUNT(*) AS n"
+                        " FROM peer_name_reject_log"
+                        " WHERE at >= datetime('now', ?)"
+                        " GROUP BY date(at) ORDER BY d",
+                        (offset,),
+                    ).fetchall()
+                }
+            return out
+    except Exception as e:
+        logger.debug("[peer_name_reject] history 查询异常: %s", e)
+        return {"total": 0, "by_event_type": {}, "samples": [],
+                "error": str(e)[:120]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 20.1.9.1 (2026-04-25): fb_alert_history — 跨进程 alert 触发历史
+# ═══════════════════════════════════════════════════════════════════════
+
+def record_alert_fired(alert: Dict[str, Any], *,
+                          region: str = "",
+                          context: Optional[Dict[str, Any]] = None) -> int:
+    """写一条 alert 触发记录到 fb_alert_history.
+
+    alert: {type, severity, message, ...}
+    region: per-region alert (Phase 20.1.9.2 用), overall alert 留空字符串
+    context: 触发时的关键 funnel 数字, 写 context_json 备查
+    返插入 id, 失败返 0.
+    """
+    try:
+        import json as _j
+        atype = str(alert.get("type") or "")
+        sev = str(alert.get("severity") or "")
+        msg = str(alert.get("message") or "")
+        if not atype:
+            return 0
+        ctx_str = ""
+        if context:
+            try:
+                ctx_str = _j.dumps(context, ensure_ascii=False)
+            except Exception:
+                ctx_str = ""
+        with _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO fb_alert_history"
+                " (alert_type, severity, message, region, context_json)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (atype, sev, msg, region or "", ctx_str or "{}"))
+            return int(cur.lastrowid or 0)
+    except Exception as e:
+        logger.debug("[alert_history] write 失败: %s", e)
+        return 0
+
+
+def get_alert_history(*, hours_window: int = 168,
+                         alert_type: Optional[str] = None,
+                         severity: Optional[str] = None,
+                         region: Optional[str] = None,
+                         limit: int = 200,
+                         by_day: bool = False) -> Dict[str, Any]:
+    """读 fb_alert_history.
+
+    返:
+      {
+        total: int,
+        by_type: {type: count},
+        by_severity: {sev: count},
+        by_day: {date: count}     # by_day=True 时
+        samples: [{...recent N}],
+      }
+    """
+    if hours_window <= 0:
+        return {"total": 0, "by_type": {}, "by_severity": {}, "samples": []}
+    try:
+        clauses = ["fired_at >= datetime('now', ?)"]
+        params: list = [f"-{int(hours_window)} hours"]
+        if alert_type:
+            clauses.append("alert_type = ?")
+            params.append(alert_type)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if region is not None:  # 显式空字符串 = "只看 overall"
+            clauses.append("region = ?")
+            params.append(region)
+        where = " AND ".join(clauses)
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM fb_alert_history WHERE {where}",
+                params).fetchone()
+            total = int(count_row["n"]) if count_row else 0
+
+            type_rows = conn.execute(
+                f"SELECT alert_type, COUNT(*) AS n FROM fb_alert_history"
+                f" WHERE {where} GROUP BY alert_type",
+                params).fetchall()
+            sev_rows = conn.execute(
+                f"SELECT severity, COUNT(*) AS n FROM fb_alert_history"
+                f" WHERE {where} GROUP BY severity",
+                params).fetchall()
+
+            samples = conn.execute(
+                f"SELECT id, alert_type, severity, message, region,"
+                f" context_json, fired_at FROM fb_alert_history"
+                f" WHERE {where} ORDER BY fired_at DESC LIMIT ?",
+                params + [max(1, min(int(limit or 200), 2000))]
+            ).fetchall()
+
+            day_map: Dict[str, int] = {}
+            if by_day:
+                day_rows = conn.execute(
+                    f"SELECT substr(fired_at, 1, 10) AS d, COUNT(*) AS n"
+                    f" FROM fb_alert_history WHERE {where}"
+                    f" GROUP BY substr(fired_at, 1, 10)"
+                    f" ORDER BY d DESC",
+                    params).fetchall()
+                day_map = {r["d"]: int(r["n"]) for r in day_rows}
+
+        return {
+            "total": total,
+            "hours_window": hours_window,
+            "by_type": {r["alert_type"]: int(r["n"]) for r in type_rows},
+            "by_severity": {r["severity"]: int(r["n"]) for r in sev_rows},
+            "by_day": day_map,
+            "samples": [dict(r) for r in samples],
+        }
+    except Exception as e:
+        logger.debug("[alert_history] read 失败: %s", e)
+        return {"total": 0, "by_type": {}, "by_severity": {},
+                "samples": [], "error": str(e)[:120]}
 
 
 def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
                          template_id: str = "",
                          preset_key: str = "",
-                         meta: Optional[Dict[str, Any]] = None) -> int:
+                         meta: Optional[Dict[str, Any]] = None,
+                         skip_sanitize: bool = False) -> int:
     """记录一条接触事件。
 
     ``event_type`` 不在 ``VALID_CONTACT_EVENT_TYPES`` 时会记 warn log 但仍然写入
     (允许 B 扩展新类型,但提醒可能拼写错误)。
 
-    ``meta`` 会被 JSON 序列化为 meta_json; 不强约束 schema, 允许放:
-      * ``reply_to_template_id`` (B 写 greeting_replied 时放)
-      * ``reply_ms_after`` (B 写 greeting_replied 时放, 对方回复距 greeting 发出的毫秒数)
-      * ``decision`` / ``lang_detected`` 等任意辅助字段
+    Phase 16 defense-in-depth: peer_name 进入 _is_valid_peer_name 校验
+    (UI 文本/消息预览/测试残留). 不合法 logger.warning + reject_count++ +
+    return 0 (不写入). ``skip_sanitize=True`` 仅供必要场景 (e.g. e2e 测试
+    seed 已知 fixture data) 显式 bypass; 默认 False 保护生产.
+
+    ``meta`` 会被 JSON 序列化为 meta_json.
     """
     if not device_id or not peer_name or not event_type:
         return 0
+    # Phase 16/17.1: peer_name sanitize + by-event_type 细分 metrics
+    if not skip_sanitize:
+        try:
+            from src.app_automation.facebook import FacebookAutomation
+            if not FacebookAutomation._is_valid_peer_name(peer_name):
+                _record_peer_name_reject(peer_name, event_type, device_id)
+                logger.warning(
+                    "[fb_contact_events] reject invalid peer_name=%r"
+                    " event_type=%s device=%s (total=%d)",
+                    peer_name[:40], event_type, device_id[:12],
+                    get_peer_name_reject_count())
+                return 0
+        except Exception:
+            pass
     if event_type not in VALID_CONTACT_EVENT_TYPES:
         logger.warning("[fb_contact_events] 未知 event_type=%s, 仍写入但请检查拼写", event_type)
     meta_str = ""
@@ -727,10 +994,59 @@ def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
                 (device_id, peer_name, event_type, template_id or "",
                  preset_key or "", meta_str),
             )
-            return cur.lastrowid or 0
+            new_id = cur.lastrowid or 0
+        # Phase 20.2.x.1: wa_referral_replied 自动复活 referral_stale tag.
+        # connection 关闭后再调用, 避免嵌套连接锁竞争.
+        if event_type == CONTACT_EVT_WA_REFERRAL_REPLIED:
+            try:
+                _maybe_revive_stale_on_reply(peer_name)
+            except Exception as e:
+                logger.debug("[fb_contact_events] revive_stale hook 失败: %s", e)
+        return new_id
     except Exception as e:
         logger.debug("[fb_contact_events] 写入失败: %s", e)
         return 0
+
+
+def _maybe_revive_stale_on_reply(peer_name: str) -> bool:
+    """Phase 20.2.x.1 (2026-04-25): peer 真回复 → 自动从 canonical 移除
+    referral_stale tag + 清 stale_at meta.
+
+    幂等: 没 referral_stale tag 时啥都不做返 False.
+    """
+    if not peer_name:
+        return False
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        from src.host.lead_mesh import remove_canonical_tags
+        from src.host.lead_mesh import update_canonical_metadata
+        with _lm_connect() as conn:
+            row = conn.execute(
+                "SELECT li.canonical_id, lc.tags FROM lead_identities li"
+                " JOIN leads_canonical lc ON li.canonical_id=lc.canonical_id"
+                " WHERE li.platform='facebook' AND li.account_id=? LIMIT 1",
+                (f"fb:{peer_name}",)).fetchone()
+            if not row:
+                return False
+            tags = {t.strip() for t in (row["tags"] or "").split(",")
+                     if t.strip()}
+            if "referral_stale" not in tags:
+                return False
+            cid = row["canonical_id"]
+        # 关闭连接后调用 (内部各自再开 _connect 写)
+        remove_canonical_tags(cid, ["referral_stale"])
+        # 清 stale 相关 meta (写入 None 会被 update_canonical_metadata 过滤掉,
+        # 所以改写一个 marker 标识"已复活")
+        import datetime as _dt
+        update_canonical_metadata(
+            cid, {"referral_stale_revived_at":
+                    _dt.datetime.now(_dt.timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")})
+        return True
+    except Exception as e:
+        logger.debug("[revive_stale] peer=%s 失败: %s",
+                       peer_name[:30], e)
+        return False
 
 
 def count_contact_events(device_id: Optional[str] = None, *,
@@ -745,11 +1061,10 @@ def count_contact_events(device_id: Optional[str] = None, *,
     """
     if hours <= 0:
         return 0
-    import datetime as _dt
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
-    sql = "SELECT COUNT(*) FROM fb_contact_events WHERE at >= ?"
-    params: list = [cutoff]
+    # at 列用 datetime('now') 默认格式 (空格分隔), 用 SQL 原生 datetime('now', '-N hours')
+    # 做 cutoff 避免字符串格式不一致 (Phase 11 发现的 silent bug, 2026-04-25 修).
+    sql = "SELECT COUNT(*) FROM fb_contact_events WHERE at >= datetime('now', ?)"
+    params: list = [f"-{int(hours)} hours"]
     if device_id:
         sql += " AND device_id=?"
         params.append(device_id)
@@ -765,6 +1080,40 @@ def count_contact_events(device_id: Optional[str] = None, *,
         return int(row[0]) if row else 0
     except Exception:
         return 0
+
+
+def list_recent_contact_events_by_types(event_types: List[str],
+                                        hours: int = 24,
+                                        limit: int = 200,
+                                        device_id: Optional[str] = None
+                                        ) -> List[Dict[str, Any]]:
+    """Phase 11: 扫近 N 小时指定类型 (多选) 的事件, 新 → 旧.
+
+    用于 fb_line_dispatch_from_reply 消费 greeting_replied/message_received.
+    ``at`` 列用 ``datetime('now')`` 默认格式 (空格分隔), 用 SQL 原生
+    ``datetime('now', '-N hours')`` 做 cutoff 避免字符串格式不一致.
+    """
+    if not event_types or hours <= 0:
+        return []
+    placeholders = ",".join(["?"] * len(event_types))
+    sql = ("SELECT id, device_id, peer_name, event_type, template_id,"
+           " preset_key, meta_json, at FROM fb_contact_events"
+           " WHERE at >= datetime('now', ?) AND event_type IN"
+           f" ({placeholders})")
+    params: list = [f"-{int(hours)} hours", *event_types]
+    if device_id:
+        sql += " AND device_id = ?"
+        params.append(device_id)
+    sql += " ORDER BY at DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 200), 2000)))
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.debug("[fb_contact_events] list_recent_by_types 失败: %s", e)
+        return []
 
 
 def list_contact_events_by_peer(device_id: str, peer_name: str,
@@ -788,6 +1137,364 @@ def list_contact_events_by_peer(device_id: str, peer_name: str,
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def get_pending_referral_peers(device_id: Optional[str] = None,
+                                  hours_back: int = 48,
+                                  limit: int = 200
+                                  ) -> List[Dict[str, Any]]:
+    """Phase 20.1 (2026-04-25): 待检 referral 反馈的 peer 列表.
+
+    返已发 ``wa_referral_sent`` 但 24-48h 内还没 ``wa_referral_replied``
+    的 peer (per device_id+peer_name 唯一). 给 B 侧 Messenger inbox 检测器
+    用作 ``peers_filter`` — 不必扫整个收件箱, 只看真有线索的对话.
+
+    时间窗口逻辑:
+      * 取最近 ``hours_back`` 小时的 wa_referral_sent 事件
+      * 排除已经写过 wa_referral_replied 的 (device_id, peer_name) 组合
+      * 按 sent_at DESC 排序 (最新 referral 优先回查)
+
+    返字段:
+      [{"device_id", "peer_name", "sent_at", "sent_event_id"}, ...]
+    """
+    if hours_back <= 0:
+        return []
+    sent_sql = (
+        "SELECT id AS sent_event_id, device_id, peer_name, at AS sent_at"
+        " FROM fb_contact_events"
+        " WHERE event_type=? AND at >= datetime('now', ?)")
+    params: list = [CONTACT_EVT_WA_REFERRAL_SENT, f"-{int(hours_back)} hours"]
+    if device_id:
+        sent_sql += " AND device_id=?"
+        params.append(device_id)
+    sent_sql += " ORDER BY at DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 200), 2000)))
+
+    replied_sql = (
+        "SELECT DISTINCT device_id, peer_name FROM fb_contact_events"
+        " WHERE event_type=? AND at >= datetime('now', ?)")
+    rep_params: list = [CONTACT_EVT_WA_REFERRAL_REPLIED, f"-{int(hours_back)} hours"]
+    if device_id:
+        replied_sql += " AND device_id=?"
+        rep_params.append(device_id)
+
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            sent_rows = conn.execute(sent_sql, params).fetchall()
+            replied_rows = conn.execute(replied_sql, rep_params).fetchall()
+        replied_set = {(r["device_id"], r["peer_name"]) for r in replied_rows}
+        # de-dup by (device_id, peer_name) — 取最新 sent
+        seen = set()
+        out: List[Dict[str, Any]] = []
+        for r in sent_rows:
+            key = (r["device_id"], r["peer_name"])
+            if key in seen or key in replied_set:
+                continue
+            seen.add(key)
+            out.append({
+                "device_id": r["device_id"],
+                "peer_name": r["peer_name"],
+                "sent_at": r["sent_at"],
+                "sent_event_id": r["sent_event_id"],
+            })
+        return out
+    except Exception as e:
+        logger.debug("[get_pending_referral_peers] 失败: %s", e)
+        return []
+
+
+def mark_stale_referrals(*, stale_hours: int = 48,
+                            escalate_to_dead_days: int = 7,
+                            device_id: Optional[str] = None,
+                            dry_run: bool = False,
+                            limit: int = 500) -> Dict[str, Any]:
+    """Phase 20.2.1 (2026-04-25): SLA 死信回收 — 标 stale + 升级 dead.
+
+    扫近 ``escalate_to_dead_days*24`` 小时内有 ``wa_referral_sent`` 但仍无
+    ``wa_referral_replied`` 的 peer:
+
+      * sent age >= stale_hours: tag canonical ``referral_stale``,
+        写 event ``referral_stale``, meta ``referral_stale_at`` / peer_name.
+        已标 stale 的 skip.
+      * sent age >= escalate_to_dead_days * 24h:
+        额外 tag ``referral_dead`` + meta dead_reason='stale_no_reply'
+
+    dry_run=True 时只统计不写入. 失败 silent (单条失败不中断).
+
+    返:
+      {
+        scanned: 候选 peer 总数,
+        marked_stale: 本次新打 stale 的数量,
+        escalated_dead: 本次升级 dead 的数量,
+        already_stale: 跳过 (已标),
+        no_canonical: peer 找不到 canonical 跳过,
+        dry_run: bool,
+        samples: [{peer_name, age_hours, action}, ...] 前 20 条预览,
+      }
+    """
+    import datetime as _dt
+    import json as _json
+    def _empty_stats():
+        return {"scanned": 0, "candidates": 0,
+                "marked_stale": 0, "escalated_dead": 0,
+                "already_stale": 0, "no_canonical": 0,
+                "dry_run": dry_run, "samples": []}
+
+    if stale_hours <= 0:
+        return _empty_stats()
+
+    # 拉满整个 escalation 窗口的 pending, 之后按 age 分类.
+    # 用 2x buffer 避免边缘 sent 漏网 (例如 stale_hours=48 escalate=7d 时
+    # 8 天前 sent 仍应被升级 dead)
+    lookback = max(stale_hours, escalate_to_dead_days * 24 * 2) + 1
+    pending = get_pending_referral_peers(
+        device_id=device_id, hours_back=lookback, limit=limit)
+    if not pending:
+        return _empty_stats()
+
+    now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    escalate_threshold_sec = escalate_to_dead_days * 24 * 3600
+    stale_threshold_sec = stale_hours * 3600
+
+    # 解析 sent_at → age_hours; 过滤掉 age 不达 stale 阈值的
+    # (pending 列表可能含很新的 sent, 那些不需要 mark)
+    candidates = []
+    for p in pending:
+        sent_at = p.get("sent_at") or ""
+        # 兼容 SQLite 默认 'YYYY-MM-DD HH:MM:SS' 与 ISO 'T...Z'
+        sent_ts: Optional[float] = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                sent_ts = _dt.datetime.strptime(
+                    sent_at, fmt).replace(
+                    tzinfo=_dt.timezone.utc).timestamp()
+                break
+            except Exception:
+                continue
+        if sent_ts is None:
+            continue
+        age_sec = now_ts - sent_ts
+        if age_sec < stale_threshold_sec:
+            continue
+        candidates.append((p, age_sec))
+
+    marked_stale = 0
+    escalated_dead = 0
+    already_stale = 0
+    no_canonical = 0
+    samples: List[Dict[str, Any]] = []
+
+    # 一次预查 canonical 拿当前 tags
+    if not candidates:
+        s = _empty_stats()
+        s["scanned"] = len(pending)
+        return s
+
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        from src.host.lead_mesh import update_canonical_metadata
+        # batch 查 canonical
+        peer_names = [p["peer_name"] for p, _ in candidates]
+        placeholders = ",".join(["?"] * len(peer_names))
+        fb_keys = [f"fb:{n}" for n in peer_names]
+        peer_to_canonical: Dict[str, Dict[str, Any]] = {}
+        with _lm_connect() as conn:
+            rows = conn.execute(
+                "SELECT li.account_id, li.canonical_id, lc.tags,"
+                " lc.metadata_json FROM lead_identities li"
+                " JOIN leads_canonical lc"
+                " ON li.canonical_id = lc.canonical_id"
+                f" WHERE li.platform='facebook' AND li.account_id IN ({placeholders})",
+                fb_keys).fetchall()
+            for r in rows:
+                aid = r["account_id"] or ""
+                if aid.startswith("fb:"):
+                    peer_to_canonical[aid[3:]] = {
+                        "canonical_id": r["canonical_id"],
+                        "tags": {t.strip() for t in
+                                  (r["tags"] or "").split(",") if t.strip()},
+                        "metadata": _json.loads(r["metadata_json"] or "{}"),
+                    }
+
+        now_iso = _dt.datetime.now(_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for p, age_sec in candidates:
+            peer_name = p["peer_name"]
+            cdata = peer_to_canonical.get(peer_name)
+            if not cdata:
+                no_canonical += 1
+                continue
+            cid = cdata["canonical_id"]
+            tags_set = cdata["tags"]
+            already = "referral_stale" in tags_set
+            already_dead = "referral_dead" in tags_set
+            should_escalate = (age_sec >= escalate_threshold_sec
+                                 and not already_dead)
+            age_h = round(age_sec / 3600, 1)
+
+            action = "noop"
+            if already:
+                already_stale += 1
+                # 已 stale 但满足 escalation 条件且没 dead: 升级
+                if should_escalate:
+                    action = "escalate_dead"
+                    escalated_dead += 1
+                else:
+                    samples.append({"peer_name": peer_name,
+                                       "age_hours": age_h,
+                                       "action": "already_stale"})
+                    continue
+            else:
+                action = "mark_stale"
+                marked_stale += 1
+                if should_escalate:
+                    action = "mark_stale_and_dead"
+                    escalated_dead += 1
+
+            samples.append({"peer_name": peer_name,
+                               "age_hours": age_h,
+                               "action": action})
+
+            if dry_run:
+                continue
+            try:
+                meta_patch: Dict[str, Any] = {}
+                tags_to_add: List[str] = []
+                if not already:
+                    meta_patch["referral_stale_at"] = now_iso
+                    meta_patch["referral_stale_peer_name"] = peer_name
+                    meta_patch["referral_stale_age_hours_when_marked"] = age_h
+                    tags_to_add.append("referral_stale")
+                if should_escalate:
+                    meta_patch["referral_dead_reason"] = "stale_no_reply"
+                    meta_patch["referral_dead_at"] = now_iso
+                    meta_patch["referral_dead_peer_name"] = peer_name
+                    if "referral_dead" not in tags_set:
+                        tags_to_add.append("referral_dead")
+                if meta_patch or tags_to_add:
+                    update_canonical_metadata(
+                        cid, meta_patch,
+                        tags=tags_to_add or None)
+                # 写 event 时间序列 (mark_stale 才写, escalation 不重复)
+                if not already:
+                    record_contact_event(
+                        p["device_id"], peer_name,
+                        CONTACT_EVT_REFERRAL_STALE,
+                        meta={"platform": "facebook",  # TG R2 Q2 namespace
+                              "sent_event_id": p.get("sent_event_id"),
+                              "sent_at": p.get("sent_at"),
+                              "age_hours": age_h,
+                              "escalated_dead": should_escalate},
+                        skip_sanitize=True)
+            except Exception as e:
+                logger.debug("[mark_stale] peer=%s 失败: %s",
+                              peer_name[:30], e)
+    except Exception as e:
+        logger.warning("[mark_stale] 整体异常: %s", e)
+
+    # 限制 samples 大小防回包过大
+    samples = samples[:20]
+    return {
+        "scanned": len(pending),
+        "candidates": len(candidates),
+        "marked_stale": marked_stale,
+        "escalated_dead": escalated_dead,
+        "already_stale": already_stale,
+        "no_canonical": no_canonical,
+        "dry_run": dry_run,
+        "samples": samples,
+    }
+
+
+def list_stale_leads(*, limit: int = 200, offset: int = 0,
+                        include_dead: bool = True) -> Dict[str, Any]:
+    """Phase 20.2.x.3 (2026-04-25): 列当前 referral_stale tagged 的 lead.
+
+    返:
+      {
+        total: int,
+        results: [
+          {canonical_id, peer_name, persona_key, region,
+           stale_at, stale_age_hours_when_marked,
+           is_dead: bool, dead_reason},
+          ...
+        ]
+      }
+
+    include_dead=False 时只列还没升级 dead 的 (运营手动复查最有用的子集).
+    """
+    import datetime as _dt
+    import json as _json
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        clauses = ["tags LIKE '%referral_stale%'"]
+        if not include_dead:
+            clauses.append("tags NOT LIKE '%referral_dead%'")
+        where = " AND ".join(clauses)
+        with _lm_connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM leads_canonical WHERE {where}"
+            ).fetchone()
+            total = int(count_row["n"]) if count_row else 0
+            rows = conn.execute(
+                f"SELECT canonical_id, tags, metadata_json"
+                f" FROM leads_canonical WHERE {where}"
+                f" ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (max(1, min(int(limit or 200), 1000)),
+                  max(0, int(offset or 0)))
+            ).fetchall()
+            results: List[Dict[str, Any]] = []
+            now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+            for r in rows:
+                try:
+                    meta = _json.loads(r["metadata_json"] or "{}")
+                except Exception:
+                    meta = {}
+                tags = (r["tags"] or "")
+                # peer_name: 从 lead_identities 拉 fb 平台 account_id
+                peer_name = meta.get("referral_stale_peer_name", "")
+                if not peer_name:
+                    try:
+                        irow = conn.execute(
+                            "SELECT account_id FROM lead_identities"
+                            " WHERE canonical_id=? AND platform='facebook'"
+                            " LIMIT 1", (r["canonical_id"],)).fetchone()
+                        if irow:
+                            aid = irow["account_id"] or ""
+                            peer_name = aid[3:] if aid.startswith("fb:") else aid
+                    except Exception:
+                        pass
+                # 计算当前 stale 持续时间
+                stale_at = meta.get("referral_stale_at", "")
+                hours_since = None
+                if stale_at:
+                    try:
+                        ts = _dt.datetime.strptime(
+                            stale_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                            tzinfo=_dt.timezone.utc).timestamp()
+                        hours_since = round((now_ts - ts) / 3600, 1)
+                    except Exception:
+                        pass
+                results.append({
+                    "canonical_id": r["canonical_id"],
+                    "peer_name": peer_name,
+                    "persona_key": meta.get("l2_persona_key", ""),
+                    "region": meta.get("region", ""),
+                    "stale_at": stale_at,
+                    "stale_age_hours_when_marked":
+                        meta.get("referral_stale_age_hours_when_marked"),
+                    "hours_since_stale": hours_since,
+                    "is_dead": "referral_dead" in tags,
+                    "dead_reason": meta.get("referral_dead_reason", ""),
+                })
+        return {"total": total, "limit": limit, "offset": offset,
+                "results": results}
+    except Exception as e:
+        logger.debug("[list_stale_leads] 失败: %s", e)
+        return {"total": 0, "limit": limit, "offset": offset,
+                "results": [], "error": str(e)[:120]}
 
 
 def get_greeting_reply_rate_by_template(device_id: Optional[str] = None,
@@ -854,6 +1561,37 @@ def count_risk_events_recent(device_id: str, hours: int = 24) -> int:
                 "WHERE device_id=? AND detected_at > datetime('now', ?)",
                 (device_id, f"-{int(hours)} hours"),
             ).fetchone()
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+
+# 2026-04-24 v2: L2 pause 决策要区分 severity.
+# CRITICAL (account-level): 触发 L2 pause (12h default)
+# MEDIUM/LOW (message-level, content_blocked 等): 不 pause L2, 只影响 greeting send
+_CRITICAL_RISK_KINDS = frozenset({
+    "identity_verify", "captcha", "checkpoint",
+    "account_review", "policy_warning",
+})
+
+
+def count_critical_risk_events_recent(device_id: str, hours: int = 12) -> int:
+    """仅 CRITICAL 级风控事件计数 (会触发 L2 pause 的).
+
+    排除: kind='other' (通常是 content_blocked 一类短期 message-level friction),
+    因为 content_blocked 只说 "今天这条消息被 FB 拒发", 不代表账号有长期风险,
+    不该 pause L2 12 小时.
+    """
+    if not device_id:
+        return 0
+    try:
+        with _connect() as conn:
+            placeholders = ",".join("?" for _ in _CRITICAL_RISK_KINDS)
+            sql = (f"SELECT COUNT(*) FROM fb_risk_events "
+                   f"WHERE device_id=? AND detected_at > datetime('now', ?) "
+                   f"AND kind IN ({placeholders})")
+            params = [device_id, f"-{int(hours)} hours", *list(_CRITICAL_RISK_KINDS)]
+            row = conn.execute(sql, params).fetchone()
             return int(row[0] or 0)
     except Exception:
         return 0

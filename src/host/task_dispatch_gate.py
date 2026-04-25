@@ -215,8 +215,13 @@ def evaluate_task_gate_detailed(
         threshold = int(risk_cfg.get("threshold", 3))
         if enabled and resolved_device_id:
             try:
-                from src.host.fb_store import count_risk_events_recent
-                recent = count_risk_events_recent(resolved_device_id, hours=hours)
+                # 2026-04-24 v3: 只统计 CRITICAL 级风控事件 (identity_verify /
+                # checkpoint / account_review 等), 不把 content_blocked 这类
+                # message-level friction 当账号级风险算. 否则 3 条重复消息被
+                # FB 拒发就冻结整个设备 24h, 过度保守.
+                from src.host.fb_store import count_critical_risk_events_recent
+                recent = count_critical_risk_events_recent(
+                    resolved_device_id, hours=hours)
             except Exception:
                 recent = 0
             if recent >= threshold:

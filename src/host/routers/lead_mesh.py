@@ -106,6 +106,173 @@ def api_revert_merge(merge_id: int, body: Dict[str, Any] = Body(default={})):
     return {"ok": ok, "merge_id": merge_id}
 
 
+@router.get("/leads/l2-verified")
+def api_list_l2_verified_leads(
+        age_band: Optional[str] = Query(default=None,
+                                         description="例如 '40s' / '50s'"),
+        gender: Optional[str] = Query(default=None,
+                                       description="'female' / 'male'"),
+        is_japanese: Optional[bool] = Query(default=None),
+        persona_key: Optional[str] = Query(default=None,
+                                            description="L2 匹配用的 persona"),
+        platform: Optional[str] = Query(default=None,
+                                         description="'facebook' / ..."),
+        min_score: float = Query(default=0, ge=0, le=100),
+        limit: int = Query(default=50, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0, description="Phase 12.4 分页"),
+        with_total: bool = Query(default=False,
+            description="Phase 12.5: True 时多返 total (SQL COUNT, 仅按 tag)"),
+        include_tags: Optional[List[str]] = Query(
+            default=None,
+            description="tags 必须全部包含, 例 ['line_referred']"),
+        exclude_tags: Optional[List[str]] = Query(
+            default=None,
+            description="含任一此 tag 的 lead 排除, 例 ['referral_dead']")):
+    """Phase 10.3 + 12.2: 查 L2 VLM 验证过的精准用户.
+
+    只返回 tags 里带 ``l2_verified`` 的 lead, 按 l2_score 降序. 所有过滤 AND.
+    Phase 12.2 新增 include/exclude tags: 例如查"已引流的":
+      /leads/l2-verified?include_tags=line_referred
+    查"L2 通过但 referral 已死不再骚扰的":
+      /leads/l2-verified?include_tags=referral_dead
+    """
+    from src.host.lead_mesh.canonical import list_l2_verified_leads
+    rows = list_l2_verified_leads(
+        age_band=age_band, gender=gender,
+        is_japanese=is_japanese, persona_key=persona_key,
+        platform=platform, min_score=min_score, limit=limit,
+        offset=offset,
+        include_tags=include_tags, exclude_tags=exclude_tags,
+    )
+    out = {"count": len(rows), "results": rows, "offset": offset,
+           "limit": limit}
+    if with_total:
+        from src.host.lead_mesh.canonical import count_l2_verified_leads
+        out["total"] = count_l2_verified_leads(
+            include_tags=include_tags, exclude_tags=exclude_tags)
+    return out
+
+
+@router.post("/leads/{canonical_id}/revive-referral")
+def api_revive_referral(canonical_id: str,
+                         body: Dict[str, Any] = Body(default={})):
+    """Phase 12.3: 给 peer 第二次机会 — 去 referral_dead tag + 清 fail counters.
+
+    Body 可选 ``actor`` (默认 ``operator_ui``, 写 journey 审计).
+    """
+    from src.host.lead_mesh import revive_referral
+    actor = (body.get("actor") or "operator_ui").strip() or "operator_ui"
+    ok = revive_referral(canonical_id, actor=actor)
+    return {"ok": ok, "canonical_id": canonical_id}
+
+
+@router.post("/leads/revive-referral-batch")
+def api_revive_referral_batch(body: Dict[str, Any] = Body(...)):
+    """Phase 12.4: 批量给多个 peer revive referral. 单条异常不中断.
+
+    Body: {canonical_ids: [...], actor?: "operator_ui"}
+    Returns: {revived: N, skipped: M, errors: [...], revived_ids: [...]}.
+    """
+    cids = body.get("canonical_ids") or []
+    if not isinstance(cids, list):
+        raise HTTPException(400, "canonical_ids 必须是 list")
+    if not cids:
+        return {"revived": 0, "skipped": 0, "errors": [],
+                "revived_ids": []}
+    # 去重 + 去空
+    seen = []
+    seen_set = set()
+    for c in cids:
+        if not isinstance(c, str):
+            continue
+        c2 = c.strip()
+        if not c2 or c2 in seen_set:
+            continue
+        seen_set.add(c2)
+        seen.append(c2)
+
+    actor = (body.get("actor") or "operator_ui").strip() or "operator_ui"
+    from src.host.lead_mesh import revive_referral
+    from src.host.lead_mesh.canonical import _connect
+
+    # Phase 12.5: 短 token (< 36 字符 UUID 长度) 视为 prefix, 自动 LIKE 展开.
+    # 用 parameterized query 防 SQL injection. 至少 3 字符避免 'a' 匹配过多.
+    expanded: List[str] = []
+    errors: List[Dict[str, str]] = []
+    UUID_LEN = 36
+    PREFIX_MIN = 3
+    for token in seen:
+        if len(token) >= UUID_LEN:
+            # 完整 canonical_id, 直传
+            expanded.append(token)
+            continue
+        if len(token) < PREFIX_MIN:
+            errors.append({"canonical_id": token,
+                            "reason": f"prefix 太短 (<{PREFIX_MIN} 字符)"})
+            continue
+        try:
+            with _connect() as conn:
+                rows = conn.execute(
+                    "SELECT canonical_id FROM leads_canonical"
+                    " WHERE canonical_id LIKE ? LIMIT 5",
+                    (token + "%",),
+                ).fetchall()
+        except Exception as e:
+            errors.append({"canonical_id": token,
+                            "reason": f"prefix 查询异常: {str(e)[:100]}"})
+            continue
+        if not rows:
+            errors.append({"canonical_id": token,
+                            "reason": "prefix 无匹配"})
+            continue
+        if len(rows) > 1:
+            errors.append({
+                "canonical_id": token,
+                "reason": (f"prefix 歧义 ({len(rows)} 个匹配, "
+                            f"e.g. {rows[0]['canonical_id'][:12]}, "
+                            f"{rows[1]['canonical_id'][:12]}, ...)"
+                            " — 请扩展 prefix 长度"),
+            })
+            continue
+        expanded.append(rows[0]["canonical_id"])
+
+    # 去重 expanded (展开后可能两个 prefix 指向同一 cid)
+    seen2 = []
+    seen2_set = set()
+    for c in expanded:
+        if c not in seen2_set:
+            seen2_set.add(c)
+            seen2.append(c)
+
+    revived_ids: List[str] = []
+    skipped = 0
+    for cid in seen2:
+        try:
+            ok = revive_referral(cid, actor=actor)
+            if ok:
+                revived_ids.append(cid)
+            else:
+                skipped += 1
+        except Exception as e:
+            errors.append({"canonical_id": cid, "reason": str(e)[:200]})
+    return {
+        "revived": len(revived_ids), "skipped": skipped,
+        "errors": errors[:50], "revived_ids": revived_ids,
+        "expanded_count": len(seen2),
+    }
+
+
+@router.post("/leads/{canonical_id}/untag")
+def api_untag(canonical_id: str, body: Dict[str, Any] = Body(...)):
+    """Phase 12.3 通用 untag: body {tags: [...]}. 返 {ok: bool}."""
+    from src.host.lead_mesh import remove_canonical_tags
+    tags = body.get("tags") or []
+    if not isinstance(tags, list):
+        raise HTTPException(400, "tags 必须是 list")
+    ok = remove_canonical_tags(canonical_id, tags)
+    return {"ok": ok, "canonical_id": canonical_id, "removed": tags}
+
+
 # 动态路径(path param) 必须在所有同前缀静态路径之后
 @router.get("/leads/{canonical_id}")
 def api_get_dossier(canonical_id: str, journey_limit: int = 100):

@@ -448,3 +448,328 @@ def revert_merge(merge_id: int,
         logger.warning("[canonical] revert merge 失败: %s", e)
         return False
     return True
+
+
+def update_canonical_metadata(canonical_id: str,
+                              metadata_patch: Dict[str, Any],
+                              tags: Optional[List[str]] = None) -> bool:
+    """合并 metadata_patch 到 leads_canonical.metadata_json (shallow merge).
+
+    用于 L2 VLM PASS 后把 age_band/gender/is_japanese/overall_confidence
+    等精准画像字段存入用户画像 DB, 供运营面板 / CRM 查询.
+
+    Args:
+        canonical_id: leads_canonical.canonical_id
+        metadata_patch: 要合并的字段 (覆盖同 key)
+        tags: 可选, append 到 tags 列 (逗号分隔)
+
+    Returns True if updated, False otherwise.
+    """
+    if not canonical_id or not metadata_patch:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json, tags FROM leads_canonical WHERE canonical_id=?",
+                (canonical_id,),
+            ).fetchone()
+            if not row:
+                logger.warning("[canonical] update_metadata: %s 不存在",
+                               canonical_id[:12])
+                return False
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            meta.update({k: v for k, v in metadata_patch.items() if v is not None})
+            new_tags = row["tags"] or ""
+            if tags:
+                existing = {t.strip() for t in new_tags.split(",") if t.strip()}
+                existing.update(t.strip() for t in tags if t)
+                new_tags = ",".join(sorted(existing))
+            conn.execute(
+                "UPDATE leads_canonical SET metadata_json=?, tags=?,"
+                " updated_at=datetime('now') WHERE canonical_id=?",
+                (json.dumps(meta, ensure_ascii=False), new_tags, canonical_id),
+            )
+            return True
+    except Exception as e:
+        logger.warning("[canonical] update_metadata 失败: %s", e)
+        return False
+
+
+def remove_canonical_tags(canonical_id: str, tags: List[str]) -> bool:
+    """Phase 12.3: 从 leads_canonical.tags 里去掉指定 tag (不改 metadata).
+
+    和 update_canonical_metadata 的 tags 参数只加不减的语义互补.
+    """
+    if not canonical_id or not tags:
+        return False
+    strip = {t.strip() for t in tags if t and t.strip()}
+    if not strip:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT tags FROM leads_canonical WHERE canonical_id=?",
+                (canonical_id,),
+            ).fetchone()
+            if not row:
+                return False
+            existing = {t.strip() for t in
+                         (row["tags"] or "").split(",") if t.strip()}
+            remain = existing - strip
+            if remain == existing:
+                return False  # 没变化
+            conn.execute(
+                "UPDATE leads_canonical SET tags=?,"
+                " updated_at=datetime('now') WHERE canonical_id=?",
+                (",".join(sorted(remain)), canonical_id),
+            )
+            return True
+    except Exception as e:
+        logger.warning("[canonical] remove_tags 失败: %s", e)
+        return False
+
+
+def revive_referral(canonical_id: str, *,
+                    actor: str = "operator") -> bool:
+    """Phase 12.3/12.4: 给"已死" peer 第二次机会 —
+      - 去 referral_dead tag
+      - 清 metadata.referral_dead_reason / at / peer_name
+      - 清 metadata.referral_fail_count_* (每种错误码的累计计数)
+      - Phase 12.4: 写 lead_journey(action='referral_revived', actor=...)
+        作为 audit trail, data 带清理前的 dead_reason + fail counts 快照.
+
+    ``actor`` 用于 journey 审计: ``"operator"`` (默认, 手动/UI), ``"operator_ui"``,
+    ``"scheduled_7d_auto"`` (cron task), ``"human:<username>"`` 等. 格式与
+    append_journey 一致.
+
+    返 True 表示确实执行了清理 (peer 原本有 referral_dead).
+    """
+    if not canonical_id:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json, tags FROM leads_canonical"
+                " WHERE canonical_id=?", (canonical_id,),
+            ).fetchone()
+            if not row:
+                return False
+            tags_set = {t.strip() for t in
+                         (row["tags"] or "").split(",") if t.strip()}
+            had_dead = "referral_dead" in tags_set
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            # 清理前快照 (供 journey 审计)
+            snapshot = {
+                "had_dead_tag": had_dead,
+                "dead_reason": meta.get("referral_dead_reason"),
+                "dead_at": meta.get("referral_dead_at"),
+                "fail_counts": {
+                    k: v for k, v in meta.items()
+                    if k.startswith("referral_fail_count_")
+                },
+            }
+            # 清 metadata 字段
+            dirty = False
+            for k in ("referral_dead_reason", "referral_dead_at",
+                       "referral_dead_peer_name"):
+                if meta.pop(k, None) is not None:
+                    dirty = True
+            for k in list(meta.keys()):
+                if k.startswith("referral_fail_count_"):
+                    meta.pop(k, None)
+                    dirty = True
+            if had_dead:
+                tags_set.discard("referral_dead")
+            if dirty or had_dead:
+                conn.execute(
+                    "UPDATE leads_canonical SET metadata_json=?, tags=?,"
+                    " updated_at=datetime('now') WHERE canonical_id=?",
+                    (json.dumps(meta, ensure_ascii=False),
+                     ",".join(sorted(tags_set)),
+                     canonical_id),
+                )
+
+        did_something = had_dead or dirty
+
+        # Phase 12.4: 写 journey audit (成功 revive 才写, 不破坏现有行为).
+        if did_something:
+            try:
+                from .journey import append_journey
+                append_journey(
+                    canonical_id=canonical_id,
+                    actor=actor or "operator",
+                    action="referral_revived",
+                    platform="system",
+                    data=snapshot,
+                )
+            except Exception as _e:
+                logger.debug("[canonical] revive journey 写失败(忽略): %s", _e)
+
+        return did_something
+    except Exception as e:
+        logger.warning("[canonical] revive_referral 失败 cid=%s: %s",
+                         canonical_id[:12] if canonical_id else "", e)
+        return False
+
+
+def count_l2_verified_leads(
+    *, include_tags: Optional[List[str]] = None,
+    exclude_tags: Optional[List[str]] = None,
+) -> int:
+    """Phase 12.5: 数 l2_verified leads (带可选 tag 过滤). SQL 层只能算 tag-LIKE,
+    其它 metadata 过滤 (age/gender/...) 不算 — 给 UI 显示总页范围用,
+    精度 OK. 性能: 单 COUNT, 几十毫秒.
+    """
+    sql_parts = ["tags LIKE '%l2_verified%'", "merged_into IS NULL"]
+    if include_tags:
+        for t in include_tags:
+            t_clean = t.strip().replace("%", "")
+            if t_clean:
+                # 用参数化避免注入. 但 LIKE 模式拼 % 必须 inline (SQLite ?
+                # 不展开为 LIKE pattern). 再用 simple 字符 whitelist.
+                if all(c.isalnum() or c in "_-:" for c in t_clean):
+                    sql_parts.append(f"tags LIKE '%{t_clean}%'")
+    if exclude_tags:
+        for t in exclude_tags:
+            t_clean = t.strip().replace("%", "")
+            if t_clean and all(c.isalnum() or c in "_-:" for c in t_clean):
+                sql_parts.append(f"tags NOT LIKE '%{t_clean}%'")
+    sql = ("SELECT COUNT(*) AS n FROM leads_canonical"
+           " WHERE " + " AND ".join(sql_parts))
+    try:
+        with _connect() as conn:
+            row = conn.execute(sql).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception as e:
+        logger.warning("[canonical] count_l2_verified 失败: %s", e)
+        return 0
+
+
+def list_l2_verified_leads(
+    *, age_band: Optional[str] = None,
+    gender: Optional[str] = None,
+    is_japanese: Optional[bool] = None,
+    persona_key: Optional[str] = None,
+    platform: Optional[str] = None,
+    min_score: float = 0,
+    limit: int = 50,
+    offset: int = 0,
+    include_tags: Optional[List[str]] = None,
+    exclude_tags: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Phase 10.3: 查询 L2 VLM 验证过的"精准画像用户".
+
+    逻辑:
+      - SQL 层按 ``tags LIKE '%l2_verified%'`` 预筛 (tag 写入时做了归一化).
+      - JSON metadata 字段 (age_band / gender / is_japanese / l2_persona_key /
+        l2_score) 由 Python 层过滤 — 避免依赖 SQLite JSON1 扩展 (老版本不带).
+      - 按 l2_score 降序返 + l2_verified_at 新 → 旧.
+
+    返回: [{canonical_id, display_name, platform, primary_account_id,
+            metadata (dict), tags (list), l2_score, l2_verified_at}, ...]
+    """
+    limit = max(1, min(int(limit or 50), 1000))
+    offset = max(0, int(offset or 0))
+    # SQL 预筛: tag 含 l2_verified + 未被合并. 其它过滤 (metadata 字段 /
+    # tag AND/NOT) 都在 Python 层. 先拉 (offset + limit) * 4 行做缓冲,
+    # 过滤完再在 Python 层切 [offset : offset+limit]. offset 小的话 (<500)
+    # 性能够用.
+    fetch_n = (offset + limit) * 4
+    sql = (
+        "SELECT canonical_id, primary_name, tags, metadata_json, updated_at"
+        "  FROM leads_canonical"
+        " WHERE tags LIKE '%l2_verified%' AND merged_into IS NULL"
+        " ORDER BY updated_at DESC LIMIT ?"
+    )
+    args: List[Any] = [fetch_n]
+
+    out: List[Dict[str, Any]] = []
+    try:
+        with _connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+            # 平台 / account_id 在 lead_identities M:N 表, 取首个 identity 作为展示.
+            ident_cache: Dict[str, Dict[str, str]] = {}
+            if rows:
+                cids_tuple = tuple(r["canonical_id"] for r in rows)
+                placeholders = ",".join(["?"] * len(cids_tuple))
+                for ir in conn.execute(
+                    f"SELECT canonical_id, platform, account_id FROM lead_identities"
+                    f" WHERE canonical_id IN ({placeholders})"
+                    f" ORDER BY id ASC",
+                    cids_tuple,
+                ).fetchall():
+                    # 只保第一条 (首次发现)
+                    ident_cache.setdefault(
+                        ir["canonical_id"],
+                        {"platform": ir["platform"] or "",
+                         "account_id": ir["account_id"] or ""})
+    except Exception as e:
+        logger.warning("[canonical] list_l2_verified SQL 失败: %s", e)
+        return []
+
+    for row in rows:
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            meta = {}
+        tags_str = row["tags"] or ""
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+        if age_band and (meta.get("age_band") or "").lower() != age_band.lower():
+            continue
+        if gender and (meta.get("gender") or "").lower() != gender.lower():
+            continue
+        if is_japanese is not None:
+            _ij = meta.get("is_japanese")
+            if bool(_ij) is not bool(is_japanese):
+                continue
+        if persona_key and (meta.get("l2_persona_key") or "") != persona_key:
+            continue
+        try:
+            score_v = float(meta.get("l2_score", 0) or 0)
+        except (TypeError, ValueError):
+            score_v = 0.0
+        if score_v < float(min_score or 0):
+            continue
+
+        ident = ident_cache.get(row["canonical_id"], {})
+        _plat = (ident.get("platform") or "").lower()
+        if platform and _plat != platform.lower():
+            continue
+        # Phase 12.2 tags include/exclude (含 referral_dead / line_referred 等)
+        if include_tags:
+            if not all(t in tags for t in include_tags):
+                continue
+        if exclude_tags:
+            if any(t in tags for t in exclude_tags):
+                continue
+
+        out.append({
+            "canonical_id": row["canonical_id"],
+            "display_name": row["primary_name"] or "",
+            "platform": _plat,
+            "primary_account_id": ident.get("account_id") or "",
+            "tags": tags,
+            "metadata": meta,
+            "l2_score": score_v,
+            "l2_verified_at": meta.get("l2_verified_at") or "",
+        })
+        # Phase 12.4: 不 break early, 跑完 fetch_n 行再 sort + offset slice.
+        # SQL ORDER BY updated_at DESC 在同秒 tie 下不保证顺序, 早退会切到
+        # 错误的 row 子集. fetch_n=(offset+limit)*4 已 cap 内存压力.
+    # 排序: 先按 l2_verified_at 新 → 旧, 再按 l2_score 高 → 低 (主键); Python
+    # sort stable 保证同 score 下仍按 verified_at 新的在前.
+    out.sort(key=lambda x: x["l2_verified_at"], reverse=True)
+    out.sort(key=lambda x: x["l2_score"], reverse=True)
+    # Phase 12.4: 应用 offset (排序后切, 保证页与页之间顺序一致)
+    if offset:
+        out = out[offset:offset + limit]
+    else:
+        out = out[:limit]
+    return out

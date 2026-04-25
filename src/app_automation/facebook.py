@@ -1868,44 +1868,132 @@ class FacebookAutomation(BaseAutomation):
             return False
 
     def _phase10_l2_gate(self, d, did: str, profile_name: str,
-                         persona_key: str) -> bool:
+                         persona_key: str, *,
+                         shots: int = 1) -> bool:
         """Phase 10 prep: L2 VLM gate (截图 → classify do_l2=True → 判 match).
 
         返回 True 表示**应阻止**继续 add_friend (L2 不命中, 已写 journey).
         返回 False 表示**通过 / 异常放行**(主流程继续).
 
         异常 / 无 persona / VLM 不可达 → fail-open (保守, 与 L1 gate 一致行为).
+
+        Phase 10.2 (2026-04-24 additive):
+          ``shots > 1`` 启用 A 的多图投票模式 — 首屏 + scroll N-1 次抓 post 图,
+          sequential classify (qwen2.5vl:7b context_length=4096 限制一次一张),
+          命中 match=True 立即停; 全部失败 → 返 True (保守阻止). 默认 shots=1
+          保 B 现行单图行为 + 测试契约.
+
+          L2 PASS 时把 insights (age_band / gender / is_japanese ...) 聚合到
+          leads_canonical.metadata_json, 供运营 CRM 一键过滤"精准用户".
         """
         try:
             from src.host.fb_profile_classifier import classify as _persona_classify
         except Exception as e:
             log.debug("[phase10_l2] import classifier 失败, 放行: %s", e)
             return False
+        shots = max(1, int(shots or 1))
         try:
             snap = self.capture_profile_snapshots(
-                shot_count=1, device_id=did, tag="phase10_l2_gate")
+                shot_count=shots, device_id=did, tag="phase10_l2_gate")
         except Exception as e:
             log.debug("[phase10_l2] capture_profile_snapshots 失败, 放行: %s", e)
             return False
-        try:
-            l2_cls = _persona_classify(
-                device_id=did,
-                persona_key=persona_key,
-                target_key=f"fb:{profile_name}",
-                display_name=profile_name,
-                image_paths=snap.get("image_paths") or [],
-                l2_image_paths=snap.get("image_paths") or [],
-                do_l2=True,
-                dry_run=False,
-            )
-        except Exception as e:
-            log.debug("[phase10_l2] classify 异常, 放行: %s", e)
-            return False
 
-        l2 = l2_cls.get("l2") or {}
-        l2_pass = l2.get("pass", True)  # 缺 'pass' 字段时保守放行
-        l2_score = l2.get("score", 0)
-        l2_reasons = l2.get("reasons") or []
+        image_paths = snap.get("image_paths") or []
+        bio = (snap.get("bio_text") or "")[:400]
+
+        if shots == 1:
+            # B 的原路径 (单图一次 classify), 保测试契约.
+            try:
+                l2_cls = _persona_classify(
+                    device_id=did,
+                    persona_key=persona_key,
+                    target_key=f"fb:{profile_name}",
+                    display_name=profile_name,
+                    image_paths=image_paths,
+                    l2_image_paths=image_paths,
+                    do_l2=True,
+                    dry_run=False,
+                )
+            except Exception as e:
+                log.debug("[phase10_l2] classify 异常, 放行: %s", e)
+                return False
+            l2 = l2_cls.get("l2") or {}
+            l2_pass = l2.get("pass", True)
+            l2_score = l2.get("score", 0)
+            l2_reasons = l2.get("reasons") or []
+            insights = l2_cls.get("insights") or {}
+        else:
+            # Phase 10.2 multi-shot: sequential classify, 命中即停, 明确 REJECT 也停.
+            import time as _t
+            _ts = int(_t.time())
+            picked = None
+            agg_insights: Dict[str, Any] = {}
+            for idx, img in enumerate(image_paths[:shots], 1):
+                try:
+                    rk = f"fb:{profile_name}:shot_{_ts}_{idx}"
+                    r_i = _persona_classify(
+                        device_id=did,
+                        persona_key=persona_key,
+                        target_key=rk,
+                        display_name=profile_name,
+                        bio=bio,
+                        image_paths=[img],
+                        l2_image_paths=[img],
+                        do_l2=True,
+                        dry_run=False,
+                    )
+                    _l2_i = r_i.get("l2") or {}
+                    _ins_i = r_i.get("insights") or {}
+                    # Phase 10.3: 聚合优先级 —
+                    #   match=True shot: **覆盖写** (可信度高, 是 PASS 依据)
+                    #   match=False shot: 只填空字段 (避免 REJECT 图的错误值
+                    #     如 gender=male 污染后续 PASS shot 的正确值)
+                    _is_pass_shot = bool(r_i.get("match"))
+                    for k, v in _ins_i.items():
+                        if not v:
+                            continue
+                        if _is_pass_shot or not agg_insights.get(k):
+                            agg_insights[k] = v
+                    log.info(
+                        "[phase10_l2] shot #%d match=%s score=%.1f stage=%s",
+                        idx, r_i.get("match"), r_i.get("score", 0),
+                        r_i.get("stage_reached"))
+                    # 命中 → 停
+                    if r_i.get("stage_reached") == "L2" and r_i.get("match"):
+                        picked = r_i
+                        break
+                    # 明确 REJECT (gender=male 或 is_japanese=False 高置信) → 停
+                    if r_i.get("stage_reached") == "L2" and not r_i.get("match"):
+                        g = (_ins_i.get("gender") or "").lower()
+                        jp = _ins_i.get("is_japanese")
+                        jp_conf = float(_ins_i.get("is_japanese_confidence", 0) or 0)
+                        if g == "male" or (jp is False and jp_conf > 0.7):
+                            picked = r_i
+                            log.info("[phase10_l2] shot #%d 明确 REJECT, 停", idx)
+                            break
+                    picked = r_i  # 保留最后一次
+                except Exception as e:
+                    log.warning("[phase10_l2] shot #%d 异常: %s", idx, e)
+                    continue
+            if picked is None:
+                log.warning("[phase10_l2] 全部 shots classify 失败, 保守阻止")
+                try:
+                    self._append_journey_for_action(
+                        profile_name, "add_friend_blocked",
+                        did=did, persona_key=persona_key,
+                        data={"reason": "l2_all_shots_failed",
+                              "shots": shots})
+                except Exception:
+                    pass
+                return True
+            _l2 = picked.get("l2") or {}
+            l2_pass = bool(picked.get("match"))
+            l2_score = float(picked.get("score", 0) or 0)
+            l2_reasons = _l2.get("reasons") or []
+            insights = agg_insights or (picked.get("insights") or {})
+            # 阶段有效性检查: 多 shot 要求至少一次真跑到 L2
+            l2_cls = picked  # 用于下方 metadata 逻辑复用
 
         if not l2_pass:
             log.info(
@@ -1920,6 +2008,7 @@ class FacebookAutomation(BaseAutomation):
                         "reason": "persona_l2_rejected",
                         "l2_score": l2_score,
                         "top_reasons": l2_reasons[:3],
+                        "shots": shots,
                     })
             except Exception:
                 pass
@@ -1935,21 +2024,62 @@ class FacebookAutomation(BaseAutomation):
                     "match": True,
                     "score": l2_score,
                     "reasons": l2_reasons[:3],
+                    "shots": shots,
+                    "age_band": insights.get("age_band"),
+                    "gender": insights.get("gender"),
+                    "is_japanese": insights.get("is_japanese"),
                 })
         except Exception:
             pass
+
+        # Phase 10.2 additive: L2 PASS 聚合 insights 到 leads_canonical.metadata_json
+        # 供运营/CRM 一键过滤"精准目标用户".
+        try:
+            from src.host.lead_mesh import (resolve_identity,
+                                             update_canonical_metadata)
+            cid = resolve_identity(platform="facebook",
+                                    account_id=f"fb:{profile_name}",
+                                    display_name=profile_name)
+            meta_patch = {
+                "age_band": insights.get("age_band"),
+                "gender": insights.get("gender"),
+                "is_japanese": insights.get("is_japanese"),
+                "is_japanese_confidence": insights.get("is_japanese_confidence"),
+                "overall_confidence": insights.get("overall_confidence"),
+                "topics": insights.get("topics"),
+                "l2_score": l2_score,
+                "l2_verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                  time.gmtime()),
+                "l2_persona_key": persona_key,
+                "l2_shots": shots,
+            }
+            tags = ["l2_verified"]
+            if insights.get("age_band"):
+                tags.append(f"age:{insights['age_band']}")
+            if insights.get("gender"):
+                tags.append(f"gender:{insights['gender']}")
+            if insights.get("is_japanese"):
+                tags.append("is_japanese")
+            update_canonical_metadata(cid, meta_patch, tags=tags)
+        except Exception as e:
+            log.debug("[phase10_l2] canonical metadata 写失败(放行): %s", e)
+
         return False  # 通过
 
     def _add_friend_safe_interaction_on_profile(
             self, d, did: str, profile_name: str, note: str,
             *, persona_key: Optional[str], source: str, preset_key: str,
-            do_l2_gate: bool = False) -> bool:
+            do_l2_gate: bool = False,
+            l2_gate_shots: int = 1) -> bool:
         """已在对方资料页：风控 → (Phase 10 prep: 可选 L2 VLM gate) → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。
 
         ``do_l2_gate`` (Phase 10 prep, 默认 OFF 保向后兼容):
           True 时, 在 risk check 之后跑 L2 VLM gate (截图 → ollama qwen2.5vl 看头像+bio).
           L2 不命中 → 写 add_friend_blocked{persona_l2_rejected} journey + return False.
-          L2 异常 / 无 persona → 保守放行 (与 L1 gate 行为一致, 见 add_friend_with_note 入口).
+
+        ``l2_gate_shots`` (Phase 10.2 additive, 默认 1 保 B 契约):
+          >1 时启用多图 sequential classify (命中即停, 明确 REJECT 早退).
+          仅 ``do_l2_gate=True`` 时生效. qwen2.5vl:7b context 限制 4096, 单图最稳.
         """
         is_risk, msg = self._detect_risk_dialog(d)
         if is_risk:
@@ -1960,7 +2090,9 @@ class FacebookAutomation(BaseAutomation):
         # 透传 do_l2_gate=True 激活. 与 add_friend_with_note 入口的 L1 gate 配套
         # (L1 = 名字启发式, L2 = 视觉判断头像/bio).
         if do_l2_gate and persona_key:
-            l2_blocked = self._phase10_l2_gate(d, did, profile_name, persona_key)
+            l2_blocked = self._phase10_l2_gate(
+                d, did, profile_name, persona_key,
+                shots=l2_gate_shots)
             if l2_blocked:
                 return False
 
@@ -2058,7 +2190,11 @@ class FacebookAutomation(BaseAutomation):
                              source: str = "",
                              preset_key: str = "",
                              from_current_profile: bool = False,
-                             do_l2_gate: bool = False) -> bool:
+                             do_l2_gate: bool = False,
+                             force: bool = False,
+                             walk_candidates: bool = False,
+                             l2_gate_shots: int = 1,
+                             max_l2_calls: int = 3) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -2110,7 +2246,31 @@ class FacebookAutomation(BaseAutomation):
                     dry_run=False,
                 )
                 _l1 = _cls.get("l1") or {}
-                if not _l1.get("pass", True):
+                _from_cache = bool(_cls.get("from_cache"))
+                # 2026-04-24 (A merge): 缓存命中时 l1/l2=None, 用顶层 match 判断
+                # 避免空 dict 的 pass 默认 True 导致误放行 cache 里标过 False 的目标.
+                if _from_cache:
+                    _matched = bool(_cls.get("match", True))
+                    if not _matched:
+                        log.info(
+                            "[add_friend_with_note] persona 缓存 match=False "
+                            "peer=%s (stage=%s), skip", profile_name,
+                            _cls.get("stage_reached"))
+                        try:
+                            self._append_journey_for_action(
+                                profile_name, "add_friend_blocked",
+                                did=did, persona_key=persona_key,
+                                data={
+                                    "reason": "persona_cached_rejected",
+                                    "stage_reached": _cls.get("stage_reached"),
+                                    "score": _cls.get("score", 0),
+                                })
+                        except Exception:
+                            pass
+                        return False
+                    # 缓存且 match=True: 已经在第一次分类时写过 journey,
+                    # 不再重复写 persona_classified, 直接放行.
+                elif not _l1.get("pass", True):
                     l1_score = _l1.get("score", 0)
                     reasons = _l1.get("reasons") or []
                     log.info(
@@ -2131,19 +2291,20 @@ class FacebookAutomation(BaseAutomation):
                     except Exception:
                         pass
                     return False
-                # L1 PASS — 记一条 journey 让 funnel 能看到命中率
-                try:
-                    self._append_journey_for_action(
-                        profile_name, "persona_classified",
-                        did=did, persona_key=persona_key,
-                        data={
-                            "stage": "L1",
-                            "match": True,
-                            "score": _l1.get("score", 0),
-                            "reasons": (_l1.get("reasons") or [])[:3],
-                        })
-                except Exception:
-                    pass
+                else:
+                    # 新一次 L1 PASS — 记一条 journey 让 funnel 能看到命中率
+                    try:
+                        self._append_journey_for_action(
+                            profile_name, "persona_classified",
+                            did=did, persona_key=persona_key,
+                            data={
+                                "stage": "L1",
+                                "match": True,
+                                "score": _l1.get("score", 0),
+                                "reasons": (_l1.get("reasons") or [])[:3],
+                            })
+                    except Exception:
+                        pass
             except Exception as e:
                 # classify 异常时保守放行 (不阻塞主流程)
                 log.debug("[add_friend_with_note] persona classify 异常, 放行: %s", e)
@@ -2170,17 +2331,25 @@ class FacebookAutomation(BaseAutomation):
                 persona_key=persona_key, eff_phase=eff_phase,
                 source=source, preset_key=preset_key,
                 from_current_profile=from_current_profile,
-                do_l2_gate=do_l2_gate)
+                do_l2_gate=do_l2_gate, force=force,
+                walk_candidates=walk_candidates,
+                l2_gate_shots=l2_gate_shots,
+                max_l2_calls=max_l2_calls)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
                                      persona_key, eff_phase,
                                      source: str = "", preset_key: str = "",
                                      from_current_profile: bool = False,
-                                     do_l2_gate: bool = False):
+                                     do_l2_gate: bool = False,
+                                     force: bool = False,
+                                     walk_candidates: bool = False,
+                                     l2_gate_shots: int = 1,
+                                     max_l2_calls: int = 3):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
-        if daily_cap > 0:
+        # 2026-04-24 (A merge): force=True 跳过 cap 检查 (smoke/QA 显式 override).
+        if daily_cap > 0 and not force:
             try:
                 from src.host.fb_store import count_friend_requests_sent_since
                 n24 = count_friend_requests_sent_since(did, hours=24)
@@ -2211,10 +2380,13 @@ class FacebookAutomation(BaseAutomation):
                 if not self._is_likely_fb_profile_page(d):
                     log.warning("[add_friend_with_note] from_current_profile=True 但当前不像资料页, 中止")
                     return False
+                # 2026-04-24 (Phase 10.2): l2_gate_shots 仅在非默认时透传, 保旧 spy 签名兼容.
+                _shot_kw = ({"l2_gate_shots": l2_gate_shots}
+                            if l2_gate_shots and l2_gate_shots != 1 else {})
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
                     persona_key=persona_key, source=source, preset_key=preset_key,
-                    do_l2_gate=do_l2_gate)
+                    do_l2_gate=do_l2_gate, **_shot_kw)
 
             results = self.search_people(profile_name, did, max_results=3)
             if not results:
@@ -2222,6 +2394,104 @@ class FacebookAutomation(BaseAutomation):
                 return False
 
             time.sleep(1)
+
+            if safe_mode and walk_candidates:
+                # Phase 10.2 additive (2026-04-24): walk top 5 候选, 快速跳过明显男性/已联系,
+                # L2 VLM 精筛. 姓搜(如 '田中')会返回混合性别候选; 默认单结果路径常撞
+                # 男性/已联系候选浪费 quota. 男性名启发式 → 跳; peer_already_contacted → 跳;
+                # L2 REJECT 后 BACK 返搜索页 → 下一个; L2 PASS 继续. 若 walk 空 → 回退单结果.
+                cands = self._list_top_search_result_cards(
+                    d, query_hint=profile_name, max_n=5)
+                if cands:
+                    log.info(
+                        "[add_friend_with_note] walk 候选 %d (budget=%d): %s",
+                        len(cands), max_l2_calls,
+                        [(c["name"][:20], "M" if c["male_hint"] else "?")
+                         for c in cands])
+                    # Phase 10.3: L2 VLM quota 保护 — 每个进 profile 的候选消耗 1 call.
+                    # 过滤掉的 (male_hint / already_contacted) 不计数. 超 budget → 停.
+                    _l2_attempts = 0
+                    for idx, cand in enumerate(cands):
+                        cand_name = cand["name"] or profile_name
+                        if cand["male_hint"]:
+                            log.info("[walk] #%d '%s' 男性名, skip",
+                                     idx + 1, cand_name[:30])
+                            continue
+                        contacted, reason = self._peer_already_contacted(cand_name)
+                        if contacted:
+                            log.info("[walk] #%d '%s' (%s), skip",
+                                     idx + 1, cand_name[:30], reason)
+                            continue
+                        if _l2_attempts >= max(1, int(max_l2_calls)):
+                            log.info(
+                                "[walk] budget=%d 已耗尽 (已试 %d), 停止剩余候选",
+                                max_l2_calls, _l2_attempts)
+                            break
+                        _l2_attempts += 1
+                        bx = cand["bounds"]
+                        cx = (bx[0] + bx[2]) // 2
+                        cy = (bx[1] + bx[3]) // 2
+                        try:
+                            self.hb.tap(d, cx, cy)
+                        except Exception as e:
+                            log.warning("[walk] tap #%d 失败: %s", idx + 1, e)
+                            continue
+                        loaded = False
+                        xml_chk = ""
+                        for _ in range(6):
+                            time.sleep(2.0)
+                            try:
+                                xml_chk = d.dump_hierarchy() or ""
+                            except Exception:
+                                xml_chk = ""
+                            if self._is_likely_fb_profile_page_xml(xml_chk):
+                                loaded = True
+                                break
+                        if not loaded and cand_name:
+                            try:
+                                el = d(text=cand_name)
+                                if el.exists(timeout=1.5):
+                                    el.click()
+                                    time.sleep(random.uniform(3.5, 5.0))
+                                    xml_chk = d.dump_hierarchy() or ""
+                                    loaded = self._is_likely_fb_profile_page_xml(xml_chk)
+                            except Exception:
+                                pass
+                        if not loaded:
+                            log.info("[walk] #%d 未进资料页, BACK 下一个", idx + 1)
+                            try:
+                                d.press("back")
+                            except Exception:
+                                pass
+                            time.sleep(1.5)
+                            continue
+                        _shot_kw = ({"l2_gate_shots": l2_gate_shots}
+                                     if l2_gate_shots and l2_gate_shots != 1 else {})
+                        res = self._add_friend_safe_interaction_on_profile(
+                            d, did, cand_name, note,
+                            persona_key=persona_key,
+                            source=source, preset_key=preset_key,
+                            do_l2_gate=do_l2_gate, **_shot_kw)
+                        if res:
+                            log.info("[walk] #%d '%s' 成功", idx + 1, cand_name[:30])
+                            return True
+                        log.info("[walk] #%d '%s' 失败, BACK 下一个",
+                                 idx + 1, cand_name[:30])
+                        try:
+                            d.press("back")
+                        except Exception:
+                            pass
+                        time.sleep(random.uniform(1.5, 2.5))
+                        try:
+                            _chk = d.dump_hierarchy() or ""
+                            if self._is_likely_fb_profile_page_xml(_chk):
+                                d.press("back")
+                                time.sleep(1.2)
+                        except Exception:
+                            pass
+                    log.info("[walk] 候选 %d 个全部失败", len(cands))
+                    return False
+                log.info("[add_friend_with_note] walk 无候选, 回退单结果路径")
 
             if safe_mode:
                 # 安全路径: 点击第一个搜索结果进主页 → 停留 → 找主页内的 Add Friend
@@ -2256,10 +2526,12 @@ class FacebookAutomation(BaseAutomation):
                     self._adb(f"shell input tap {int(w * 0.5)} {int(620)}", device_id=did)
                     time.sleep(random.uniform(3.0, 5.0))
 
+                _shot_kw = ({"l2_gate_shots": l2_gate_shots}
+                            if l2_gate_shots and l2_gate_shots != 1 else {})
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
                     persona_key=persona_key, source=source, preset_key=preset_key,
-                    do_l2_gate=do_l2_gate)
+                    do_l2_gate=do_l2_gate, **_shot_kw)
             if not self.smart_tap("Add Friend button", device_id=did):
                 return False
             time.sleep(1)
@@ -3356,7 +3628,13 @@ class FacebookAutomation(BaseAutomation):
                              preset_key: str = "",
                              source: str = "",
                              greet_on_failure: bool = False,
-                             do_l2_gate: bool = False) -> Dict[str, Any]:
+                             do_l2_gate: bool = False,
+                             force: bool = False,
+                             ai_dynamic_greeting: Optional[bool] = None,
+                             force_send_greeting: Optional[bool] = None,
+                             walk_candidates: bool = False,
+                             l2_gate_shots: int = 1,
+                             max_l2_calls: int = 3) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -3398,6 +3676,10 @@ class FacebookAutomation(BaseAutomation):
             source=source,
             preset_key=preset_key,
             do_l2_gate=do_l2_gate,
+            force=force,
+            walk_candidates=walk_candidates,
+            l2_gate_shots=l2_gate_shots,
+            max_l2_calls=max_l2_calls,
         )
         out["add_friend_ok"] = bool(add_ok)
 
@@ -5476,8 +5758,229 @@ class FacebookAutomation(BaseAutomation):
 
     # ── Inbox helpers (Sprint 2 P0 内部支持函数) ─────────────────────────
 
+    # ── Phase 15 (2026-04-25): peer_name UI 文本黑名单 ─────────────────
+    # 之前 _check_message_requests 把"查看翻译"等 Messenger UI 按钮文本当
+    # peer_name 写进了 fb_contact_events, dispatcher 拿这种"假 peer" 永远
+    # filter 不出合格 lead. 全方位 ban 各种 UI 词 + 多语言 (中/英/日/意).
+    _MESSENGER_UI_TEXT_BLACKLIST = frozenset(s.lower() for s in (
+        # tab/导航
+        "chats", "people", "stories", "calls", "messenger", "search",
+        "back", "home", "notifications", "menu", "settings", "marketplace",
+        "聊天", "联系人", "动态", "通讯录",
+        # 翻译 (核心 root cause)
+        "translate", "see translation", "tap to translate",
+        "translation", "翻译", "查看翻译", "点击翻译", "显示原文",
+        "翻訳", "翻訳を表示", "原文", "Vedi traduzione", "Tradurre",
+        # 操作按钮
+        "reply", "send", "more", "edit", "delete", "block", "report",
+        "回复", "发送", "更多", "编辑", "删除", "屏蔽", "举报", "更多选项",
+        "返信", "送信", "もっと見る", "編集", "削除", "ブロック", "通報",
+        "rispondi", "invia", "altro",
+        # 状态
+        "active now", "online", "offline", "typing", "seen",
+        "在线", "离线", "正在输入", "已读",
+        "オンライン", "入力中", "既読", "未読",
+        "online ora",
+        # 消息列表常见控件
+        "mark as read", "mark all as read", "filter", "filters",
+        "标为已读", "全部已读", "筛选", "过滤",
+        "既読にする", "全て既読",
+        # 列表头/empty state
+        "message requests", "spam", "archived", "new message",
+        "消息请求", "垃圾", "已存档", "新消息",
+        "メッセージリクエスト", "新規メッセージ",
+        # 表情符号 / 1 字符 reaction (避免抓 ✓✓ ❤ 等)
+        "✓", "✓✓", "❤", "👍", "•",
+    ))
+
+    # 含这些子串视为消息预览 (而非 peer 名)
+    _MESSENGER_PREVIEW_HINTS = (
+        ": ",   # "Alice: hello"
+        "...",   # 省略号预览
+        "…",
+    )
+
+    # Phase 16: 截断标记 — Messenger preview 末尾常带 "更多" / "more" / "もっと見る"
+    # 表示原文被截断, peer_name 不会带这种.
+    _MESSENGER_TRUNCATION_MARKERS = (
+        "更多", "more", "もっと見る", "もっと",
+        "Mehr", "altro",  # de/it
+    )
+
+    # Phase 17.1 (2026-04-25): yaml 热加载黑名单缓存
+    # config/peer_name_blacklist.yaml 改完 5 分钟内自动生效 (无需重启).
+    _BLACKLIST_YAML_CACHE = {
+        "extra": frozenset(),     # 从 yaml 读到的 lower-case set
+        "loaded_at": 0.0,
+    }
+    _BLACKLIST_YAML_TTL_SEC = 300  # 5 min
+
+    @staticmethod
+    def _load_extra_blacklist() -> "frozenset[str]":
+        """Phase 17.1 / 18: 读 config/peer_name_blacklist.yaml 的 extra_blacklist.
+
+        TTL 5 min 缓存. yaml 不存在 → 返空 (静默, 不警告). 解析/schema 错
+        → logger.error visible warning + 返空 (不抛, 主流程不受影响).
+
+        Phase 18 schema 校验:
+          - 顶层必须是 dict (不是 list/scalar)
+          - extra_blacklist 必须是 list 或缺省 (不能是 dict/scalar/None)
+          - 每个 item 必须是 str (非 str 跳过 + warning)
+        """
+        import time as _t
+        cache = FacebookAutomation._BLACKLIST_YAML_CACHE
+        now = _t.time()
+        if now - cache.get("loaded_at", 0) < FacebookAutomation._BLACKLIST_YAML_TTL_SEC:
+            return cache.get("extra", frozenset())
+        extra: frozenset = frozenset()
+        try:
+            from pathlib import Path
+            import yaml
+            here = Path(__file__).resolve().parent.parent.parent
+            yaml_path = here / "config" / "peer_name_blacklist.yaml"
+            if not yaml_path.exists():
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            try:
+                with yaml_path.open(encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+            except Exception as e:
+                log.error("[blacklist_yaml] YAML 解析失败 (退化空 set): %s", e)
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            # Phase 18: schema 校验
+            if data is None:
+                # 空文件 — 合法
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            if not isinstance(data, dict):
+                log.error("[blacklist_yaml] 顶层必须是 dict, 实际 %s, 退化空 set",
+                            type(data).__name__)
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            items = data.get("extra_blacklist")
+            if items is None:
+                # 缺 key — 合法
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            if not isinstance(items, list):
+                log.error("[blacklist_yaml] extra_blacklist 必须是 list, "
+                            "实际 %s, 退化空 set", type(items).__name__)
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            valid_items = []
+            for i, s in enumerate(items):
+                if not isinstance(s, str):
+                    log.warning("[blacklist_yaml] item[%d] 不是 str (%s), skip",
+                                  i, type(s).__name__)
+                    continue
+                s2 = s.strip().lower()
+                if s2:
+                    valid_items.append(s2)
+            extra = frozenset(valid_items)
+        except Exception as e:
+            log.error("[blacklist_yaml] 未预期异常 (退化空): %s", e)
+            extra = frozenset()
+        cache["extra"] = extra
+        cache["loaded_at"] = now
+        return extra
+
+    @staticmethod
+    def reload_extra_blacklist() -> int:
+        """运维 / 测试 force reload yaml 黑名单. 返加载条数."""
+        FacebookAutomation._BLACKLIST_YAML_CACHE["loaded_at"] = 0.0
+        return len(FacebookAutomation._load_extra_blacklist())
+
+    @staticmethod
+    def _is_valid_peer_name(text: str) -> bool:
+        """Phase 15 / 15.1: peer_name 多层 sanitize.
+
+        过滤 Messenger UI 按钮文本 ("查看翻译" / "Reply") + 消息预览片段
+        ("Alice: hi...") + 测试残留 ("p0"/"Alice"/"Bob") + 全 emoji 串.
+        保留真用户 display name (中/日/英全名).
+
+        过滤规则 (任一命中即 reject):
+          1. 空 / 长度 < 2 或 > 30
+          2. 全数字 / 全标点 / 全 emoji (Unicode So 类)
+          3. 出现在 _MESSENGER_UI_TEXT_BLACKLIST
+          4. 含 _MESSENGER_PREVIEW_HINTS (": " / "..." / "…")
+          5. 句尾标点 (display name 不带)
+          6. ASCII 单词首大写后小写 + 长度<=12 = 按钮启发式
+          7. (Phase 15.1) ASCII 短串 ≤ 4 字符且含数字 = 测试残留/编号 ban
+             (例 "p0"/"a1"/"X3"; 但放过 "alice"/"bob" 之类纯字母)
+        """
+        if not text:
+            return False
+        s = text.strip()
+        if len(s) < 2 or len(s) > 30:
+            return False
+        if s.isdigit():
+            return False
+        # 全 ASCII 标点 + 非汉字 (基本平面外字符也排) 视为不合法
+        if all(not c.isalnum() and ord(c) < 0x4E00 for c in s):
+            return False
+        # Phase 15.1: 全 emoji (Unicode 类 So/Sk + ZWJ) ban
+        try:
+            import unicodedata as _ud
+            if all(_ud.category(c).startswith(("S",)) or c in "‍️"
+                   for c in s):
+                return False
+        except Exception:
+            pass
+        # 黑名单 (内置 + yaml 热加载)
+        sl = s.lower()
+        if sl in FacebookAutomation._MESSENGER_UI_TEXT_BLACKLIST:
+            return False
+        # Phase 17.1: yaml 黑名单 (运营自加, 5 min TTL)
+        if sl in FacebookAutomation._load_extra_blacklist():
+            return False
+        # 消息预览
+        for hint in FacebookAutomation._MESSENGER_PREVIEW_HINTS:
+            if hint in s:
+                return False
+        # Phase 16: 截断标记 (Messenger preview "... 更多" 等)
+        for marker in FacebookAutomation._MESSENGER_TRUNCATION_MARKERS:
+            # 只 ban 句末 / 包尾的截断标记, 不 ban 含 "more" 的真名 (罕见但
+            # 假设 Maro = 真名末位 "more" 实际不会出现; 保守只 ban 末尾匹配)
+            if s.endswith(marker) or s.endswith(" " + marker):
+                return False
+        # 句尾标点
+        if s[-1] in ".!?,。!?、,…":
+            return False
+        # ASCII 单词按钮启发
+        if (s.replace(" ", "").isascii()
+                and " " not in s
+                and len(s) <= 12
+                and s[0].isupper()
+                and s[1:].islower()):
+            return False
+        # Phase 15.1: ASCII 短串 (<=4) 且含数字 — 测试残留 (p0/p1/X3)
+        if len(s) <= 4 and s.isascii() and any(c.isdigit() for c in s):
+            return False
+        return True
+
+    # Phase 17: ListView 行级匹配, 限定父容器 class 必须含这些关键字
+    _MESSENGER_LIST_CONTAINERS = (
+        "RecyclerView", "ListView", "ScrollView", "LinearLayout",
+    )
+
     def _list_messenger_conversations(self, d, max_n: int) -> List[Dict]:
-        """从 Messenger 主列表 dump 当前可见对话。返回 [{name, unread, bounds}]。"""
+        """从 Messenger 主列表 dump 当前可见对话。返回 [{name, unread, bounds}].
+
+        Phase 17 (2026-04-25): 结构敏感 ListView 行级匹配.
+        旧实现 flat scan 所有 clickable element + sanitize 兜底;
+        现实现优先用 parent_class 过滤 — peer 行的父容器必含 RecyclerView/
+        ListView/ScrollView/LinearLayout. 不匹配父容器的 element (顶部工具栏
+        按钮 / 底部 navigation tab) 直接跳过.
+
+        旧 sanitize 仍作为内层兜底 (双层防御).
+        """
         try:
             xml = d.dump_hierarchy()
         except Exception:
@@ -5494,12 +5997,20 @@ class FacebookAutomation(BaseAutomation):
         seen = set()
         for el in elements:
             text = (el.text or "").strip()
-            if not text or len(text) < 2 or len(text) > 60:
-                continue
             if not el.clickable:
                 continue
-            if text.lower() in {"chats", "people", "stories", "calls",
-                                "messenger", "search", "back"}:
+            # Phase 17: 父容器结构过滤 (老 XMLParser 没 parent_class 则
+            # parent_class="" 跳过此 check 退化为旧行为, 不破兼容).
+            parent_cls = getattr(el, "parent_class", "") or ""
+            if parent_cls:
+                # 新 parser 提供了 parent_class — 必须父容器含 list 关键字
+                in_list = any(kw in parent_cls
+                               for kw in
+                               FacebookAutomation._MESSENGER_LIST_CONTAINERS)
+                if not in_list:
+                    continue
+            # Phase 15-16 字符串 sanitize 兜底
+            if not FacebookAutomation._is_valid_peer_name(text):
                 continue
             if text in seen:
                 continue
@@ -5924,6 +6435,11 @@ class FacebookAutomation(BaseAutomation):
         """从 FB Friends 页 dump 当前可见好友请求。
 
         启发式:扫描页面所有 textView,查找带"X mutual friends"模式的卡片。
+
+        Phase 15.1 (2026-04-25): peer_name 走 _is_valid_peer_name 校验,
+        过滤 UI 文本 / 消息预览 / 测试残留 (与 _list_messenger_conversations
+        共享 sanitize 逻辑). cleanup 报告显示 add_friend_accepted 210 条脏行,
+        说明本 method 也漏过 UI 文本进入 contact_events.
         """
         items: List[Dict] = []
         try:
@@ -5934,19 +6450,24 @@ class FacebookAutomation(BaseAutomation):
             return items
         for el in elements:
             text = (el.text or "").strip()
-            if not text or len(text) < 2 or len(text) > 60:
-                continue
             if " mutual friend" in text.lower() or text.lower().endswith("mutual"):
                 import re as _re
                 m = _re.search(r"(\d+)\s+mutual", text.lower())
                 count = int(m.group(1)) if m else 0
+                # 抠 name 部分 (去掉 mutual 行 / 项目符号 / 多行)
+                name_part = text.split(" •")[0].split("\n")[0].strip()
+                # mutual line 提取的 name 部分单独 sanitize
+                if not FacebookAutomation._is_valid_peer_name(name_part):
+                    continue
                 items.append({
-                    "name": text.split(" •")[0].split("\n")[0],
+                    "name": name_part,
                     "mutual_friends": count,
                 })
                 if len(items) >= max_n:
                     break
             elif el.clickable and len(text.split()) <= 4:
+                if not FacebookAutomation._is_valid_peer_name(text):
+                    continue
                 items.append({"name": text, "mutual_friends": 0})
                 if len(items) >= max_n:
                     break
@@ -6287,6 +6808,91 @@ class FacebookAutomation(BaseAutomation):
             return True
         nl = n.lower()
         return any(t.lower() in nl for t in qtok)
+
+    # 2026-04-24 v3: 姓搜 + walk candidates 支持
+    # 常见男性日文名后缀 — 在搜索结果卡片级就快速跳过, 不浪费 L2 VLM quota
+    _MALE_JP_NAME_SUFFIXES = (
+        "郎", "太", "雄", "健", "輔", "介", "也", "司", "彦",
+        "男", "夫", "之", "治", "樹", "一", "二", "三", "博",
+        "志", "朗", "哉", "佑", "翔", "斗", "馬", "弥",
+    )
+
+    def _is_likely_male_jp_name(self, name: str) -> bool:
+        """通过姓名末尾汉字启发式判断是否明显为男性日文名."""
+        if not name:
+            return False
+        parts = name.replace("　", " ").split()
+        first_name = parts[-1] if parts else name
+        if not first_name:
+            return False
+        return first_name[-1] in self._MALE_JP_NAME_SUFFIXES
+
+    def _peer_already_contacted(self, name: str) -> tuple:
+        """检查 peer 是否已联系过, 用于 walk candidates 跳过已互动的 peer.
+
+        Returns (contacted: bool, reason: str).
+        """
+        if not name:
+            return False, ""
+        try:
+            from src.host.lead_mesh import resolve_identity, get_journey
+            cid = resolve_identity(platform="facebook",
+                                    account_id=f"fb:{name}",
+                                    display_name=name)
+            events = get_journey(cid) or []
+            actions = [e.get("action") for e in events]
+            if "greeting_sent" in actions:
+                return True, "already_greeted"
+            if "friend_requested" in actions:
+                return True, "already_friend_requested"
+            if "friend_already" in actions:
+                return True, "already_friend_contacted"
+            for e in events:
+                if (e.get("action") == "add_friend_blocked"
+                        and (e.get("data") or {}).get("reason") == "request_already_pending"):
+                    return True, "request_already_pending"
+        except Exception:
+            pass
+        return False, ""
+
+    def _try_dismiss_verify_dialog(self, d) -> bool:
+        """尝试点击 "以后再说" 类按钮 dismiss 账号验证/checkpoint 弹窗.
+
+        Returns True if 找到并点了 dismiss 按钮, False 否则.
+        """
+        dismiss_texts = (
+            "以后再说", "稍后", "稍后再说", "跳过", "不再显示", "取消",
+            "Later", "Not Now", "Not now", "Skip", "Dismiss",
+            "Maybe Later", "Remind Me Later",
+            "あとで", "スキップ", "後で", "今はしない",
+        )
+        for txt in dismiss_texts:
+            try:
+                el = d(text=txt, clickable=True)
+                if el.exists(timeout=0.4):
+                    el.click()
+                    log.info("[risk/dismiss] 点击 '%s' 成功", txt)
+                    time.sleep(1.2)
+                    return True
+                el = d(text=txt)
+                if el.exists(timeout=0.3):
+                    el.click()
+                    log.info("[risk/dismiss] 点击 '%s' (非 clickable) 成功", txt)
+                    time.sleep(1.2)
+                    return True
+            except Exception:
+                continue
+        for desc in ("Later", "Skip", "Not Now", "以后", "稍后", "あとで"):
+            try:
+                el = d(descriptionContains=desc, clickable=True)
+                if el.exists(timeout=0.3):
+                    el.click()
+                    log.info("[risk/dismiss] 点击 desc='%s' 成功", desc)
+                    time.sleep(1.2)
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _first_search_result_element(self, d, query_hint: str = ""):
         """返回搜索结果列表里第 1 个**匹配 query_hint**的人员卡片元素(用于进入主页)。

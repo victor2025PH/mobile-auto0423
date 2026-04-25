@@ -1832,13 +1832,31 @@ class HealthMonitor(threading.Thread):
 
     @staticmethod
     def _auto_deploy_wallpaper(manager, device_id: str):
-        """Auto-deploy numbered wallpaper when device comes online."""
+        """Auto-deploy numbered wallpaper when device comes online.
+
+        先做 MIUI 安全硬化（device-online 第一时刻），防止部署壁纸过程被手机管家拦下。
+        硬化是幂等 + 持久化跳过的，对非 MIUI 设备无副作用。
+        """
+        try:
+            from src.host.routers.devices_core import _ensure_hardened, _ensure_ime_unified
+            _ensure_hardened(device_id)
+            _ensure_ime_unified(device_id)
+        except Exception as e:
+            logger.debug("MIUI 硬化/IME 统一跳过 %s: %s", device_id[:8], e)
         try:
             from src.utils.wallpaper_generator import get_wallpaper_auto_manager
             wp = get_wallpaper_auto_manager()
             wp.on_device_online(manager, device_id)
         except Exception as e:
             logger.debug("壁纸自动部署跳过 %s: %s", device_id[:8], e)
+        # 兜底：wp.on_device_online 内部 _save_aliases 是整体覆盖（不 merge），
+        # 会把 _ensure_hardened 写入的 miui_hardened_at 冲掉。这里在 wp 之后补写一次。
+        try:
+            from src.host.routers.devices_core import _HARDENED_SERIALS, _mark_hardened
+            if device_id in _HARDENED_SERIALS:
+                _mark_hardened(device_id)
+        except Exception:
+            pass
 
     @staticmethod
     def _pre_push_scrcpy(device_id: str):

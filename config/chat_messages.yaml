@@ -1,17 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════════
-# Facebook / TikTok 引流文案与账号配置（P2-UI Sprint 多国化）
-# ═══════════════════════════════════════════════════════════════════════
-# 说明：
-#   * device_referrals 是每台设备的"主引流账号"（WA/TG/LINE/IG），
-#     与 persona 的 referral_priority 共同决定下发私信时的渠道顺序。
-#   * countries.* 按 ISO2 国家代码提供本地化文案，launch 时会根据
-#     persona.country_code 自动选择对应语言模板。
-#   * 旧版顶层 country: italy + greeting_messages[it] 保留作为向后兼容，
-#     直到所有 automation 层切换到 countries[*] 读取。
-# ═══════════════════════════════════════════════════════════════════════
-
-country: italy   # legacy，待下线；新代码请读 persona.country_code + countries.{cc}
-
+country: italy
 device_referrals:
   89NZVGKFD6BYUO5P:
     telegram: '@dthb3'
@@ -21,72 +8,66 @@ device_referrals:
     whatsapp: '+639952948809'
   BIIVOZFQZTXGVOBU:
     telegram: '@ykj123'
-
-# ── 多国化文案（按国家 ISO2 代码索引）──────────────────────────────────
-# 当前启用 JP（日本 37-60 女性客群）；IT 保留作为 legacy 样板。
 countries:
-
-  # ── 🇯🇵 日本（默认目标客群：37-60 岁女性）────────────────────────────
   jp:
     language: ja
-    # 引流账号渠道偏好（与 personas.jp_female_midlife.referral_priority 对齐）
-    referral_priority: [line, instagram, whatsapp, telegram]
-
-    # 加好友验证语（日本礼节要求必带）
-    # 占位符 {name} 可缺省，占位符 {interest} 若传入会替换为"韓ドラ/手芸/旅行"等
+    referral_priority:
+    - line
+    - instagram
+    - whatsapp
+    - telegram
     friend_request_notes:
-      - "はじめまして🌸同じ{interest}好きで繋がりたくて、よろしければ仲良くしてください☕️"
-      - "こんにちは！プロフィール拝見して素敵だなと思いました🌿よろしくお願いします"
-      - "突然失礼します🙇‍♀️同世代で共通の話題があれば嬉しいです🌼"
-
-    # 首次开场 DM（保守型，不直接引流，先建立关系）
+    - はじめまして🌸同じ{interest}好きで繋がりたくて、よろしければ仲良くしてください☕️
+    - こんにちは！プロフィール拝見して素敵だなと思いました🌿よろしくお願いします
+    - 突然失礼します🙇‍♀️同世代で共通の話題があれば嬉しいです🌼
     greeting_messages:
-      - "はじめまして😊友達になってくれてありがとうございます🌸"
-      - "こんにちは！フォロー返ししてくれてありがとう✨少しずつ仲良くしてください"
-      - "{name}さん、繋がれて嬉しいです🌿素敵な投稿楽しみにしています"
-
-    # 跟进 DM（第 2-3 次，开始切入引流）
+    - はじめまして😊友達になってくれてありがとうございます🌸
+    - こんにちは！フォロー返ししてくれてありがとう✨少しずつ仲良くしてください
+    - '{name}さん、繋がれて嬉しいです🌿素敵な投稿楽しみにしています'
+    - こんばんは🌙友達申請受けてくれてありがとう、よろしくお願いします🍀
+    - 初めまして！プロフィール見て親近感を持ちました😌お話しできたら嬉しいです
+    - '{name}さん、こんにちは☀️繋がれて光栄です、今後ともよろしくお願いします✨'
+    - はじめまして🙇‍♀️同年代の方と知り合えて嬉しいです、これからよろしくお願いします🌷
+    - こんにちは😊同じような趣味の方と繋がれて嬉しいです、仲良くしてくださいね🎵
     message_variants:
-      - id: jp_v1_gentle
-        name: 穏やか型（推奨）
-        description: 敬语 + 低压力 + LINE 切换自然
-        weight: 70
-        greeting_messages:
-          - "{name}さん、こんにちは☕️最近いかがお過ごしですか？"
-          - "いつも楽しい投稿ありがとうございます🌸{name}さんのセンス素敵です"
-        referral_line:
-          - "もしよかったらLINEの方でお話ししませんか？ID: {line}（ご無理のない範囲で✨）"
-          - "LINEだともう少しゆっくりお話できるので良かったらどうぞ🌿 {line}"
-        referral_instagram:
-          - "Instagram もやっています、よかったらどうぞ🌼 {instagram}"
-      - id: jp_v2_direct
-        name: 率直型（フォロー後 3 日経過）
-        description: 直接切入，但仍带敬语
-        weight: 30
-        greeting_messages:
-          - "{name}さん、一つお誘いしたいことがあるのですがお時間ありますか？"
-        referral_line:
-          - "詳しくはLINEでお伝えします → {line}"
-
-    # 评论模板（共感型，绝不硬广）
+    - id: jp_v1_gentle
+      name: 穏やか型（推奨）
+      description: 敬语 + 低压力 + LINE 切换自然
+      weight: 70
+      greeting_messages:
+      - '{name}さん、こんにちは☕️最近いかがお過ごしですか？'
+      - いつも楽しい投稿ありがとうございます🌸{name}さんのセンス素敵です
+      referral_line:
+      - 'もしよかったらLINEの方でお話ししませんか？ID: {line}（ご無理のない範囲で✨）'
+      - LINEだともう少しゆっくりお話できるので良かったらどうぞ🌿 {line}
+      referral_instagram:
+      - Instagram もやっています、よかったらどうぞ🌼 {instagram}
+    - id: jp_v2_direct
+      name: 率直型（フォロー後 3 日経過）
+      description: 直接切入，但仍带敬语
+      weight: 30
+      greeting_messages:
+      - '{name}さん、一つお誘いしたいことがあるのですがお時間ありますか？'
+      referral_line:
+      - 詳しくはLINEでお伝えします → {line}
     comment_templates:
-      - "わかる～！うちも同じです🥹"
-      - "素敵ですね🌸参考にさせていただきます"
-      - "おしゃれ✨憧れます"
-      - "ありがとうございます🌿今度試してみます"
-
-  # ── 🇮🇹 意大利（legacy，原项目目标客群样板）────────────────────────
+    - わかる～！うちも同じです🥹
+    - 素敵ですね🌸参考にさせていただきます
+    - おしゃれ✨憧れます
+    - ありがとうございます🌿今度試してみます
   it:
     language: it
-    referral_priority: [whatsapp, telegram, instagram, line]
+    referral_priority:
+    - whatsapp
+    - telegram
+    - instagram
+    - line
     friend_request_notes:
-      - "Ciao {name}! Mi piacerebbe connettermi con te, abbiamo interessi in comune 🌟"
+    - Ciao {name}! Mi piacerebbe connettermi con te, abbiamo interessi in comune 🌟
     greeting_messages:
-      - "Ciao {name}! Grazie per il follow back! Mi piacciono molto i tuoi contenuti!"
-      - "Hey {name}! Ho visto che mi segui, grazie! Parliamone!"
-      - "Grazie {name} per il follow! I tuoi video sono fantastici!"
-
-# ── Legacy 顶层字段（待 automation 层迁移完成后删除）────────────────
+    - Ciao {name}! Grazie per il follow back! Mi piacciono molto i tuoi contenuti!
+    - Hey {name}! Ho visto che mi segui, grazie! Parliamone!
+    - Grazie {name} per il follow! I tuoi video sono fantastici!
 greeting_messages:
 - Ciao {name}! Grazie per il follow back! Mi piacciono molto i tuoi contenuti!
 - Hey {name}! Ho visto che mi segui, grazie! Parliamone!
@@ -105,7 +86,7 @@ message_variants:
   - 'Se vuoi conoscermi meglio, scrivimi su Telegram: {telegram}'
   referral_whatsapp:
   - 'Puoi anche scrivermi su WhatsApp: {whatsapp} Sempre disponibile!'
-  weight: 66
+  weight: 85
 - description: 直接切入重点，商务效率
   greeting_messages:
   - Ciao {name}! Grazie per il follow. Ho qualcosa di interessante per te!

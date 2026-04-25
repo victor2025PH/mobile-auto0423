@@ -28,6 +28,27 @@ logger = logging.getLogger(__name__)
 _project_root = PROJECT_ROOT
 
 
+def _phase10_task_extras(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Phase 10/10.2/10.3 opt-in kwargs 组装 (walk_candidates / l2_gate_shots /
+    do_l2_gate / max_l2_calls).
+
+    只在显式 True/>1/非默认 时加 key, 避免未升级的 automation 分支撞 TypeError.
+    """
+    out: Dict[str, Any] = {}
+    if params.get("walk_candidates"):
+        out["walk_candidates"] = True
+    shots = int(params.get("l2_gate_shots", 0) or 0)
+    if shots > 1:
+        out["l2_gate_shots"] = shots
+    if params.get("do_l2_gate"):
+        out["do_l2_gate"] = True
+    budget = int(params.get("max_l2_calls", 0) or 0)
+    # walk 启用时才传 budget, 且非默认 3 才值得发 kwarg.
+    if out.get("walk_candidates") and budget and budget != 3:
+        out["max_l2_calls"] = budget
+    return out
+
+
 def _vpn_required() -> bool:
     """读取 config/devices.yaml 中 connection.vpn_required (默认 True)。"""
     try:
@@ -713,13 +734,16 @@ def _execute_facebook(manager, resolved, task_type, params):
             _persona_key = params.get("persona_key") or ""
             _phase_override = params.get("phase") or params.get("phase_override") or ""
             if hasattr(fb, "add_friend_with_note"):
+                _extra = _phase10_task_extras(params)
                 ok = fb.add_friend_with_note(target, note=note,
                                              safe_mode=safe_mode,
                                              device_id=resolved,
                                              persona_key=_persona_key or None,
                                              phase=_phase_override or None,
                                              source=params.get("source", "") or params.get("group_name", ""),
-                                             preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")))
+                                             preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")),
+                                             force=bool(params.get("force_add_friend")),
+                                             **_extra)
             else:
                 ok = fb.add_friend(target, device_id=resolved)
 
@@ -763,6 +787,13 @@ def _execute_facebook(manager, resolved, task_type, params):
                 return False, "facebook.add_friend_and_greet 尚未实现", None
             # 把 source / preset_key 下推,automation 层锁内 record 时用
             _src_val = params.get("source", "") or params.get("group_name", "")
+            _extra = _phase10_task_extras(params)
+            if params.get("force_add_friend"):
+                _extra["force"] = True
+            if params.get("ai_dynamic_greeting") is not None:
+                _extra["ai_dynamic_greeting"] = bool(params.get("ai_dynamic_greeting"))
+            if params.get("force_send_greeting") is not None:
+                _extra["force_send_greeting"] = bool(params.get("force_send_greeting"))
             res = fb.add_friend_and_greet(
                 target,
                 note=note,
@@ -773,6 +804,7 @@ def _execute_facebook(manager, resolved, task_type, params):
                 preset_key=_preset_key,
                 source=_src_val,
                 greet_on_failure=bool(params.get("greet_on_failure", False)),
+                **_extra,
             ) or {}
             # 2026-04-23 P3-1: automation 层已在锁内 record(ok 时 sent;
             # 不 ok 时不写)。这里仅补 risk 标记, 便于失败漏斗分析。
@@ -997,11 +1029,1933 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_campaign_run":
             return _run_facebook_campaign(fb, resolved, params)
 
+        # Phase 12.3 (2026-04-25): facebook_recycle_dead_peers
+        # 扫 canonical 含 referral_dead tag 且 referral_dead_at 早于 now - days,
+        # 去 tag + 清 counter → peer 再次可被 dispatcher plan.
+        # 前缀用 facebook_ 让 executor 路由把它送到 Facebook 分支 (函数本身不依赖 fb).
+        if task_type == "facebook_recycle_dead_peers":
+            return _line_pool_recycle_dead_peers(params)
+
+        # Phase 18 (2026-04-25): facebook_daily_referral_summary
+        # 组装 funnel + ranking + reject metrics, 写 logs/daily_summary_YYYYMMDD.json
+        # 可选 webhook (env SLACK_WEBHOOK_URL).
+        if task_type == "facebook_daily_referral_summary":
+            return _fb_daily_referral_summary(params)
+
+        # Phase 11 (2026-04-25): fb_line_dispatch_from_reply
+        # 扫近 N 小时 contact_events (greeting_replied/message_received) → 按
+        # canonical.metadata (l2_verified / persona 匹配) 过滤 → allocate LINE
+        # pool → 写 line_dispatch_log + 返 "派发计划" 给调用方 (B 机/运营).
+        if task_type == "facebook_line_dispatch_from_reply":
+            return _fb_line_dispatch_from_reply(resolved, params)
+
+        # Phase 12 Alpha (2026-04-25): A 自立消费 line_dispatch_planned → 用
+        # Messenger 直接把 referral 话术发给对方, 不等 B 协同就位.
+        if task_type == "facebook_send_referral_replies":
+            return _fb_send_referral_replies(fb, resolved, params)
+
+        # Phase 19.x.1 (2026-04-25): facebook_alert_check_hourly
+        # 轻量 alert 检测 + 状态抑制 (24h 内同 alert 不重发).
+        if task_type == "facebook_alert_check_hourly":
+            return _fb_alert_check_hourly(params)
+
+        # Phase 20.1 (2026-04-25): facebook_check_referral_replies
+        # 扫 wa_referral_sent 后 24-48h 内未 replied 的 peer, 走 B 侧 Messenger
+        # inbox 检测器, 命中关键词写 wa_referral_replied event.
+        if task_type == "facebook_check_referral_replies":
+            return _fb_check_referral_replies(fb, resolved, params)
+
+        # Phase 20.2 (2026-04-25): facebook_mark_stale_referrals
+        # 扫 sent 但 stale_hours 内仍未 replied 的 peer, 标 referral_stale,
+        # 超过 escalate_to_dead_days 天升级 referral_dead.
+        if task_type == "facebook_mark_stale_referrals":
+            return _fb_mark_stale_referrals(params)
+
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
     except Exception as e:
         logger.exception("Facebook 任务执行异常: %s", task_type)
         return False, f"{task_type} 异常: {e}", None
+
+
+# Phase 19.x.1 (2026-04-25): alert detection + state suppression
+# 抽出来给 daily_summary + hourly_check 共用.
+
+_ALERT_STATE_PATH = "logs/alert_state.json"
+_ALERT_DEFAULT_COOLDOWN_HOURS = 24
+# Phase 19.x.3.1: severity-based cooldown (critical 重要应较早重发)
+_ALERT_DEFAULT_SEVERITY_COOLDOWNS = {
+    "critical": 4,
+    "warning": 24,
+    "info": 48,
+}
+
+
+def _load_alert_state() -> Dict[str, str]:
+    """logs/alert_state.json: {alert_type: last_fired_iso}."""
+    import json as _json
+    from pathlib import Path as _Path
+    p = _Path(_ALERT_STATE_PATH)
+    if not p.exists():
+        return {}
+    try:
+        with p.open(encoding="utf-8") as f:
+            data = _json.load(f) or {}
+        return {k: str(v) for k, v in data.items() if isinstance(k, str)}
+    except Exception as e:
+        logger.debug("[alert_state] load 失败: %s", e)
+        return {}
+
+
+def _save_alert_state(state: Dict[str, str]) -> None:
+    """原子写 (tmp + rename) 避免半写."""
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+    p = _Path(_ALERT_STATE_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            _json.dump(state, f, ensure_ascii=False, indent=2)
+        # atomic rename (Windows 可能要先删旧)
+        if p.exists():
+            _os.replace(str(tmp), str(p))
+        else:
+            tmp.rename(p)
+    except Exception as e:
+        logger.debug("[alert_state] save 失败: %s", e)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _alert_state_key(a: Dict[str, Any]) -> str:
+    """Phase 20.1.9.2: state key = type + (":region" if region 非空).
+
+    region 非空时 cooldown / history 按 (type, region) 独立, 同 type 不同 region
+    互不抑制. 用于 per-region replied_rate_low 等场景.
+    """
+    rg = (a.get("region") or "").strip()
+    base = a.get("type") or ""
+    return f"{base}:{rg}" if rg else base
+
+
+def _detect_referral_alerts(funnel: Dict[str, Any],
+                              reject_total: int,
+                              alert_send_threshold: float = 0.3,
+                              alert_reject_threshold: int = 10,
+                              alert_reply_threshold: float = 0.2,
+                              alert_reply_min_sent: int = 10,
+                              alert_stale_threshold: float = 0.5,
+                              alert_stale_min_sent: int = 10,
+                              *,
+                              region_label: str = ""
+                              ) -> List[Dict[str, Any]]:
+    """共用 alert 检测逻辑 (4 类规则). daily_summary + hourly_check 都调.
+
+    Phase 20.1.8.2: 加 replied_rate_low — sent 多但 reply rate < 阈值, 文案
+    /persona 信号失效预警.
+    Phase 20.1.9.2: region_label 非空时, 每条 alert 自动 tag region 字段;
+    cooldown / history 按 (type, region) 独立 state_key.
+
+    返 list of {type, severity, message, region?}. 无 alert 返空 list.
+    """
+    alerts: List[Dict[str, Any]] = []
+    if (funnel.get("planned", 0) >= 5
+            and funnel.get("send_rate", 0) < alert_send_threshold):
+        alerts.append({
+            "type": "send_rate_low",
+            "severity": "warning",
+            "message": (f"send_rate={funnel['send_rate']*100:.1f}% "
+                          f"< {alert_send_threshold*100:.0f}% "
+                          f"(planned={funnel['planned']})"),
+        })
+    if reject_total >= alert_reject_threshold:
+        alerts.append({
+            "type": "reject_rate_high",
+            "severity": "warning",
+            "message": (f"reject_history={reject_total} "
+                          f"(阈值={alert_reject_threshold})"),
+        })
+    if funnel.get("planned", 0) >= 5 and funnel.get("sent", 0) == 0:
+        alerts.append({
+            "type": "no_dispatched",
+            "severity": "critical",
+            "message": (f"planned={funnel['planned']} 但 sent=0, "
+                          "检查 send_referral_replies 任务/账号"),
+        })
+    # Phase 20.1.8.2: replied_rate_low — sent 够多但 reply 比率低
+    sent_n = int(funnel.get("sent", 0) or 0)
+    replied_n = int(funnel.get("replied", 0) or 0)
+    if sent_n >= alert_reply_min_sent:
+        reply_rate = replied_n / sent_n if sent_n else 0.0
+        if reply_rate < alert_reply_threshold:
+            alerts.append({
+                "type": "replied_rate_low",
+                "severity": "warning",
+                "message": (f"reply_rate={reply_rate*100:.1f}% "
+                              f"< {alert_reply_threshold*100:.0f}% "
+                              f"(sent={sent_n}, replied={replied_n}); "
+                              "文案/persona 可能失效"),
+            })
+    # Phase 20.2.x.2: stale_rate_high — sent 多但 stale 占比高 (受众失活)
+    stale_n = int(funnel.get("stale", 0) or 0)
+    if sent_n >= alert_stale_min_sent and stale_n > 0:
+        stale_rate = stale_n / sent_n
+        if stale_rate >= alert_stale_threshold:
+            alerts.append({
+                "type": "stale_rate_high",
+                "severity": "warning",
+                "message": (f"stale_rate={stale_rate*100:.1f}% "
+                              f">= {alert_stale_threshold*100:.0f}% "
+                              f"(sent={sent_n}, stale={stale_n}); "
+                              "受众/时段可能不匹配"),
+            })
+    # Phase 20.1.9.2: region_label 非空时给所有 alerts 打 region 标签
+    if region_label:
+        for a in alerts:
+            a["region"] = region_label
+            # message 加前缀方便人眼区分
+            a["message"] = f"[{region_label}] {a['message']}"
+    return alerts
+
+
+def _filter_alerts_by_cooldown(alerts: List[Dict[str, Any]],
+                                  state: Dict[str, str],
+                                  cooldown_hours: int = _ALERT_DEFAULT_COOLDOWN_HOURS,
+                                  severity_cooldowns: Optional[Dict[str, int]] = None
+                                  ) -> List[Dict[str, Any]]:
+    """Phase 19.x.1 / 19.x.3.1: 根据 alert_state + severity 抑制重复.
+
+    Phase 19.x.3.1: cooldown 按 severity 分级 (critical 4h / warning 24h /
+    info 48h). 没指定 severity 退化用 cooldown_hours 兜底.
+
+    severity_cooldowns 可被 caller 完全覆盖默认 dict.
+
+    只返 "应该真发 webhook" 的 alerts. cooldown 内同 type 跳过.
+    """
+    import datetime as _dt
+    now = _dt.datetime.utcnow()
+    sev_map = (severity_cooldowns
+                if severity_cooldowns is not None
+                else _ALERT_DEFAULT_SEVERITY_COOLDOWNS)
+    out: List[Dict[str, Any]] = []
+    for a in alerts:
+        # Phase 20.1.9.2: state_key = type + (:region if any) 区分 per-region
+        last_iso = state.get(_alert_state_key(a), "")
+        # 选 cooldown: severity 优先, 没匹配用全局 cooldown_hours
+        sev = (a.get("severity") or "").lower()
+        eff_cd = sev_map.get(sev, cooldown_hours)
+        if last_iso:
+            try:
+                last_dt = _dt.datetime.strptime(last_iso, "%Y-%m-%dT%H:%M:%SZ")
+                if (now - last_dt).total_seconds() < eff_cd * 3600:
+                    continue
+            except Exception:
+                pass
+        out.append(a)
+    return out
+
+
+def _record_alerts_fired(alerts: List[Dict[str, Any]],
+                            state: Dict[str, str],
+                            *,
+                            history_context: Optional[Dict[str, Any]] = None
+                            ) -> Dict[str, str]:
+    """更新 alert_state.json + 写 fb_alert_history (Phase 20.1.9.1).
+
+    state file 用于 cooldown 抑制 (in-memory + 单文件); history 表用于跨进程
+    历史回顾 / 趋势分析. 两路并存, 失败互不影响.
+
+    history_context 是触发时 funnel 等上下文 dict, 写入 fb_alert_history.context_json.
+    """
+    import datetime as _dt
+    now_iso = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_state = dict(state)
+    for a in alerts:
+        # Phase 20.1.9.2: state_key 含 region 后缀
+        new_state[_alert_state_key(a)] = now_iso
+        # Phase 20.1.9.1: 同步写 history (失败 silent)
+        try:
+            from src.host.fb_store import record_alert_fired
+            record_alert_fired(a, region=str(a.get("region") or ""),
+                                 context=history_context)
+        except Exception as e:
+            logger.debug("[alert_history] hook 失败: %s", e)
+    return new_state
+
+
+def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
+    """Phase 19.x.1: 每小时 lightweight alert 检测.
+
+    比 daily summary 轻 — 只跑 funnel + reject_history, 不写 daily_summary 文件.
+    检测出 alerts 后用 alert_state.json 抑制 24h 内重复, 仅新触发才 webhook.
+
+    Params:
+      hours_window: int = 24
+      cooldown_hours: int = 24 (重复抑制)
+      alert_send_rate_threshold: float = 0.3
+      alert_reject_threshold: int = 10
+    """
+    hours_window = int(params.get("hours_window", 24) or 24)
+    cooldown = int(params.get("cooldown_hours", 24) or 24)
+    send_thr = float(params.get("alert_send_rate_threshold", 0.3) or 0.3)
+    reject_thr = int(params.get("alert_reject_threshold", 10) or 10)
+    # Phase 20.1.8.2: replied_rate alert
+    reply_thr = float(params.get("alert_reply_threshold", 0.2) or 0.2)
+    reply_min_sent = int(params.get("alert_reply_min_sent", 10) or 10)
+    # Phase 20.2.x.2: stale_rate alert
+    stale_thr = float(params.get("alert_stale_threshold", 0.5) or 0.5)
+    stale_min_sent = int(params.get("alert_stale_min_sent", 10) or 10)
+    severity_cd = params.get("severity_cooldowns")  # 可选 dict 覆盖默认
+
+    from src.host.line_pool import referral_funnel
+    from src.host.fb_store import get_peer_name_reject_history
+
+    funnel = referral_funnel(hours_window=hours_window)
+    rej_hist = get_peer_name_reject_history(hours_window=hours_window)
+    rej_total = rej_hist.get("total", 0)
+
+    all_alerts = _detect_referral_alerts(
+        funnel, rej_total, send_thr, reject_thr,
+        alert_reply_threshold=reply_thr,
+        alert_reply_min_sent=reply_min_sent,
+        alert_stale_threshold=stale_thr,
+        alert_stale_min_sent=stale_min_sent)
+
+    state = _load_alert_state()
+    fire_now = _filter_alerts_by_cooldown(
+        all_alerts, state, cooldown_hours=cooldown,
+        severity_cooldowns=severity_cd if isinstance(severity_cd, dict) else None)
+
+    webhook_sent = False
+    if fire_now:
+        # 发 webhook
+        import os as _os
+        webhook_url = _os.environ.get("OPENCLAW_SLACK_WEBHOOK_URL", "")
+        if webhook_url:
+            try:
+                import urllib.request
+                import json as _json
+                lines = [
+                    "🚨 *Referral Alert (hourly)*",
+                    f"hours_window: {hours_window}h",
+                    f"funnel: planned={funnel['planned']} sent={funnel['sent']} replied={funnel['replied']}",
+                ]
+                for a in fire_now:
+                    lines.append(f"  - [{a['severity']}] {a['type']}: {a['message']}")
+                req = urllib.request.Request(
+                    webhook_url,
+                    data=_json.dumps({"text": "\n".join(lines)}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                urllib.request.urlopen(req, timeout=10)
+                webhook_sent = True
+            except Exception as e:
+                logger.warning("[hourly_alert] webhook 失败: %s", e)
+        # 状态写文件 + 历史 DB (即使 webhook 失败也写, 避免反复尝试)
+        hist_ctx = {
+            "hours_window": hours_window,
+            "funnel": {"planned": funnel.get("planned", 0),
+                          "sent": funnel.get("sent", 0),
+                          "replied": funnel.get("replied", 0),
+                          "send_rate": funnel.get("send_rate", 0)},
+            "reject_total": rej_total,
+            "source": "hourly_check",
+        }
+        new_state = _record_alerts_fired(fire_now, state,
+                                            history_context=hist_ctx)
+        _save_alert_state(new_state)
+
+    return True, "", {
+        "all_alerts": all_alerts,
+        "fired_now": fire_now,
+        "suppressed": len(all_alerts) - len(fire_now),
+        "webhook_sent": webhook_sent,
+        "funnel_summary": {
+            "planned": funnel.get("planned", 0),
+            "sent": funnel.get("sent", 0),
+            "replied": funnel.get("replied", 0),
+        },
+    }
+
+
+def _compute_reply_latency_stats(hours_window: int = 24) -> Dict[str, Any]:
+    """Phase 20.1.7.2 (2026-04-25): 从 wa_referral_replied 事件 meta 算 latency 统计.
+
+    返:
+      {
+        samples: int,                 # 有 latency_seconds 的样本数
+        avg_min: float | None,
+        median_min: float | None,
+        p95_min: float | None,
+        max_min: float | None,
+      }
+    全 None 表示窗口内没数据.
+    """
+    out: Dict[str, Any] = {
+        "samples": 0, "avg_min": None, "median_min": None,
+        "p95_min": None, "max_min": None,
+    }
+    try:
+        from src.host.fb_store import (list_recent_contact_events_by_types,
+                                          CONTACT_EVT_WA_REFERRAL_REPLIED)
+        import json as _j
+        rows = list_recent_contact_events_by_types(
+            [CONTACT_EVT_WA_REFERRAL_REPLIED],
+            hours=hours_window, limit=2000)
+        latencies_min: List[float] = []
+        for r in rows:
+            try:
+                m = _j.loads(r.get("meta_json") or "{}")
+            except Exception:
+                continue
+            lm = m.get("latency_min")
+            if isinstance(lm, (int, float)) and lm >= 0:
+                latencies_min.append(float(lm))
+        if not latencies_min:
+            return out
+        latencies_min.sort()
+        n = len(latencies_min)
+        # p95: 最少 20 样本才有意义, 否则用 max
+        if n >= 20:
+            p95_idx = max(0, min(n - 1, int(round(0.95 * (n - 1)))))
+            p95 = latencies_min[p95_idx]
+        else:
+            p95 = latencies_min[-1]
+        median_idx = n // 2
+        median = (latencies_min[median_idx]
+                   if n % 2 == 1
+                   else (latencies_min[median_idx - 1]
+                          + latencies_min[median_idx]) / 2.0)
+        out.update({
+            "samples": n,
+            "avg_min": round(sum(latencies_min) / n, 2),
+            "median_min": round(median, 2),
+            "p95_min": round(p95, 2),
+            "max_min": round(latencies_min[-1], 2),
+        })
+    except Exception as e:
+        logger.debug("[reply_latency] 计算失败: %s", e)
+    return out
+
+
+def _compute_latency_anomaly(today_latency: Dict[str, Any],
+                                lookback_days: int = 7,
+                                min_baseline_samples: int = 3,
+                                z_threshold: float = 2.0
+                                ) -> Optional[Dict[str, Any]]:
+    """Phase 20.1.9.3 (2026-04-25): 7d daily_summary 历史 vs 今天 latency.
+
+    读 logs/daily_summary_YYYYMMDD.json 历史 (排除今天), 拿
+    summary.reply_latency.avg_min 序列, 算 stdev + z-score.
+
+    返:
+      {avg_baseline, stdev, samples, z, anomaly}  -- 有数据时
+      None -- 历史样本数 < min_baseline_samples 或 today 没数据
+    """
+    try:
+        today_avg = today_latency.get("avg_min") if today_latency else None
+        if today_avg is None:
+            return None
+        import datetime as _dt
+        import json as _j
+        from pathlib import Path as _Path
+        import statistics as _stats
+        baseline: List[float] = []
+        for i in range(1, lookback_days + 1):
+            d = (_dt.datetime.utcnow() - _dt.timedelta(days=i)).strftime("%Y%m%d")
+            p = _Path("logs") / f"daily_summary_{d}.json"
+            if not p.exists():
+                continue
+            try:
+                with p.open(encoding="utf-8") as f:
+                    data = _j.load(f) or {}
+                avg = data.get("reply_latency", {}).get("avg_min")
+                if isinstance(avg, (int, float)) and avg >= 0:
+                    baseline.append(float(avg))
+            except Exception:
+                continue
+        if len(baseline) < min_baseline_samples:
+            return None
+        avg_b = sum(baseline) / len(baseline)
+        std = _stats.pstdev(baseline) if len(baseline) >= 2 else 0.0
+        z: Optional[float] = None
+        anomaly = False
+        if std > 0:
+            z = (today_avg - avg_b) / std
+            anomaly = abs(z) > z_threshold
+        return {
+            "samples": len(baseline),
+            "avg_baseline": round(avg_b, 2),
+            "stdev": round(std, 3),
+            "z": round(z, 3) if z is not None else None,
+            "anomaly": anomaly,
+            "today_avg": today_avg,
+        }
+    except Exception as e:
+        logger.debug("[latency_anomaly] 失败: %s", e)
+        return None
+
+
+def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
+    """Phase 18 / 19 (2026-04-25): 每日 referral 闭环健康摘要 + 趋势 + 告警.
+
+    Phase 19 新增:
+      - trend: vs 昨天 daily_summary_*.json diff (planned/sent/replied 增减)
+      - alerts: send_rate < 30% (planned >= 5) / reject_rate > 20% (rejects >= 10)
+      - by_region: jp / it 分别跑一次 funnel 拿 per-region 数字
+
+    Params:
+      hours_window: int = 24
+      write_file: bool = True
+      send_webhook: bool = True
+      regions: list[str] = ["jp", "it"]   # Phase 19.3: per-region funnel
+      alert_send_rate_threshold: float = 0.3
+      alert_reject_threshold: int = 10
+    """
+    import datetime as _dt
+    import json as _json
+    from pathlib import Path as _Path
+
+    hours_window = int(params.get("hours_window", 24) or 24)
+    write_file = bool(params.get("write_file", True))
+    send_webhook = bool(params.get("send_webhook", True))
+    regions = params.get("regions", ["jp", "it"])
+    if not isinstance(regions, list):
+        regions = ["jp", "it"]
+    alert_send_threshold = float(
+        params.get("alert_send_rate_threshold", 0.3) or 0.3)
+    alert_reject_threshold = int(
+        params.get("alert_reject_threshold", 10) or 10)
+    # Phase 20.1.8.2: replied_rate alert
+    alert_reply_threshold = float(
+        params.get("alert_reply_threshold", 0.2) or 0.2)
+    alert_reply_min_sent = int(
+        params.get("alert_reply_min_sent", 10) or 10)
+    # Phase 20.2.x.2: stale_rate alert
+    alert_stale_threshold = float(
+        params.get("alert_stale_threshold", 0.5) or 0.5)
+    alert_stale_min_sent = int(
+        params.get("alert_stale_min_sent", 10) or 10)
+
+    from src.host.line_pool import (referral_funnel, account_ranking,
+                                      recent_dispatch_log)
+    from src.host.fb_store import (get_peer_name_reject_history,
+                                     get_peer_name_reject_metrics)
+
+    funnel = referral_funnel(hours_window=hours_window)
+    ranking = account_ranking(hours_window=hours_window, limit=5)
+    rej_history = get_peer_name_reject_history(
+        hours_window=hours_window, limit=20, by_day=True)
+    rej_live = get_peer_name_reject_metrics()
+    log_recent = recent_dispatch_log(limit=200)
+    log_status_count: Dict[str, int] = {}
+    for r in log_recent:
+        st = r.get("status") or "?"
+        log_status_count[st] = log_status_count.get(st, 0) + 1
+
+    # Phase 19.3: per-region funnel
+    by_region: Dict[str, Dict[str, Any]] = {}
+    for rg in regions:
+        try:
+            by_region[rg] = referral_funnel(
+                hours_window=hours_window, region=rg)
+        except Exception as e:
+            logger.debug("[daily_summary] per-region %s 失败: %s", rg, e)
+            by_region[rg] = {}
+
+    # Phase 19.2 / 19.x.1 / 20.1.8.2: 共用 alert detection helper
+    rej_history_total = rej_history.get("total", 0)
+    alerts = _detect_referral_alerts(
+        funnel, rej_history_total,
+        alert_send_threshold, alert_reject_threshold,
+        alert_reply_threshold=alert_reply_threshold,
+        alert_reply_min_sent=alert_reply_min_sent,
+        alert_stale_threshold=alert_stale_threshold,
+        alert_stale_min_sent=alert_stale_min_sent)
+
+    # Phase 20.1.9.2: per-region alert 检测 (jp/it 各自跑 detection)
+    # reject 是全 region 共用的, 只查 overall, region 维度不重复算
+    for rg, rg_funnel in by_region.items():
+        if not rg_funnel:
+            continue
+        try:
+            rg_alerts = _detect_referral_alerts(
+                rg_funnel, 0,  # reject 不重复
+                alert_send_threshold, alert_reject_threshold,
+                alert_reply_threshold=alert_reply_threshold,
+                alert_reply_min_sent=alert_reply_min_sent,
+                alert_stale_threshold=alert_stale_threshold,
+                alert_stale_min_sent=alert_stale_min_sent,
+                region_label=rg)
+            # 滤掉 reject_rate_high (全局 alert 已含, region 层不重复)
+            rg_alerts = [a for a in rg_alerts
+                          if a.get("type") != "reject_rate_high"]
+            alerts.extend(rg_alerts)
+        except Exception as e:
+            logger.debug("[daily_summary] region %s alert 失败: %s", rg, e)
+
+    # Phase 20.1.7.2: reply latency 统计 (从 wa_referral_replied.meta.latency_seconds)
+    latency_stats = _compute_reply_latency_stats(hours_window=hours_window)
+
+    # Phase 20.1.9.3: latency anomaly z-score (read 7d daily_summary history)
+    latency_anomaly = _compute_latency_anomaly(latency_stats)
+    if latency_anomaly and latency_anomaly.get("anomaly"):
+        alerts.append({
+            "type": "latency_anomaly",
+            "severity": "warning",
+            "message": (
+                f"reply latency avg={latency_stats.get('avg_min')}min, "
+                f"|z|={abs(latency_anomaly['z']):.2f} > 2 vs 7d avg "
+                f"{latency_anomaly['avg_baseline']:.1f}min "
+                f"(stdev={latency_anomaly['stdev']:.1f})"),
+        })
+
+    # Phase 20.1.9.1: 把 daily summary 检出的 alerts 也写到 fb_alert_history,
+    # 不参与 cooldown (daily 一天就触发一次, 没必要抑制), 只持久化便于回溯.
+    if alerts:
+        try:
+            from src.host.fb_store import record_alert_fired as _rec_alert
+            ds_ctx = {
+                "hours_window": hours_window,
+                "funnel": funnel,
+                "reject_total": rej_history_total,
+                "source": "daily_summary",
+            }
+            for a in alerts:
+                _rec_alert(a, region=str(a.get("region") or ""),
+                            context=ds_ctx)
+        except Exception as e:
+            logger.debug("[alert_history] daily_summary 写入失败: %s", e)
+
+    summary: Dict[str, Any] = {
+        "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hours_window": hours_window,
+        "funnel": funnel,
+        "by_region": by_region,
+        "top_5_accounts": ranking,
+        "reply_latency": latency_stats,
+        "latency_anomaly": latency_anomaly,
+        "peer_name_rejects": {
+            "live_total": rej_live.get("total", 0),
+            "live_by_event_type": rej_live.get("by_event_type", {}),
+            "history_total": rej_history_total,
+            "history_by_day": rej_history.get("by_day", {}),
+            "history_by_event": rej_history.get("by_event_type", {}),
+        },
+        "dispatch_log_status": log_status_count,
+        "dispatch_log_total_24h": len(log_recent),
+        "alerts": alerts,
+    }
+
+    # Phase 19.1: trend vs 昨天
+    trend: Optional[Dict[str, Any]] = None
+    try:
+        yest_str = (_dt.datetime.utcnow() - _dt.timedelta(days=1)).strftime("%Y%m%d")
+        yest_path = _Path("logs") / f"daily_summary_{yest_str}.json"
+        if yest_path.exists():
+            with yest_path.open(encoding="utf-8") as f:
+                yest_data = _json.load(f)
+            yest_funnel = yest_data.get("funnel", {})
+            trend = {
+                "yesterday_date": yest_str,
+                "planned_delta": funnel.get("planned", 0) - yest_funnel.get("planned", 0),
+                "sent_delta": funnel.get("sent", 0) - yest_funnel.get("sent", 0),
+                "replied_delta": funnel.get("replied", 0) - yest_funnel.get("replied", 0),
+                "send_rate_delta": round(
+                    funnel.get("send_rate", 0) - yest_funnel.get("send_rate", 0), 4),
+                "yesterday_planned": yest_funnel.get("planned", 0),
+                "yesterday_sent": yest_funnel.get("sent", 0),
+                "yesterday_replied": yest_funnel.get("replied", 0),
+            }
+    except Exception as e:
+        logger.debug("[daily_summary] trend 计算失败: %s", e)
+    summary["trend"] = trend
+
+    # Phase 19.x.2: trend_7d (7 天滚动平均)
+    trend_7d: Optional[Dict[str, Any]] = None
+    try:
+        days_data = []
+        for i in range(1, 8):
+            d_str = (_dt.datetime.utcnow() - _dt.timedelta(days=i)).strftime("%Y%m%d")
+            d_path = _Path("logs") / f"daily_summary_{d_str}.json"
+            if d_path.exists():
+                try:
+                    with d_path.open(encoding="utf-8") as f:
+                        days_data.append(_json.load(f).get("funnel", {}))
+                except Exception:
+                    pass
+        if len(days_data) >= 3:
+            import statistics as _stats
+            n = len(days_data)
+            planned_vals = [d.get("planned", 0) for d in days_data]
+            sent_vals = [d.get("sent", 0) for d in days_data]
+            replied_vals = [d.get("replied", 0) for d in days_data]
+            avg_planned = sum(planned_vals) / n
+            avg_sent = sum(sent_vals) / n
+            avg_replied = sum(replied_vals) / n
+            avg_send_rate = sum(d.get("send_rate", 0) or 0 for d in days_data) / n
+            today_planned = funnel.get("planned", 0)
+            today_sent = funnel.get("sent", 0)
+            today_replied = funnel.get("replied", 0)
+
+            # Phase 19.x.3.2: stdev + z-score (population stdev; n=1 时 0)
+            def _safe_stdev(vals):
+                try:
+                    return _stats.pstdev(vals) if len(vals) >= 2 else 0.0
+                except Exception:
+                    return 0.0
+
+            std_p = _safe_stdev(planned_vals)
+            std_s = _safe_stdev(sent_vals)
+            std_r = _safe_stdev(replied_vals)
+
+            def _z(today, avg, std):
+                if std and std > 0:
+                    return round((today - avg) / std, 3)
+                return None
+
+            z_p = _z(today_planned, avg_planned, std_p)
+            z_s = _z(today_sent, avg_sent, std_s)
+            z_r = _z(today_replied, avg_replied, std_r)
+            # 异常: 任一 |z| > 2 (≈ 95% 置信区间外)
+            anomaly = any(z is not None and abs(z) > 2
+                           for z in (z_p, z_s, z_r))
+
+            trend_7d = {
+                "samples": len(days_data),
+                "avg_planned": round(avg_planned, 2),
+                "avg_sent": round(avg_sent, 2),
+                "avg_replied": round(avg_replied, 2),
+                "avg_send_rate": round(avg_send_rate, 4),
+                "stdev_planned": round(std_p, 3),
+                "stdev_sent": round(std_s, 3),
+                "stdev_replied": round(std_r, 3),
+                "z_planned": z_p,
+                "z_sent": z_s,
+                "z_replied": z_r,
+                "anomaly": anomaly,
+                "ratio_planned": (round(today_planned / avg_planned, 3)
+                                    if avg_planned else None),
+                "ratio_sent": (round(today_sent / avg_sent, 3)
+                                 if avg_sent else None),
+                "ratio_replied": (round(today_replied / avg_replied, 3)
+                                    if avg_replied else None),
+            }
+    except Exception as e:
+        logger.debug("[daily_summary] trend_7d 计算失败: %s", e)
+    summary["trend_7d"] = trend_7d
+
+    written_to = ""
+    if write_file:
+        try:
+            today = _dt.datetime.utcnow().strftime("%Y%m%d")
+            logs_dir = _Path("logs")
+            logs_dir.mkdir(exist_ok=True)
+            fpath = logs_dir / f"daily_summary_{today}.json"
+            with fpath.open("w", encoding="utf-8") as f:
+                _json.dump(summary, f, ensure_ascii=False, indent=2)
+            written_to = str(fpath)
+            logger.info("[daily_summary] 写文件: %s", fpath)
+        except Exception as e:
+            logger.warning("[daily_summary] 写文件失败: %s", e)
+
+    webhook_sent = False
+    if send_webhook:
+        import os as _os
+        webhook_url = _os.environ.get("OPENCLAW_SLACK_WEBHOOK_URL", "")
+        if webhook_url:
+            try:
+                import urllib.request
+                # 标题: 有 alerts 加 🚨
+                title_prefix = "🚨 " if alerts else ""
+                # Phase 20.2: 加 stale 一行 (有 stale 才展示)
+                stale_n = funnel.get("stale", 0)
+                stale_line = ""
+                if stale_n > 0:
+                    stale_line = (f"stale_24h: {stale_n} "
+                                    f"({funnel.get('stale_rate', 0)*100:.1f}% of sent)")
+                lines = [
+                    f"{title_prefix}*Referral 闭环 24h 摘要* ({summary['generated_at']})",
+                    f"funnel: planned={funnel['planned']} sent={funnel['sent']} replied={funnel['replied']}",
+                    f"send_rate={funnel['send_rate']*100:.1f}% conv_rate={funnel['conversion_rate']*100:.1f}%",
+                ]
+                if stale_line:
+                    lines.append(stale_line)
+                # Phase 19.1: trend
+                if trend:
+                    arrow = lambda v: ("+" if v > 0 else "") + str(v)
+                    lines.append(
+                        f"vs 昨天 ({trend['yesterday_date']}): "
+                        f"planned {arrow(trend['planned_delta'])}, "
+                        f"sent {arrow(trend['sent_delta'])}, "
+                        f"replied {arrow(trend['replied_delta'])}")
+                # Phase 19.x.2 / 19.x.3.2: trend_7d + anomaly z-score
+                if trend_7d:
+                    rs = trend_7d.get("ratio_sent")
+                    rp = trend_7d.get("ratio_planned")
+                    anomaly_mark = "⚠ " if trend_7d.get("anomaly") else ""
+                    lines.append(
+                        f"{anomaly_mark}vs 7d avg ({trend_7d['samples']} samples): "
+                        f"planned ratio={rp if rp is not None else 'n/a'}, "
+                        f"sent ratio={rs if rs is not None else 'n/a'} "
+                        f"(avg={trend_7d['avg_planned']:.1f}/{trend_7d['avg_sent']:.1f})")
+                    if trend_7d.get("anomaly"):
+                        z_p = trend_7d.get("z_planned")
+                        z_s = trend_7d.get("z_sent")
+                        lines.append(
+                            f"  └ anomaly detected: z_planned={z_p}, z_sent={z_s} "
+                            f"(|z| > 2 = 95% 置信区间外)")
+                # Phase 19.3: per-region
+                if by_region:
+                    rg_parts = []
+                    for rg, rf in by_region.items():
+                        if rf:
+                            rg_parts.append(
+                                f"{rg}={rf.get('planned',0)}/{rf.get('sent',0)}")
+                    if rg_parts:
+                        lines.append("by_region (planned/sent): " + ", ".join(rg_parts))
+                # Phase 20.1.7.2: reply latency
+                if latency_stats and latency_stats.get("samples", 0) > 0:
+                    lines.append(
+                        f"reply_latency: n={latency_stats['samples']} "
+                        f"avg={latency_stats['avg_min']:.1f}min "
+                        f"median={latency_stats['median_min']:.1f}min "
+                        f"p95={latency_stats['p95_min']:.1f}min")
+                lines.append(
+                    f"reject_24h: history={rej_history_total} (live={rej_live.get('total', 0)})")
+                lines.append(
+                    "top accounts: " + ", ".join(
+                        f"{a['line_id']}={a['success_rate']*100:.0f}%"
+                        for a in ranking[:3]))
+                lines.append(f"dispatch_log_status: {log_status_count}")
+                # Phase 19.2: alerts
+                if alerts:
+                    lines.append("")
+                    lines.append("⚠ *ALERTS:*")
+                    for a in alerts:
+                        lines.append(f"  - [{a['severity']}] {a['type']}: {a['message']}")
+
+                # Phase 19.x.3.3: dashboard URL link (env 没设就跳过)
+                dash_base = _os.environ.get("OPENCLAW_DASHBOARD_BASE_URL", "").rstrip("/")
+                if dash_base:
+                    today_str = _dt.datetime.utcnow().strftime("%Y%m%d")
+                    lines.append("")
+                    lines.append(
+                        f"📊 详情: {dash_base}/line-pool/stats/daily-summary?date={today_str}")
+
+                req = urllib.request.Request(
+                    webhook_url,
+                    data=_json.dumps({"text": "\n".join(lines)}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                urllib.request.urlopen(req, timeout=10)
+                webhook_sent = True
+                logger.info("[daily_summary] webhook 发送成功 (alerts=%d)",
+                              len(alerts))
+            except Exception as e:
+                logger.warning("[daily_summary] webhook 发送失败: %s", e)
+
+    return True, "", {
+        "summary": summary,
+        "written_to": written_to,
+        "webhook_sent": webhook_sent,
+    }
+
+
+def _line_pool_recycle_dead_peers(params: Dict[str, Any]) -> tuple:
+    """Phase 12.3 (2026-04-25): 把"死太久"的 referral_dead peer 自动复活.
+
+    扫所有带 referral_dead tag 的 canonical, metadata.referral_dead_at 早于
+    ``now - days`` 的 → revive_referral (去 tag + 清 counter). 给 peer
+    第二次机会 (FB 可能已经解开对该 peer 的发消息限制).
+
+    Params:
+      days: int = 7           # 多少天前标 dead 的才 recycle
+      dry_run: bool = False   # 只列, 不真做
+      limit: int = 500        # 每轮最多处理多少条 (防 DB 爆)
+    """
+    days = max(1, int(params.get("days", 7) or 7))
+    dry_run = bool(params.get("dry_run", False))
+    limit = max(1, min(int(params.get("limit", 500) or 500), 5000))
+
+    from src.host.lead_mesh import (list_l2_verified_leads,
+                                     revive_referral)
+    import datetime as _dt
+
+    # list_l2_verified_leads 只返 l2_verified 的; dead peers 大部分也是 L2 verified
+    # (因为只有 L2 过的才会被 dispatcher plan + 之后被标 dead). 这里
+    # include_tags=['referral_dead'] 精准定位, limit 放大一点.
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=days)
+
+    rows = list_l2_verified_leads(
+        include_tags=["referral_dead"], limit=limit,
+    )
+
+    revived_ids: List[str] = []
+    skipped_young: int = 0
+    for r in rows:
+        dead_at_iso = r.get("metadata", {}).get("referral_dead_at") or ""
+        if dead_at_iso:
+            try:
+                dead_dt = _dt.datetime.strptime(
+                    dead_at_iso, "%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                dead_dt = None
+            if dead_dt and dead_dt > cutoff:
+                # 还没到 days 天, skip
+                skipped_young += 1
+                continue
+        # 没 dead_at_iso (老数据) 或已够久 → revive
+        if dry_run:
+            revived_ids.append(r["canonical_id"])
+            continue
+        try:
+            if revive_referral(r["canonical_id"],
+                                actor="scheduled_7d_auto"):
+                revived_ids.append(r["canonical_id"])
+        except Exception as e:
+            logger.debug("[recycle] revive %s 失败: %s",
+                          r["canonical_id"][:12], e)
+
+    return True, "", {
+        "scanned": len(rows), "revived": len(revived_ids),
+        "skipped_young": skipped_young,
+        "revived_canonical_ids": revived_ids[:50],  # cap response size
+        "days_threshold": days, "dry_run": dry_run,
+    }
+
+
+def _fb_line_dispatch_from_reply(resolved: str,
+                                  params: Dict[str, Any]
+                                  ) -> tuple:
+    """Phase 11 (2026-04-25) dispatcher.
+
+    Flow:
+      1. 扫 hours_window 内 greeting_replied + message_received events
+      2. 去重: 每个 canonical_id 在 dedupe_hours 内最多派发一次
+      3. 按 persona / l2_verified / is_japanese / min_score 过滤
+      4. line_pool.allocate(region, persona_key, canonical_id, peer_name, ...)
+      5. 组装 referral 话术 (chat_messages.yaml referral_line[] 模板 + {line_id})
+      6. 写 line_dispatch_log (planned) + 可选 contact_event (line_dispatch_planned
+         / wa_referral_sent, 可配)
+      7. 返 stats {scanned, filtered_out, dispatched, no_account, dispatches}
+
+    Params:
+      hours_window: int = 6           # 扫近几小时事件
+      dedupe_hours: int = 24          # 同一 canonical 去重窗口
+      require_l2_verified: bool = True
+      persona_key: str = ""           # 只对匹配 persona 的 lead 分配
+      region: str = ""                # 按区域过滤 line pool
+      min_score: float = 0
+      limit: int = 20                 # 单次最多派发几条
+      dispatch_mode: str = "messenger_text"  # messenger_text | line_direct_send
+      write_contact_event: bool = False  # True 写 event 供 B 消费
+      event_type: str = "line_dispatch_planned"  # 或 "wa_referral_sent" 保兼容
+    """
+    hours_window = int(params.get("hours_window", 6) or 6)
+    dedupe_hours = int(params.get("dedupe_hours", 24) or 24)
+    require_l2 = bool(params.get("require_l2_verified", True))
+    persona_key = (params.get("persona_key") or "").strip()
+    region = (params.get("region") or "").strip()
+    min_score = float(params.get("min_score", 0) or 0)
+    limit = max(1, min(int(params.get("limit", 20) or 20), 200))
+    write_ce = bool(params.get("write_contact_event", False))
+    dispatch_mode = (params.get("dispatch_mode") or "messenger_text").strip()
+    if dispatch_mode not in {"messenger_text", "line_direct_send"}:
+        dispatch_mode = "messenger_text"
+    event_type = (params.get("event_type")
+                   or "line_dispatch_planned").strip()
+    # Phase 12.3: 通用 tags 过滤 (AND 包含 / NOT 排除)
+    include_tags = {t.strip() for t in (params.get("include_tags") or [])
+                     if isinstance(t, str) and t.strip()}
+    exclude_tags = {t.strip() for t in (params.get("exclude_tags") or [])
+                     if isinstance(t, str) and t.strip()}
+    # Phase 12.3: dry_run — 不 allocate 不写 log 不写 event, 只列候选
+    dry_run = bool(params.get("dry_run", False))
+    # Phase 13: verbose_dry_run — 逐 event 诊断, stats.per_event_decisions
+    # 列每条 event 为何 dispatched / skipped
+    verbose_dry_run = bool(params.get("verbose_dry_run", False))
+    per_event_decisions: List[Dict[str, Any]] = []
+
+    def _rec_decision(ev_, reason_, extra_=None):
+        """Phase 13: 只在 verbose_dry_run=True 时追加决策记录."""
+        if not verbose_dry_run:
+            return
+        d = {
+            "event_id": ev_.get("id"),
+            "peer_name": ev_.get("peer_name"),
+            "event_type": ev_.get("event_type"),
+            "decision": reason_,
+        }
+        if extra_:
+            d.update(extra_)
+        per_event_decisions.append(d)
+
+    from src.host.fb_store import (list_recent_contact_events_by_types,
+                                    CONTACT_EVT_GREETING_REPLIED,
+                                    CONTACT_EVT_MESSAGE_RECEIVED)
+    from src.host import line_pool as _lp
+    try:
+        from src.host.fb_store import record_contact_event
+    except Exception:
+        record_contact_event = None  # type: ignore
+    try:
+        from src.app_automation.fb_content_assets import get_referral_snippet
+    except Exception:
+        get_referral_snippet = None  # type: ignore
+
+    events = list_recent_contact_events_by_types(
+        [CONTACT_EVT_GREETING_REPLIED, CONTACT_EVT_MESSAGE_RECEIVED],
+        hours=hours_window, limit=limit * 5,
+    )
+
+    dispatches: List[Dict[str, Any]] = []
+    seen_canonical: set = set()
+    filtered_out = 0
+    no_account = 0
+
+    from src.host.lead_mesh import resolve_identity
+    from src.host.lead_mesh.canonical import _connect as _lm_connect
+    import json as _json
+
+    # line_dispatch_log.created_at 用 datetime('now') 空格分隔格式, 用 SQL 原生
+    # datetime('now', '-N hours') 做 cutoff 避免字符串格式不一致.
+    dedupe_sql_offset = f"-{int(dedupe_hours)} hours"
+
+    for ev in events:
+        if len(dispatches) >= limit:
+            break
+        peer_name = ev.get("peer_name") or ""
+        device_id = ev.get("device_id") or ""
+        event_id = str(ev.get("id") or "")
+        if not peer_name:
+            filtered_out += 1
+            _rec_decision(ev, "skipped_no_peer_name")
+            continue
+
+        try:
+            cid = resolve_identity(
+                platform="facebook",
+                account_id=f"fb:{peer_name}",
+                display_name=peer_name)
+        except Exception:
+            filtered_out += 1
+            _rec_decision(ev, "skipped_resolve_identity_fail")
+            continue
+
+        if cid in seen_canonical:
+            filtered_out += 1
+            _rec_decision(ev, "skipped_seen_canonical_in_batch",
+                           {"canonical_id": cid})
+            continue
+
+        # 去重: dedupe_hours 内已有 line_dispatch_log 就跳
+        try:
+            with _lm_connect() as conn:
+                prev = conn.execute(
+                    "SELECT 1 FROM line_dispatch_log WHERE canonical_id=?"
+                    " AND status != 'skipped'"
+                    " AND created_at >= datetime('now', ?) LIMIT 1",
+                    (cid, dedupe_sql_offset),
+                ).fetchone()
+            if prev:
+                seen_canonical.add(cid)
+                filtered_out += 1
+                _rec_decision(ev, "skipped_dedupe_24h",
+                               {"canonical_id": cid})
+                continue
+        except Exception:
+            pass
+
+        # 读 canonical metadata 决定是否值得引流
+        meta: Dict[str, Any] = {}
+        try:
+            with _lm_connect() as conn:
+                row = conn.execute(
+                    "SELECT metadata_json, tags FROM leads_canonical"
+                    " WHERE canonical_id=?", (cid,),
+                ).fetchone()
+                if row:
+                    try:
+                        meta = _json.loads(row["metadata_json"] or "{}")
+                    except Exception:
+                        meta = {}
+                    tags_set = {t.strip() for t in
+                                 (row["tags"] or "").split(",") if t.strip()}
+                else:
+                    tags_set = set()
+        except Exception:
+            tags_set = set()
+
+        if require_l2 and "l2_verified" not in tags_set:
+            filtered_out += 1
+            _rec_decision(ev, "skipped_not_l2_verified",
+                           {"canonical_id": cid, "tags": sorted(tags_set)})
+            continue
+        # Phase 12.2: peer 被标 referral_dead 跳过 (永久 fail 过, 再试浪费)
+        if "referral_dead" in tags_set:
+            filtered_out += 1
+            _rec_decision(ev, "skipped_referral_dead",
+                           {"canonical_id": cid,
+                            "dead_reason": meta.get("referral_dead_reason")})
+            continue
+        # Phase 12.3: 通用 include/exclude_tags 过滤
+        if include_tags and not include_tags.issubset(tags_set):
+            filtered_out += 1
+            _rec_decision(ev, "skipped_include_tags_miss",
+                           {"required": sorted(include_tags),
+                            "actual": sorted(tags_set)})
+            continue
+        if exclude_tags and (exclude_tags & tags_set):
+            filtered_out += 1
+            _rec_decision(ev, "skipped_exclude_tags_hit",
+                           {"excluded_hit": sorted(exclude_tags & tags_set)})
+            continue
+        try:
+            if float(meta.get("l2_score", 0) or 0) < min_score:
+                filtered_out += 1
+                _rec_decision(ev, "skipped_l2_score_below_min",
+                               {"score": meta.get("l2_score"),
+                                "min_score": min_score})
+                continue
+        except (TypeError, ValueError):
+            pass
+        if persona_key and meta.get("l2_persona_key") != persona_key:
+            filtered_out += 1
+            _rec_decision(ev, "skipped_persona_mismatch",
+                           {"lead_persona": meta.get("l2_persona_key"),
+                            "filter_persona": persona_key})
+            continue
+
+        # 分配 LINE 账号 — dry_run 模式只预览选中账号, 不更新 DB.
+        # NB: list_accounts 的 owner_device_id 是精确匹配, allocate 实际用
+        # "OR empty (通用池)" 语义. 预览时不过滤 owner, 再在 Python 层筛一次
+        # 保持与 allocate 行为一致.
+        if dry_run:
+            from src.host.line_pool import list_accounts as _lp_list
+            cand_all = _lp_list(
+                status="active", region=region or None,
+                persona_key=persona_key or None,
+                limit=20,
+            )
+            candidates = [
+                c for c in cand_all
+                if not device_id
+                    or c.get("owner_device_id", "") == ""
+                    or c.get("owner_device_id") == device_id
+            ]
+            if not candidates:
+                no_account += 1
+                seen_canonical.add(cid)
+                _rec_decision(ev, "skipped_no_account_dry",
+                               {"canonical_id": cid, "filter_region": region,
+                                "filter_persona": persona_key})
+                continue
+            acc = candidates[0]
+        else:
+            acc = _lp.allocate(
+                region=region or None,
+                persona_key=persona_key or None,
+                owner_device_id=device_id or None,
+                canonical_id=cid, peer_name=peer_name,
+                source_device_id=device_id, source_event_id=event_id,
+            )
+            if acc is None:
+                no_account += 1
+                seen_canonical.add(cid)
+                _rec_decision(ev, "skipped_no_account_allocate",
+                               {"canonical_id": cid,
+                                "reason": "no_match_or_all_capped"})
+                continue
+
+        seen_canonical.add(cid)
+
+        # Phase 11.2: 组装 messenger 引流话术 (dispatch_mode=messenger_text)
+        # line_direct_send 模式下 B 机/LINE automation 用自己的话术, 这里只传 line_id.
+        # Phase 12.1: persona fallback 优先级反转 — lead.metadata 优先于 task.persona_key
+        # (lead 自身 L2 分类的 persona 比 task-level 全局 persona 更贴 lead 真实画像).
+        effective_persona = (meta.get("l2_persona_key") or persona_key or "")
+        message_template = ""
+        if dispatch_mode == "messenger_text" and get_referral_snippet:
+            try:
+                message_template = get_referral_snippet(
+                    channel="line",
+                    value=acc["line_id"],
+                    persona_key=effective_persona,
+                    peer_name=peer_name,
+                    age_band=meta.get("age_band") or "",
+                    gender=meta.get("gender") or "",
+                )
+            except Exception as e:
+                logger.debug("[phase11] referral_snippet 失败: %s", e)
+
+        dispatch = {
+            "canonical_id": cid,
+            "peer_name": peer_name,
+            "source_device_id": device_id,
+            "source_event_id": event_id,
+            "source_event_type": ev.get("event_type"),
+            "line_account_id": acc["id"],
+            "line_id": acc["line_id"],
+            "dispatch_mode": dispatch_mode,
+            "message_template": message_template,
+            "metadata": {
+                "age_band": meta.get("age_band"),
+                "gender": meta.get("gender"),
+                "is_japanese": meta.get("is_japanese"),
+                "l2_score": meta.get("l2_score"),
+            },
+        }
+        dispatches.append(dispatch)
+        _rec_decision(ev, "dispatched",
+                       {"canonical_id": cid,
+                        "line_account_id": acc["id"],
+                        "line_id": acc["line_id"]})
+
+        if write_ce and record_contact_event is not None and not dry_run:
+            try:
+                record_contact_event(
+                    device_id or resolved, peer_name,
+                    event_type,
+                    preset_key=f"line_pool:{acc['id']}",
+                    meta={"line_id": acc["line_id"],
+                          "line_account_id": acc["id"],
+                          "dispatch_mode": dispatch_mode,
+                          "message_template": message_template,
+                          "dispatched_by": "agent_a_phase11",
+                          "source_event_id": event_id,
+                          "original_device_id": device_id,  # Phase 11.1 溯源
+                          "canonical_id": cid})
+            except Exception as e:
+                logger.debug("[phase11] write %s 失败: %s", event_type, e)
+
+    stats = {
+        "scanned": len(events),
+        "dispatched": len(dispatches),
+        "filtered_out": filtered_out,
+        "no_account": no_account,
+        "dispatches": dispatches,
+        "dry_run": dry_run,
+    }
+    if verbose_dry_run:
+        stats["per_event_decisions"] = per_event_decisions
+    return True, "", stats
+
+
+# Phase 12.0.1: MessengerError code 分类 — 哪些值得 retry
+_REFERRAL_TRANSIENT_CODES = frozenset({
+    "messenger_unavailable",    # app 启动中
+    "search_ui_missing",         # UI 加载慢
+    "send_button_missing",       # UI glitch
+})
+_REFERRAL_PERMANENT_CODES = frozenset({
+    "risk_detected",             # 风控
+    "xspace_blocked",            # MIUI 双开
+    "recipient_not_found",       # peer 搜不到
+    "send_blocked_by_content",   # 内容被 FB 挡
+})
+
+# Phase 12.2: peer 级失败阈值 — 达阈值给 canonical 打 referral_dead tag,
+# dispatcher 下次扫到会跳过. 按错误严重度分级:
+#   recipient_not_found: peer 账号不存在/改名 → 1 次即 dead (retry 永远搜不到)
+#   send_blocked_by_content: peer 过往封禁本文案 → 2 次 dead (换模板可能解)
+# risk_detected/xspace_blocked 是 device/global 问题不计 peer 账.
+_REFERRAL_PEER_FAIL_THRESHOLDS = {
+    "recipient_not_found": 1,
+    "send_blocked_by_content": 2,
+}
+
+
+def _referral_peer_fail_record(canonical_id: str,
+                                err_code: str,
+                                peer_name: str = "") -> bool:
+    """Phase 12.2: 累加 canonical.metadata.referral_fail_count, 达到该
+    err_code 对应阈值时打 referral_dead tag + 存 dead_reason/at.
+
+    返回 True 表示本次调用触发了 referral_dead (状态由"活"转"死").
+    """
+    if not canonical_id or err_code not in _REFERRAL_PEER_FAIL_THRESHOLDS:
+        return False
+    threshold = _REFERRAL_PEER_FAIL_THRESHOLDS[err_code]
+    try:
+        from src.host.lead_mesh import update_canonical_metadata
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        import json as _json
+        import time as _tt
+        with _lm_connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json, tags FROM leads_canonical"
+                " WHERE canonical_id=?", (canonical_id,),
+            ).fetchone()
+            if not row:
+                return False
+            try:
+                existing = _json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                existing = {}
+            existing_tags = {t.strip() for t in
+                              (row["tags"] or "").split(",") if t.strip()}
+            if "referral_dead" in existing_tags:
+                return False  # 已经 dead, 不重复
+        # 构造增量
+        counter_key = f"referral_fail_count_{err_code}"
+        prev_n = int(existing.get(counter_key, 0) or 0)
+        new_n = prev_n + 1
+        meta_patch = {counter_key: new_n}
+        tags = []
+        if new_n >= threshold:
+            meta_patch["referral_dead_reason"] = err_code
+            meta_patch["referral_dead_at"] = _tt.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", _tt.gmtime())
+            meta_patch["referral_dead_peer_name"] = peer_name or ""
+            tags.append("referral_dead")
+        update_canonical_metadata(canonical_id, meta_patch,
+                                   tags=tags or None)
+        return new_n >= threshold
+    except Exception as e:
+        logger.debug("[phase12.2.peer_fail] canonical=%s err=%s 异常: %s",
+                       canonical_id[:12] if canonical_id else "", err_code, e)
+        return False
+
+
+def _fb_send_referral_replies(fb, resolved: str,
+                               params: Dict[str, Any]) -> tuple:
+    """Phase 12 Alpha (2026-04-25): A 自立消费 line_dispatch_planned event.
+
+    为什么需要这个 task (而不仅仅是 dispatcher 写事件等 B 消费):
+      * B 机实装 line_dispatch_planned 消费逻辑需要协调, 不知何时就绪
+      * A 端已有 facebook.send_message, 能直接把 message_template 发出去
+      * 闭环立刻跑通, 不阻塞生产. B 将来就位后作为 fallback 路径
+
+    Flow:
+      1. 扫近 hours_window 小时 line_dispatch_planned events
+      2. dispatch_mode=messenger_text 直发; line_direct_send 若 LINE auto 未就位,
+         fallback 为 messenger_text (Phase 12.0.1)
+      3. strict_device_match=True: 只发 original_device_id 匹配本机
+      4. 24h 去重: 若该 peer 已有 wa_referral_sent → skip
+      5. 发送前 random.uniform(min, max) sleep 做速率平滑 (防风控)
+      6. 调 facebook.send_message(raise_on_error=True), 按 MessengerError.code
+         分瞬时/永久: 瞬时 retry max_retry 次 interval retry_interval_sec
+      7. 成功 → 写 wa_referral_sent + mark_dispatch_outcome(sent)
+         失败 → mark_dispatch_outcome(failed, note=<err_code>)
+
+    Params:
+      hours_window: int = 2
+      dedupe_hours: int = 24
+      strict_device_match: bool = True
+      limit: int = 10
+      min_interval_sec: float = 30   # 两条 send 之间最短 sleep
+      max_interval_sec: float = 90   # 最长 sleep (random 0-1 混合)
+      max_retry: int = 2             # 瞬时错误 retry 次数 (不含首发)
+      retry_interval_sec: float = 10
+      fallback_line_direct_send: bool = True  # True 时 line_direct_send 降级为
+                                                # messenger_text 发 (避免死信)
+    """
+    import random as _r
+    import time as _time
+
+    hours_window = int(params.get("hours_window", 2) or 2)
+    dedupe_hours = int(params.get("dedupe_hours", 24) or 24)
+    strict_device = bool(params.get("strict_device_match", True))
+    limit = max(1, min(int(params.get("limit", 10) or 10), 100))
+    min_iv = float(params.get("min_interval_sec", 30) or 0)
+    max_iv = float(params.get("max_interval_sec", 90) or 0)
+    if max_iv < min_iv:
+        max_iv = min_iv
+    max_retry = max(0, int(params.get("max_retry", 2) or 0))
+    retry_iv = float(params.get("retry_interval_sec", 10) or 0)
+    fallback_direct_send = bool(params.get("fallback_line_direct_send", True))
+    # Phase 12.3: dry_run — 不真发, 只列 matched planned events + 会发什么 template.
+    dry_run = bool(params.get("dry_run", False))
+
+    from src.host.fb_store import (list_recent_contact_events_by_types,
+                                    record_contact_event,
+                                    count_contact_events,
+                                    CONTACT_EVT_LINE_DISPATCH_PLANNED,
+                                    CONTACT_EVT_WA_REFERRAL_SENT)
+    from src.host import line_pool as _lp
+    try:
+        from src.app_automation.facebook import MessengerError
+    except Exception:
+        MessengerError = Exception  # 兜底, 不应命中
+    import json as _json
+
+    events = list_recent_contact_events_by_types(
+        [CONTACT_EVT_LINE_DISPATCH_PLANNED],
+        hours=hours_window, limit=limit * 5,
+    )
+
+    sent = 0
+    failed = 0
+    skipped_dedup = 0
+    skipped_device = 0
+    skipped_mode = 0
+    outcomes: List[Dict[str, Any]] = []
+
+    processed_count = 0  # 已真正尝试发送的条数 (用于速率平滑间隔判断)
+
+    for ev in events:
+        if sent + failed >= limit:
+            break
+        try:
+            meta = _json.loads(ev.get("meta_json") or "{}") or {}
+        except Exception:
+            meta = {}
+
+        dispatch_mode = meta.get("dispatch_mode") or "messenger_text"
+        # Phase 12.0.1: line_direct_send 若无 LINE auto 消费者会成死信,
+        # fallback 为 messenger_text 直发 LINE ID 文本.
+        effective_mode = dispatch_mode
+        if dispatch_mode == "line_direct_send":
+            if fallback_direct_send:
+                effective_mode = "messenger_text"
+            else:
+                skipped_mode += 1
+                continue
+        if effective_mode != "messenger_text":
+            skipped_mode += 1
+            continue
+
+        peer_name = ev.get("peer_name") or ""
+        message_template = meta.get("message_template") or ""
+        line_account_id = int(meta.get("line_account_id") or 0)
+        original_device_id = (meta.get("original_device_id")
+                                or ev.get("device_id") or "")
+
+        if not peer_name or not message_template:
+            skipped_mode += 1
+            continue
+
+        # 设备匹配: 只在同一台 FB 账号的设备上继续发, 避免串线
+        if strict_device and original_device_id and resolved != original_device_id:
+            skipped_device += 1
+            continue
+
+        # 24h 去重 peer 级 (可能多次 planned 但只发一次 referral)
+        try:
+            n_sent = count_contact_events(
+                device_id=resolved, peer_name=peer_name,
+                event_type=CONTACT_EVT_WA_REFERRAL_SENT,
+                hours=dedupe_hours,
+            )
+            if n_sent > 0:
+                skipped_dedup += 1
+                continue
+        except Exception:
+            pass
+
+        # Phase 12.0.1 速率平滑: 第二条起 random sleep [min, max]
+        if processed_count > 0 and max_iv > 0:
+            sleep_for = _r.uniform(min_iv, max_iv)
+            logger.debug("[referral.send] rate-limit sleep %.1fs", sleep_for)
+            _time.sleep(sleep_for)
+        processed_count += 1
+
+        # Phase 12.0.1 in-task retry: 瞬时错误 retry 最多 max_retry 次,
+        # 永久错误立即 failed. raise_on_error=True 拿到 MessengerError.code.
+        # Phase 12.3 dry_run: 不调 fb.send_message, 只记"会发" 不实发, 不 mark outcome
+        if dry_run:
+            outcomes.append({
+                "peer_name": peer_name, "line_account_id": line_account_id,
+                "line_id": meta.get("line_id"),
+                "planned_event_id": ev.get("id"),
+                "sent": None, "err_code": "dry_run",
+                "note": "dry_run_would_send",
+                "effective_mode": effective_mode,
+                "would_send_template": message_template,
+            })
+            processed_count += 1
+            continue
+
+        ok = False
+        err_note = ""
+        err_code = ""
+        attempts = max_retry + 1
+        for attempt in range(attempts):
+            try:
+                ok = bool(fb.send_message(
+                    recipient=peer_name, message=message_template,
+                    device_id=resolved, raise_on_error=True,
+                ))
+                err_code = ""
+                break
+            except MessengerError as me:
+                err_code = getattr(me, "code", "") or ""
+                err_note = f"code={err_code}|{str(me)[:80]}"
+                if err_code in _REFERRAL_PERMANENT_CODES:
+                    logger.info("[referral.send] %s 永久错误 %s, 不 retry",
+                                 peer_name, err_code)
+                    break
+                # 瞬时错误 / 未分类 → retry
+                if attempt + 1 < attempts:
+                    logger.info("[referral.send] %s 瞬时错误 %s, retry %d/%d",
+                                 peer_name, err_code, attempt + 1,
+                                 max_retry)
+                    _time.sleep(retry_iv)
+                    continue
+                # 耗尽 retry
+                logger.info("[referral.send] %s 瞬时错误 %s retry 耗尽",
+                             peer_name, err_code)
+                break
+            except Exception as e:
+                err_note = f"send_message_exception:{type(e).__name__}:{str(e)[:80]}"
+                err_code = "unknown_exception"
+                logger.warning("[referral.send] %s 未知异常: %s",
+                                 peer_name, e)
+                break
+
+        canonical_id_of_peer = meta.get("canonical_id") or ""
+        became_dead = False
+
+        if ok:
+            sent += 1
+            try:
+                record_contact_event(
+                    resolved, peer_name,
+                    CONTACT_EVT_WA_REFERRAL_SENT,
+                    preset_key=f"line_pool:{line_account_id}",
+                    meta={"line_id": meta.get("line_id"),
+                          "line_account_id": line_account_id,
+                          "sent_by": "agent_a_phase12_alpha",
+                          "effective_mode": effective_mode,
+                          "original_mode": dispatch_mode,
+                          "source_event_id": str(ev.get("id") or ""),
+                          "source_planned_event_id": str(ev.get("id") or ""),
+                          "canonical_id": canonical_id_of_peer})
+            except Exception as e:
+                logger.debug("[referral.send] write wa_referral_sent 失败: %s", e)
+            if line_account_id:
+                try:
+                    _lp.mark_dispatch_outcome(
+                        line_account_id, status="sent",
+                        note=f"via=messenger peer={peer_name}")
+                except Exception:
+                    pass
+            # Phase 12.2: success 写 canonical metadata + tag line_referred
+            if canonical_id_of_peer:
+                try:
+                    import time as _t_phase12
+                    from src.host.lead_mesh import update_canonical_metadata
+                    update_canonical_metadata(
+                        canonical_id_of_peer,
+                        {
+                            "line_referred_at": _t_phase12.strftime(
+                                "%Y-%m-%dT%H:%M:%SZ", _t_phase12.gmtime()),
+                            "line_id": meta.get("line_id"),
+                            "line_account_id": line_account_id,
+                            "referral_sent_via": effective_mode,
+                        },
+                        tags=["line_referred"],
+                    )
+                except Exception as e:
+                    logger.debug("[referral.send] canonical line_referred "
+                                   "写回失败: %s", e)
+        else:
+            failed += 1
+            if line_account_id:
+                try:
+                    _lp.mark_dispatch_outcome(
+                        line_account_id, status="failed",
+                        note=err_note or "send_message_returned_false")
+                except Exception:
+                    pass
+            # Phase 12.2: peer 级失败计数 + 达阈值 tag referral_dead.
+            # 只 PERMANENT code 计 peer 账 (transient/unknown 不算 peer 问题).
+            if (canonical_id_of_peer
+                    and err_code in _REFERRAL_PEER_FAIL_THRESHOLDS):
+                try:
+                    became_dead = _referral_peer_fail_record(
+                        canonical_id_of_peer, err_code, peer_name)
+                except Exception as e:
+                    logger.debug("[referral.send] peer fail 累计失败: %s", e)
+
+        outcomes.append({
+            "peer_name": peer_name, "line_account_id": line_account_id,
+            "line_id": meta.get("line_id"),
+            "planned_event_id": ev.get("id"),
+            "sent": ok, "err_code": err_code, "note": err_note,
+            "effective_mode": effective_mode,
+            "became_dead": became_dead,
+        })
+
+    # Phase 12.6: simulated_duration_ms 估算真跑预计耗时 (dry_run 也算, 给
+    # 运营直观感受 "启用后每轮要多久"). 估算:
+    #   (would_send - 1) * avg_interval_sec * 1000 ← rate-limit sleep
+    #   + would_send * estimated_send_ms            ← 每条 send 估 8s 平均
+    # 注: retry 开销省略 (transient 错误概率低, 估算偏保守下界).
+    would_send_n = (sent + failed
+                     if not dry_run
+                     else sum(1 for o in outcomes
+                               if o.get("err_code") == "dry_run"))
+    avg_iv = (min_iv + max_iv) / 2.0
+    # estimated_send_ms 允许 caller 覆盖 (真机测后调)
+    est_send_ms = int(params.get("estimated_send_ms", 8000) or 8000)
+    if would_send_n > 0:
+        sim_ms = int(max(0, would_send_n - 1) * avg_iv * 1000
+                      + would_send_n * est_send_ms)
+    else:
+        sim_ms = 0
+    m, s = divmod(sim_ms // 1000, 60)
+    sim_human = f"约 {m} 分 {s} 秒" if m else f"约 {s} 秒"
+
+    stats = {
+        "scanned": len(events),
+        "sent": sent,
+        "failed": failed,
+        "skipped_dedup": skipped_dedup,
+        "skipped_device": skipped_device,
+        "skipped_mode": skipped_mode,
+        "outcomes": outcomes,
+        "dry_run": dry_run,
+        "simulated_duration_ms": sim_ms,
+        "simulated_duration_human": sim_human,
+    }
+    return True, "", stats
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 20.1 (2026-04-25): facebook_check_referral_replies
+# A 调度 + 关键词字典加载, 实际 UI 抓取由 B 侧 check_messenger_inbox
+# (referral_mode=True) 提供.
+# ═══════════════════════════════════════════════════════════════════════
+
+_REFERRAL_KEYWORDS_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "data": None}
+_REFERRAL_KEYWORDS_TTL_SEC = 300  # 5 分钟
+
+
+def _load_referral_keywords(force: bool = False) -> Dict[str, List[str]]:
+    """读 config/referral_reply_keywords.yaml, 5min TTL 缓存.
+
+    返 dict: {region: [keyword, ...]}, 含 "default" 兜底组. 文件不存在或解析
+    失败返 {"default": []} (调用方应当 default 为 0 keyword → 全部不命中).
+    """
+    import time as _t
+    now = _t.time()
+    if (not force and _REFERRAL_KEYWORDS_CACHE["data"] is not None
+            and (now - _REFERRAL_KEYWORDS_CACHE["loaded_at"])
+            < _REFERRAL_KEYWORDS_TTL_SEC):
+        return _REFERRAL_KEYWORDS_CACHE["data"]
+    from pathlib import Path as _Path
+    out: Dict[str, List[str]] = {"default": []}
+    try:
+        import yaml as _yaml
+        # 项目根: src/host/executor.py → ../..
+        here = _Path(__file__).resolve().parent.parent.parent
+        ypath = here / "config" / "referral_reply_keywords.yaml"
+        if ypath.exists():
+            with ypath.open(encoding="utf-8") as f:
+                data = _yaml.safe_load(f) or {}
+            if isinstance(data, dict):
+                for region, words in data.items():
+                    if isinstance(words, list):
+                        out[str(region).lower()] = [
+                            str(w).strip().lower()
+                            for w in words if str(w).strip()]
+    except Exception as e:
+        logger.warning("[referral_keywords] load 失败: %s", e)
+    _REFERRAL_KEYWORDS_CACHE["data"] = out
+    _REFERRAL_KEYWORDS_CACHE["loaded_at"] = now
+    return out
+
+
+def _match_referral_keyword(text: str, region: str = "") -> str:
+    """在 text 中找首个匹配的关键词 (lowercased substring 匹配).
+
+    region 优先级: <region> > default. 匹配返关键词字符串, 不匹配返 ""."""
+    if not text:
+        return ""
+    txt = text.lower()
+    kws_map = _load_referral_keywords()
+    pools: List[List[str]] = []
+    if region:
+        pool = kws_map.get(region.lower())
+        if pool:
+            pools.append(pool)
+    pools.append(kws_map.get("default", []))
+    for pool in pools:
+        for kw in pool:
+            if kw and kw in txt:
+                return kw
+    return ""
+
+
+# Phase 20.1.8.1: peer→region TTL 缓存 (减少 cron 重复 SQL).
+# key = peer_name (str), value = (region_str, expires_at_epoch).
+_PEER_REGION_CACHE: Dict[str, tuple] = {}
+_PEER_REGION_CACHE_TTL_SEC = 300  # 5 分钟
+
+
+def _peer_region_cache_clear() -> None:
+    """运维 / 测试: 强清缓存."""
+    _PEER_REGION_CACHE.clear()
+
+
+def _resolve_peer_regions(peer_names: List[str],
+                            use_cache: bool = True) -> Dict[str, str]:
+    """Phase 20.1.7.1 / 20.1.8.1 (2026-04-25): batch peer_name → region map.
+
+    实现:
+      1. 先查缓存 (5min TTL): 命中的 peer 直接复用
+      2. 未命中的批量查 lead_identities (一次 SQL) → canonical_id
+      3. 对每个有 canonical_id 的 peer 调 line_pool._get_lead_region (3 级 fallback)
+      4. 写入缓存
+
+    use_cache=False 时绕开缓存 (测试 / 运维强刷).
+
+    cache 设计:
+      * "" (没找到 region) 也缓存, TTL 内不再重查 (避免 ghost peer 反复查)
+      * cache 是进程内, 重启自动清除; 跨进程不共享 (cron 同进程跑, 够用)
+    """
+    if not peer_names:
+        return {}
+    import time as _t
+    now = _t.time()
+    out: Dict[str, str] = {}
+    miss: List[str] = []
+    if use_cache:
+        for pn in peer_names:
+            entry = _PEER_REGION_CACHE.get(pn)
+            if entry and entry[1] > now:
+                out[pn] = entry[0]
+            else:
+                miss.append(pn)
+    else:
+        miss = list(peer_names)
+
+    if not miss:
+        return out
+
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        from src.host.line_pool import _get_lead_region
+        placeholders = ",".join(["?"] * len(miss))
+        fb_keys = [f"fb:{n}" for n in miss]
+        with _lm_connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id, canonical_id FROM lead_identities"
+                f" WHERE platform='facebook' AND account_id IN ({placeholders})",
+                fb_keys).fetchall()
+        peer_to_cid: Dict[str, str] = {}
+        for r in rows:
+            aid = r["account_id"] or ""
+            if aid.startswith("fb:"):
+                peer_to_cid[aid[3:]] = r["canonical_id"]
+        expires = now + _PEER_REGION_CACHE_TTL_SEC
+        for pn in miss:
+            cid = peer_to_cid.get(pn)
+            rg = _get_lead_region(cid) if cid else ""
+            out[pn] = rg
+            if use_cache:
+                _PEER_REGION_CACHE[pn] = (rg, expires)
+    except Exception as e:
+        logger.debug("[resolve_peer_regions] 失败: %s", e)
+        # miss 全部填 "" 兜底
+        for pn in miss:
+            out.setdefault(pn, "")
+    # 保 key 顺序一致
+    return {pn: out.get(pn, "") for pn in peer_names}
+
+
+def _parse_event_at(at_str: str) -> Optional[float]:
+    """Phase 20.1.7.2: parse fb_contact_events.at 列回 epoch 秒.
+
+    支持两种格式:
+      * SQLite datetime('now') 默认: 'YYYY-MM-DD HH:MM:SS' (空格)
+      * meta.sent_at 写的: 'YYYY-MM-DDTHH:MM:SSZ' (T+Z)
+
+    解析失败返 None.
+    """
+    if not at_str:
+        return None
+    import datetime as _dt
+    s = str(at_str).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return _dt.datetime.strptime(s, fmt).replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except Exception:
+            continue
+    return None
+
+
+def _fb_check_referral_replies(fb, resolved: str,
+                                  params: Dict[str, Any]) -> tuple:
+    """Phase 20.1 / 20.1.7 (2026-04-25): 扫 Messenger inbox 找 referral 反馈.
+
+    A 侧调度逻辑 (本函数):
+      1. 拉 pending peers (wa_referral_sent 后 N 小时内未 replied)
+      2. Phase 20.1.7.1: batch 解析 peer → region 用于关键词路由
+      3. 调 fb.check_messenger_inbox(referral_mode=True, peers_filter=names) — B 实
+      4. B 返 list of {peer_name, last_inbound_text, conv_id} (匹配 + 未匹配都返)
+      5. 本函数遍历 inbound_text, 关键词匹配 (按该 peer 自己的 region) → 写 event
+      6. Phase 20.1.7.2: 写 event 时计算 latency_seconds 入 meta
+
+    Params:
+      hours_back: int = 48           pending 时间窗
+      limit: int = 50                单次最多扫 peer 数
+      keyword_region: str = ""       OVERRIDE — 强制用此 region; 空 → 自动推断 per-peer
+      max_messages_per_peer: int = 5  B 侧每个 peer 最多抓最近几条
+    """
+    import datetime as _dt
+    hours_back = int(params.get("hours_back", 48) or 48)
+    limit = max(1, min(int(params.get("limit", 50) or 50), 500))
+    region_override = str(params.get("keyword_region", "") or "").lower()
+    msgs_per_peer = max(1, min(
+        int(params.get("max_messages_per_peer", 5) or 5), 20))
+
+    from src.host.fb_store import (get_pending_referral_peers,
+                                    record_contact_event,
+                                    CONTACT_EVT_WA_REFERRAL_REPLIED)
+
+    # 步骤 1: pending peers (限本设备)
+    pending = get_pending_referral_peers(device_id=resolved,
+                                          hours_back=hours_back,
+                                          limit=limit)
+    if not pending:
+        return True, "", {
+            "pending_count": 0, "scanned": 0,
+            "replied_now": 0, "no_match": 0,
+            "matches": [],
+        }
+
+    peer_names = [p["peer_name"] for p in pending]
+
+    # Phase 20.1.7.1: 提前 batch 解析 region (一次 SQL + 多次 _get_lead_region)
+    if region_override:
+        # 全 force 用同一 region
+        peer_regions = {pn: region_override for pn in peer_names}
+    else:
+        peer_regions = _resolve_peer_regions(peer_names)
+
+    # 步骤 2: 调 B 侧 inbox 检测 (尚未实装时 graceful)
+    inbox_results: List[Dict[str, Any]] = []
+    if not hasattr(fb, "check_messenger_inbox"):
+        return False, "facebook.check_messenger_inbox 尚未实现", {
+            "pending_count": len(pending), "scanned": 0,
+            "replied_now": 0, "no_match": 0,
+        }
+    try:
+        # B 侧 referral_mode 接口契约见 docs/A_TO_B_PHASE20_INBOX.md
+        scan_result = fb.check_messenger_inbox(
+            auto_reply=False,
+            referral_mode=True,
+            peers_filter=peer_names,
+            max_messages_per_peer=msgs_per_peer,
+            device_id=resolved,
+        )
+        # B 应返 {"conversations": [{"peer_name", "last_inbound_text", ...}, ...]}
+        # 旧版 B 不认这些 kwargs 时退化只返 messenger_active 状态
+        if isinstance(scan_result, dict):
+            inbox_results = scan_result.get("conversations") or []
+    except TypeError:
+        # B 还没扩 referral_mode 参数 → 直接报告未对齐
+        return False, ("B 侧 check_messenger_inbox 还没支持 referral_mode 参数, "
+                       "见 docs/A_TO_B_PHASE20_INBOX.md"), {
+            "pending_count": len(pending),
+            "scanned": 0,
+            "replied_now": 0,
+            "no_match": 0,
+        }
+    except Exception as e:
+        logger.warning("[referral_replies] check_messenger_inbox 失败: %s", e)
+        return False, f"check_messenger_inbox 异常: {e}", {
+            "pending_count": len(pending),
+            "scanned": 0,
+            "replied_now": 0,
+            "no_match": 0,
+        }
+
+    # 步骤 3-4: 遍历 + 关键词匹配 + 写 event
+    pending_by_peer = {p["peer_name"]: p for p in pending}
+    replied_now = 0
+    no_match = 0
+    matches: List[Dict[str, Any]] = []
+    now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    for conv in inbox_results:
+        peer_name = (conv.get("peer_name") or "").strip()
+        if not peer_name or peer_name not in pending_by_peer:
+            continue
+        text = conv.get("last_inbound_text") or ""
+        # Phase 20.1.7.1: per-peer region (override 已在上面 force 全填好)
+        peer_region = peer_regions.get(peer_name, "")
+        kw = _match_referral_keyword(text, region=peer_region)
+        if not kw:
+            no_match += 1
+            continue
+        sent_meta = pending_by_peer[peer_name]
+        # Phase 20.1.7.2: latency = now - sent_at (秒)
+        sent_ts = _parse_event_at(sent_meta.get("sent_at") or "")
+        latency_sec = (round(now_ts - sent_ts, 1)
+                        if sent_ts and now_ts >= sent_ts else None)
+        latency_min = (round(latency_sec / 60.0, 2)
+                        if latency_sec is not None else None)
+        try:
+            record_contact_event(
+                resolved, peer_name, CONTACT_EVT_WA_REFERRAL_REPLIED,
+                meta={
+                    "platform": "facebook",  # TG R2 Q2 cross-repo namespace
+                    "keyword_matched": kw,
+                    "raw_excerpt": text[:200],
+                    "sent_event_id": sent_meta.get("sent_event_id"),
+                    "sent_at": sent_meta.get("sent_at"),
+                    "conv_id": conv.get("conv_id") or "",
+                    "region": peer_region or None,
+                    "latency_seconds": latency_sec,
+                    "latency_min": latency_min,
+                    "matched_by": "agent_a_phase20_1",
+                })
+            replied_now += 1
+            matches.append({
+                "peer_name": peer_name,
+                "keyword": kw,
+                "region": peer_region,
+                "latency_min": latency_min,
+                "excerpt": text[:80],
+            })
+        except Exception as e:
+            logger.warning("[referral_replies] 写 wa_referral_replied 失败 "
+                            "peer=%s: %s", peer_name, e)
+
+    return True, "", {
+        "pending_count": len(pending),
+        "scanned": len(inbox_results),
+        "replied_now": replied_now,
+        "no_match": no_match,
+        "matches": matches,
+    }
+
+
+def _fb_mark_stale_referrals(params: Dict[str, Any]) -> tuple:
+    """Phase 20.2 (2026-04-25): SLA 死信回收 task wrapper.
+
+    扫整个 referral funnel, 把 sent N 小时未 replied 的 peer 标 referral_stale,
+    超 M 天升级 referral_dead. 跑完后会被 Phase 14 daily 回收链消化.
+
+    Params:
+      stale_hours: int = 48          多久未 replied 算 stale (建议 24-72)
+      escalate_to_dead_days: int = 7 多久 stale 后升级 dead
+      device_id: str = ""            可限制单 device, 默认全部
+      dry_run: bool = False          不写入只统计 (推预览安全)
+      limit: int = 500
+    """
+    stale_hours = int(params.get("stale_hours", 48) or 48)
+    esc_days = int(params.get("escalate_to_dead_days", 7) or 7)
+    device_id = (params.get("device_id") or "").strip() or None
+    dry_run = bool(params.get("dry_run", False))
+    limit = max(1, min(int(params.get("limit", 500) or 500), 5000))
+
+    from src.host.fb_store import mark_stale_referrals
+    stats = mark_stale_referrals(
+        stale_hours=stale_hours,
+        escalate_to_dead_days=esc_days,
+        device_id=device_id,
+        dry_run=dry_run,
+        limit=limit)
+    return True, "", stats
 
 
 _FB_CAMPAIGN_DEFAULT_STEPS = ["warmup", "group_engage", "extract_members",
@@ -1166,6 +3120,9 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = str(_tg[0])
                             elif isinstance(params.get("group_name"), str):
                                 _camp_src = params.get("group_name") or ""
+                        _ai_g = params.get("ai_dynamic_greeting")
+                        _fsg = params.get("force_send_greeting")
+                        _p10_extra = _phase10_task_extras(params)
                         res = fb.add_friend_and_greet(
                             name,
                             note=note,
@@ -1175,6 +3132,10 @@ def _run_facebook_campaign(fb, resolved, params):
                             phase=_ph,
                             preset_key=_pr,
                             source=_camp_src,
+                            force=bool(params.get("force_add_friend")),
+                            ai_dynamic_greeting=(bool(_ai_g) if _ai_g is not None else None),
+                            force_send_greeting=(bool(_fsg) if _fsg is not None else None),
+                            **_p10_extra,
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
                         if ok:
@@ -1196,13 +3157,16 @@ def _run_facebook_campaign(fb, resolved, params):
                                 _camp_src = str(_tg[0])
                             elif isinstance(params.get("group_name"), str):
                                 _camp_src = params.get("group_name") or ""
+                        _p10_extra2 = _phase10_task_extras(params)
                         ok = fb.add_friend_with_note(name, note=note,
                                                      safe_mode=True,
                                                      device_id=resolved,
                                                      persona_key=_pk,
                                                      phase=_ph,
                                                      source=_camp_src,
-                                                     preset_key=_pr)
+                                                     preset_key=_pr,
+                                                     force=bool(params.get("force_add_friend")),
+                                                     **_p10_extra2)
                         if ok:
                             sent += 1
                     else:
