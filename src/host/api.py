@@ -168,6 +168,46 @@ async def lifespan(application: FastAPI):
     except Exception as e:
         logger.warning("平台 Action 注册失败 (WorkflowEngine 将使用内置 util actions): %s", e)
 
+    # L2 (PR-3): 启动失败队列 drain 后台线程
+    # 60 秒周期扫本地 SQLite push_queue, 失败 push 入指数 backoff,
+    # 超过 100 次移死信表. 防数据丢.
+    try:
+        from src.host.central_push_drain import start_drain_thread
+        _drain = start_drain_thread()
+        logger.info("L2 push drain thread 启动成功 (interval=60s, limit=100)")
+    except Exception as e:
+        logger.warning("L2 push drain thread 启动失败 (push 失败队列将堆积): %s", e)
+
+    # PR-6.6: worker 角色起 agent_mesh listener
+    # 30 秒周期 poll 主控 agent_messages, 收 cmd=manual_reply / pause_ai / resume_ai
+    # 用对应物理手机发消息或调 ai_takeover_state. coordinator 不需要起.
+    try:
+        from src.host.multi_host import _load_role  # type: ignore
+        _role = _load_role() if callable(_load_role) else ""
+    except Exception:
+        _role = ""
+    if not _role:
+        try:
+            import yaml as _yaml
+            from src.host.device_registry import config_file as _cf
+            _cluster_yaml = _cf("cluster.yaml")
+            if _cluster_yaml.exists():
+                with _cluster_yaml.open(encoding="utf-8") as _f:
+                    _cluster_cfg = _yaml.safe_load(_f) or {}
+                _role = (_cluster_cfg.get("role") or "").strip()
+        except Exception as e:
+            logger.debug("[mesh_listener] cluster.yaml 读 role 失败: %s", e)
+
+    if _role == "worker":
+        try:
+            from src.host.agent_mesh_worker_listener import start_worker_listener
+            start_worker_listener(interval_sec=30.0, limit=50)
+            logger.info("PR-6.6 worker mesh listener 启动成功 (role=worker)")
+        except Exception as e:
+            logger.warning("PR-6.6 worker mesh listener 启动失败: %s", e)
+    else:
+        logger.info("PR-6.6 worker mesh listener 跳过 (role=%s, 仅 worker 角色启动)", _role or "unknown")
+
     # ★ P1: 启动策略优化器（A/B 自动应用 + 每日参数调节）
     try:
         from src.host.task_policy import policy_blocks_strategy_optimizer

@@ -224,6 +224,36 @@
         + '</div>'
       : '';
 
+    // PR-6: 真人客服接管区 (assign / reply / note / outcome)
+    const csAssigned = h.assigned_to_username || '';
+    const csOutcome = h.outcome || '';
+    const csReplies = h.customer_service_replies_json
+      ? (function () { try { return JSON.parse(h.customer_service_replies_json).length; } catch (e) { return 0; } })() : 0;
+    const csNotes = h.internal_notes_json
+      ? (function () { try { return JSON.parse(h.internal_notes_json).length; } catch (e) { return 0; } })() : 0;
+
+    const csButtons = csOutcome
+      ? '<span style="font-size:11px;padding:3px 10px;border-radius:6px;background:'
+          + (csOutcome === 'converted' ? 'rgba(34,197,94,.2);color:#22c55e' :
+             csOutcome === 'lost' ? 'rgba(239,68,68,.15);color:#ef4444' :
+             'rgba(245,158,11,.15);color:#f59e0b')
+          + '">' + (csOutcome === 'converted' ? '✓ 成交' : csOutcome === 'lost' ? '× 流失' : '⏳ 待跟进') + '</span>'
+      : (!csAssigned
+        ? '<button onclick="lmCsAssign(\'' + hid + '\')" '
+          + 'style="padding:5px 12px;background:rgba(168,85,247,.15);color:#a855f7;border:1px solid rgba(168,85,247,.4);border-radius:6px;font-size:11px;cursor:pointer;font-weight:600">🙋 我接手</button>'
+        : '<span style="font-size:11px;color:var(--text-muted)">已被 <code>' + _safe(csAssigned) + '</code> 接管</span>'
+          + '<button onclick="lmCsReply(\'' + hid + '\')" '
+          + 'style="padding:5px 12px;background:rgba(96,165,250,.15);color:#60a5fa;border:1px solid rgba(96,165,250,.4);border-radius:6px;font-size:11px;cursor:pointer">💬 回复 (' + csReplies + ')</button>'
+          + '<button onclick="lmCsNote(\'' + hid + '\')" '
+          + 'style="padding:5px 12px;background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.4);border-radius:6px;font-size:11px;cursor:pointer">📝 备注 (' + csNotes + ')</button>'
+          + '<button onclick="lmCsOutcome(\'' + hid + '\')" '
+          + 'style="padding:5px 12px;background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.4);border-radius:6px;font-size:11px;cursor:pointer;font-weight:600">🏁 标记结果</button>');
+
+    const csRow = !csOutcome || csOutcome
+      ? '<div style="display:flex;gap:6px;align-items:center;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);flex-wrap:wrap">'
+        + '<span style="font-size:11px;color:var(--text-dim)">真人客服:</span>' + csButtons + '</div>'
+      : '';
+
     return ''
       + '<div id="lm-card-' + hid + '" style="background:var(--bg-main);border:1px solid var(--border);'
       + '  border-left:4px solid ' + color + ';border-radius:10px;padding:14px">'
@@ -266,8 +296,98 @@
       + '      🔍 Lead 档案</button>'
       + '  </div>'
       + actions
+      + csRow
       + '</div>';
   }
+
+  // PR-6 真人客服动作 — 调 PR-6 后端 4 个 API
+  function _lmCsCurrentUser() {
+    // 优先用当前 dashboard 登录的 username, fallback "human:dashboard"
+    try {
+      const me = window.PlatShell && window.PlatShell.session && window.PlatShell.session.user;
+      return (me && me.username) || prompt('请输入你的客服 ID (username):', 'agent_zhang') || '';
+    } catch (e) { return prompt('请输入你的客服 ID (username):', 'agent_zhang') || ''; }
+  }
+
+  window.lmCsAssign = async function (handoffId) {
+    const Shell = _shell();
+    if (!Shell) return;
+    const username = _lmCsCurrentUser();
+    if (!username) return;
+    const peerName = prompt('客户姓名 (peer_name, 为空跳过 AI 暂停):', '') || '';
+    const deviceId = peerName ? (prompt('设备 ID (device_id):', '') || '') : '';
+    try {
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/assign', {
+        username: username,
+        peer_name: peerName,
+        device_id: deviceId,
+      });
+      showToast('✅ 接管成功 (AI 已暂停: ' + (peerName && deviceId ? '是' : '否') + ')', 'success');
+      _lmRenderInbox();
+    } catch (e) {
+      showToast('接管失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  window.lmCsReply = async function (handoffId) {
+    const Shell = _shell();
+    if (!Shell) return;
+    const username = _lmCsCurrentUser();
+    if (!username) return;
+    const text = prompt('输入要发送给客户的话:', '');
+    if (!text) return;
+    try {
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/reply', {
+        username: username, text: text, sent_via_worker: false,
+      });
+      showToast('💬 回复已记录 (PR-6.6 后真发到客户手机)', 'success');
+      _lmRenderInbox();
+    } catch (e) {
+      showToast('回复失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  window.lmCsNote = async function (handoffId) {
+    const Shell = _shell();
+    if (!Shell) return;
+    const username = _lmCsCurrentUser();
+    if (!username) return;
+    const note = prompt('输入内部备注 (不发给客户):', '');
+    if (!note) return;
+    try {
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/note', {
+        username: username, note: note,
+      });
+      showToast('📝 备注已记录', 'success');
+      _lmRenderInbox();
+    } catch (e) {
+      showToast('备注失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  window.lmCsOutcome = async function (handoffId) {
+    const Shell = _shell();
+    if (!Shell) return;
+    const username = _lmCsCurrentUser();
+    if (!username) return;
+    const choice = prompt('标记结果:\n  1 = 成交 (converted)\n  2 = 流失 (lost)\n  3 = 待跟进 (pending_followup)\n输入 1/2/3:', '');
+    const outcomeMap = {'1': 'converted', '2': 'lost', '3': 'pending_followup'};
+    const outcome = outcomeMap[choice];
+    if (!outcome) { showToast('无效选项', 'warn'); return; }
+    const notes = prompt('原因 / 备注 (可选):', '') || '';
+    const peerName = prompt('客户姓名 (释放 AI 接管用, 可空):', '') || '';
+    const deviceId = peerName ? (prompt('设备 ID (释放 AI 接管用, 可空):', '') || '') : '';
+    try {
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/outcome', {
+        username: username, outcome: outcome, notes: notes,
+        peer_name: peerName, device_id: deviceId,
+      });
+      showToast('🏁 已标记 ' + outcome + (outcome === 'converted' || outcome === 'lost' ? ' (AI 接管已释放)' : ''), 'success');
+      _lmRenderInbox();
+    } catch (e) {
+      showToast('标记失败: ' + (e.message || e), 'error');
+    }
+  };
 
   window.lmSwitchInboxTab = function (tab) {
     _lmInboxState.tab = tab;

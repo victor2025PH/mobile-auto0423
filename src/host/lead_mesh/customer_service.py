@@ -143,11 +143,20 @@ def record_human_reply(
     *,
     sent_via_worker: bool = False,
     extra_meta: Optional[Dict[str, Any]] = None,
+    peer_name_hint: str = "",
+    device_id_hint: str = "",
+    worker_id_hint: str = "",
 ) -> Dict[str, Any]:
-    """真人在后台输入了一条回复. 写到 customer_service_replies_json.
+    """真人在后台输入了一条回复.
 
-    sent_via_worker: 是否已经通过 agent_mesh → worker 发出 (PR-6.5 真接).
-    PR-6 当前阶段先记录, worker 端发消息能力放 PR-6.5.
+    1. 永远写到 customer_service_replies_json (本地审计)
+    2. sent_via_worker=True 时 ALSO 调 agent_mesh.send_message 推 worker
+       (cmd=manual_reply), worker listener (PR-6.6) 收到用对应物理手机发出去
+    3. 真人接管期间 worker AI 自动回应已经被 ai_takeover_state 暂停, 客户
+       看到的就是 worker 用同一台物理手机发的消息, 自然连续
+
+    peer_name_hint / device_id_hint / worker_id_hint: 给 worker 路由用. 没传
+    时只记录本地不真发 (跟 sent_via_worker=True 矛盾会自动降级 sent_via_worker=False).
     """
     if not handoff_id or not username or not text:
         raise ValueError("handoff_id / username / text 必填")
@@ -160,6 +169,33 @@ def record_human_reply(
             f"该 handoff 已被 {assigned} 接管, 你不是当前接管人"
         )
 
+    # 真发: 检查 hint 齐全否, 不齐全降级 (依然记录本地, 但不推 worker)
+    really_sent = False
+    push_error: Optional[str] = None
+    if sent_via_worker:
+        if not (peer_name_hint and device_id_hint and worker_id_hint):
+            push_error = "缺 peer_name/device_id/worker_id hint, 降级仅本地记录"
+            sent_via_worker = False
+        else:
+            try:
+                from src.host.lead_mesh.agent_mesh import send_message, MSG_COMMAND
+                send_message(
+                    from_agent=_human_actor(username),
+                    to_agent=worker_id_hint,
+                    message_type=MSG_COMMAND,
+                    canonical_id=rec.get("canonical_id", ""),
+                    payload={
+                        "cmd": "manual_reply",
+                        "device_id": device_id_hint,
+                        "peer_name": peer_name_hint,
+                        "text": text,
+                    },
+                )
+                really_sent = True
+            except Exception as exc:  # noqa: BLE001
+                push_error = f"send_message failed: {exc}"
+                sent_via_worker = False
+
     replies = []
     try:
         replies = json.loads(rec.get("customer_service_replies_json") or "[]")
@@ -169,8 +205,11 @@ def record_human_reply(
         "by": username,
         "text": text,
         "sent_via_worker": sent_via_worker,
+        "really_sent": really_sent,
         "at": _now_iso(),
     }
+    if push_error:
+        entry["push_error"] = push_error
     if extra_meta:
         entry["meta"] = extra_meta
     replies.append(entry)
@@ -188,10 +227,13 @@ def record_human_reply(
         action="human_reply_recorded",
         actor=_human_actor(username),
         data={"handoff_id": handoff_id, "len": len(text),
-              "sent_via_worker": sent_via_worker},
+              "sent_via_worker": sent_via_worker,
+              "really_sent": really_sent,
+              "push_error": push_error or ""},
     )
     return {"handoff_id": handoff_id, "replies_count": len(replies),
-            "last_at": entry["at"]}
+            "last_at": entry["at"], "really_sent": really_sent,
+            "push_error": push_error}
 
 
 # ── 3. record_internal_note ──────────────────────────────────────────
