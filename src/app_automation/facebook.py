@@ -2599,6 +2599,19 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             pass
+        # L2 中央客户画像双写 (fire_and_forget, 失败不影响主流程)
+        try:
+            from src.host.customer_sync_bridge import sync_friend_request_sent
+            sync_friend_request_sent(
+                device_id, target_name,
+                status=status,
+                persona_key=persona_key,
+                preset_key=preset_key,
+                source=source,
+                note=note,
+            )
+        except Exception:
+            pass
         # Phase 6.A: Lead Mesh journey 同步写
         action = ("friend_requested" if status == "sent"
                   else "friend_request_risk")
@@ -3601,6 +3614,20 @@ class FacebookAutomation(BaseAutomation):
                 preset_key=preset_key or "",
                 meta={"persona_key": persona_key or "", "phase": eff_phase,
                       "msg_len": len(greeting or "")},
+            )
+        except Exception:
+            pass
+        # L2 中央客户画像双写 (fire_and_forget)
+        try:
+            from src.host.customer_sync_bridge import sync_greeting_sent
+            sync_greeting_sent(
+                did, profile_name,
+                greeting=greeting or "",
+                template_id=template_id,
+                preset_key=preset_key,
+                persona_key=persona_key,
+                phase=eff_phase,
+                fallback=False,
             )
         except Exception:
             pass
@@ -6063,6 +6090,17 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             log.debug("[inbox] 写库失败", exc_info=True)
+        # L2 中央客户画像双写 — 入站消息升级 status='in_messenger'
+        try:
+            from src.host.customer_sync_bridge import sync_messenger_incoming
+            sync_messenger_incoming(
+                did, conv["name"],
+                content=incoming_text or "",
+                content_lang=lang or None,
+                peer_type=peer_type,
+            )
+        except Exception:
+            pass
 
         # P7 §7.1 greeting_replied: 对方一 incoming 就尝试标记最近 7 天未回
         # 的 greeting 行 (P0 的 mark_greeting_replied_back 幂等, 已标则跳过)。
@@ -6137,6 +6175,17 @@ class FacebookAutomation(BaseAutomation):
         """
         reply = None
         decision = "skip"
+        # PR-7: 真人接管中的 peer 不走 AI 自动回复, 留给真人在后台手动发
+        try:
+            from src.host.ai_takeover_state import is_taken_over
+            if is_taken_over(peer_name, did):
+                log.info(
+                    "[ai_reply] peer=%s device=%s 真人接管中, AI 不自动回",
+                    peer_name, did,
+                )
+                return None, "human_takeover"
+        except Exception:
+            pass
         target_lang = ""
         ab_style_hint = ""
         # P0 2026-04-23: incoming 侧语言检测,用于:
@@ -6265,6 +6314,15 @@ class FacebookAutomation(BaseAutomation):
             # return None, "skip" — 生产 auto_reply 从未真正生成 reply。
             # 真机 dry-run (scripts/messenger_production_dryrun.py) 发现。
             profile = UserProfile(username=peer_name, bio="", source="fb_inbox")
+            # PR-7: 从 persona 配置取 bot_persona (如 jp_female_midlife → jp_caring_male)
+            # 让 ChatBrain stage='referral' 时注入"日本男性关爱"调性
+            _bot_persona = ""
+            try:
+                from src.ai.referral_gate import load_persona_config
+                _bot_persona = (load_persona_config(persona_key)
+                                .get("bot_persona") or "")
+            except Exception:
+                pass
             result = brain.generate_reply(
                 lead_id=peer_name,
                 incoming_message=incoming_text,
@@ -6274,6 +6332,7 @@ class FacebookAutomation(BaseAutomation):
                 contact_info=_contact_for_brain,
                 source="inbox",
                 ab_style_hint=ab_style_hint.strip(),
+                bot_persona=_bot_persona or None,
             )
             if result and result.message:
                 reply = result.message
@@ -6312,8 +6371,26 @@ class FacebookAutomation(BaseAutomation):
                         lead_score=lead_score_val,
                         has_contact=has_contact,
                         config=_gate_cfg,
+                        # PR-7: 让关键词触发 / 拒绝词命中 / persona min_turns 真生效
+                        incoming_text=incoming_text or "",
+                        persona_key=persona_key,
                     )
                     decision = "wa_referral" if gate.refer else "reply"
+                    # PR-7: 拒绝词命中 → 写 referral_rejected_at 触发 7 天冷却
+                    # gate.reasons 含 "拒绝引流关键词命中" 时即拒绝路径
+                    if any("拒绝引流关键词命中" in r for r in gate.reasons):
+                        try:
+                            from src.host.fb_store import record_contact_event
+                            record_contact_event(
+                                did, peer_name, "referral_rejected",
+                                meta={
+                                    "persona_key": persona_key or "",
+                                    "rejected_at": _now_iso(),
+                                    "incoming_text_snippet": (incoming_text or "")[:100],
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("[ai_reply] 写 referral_rejected 事件失败: %s", exc)
                     log.info(
                         "[ai_reply] peer=%s gate level=%s refer=%s score=%d "
                         "reasons=%s",
@@ -6324,8 +6401,13 @@ class FacebookAutomation(BaseAutomation):
                     # gate 不可用降级到 pre-P5 行为
                     log.debug("[ai_reply] referral_gate 失败(降级): %s", e)
                     decision = "wa_referral" if (has_contact and ref_score > 0.5) else "reply"
-                # P1-1 + P1-5: 引流出站用 **首推渠道 + 对应 ID** 的本地化模板
-                if decision == "wa_referral" and _r_val:
+                # PR-4 (2026-04-26): AI 动态生成话术优先, 模板仅做兜底.
+                # 旧逻辑是模板覆盖 ChatBrain 的 reply, 但 ChatBrain 已能根据
+                # persona / 聊天历史 / 客户画像动态生成自然话术 (chat_brain.py
+                # _build_system_prompt stage='referral' + bot_persona='jp_caring_male'),
+                # 模板覆盖会让每次引流都是同一句, 容易被识别. 反转: 只在 AI 输出
+                # 为空 / 异常时才回退到模板.
+                if decision == "wa_referral" and _r_val and not (reply or "").strip():
                     try:
                         from .fb_content_assets import get_referral_snippet
                         snippet = get_referral_snippet(
@@ -6334,8 +6416,12 @@ class FacebookAutomation(BaseAutomation):
                         )
                         if snippet:
                             reply = snippet
+                            log.info(
+                                "[ai_reply] AI 话术为空, 兜底到模板 snippet "
+                                "(channel=%s persona=%s)", _r_channel, persona_key,
+                            )
                     except Exception as e:
-                        log.debug("[ai_reply] referral_snippet 覆盖失败: %s", e)
+                        log.debug("[ai_reply] referral_snippet 兜底也失败: %s", e)
         except Exception as e:
             log.debug("[ai_reply] 生成失败: %s", e)
             return None, "skip"
@@ -6380,6 +6466,19 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             pass
+        # L2 双写 — AI 回复 / 模板回复 push 到中央
+        try:
+            from src.host.customer_sync_bridge import sync_messenger_outgoing
+            sync_messenger_outgoing(
+                did, peer_name,
+                content=reply,
+                ai_decision=decision,
+                ai_generated=(decision == "reply"),
+                content_lang=target_lang or detected_incoming_lang or None,
+                intent_tag=intent_tag,
+            )
+        except Exception:
+            pass
 
         # P0 2026-04-23: 跨 bot 归因 — 回写 replied_at
         #   1) 被 B 刚回复的最近一条 incoming 行
@@ -6407,6 +6506,18 @@ class FacebookAutomation(BaseAutomation):
                     "intent": intent_tag,  # P4 意图信号
                 },
             )
+            # L2 双写 — 引流话术发出 (不升级 status, 等真发起 handoff 才升)
+            try:
+                from src.host.customer_sync_bridge import sync_wa_referral_sent
+                sync_wa_referral_sent(
+                    did, peer_name,
+                    channel=_r_channel or "unknown",
+                    content=reply,
+                    content_lang=target_lang or detected_incoming_lang or None,
+                    intent_tag=intent_tag,
+                )
+            except Exception:
+                pass
 
         # P10b L3 结构化记忆 — LLM 抽取 extracted_facts 写 fb_contact_events。
         # 默认 config.enabled=False, 不激活则 zero cost (gate 首行就 skip,

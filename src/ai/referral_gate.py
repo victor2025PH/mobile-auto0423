@@ -58,7 +58,128 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "score_threshold": 3,          # soft: 5 档评分里满足 3 档即通过
     "refer_cooldown_hours": 1,     # hard: 同 peer 再次引流的冷却期
     "ref_score_threshold": 0.5,    # soft: ChatBrain referral_score 门槛
+    "rejection_cooldown_days": 0,  # hard: 客户明确拒绝后冷却天数 (0 = 禁用)
+    "min_emotion_score": 0.0,      # soft: L3 情感综合分门槛 (0 = 禁用)
+                                   # jp_female_midlife yaml 里设 0.5
+                                   # (聊得有温度才允许引)
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persona 配置加载 (从 config/referral_strategies.yaml)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PERSONA_CFG_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_PERSONA_CFG_LOCK_PATH = "config/referral_strategies.yaml"
+
+
+def _load_persona_strategies_yaml() -> Dict[str, Dict[str, Any]]:
+    """读 config/referral_strategies.yaml, 失败返 {}. 模块级 cache."""
+    global _PERSONA_CFG_CACHE
+    if _PERSONA_CFG_CACHE is not None:
+        return _PERSONA_CFG_CACHE
+    try:
+        import yaml
+        from pathlib import Path
+        # 相对项目根 (cwd) 找
+        path = Path(_PERSONA_CFG_LOCK_PATH)
+        if not path.exists():
+            _PERSONA_CFG_CACHE = {}
+            return _PERSONA_CFG_CACHE
+        with path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        _PERSONA_CFG_CACHE = data if isinstance(data, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[referral_gate] load persona strategies failed: %s", exc)
+        _PERSONA_CFG_CACHE = {}
+    return _PERSONA_CFG_CACHE
+
+
+def reload_persona_strategies_for_tests() -> None:
+    """仅测试用. 清掉 cache, 让下次 load 重新读 yaml."""
+    global _PERSONA_CFG_CACHE
+    _PERSONA_CFG_CACHE = None
+
+
+def load_persona_config(persona_key: Optional[str]) -> Dict[str, Any]:
+    """获取 persona 特定 config (DEFAULT 覆盖 < yaml.default 覆盖 < yaml.<persona>).
+
+    persona_key=None 或未在 yaml 配置: 返回 DEFAULT_CONFIG 副本.
+    """
+    cfg = dict(DEFAULT_CONFIG)
+    yaml_data = _load_persona_strategies_yaml()
+    if not yaml_data:
+        return cfg
+    # yaml.default 覆盖 module DEFAULT
+    if isinstance(yaml_data.get("default"), dict):
+        cfg.update(yaml_data["default"])
+    # persona 段覆盖 default
+    if persona_key and isinstance(yaml_data.get(persona_key), dict):
+        cfg.update(yaml_data[persona_key])
+    return cfg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 关键词命中 (trigger / rejection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TRIGGER_KW_CACHE: Optional[Dict[str, List[str]]] = None
+_TRIGGER_KW_PATH = "config/referral_trigger_keywords.yaml"
+
+
+def _load_trigger_keywords() -> Dict[str, List[str]]:
+    """读 config/referral_trigger_keywords.yaml. 失败返 {}."""
+    global _TRIGGER_KW_CACHE
+    if _TRIGGER_KW_CACHE is not None:
+        return _TRIGGER_KW_CACHE
+    try:
+        import yaml
+        from pathlib import Path
+        path = Path(_TRIGGER_KW_PATH)
+        if not path.exists():
+            _TRIGGER_KW_CACHE = {}
+            return _TRIGGER_KW_CACHE
+        with path.open(encoding="utf-8") as f:
+            _TRIGGER_KW_CACHE = yaml.safe_load(f) or {}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[referral_gate] load trigger keywords failed: %s", exc)
+        _TRIGGER_KW_CACHE = {}
+    return _TRIGGER_KW_CACHE
+
+
+def reload_trigger_keywords_for_tests() -> None:
+    global _TRIGGER_KW_CACHE
+    _TRIGGER_KW_CACHE = None
+
+
+def hits_trigger_keyword(text: str, lang: str = "ja") -> bool:
+    """text 是否命中"客户主动要 LINE"关键词 (按 lang 字段查 yaml)."""
+    if not text:
+        return False
+    kw = _load_trigger_keywords()
+    candidates = kw.get(lang) or []
+    if not candidates:
+        return False
+    t = text.lower()
+    for k in candidates:
+        if k and k.lower() in t:
+            return True
+    return False
+
+
+def hits_rejection_keyword(text: str, lang: str = "ja") -> bool:
+    """text 是否命中"客户拒绝引流"关键词 (查 yaml.rejection_<lang>)."""
+    if not text:
+        return False
+    kw = _load_trigger_keywords()
+    candidates = kw.get(f"rejection_{lang}") or []
+    if not candidates:
+        return False
+    t = text.lower()
+    for k in candidates:
+        if k and k.lower() in t:
+            return True
+    return False
 
 
 @dataclass
@@ -90,7 +211,10 @@ def should_refer(*,
                  lead_score: int = 0,
                  has_contact: bool = False,
                  config: Optional[Dict[str, Any]] = None,
-                 now: Optional[_dt.datetime] = None) -> GateDecision:
+                 now: Optional[_dt.datetime] = None,
+                 incoming_text: str = "",
+                 persona_key: Optional[str] = None,
+                 emotion_overall: Optional[float] = None) -> GateDecision:
     """返回引流闸决策 — graceful, 永不抛。
 
     Args:
@@ -98,29 +222,71 @@ def should_refer(*,
         ref_score: ChatBrain 生成 reply 时给的 referral_score (0.0-1.0)
         memory_ctx: 来自 chat_memory.build_context_block 的记忆块,包含:
             - should_block_referral: 上次引流未回的标记
+            - referral_rejected_at: 客户上次明确拒绝引流的 ISO 时间戳 (可选)
             - profile: { total_turns, peer_reply_count, last_referral_at, ... }
         lead_score: A 机 fb_lead_scorer_v2 落库的 leads.score (0-100)
         has_contact: 是否配置了 referral_contact (WhatsApp/LINE ID)
         config: 覆盖 DEFAULT_CONFIG 部分字段,未指定字段取默认
         now: 注入时钟用于测试 cooldown,默认 utcnow
+        incoming_text: 当前入站消息原文, 用于 trigger / rejection 关键词命中检查
+        persona_key: 当前 persona (e.g. "jp_female_midlife"), 决定 trigger keyword
+            的语言 + cooldown 天数等. 未传则按 DEFAULT_CONFIG.
 
     Returns:
         GateDecision,调用方 if .refer: decision='wa_referral' else 'reply'
     """
-    cfg = dict(DEFAULT_CONFIG)
+    # 优先用 persona config (含 yaml.default + yaml.<persona>), 然后 caller config 覆盖
+    cfg = load_persona_config(persona_key)
     if config:
         cfg.update(config)
     memory_ctx = memory_ctx or {}
     profile = memory_ctx.get("profile") or {}
     now = now or _dt.datetime.utcnow()
+    trigger_lang = cfg.get("trigger_keywords_lang") or "ja"
 
     reasons: List[str] = []
+
+    # ── 层 0: 关键词命中 (拒绝词优先于触发词) ─────────────────────────
+    if incoming_text:
+        if hits_rejection_keyword(incoming_text, lang=trigger_lang):
+            reasons.append(
+                f"客户拒绝引流关键词命中 (lang={trigger_lang}, "
+                f"会触发 {cfg.get('rejection_cooldown_days')} 天冷却)"
+            )
+            return GateDecision(refer=False, level="hard_block",
+                                reasons=reasons)
+        if hits_trigger_keyword(incoming_text, lang=trigger_lang):
+            reasons.append(
+                f"客户主动要 LINE 关键词命中 (lang={trigger_lang})"
+            )
+            if has_contact:
+                return GateDecision(refer=True, level="hard_allow",
+                                    reasons=reasons)
+            # 没 contact 还是不能引, 落到正常 has_contact 检查
 
     # ── 层 1: hard_block ────────────────────────────────────────────────
     if not has_contact:
         reasons.append("无引流目标(has_contact=False)")
         return GateDecision(refer=False, level="hard_block",
                             reasons=reasons)
+
+    # 客户拒绝冷却 (rejection_cooldown_days) — 完全 hard_block, 不放行 referral_ask
+    rejection_days = int(cfg.get("rejection_cooldown_days", 0))
+    if rejection_days > 0:
+        rejected_at_iso = memory_ctx.get("referral_rejected_at") or \
+            profile.get("referral_rejected_at") or ""
+        if rejected_at_iso:
+            rejected_dt = _parse_iso(rejected_at_iso)
+            if rejected_dt is not None:
+                delta_sec = (now - rejected_dt).total_seconds()
+                if 0 <= delta_sec < rejection_days * 86400:
+                    days_left = (rejection_days * 86400 - delta_sec) / 86400.0
+                    reasons.append(
+                        f"客户拒绝冷却中 (剩 {days_left:.1f} 天 / "
+                        f"配置 {rejection_days} 天)"
+                    )
+                    return GateDecision(refer=False, level="hard_block",
+                                        reasons=reasons)
 
     # should_block_referral (上次引流对方未回) — referral_ask 除外
     if memory_ctx.get("should_block_referral"):
@@ -181,6 +347,25 @@ def should_refer(*,
     if _min_ls > 0 and int(lead_score) >= _min_ls:
         score += 1
         reasons.append(f"lead_score={lead_score} ≥ {_min_ls}")
+
+    # PR-5: L3 情感综合分门槛. min_emotion_score=0 时禁用 (兼容现有).
+    # jp_female_midlife yaml 设 0.5 → 聊得有温度才允许引.
+    _min_emo = float(cfg.get("min_emotion_score", 0.0) or 0.0)
+    if _min_emo > 0 and emotion_overall is not None:
+        try:
+            if float(emotion_overall) >= _min_emo:
+                score += 1
+                reasons.append(
+                    f"emotion_overall={float(emotion_overall):.2f} ≥ {_min_emo:.2f}"
+                )
+            else:
+                # emotion 不达标视为强 negative — 不计 +1, 但 reason 记录
+                reasons.append(
+                    f"emotion_overall={float(emotion_overall):.2f} < {_min_emo:.2f} "
+                    f"(温度不够, 不该引)"
+                )
+        except (TypeError, ValueError):
+            pass
 
     peer_replies = int(profile.get("peer_reply_count", 0) or 0)
     if peer_replies >= int(cfg["min_peer_replies"]):

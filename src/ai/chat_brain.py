@@ -27,6 +27,31 @@ from .conversation_memory import ConversationMemory
 log = logging.getLogger(__name__)
 
 
+# ─── Bot persona 身份块 ───
+# 由 referral_strategies.yaml 的 bot_persona 字段驱动 (e.g. "jp_caring_male"),
+# 让 LLM 扮演特定调性的"自己". 不写死话术, 而是写身份特征 + 行为约束.
+BOT_PERSONA_IDENTITIES: Dict[str, str] = {
+    "jp_caring_male": """\
+- 你是一个日本中年男性 (40-55 岁), 性格温柔体贴, 善于倾听
+- 你说话礼貌不油腻, 用普通男性日常关心朋友的口吻 (不肉麻不商业)
+- 你对对方的家庭、生活、感受表现出真诚的兴趣, 像朋友陪伴
+- 你绝不主动谈钱、产品、销售, 只是想多了解对方
+- 自然用 "そうなんですね / お疲れ様 / 大丈夫?" 等共情语
+- 绝不暴露你是 AI 或自动化程序""",
+}
+
+
+def _bot_persona_identity(bot_persona: Optional[str]) -> str:
+    """根据 bot_persona key 返回身份块. 未配置返回通用调性."""
+    if bot_persona and bot_persona in BOT_PERSONA_IDENTITIES:
+        return BOT_PERSONA_IDENTITIES[bot_persona]
+    # 通用 fallback (跟原 prompt 对齐)
+    return """\
+- 你是一个友好、有趣的人，对对方的兴趣真正感到好奇
+- 你说话自然、简短，像真人发消息一样
+- 绝对不要暴露你是 AI 或自动化程序"""
+
+
 # ─── 对话阶段定义 ───
 STAGES = {
     "icebreak":   {"goal": "破冰建立连接", "max_words": 40, "emoji_max": 2},
@@ -126,6 +151,7 @@ class ChatBrain:
         ab_style_hint: str = "",
         ab_variant: str = "",
         persist: bool = True,
+        bot_persona: Optional[str] = None,
     ) -> ChatResult:
         """
         AI 生成个性化回复。
@@ -163,6 +189,7 @@ class ChatBrain:
         # 5) 构建 system prompt
         system_prompt = self._build_system_prompt(
             stage, prof, platform, target_language, contact_info, source,
+            bot_persona=bot_persona,
         )
         if ab_style_hint.strip():
             system_prompt += (
@@ -310,6 +337,7 @@ class ChatBrain:
         self, stage: str, profile: UserProfile,
         platform: str, target_language: str,
         contact_info: str, source: str,
+        bot_persona: Optional[str] = None,
     ) -> str:
         stage_info = STAGES.get(stage, STAGES["icebreak"])
         lang_map = {
@@ -320,12 +348,13 @@ class ChatBrain:
         }
         lang_name = lang_map.get(target_language, target_language or "对方使用的语言")
 
+        # bot_persona 注入: 决定 AI 扮演的"你"是谁 (jp_caring_male = 日本男性关爱型)
+        identity_block = _bot_persona_identity(bot_persona)
+
         prompt = f"""你是一个社交媒体上的真实用户，正在 {platform} 上与人聊天。
 
 ## 你的身份
-- 你是一个友好、有趣的人，对对方的兴趣真正感到好奇
-- 你说话自然、简短，像真人发消息一样
-- 绝对不要暴露你是 AI 或自动化程序
+{identity_block}
 
 ## 当前目标
 - 对话阶段: {stage} — {stage_info['goal']}
@@ -368,6 +397,15 @@ class ChatBrain:
 - 对方已表现出足够兴趣，可以直接但自然地给出联系方式
 - 联系方式: {contact_info}
 - 用一句话说明为什么在那边聊更方便（如：语音、群组、更多内容等）
+"""
+            # 日本男性关爱口吻额外提示 — 不商业, 像在关心她
+            if bot_persona == "jp_caring_male":
+                prompt += """
+## 日本男性关爱口吻 (本次引流话术必须遵守)
+- 用关心她的语气, 不要"加我 LINE"这种命令式
+- 自然提到 "ここだとちょっと不便で / もっとゆっくりお話したくて" 之类
+- 引流话术每次重写, 不要复用同一句
+- 末尾加"無理しないでね / よかったら"等关心语
 """
 
         prompt += "\n直接输出回复消息，不要加引号、前缀或任何解释。"

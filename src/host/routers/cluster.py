@@ -1429,8 +1429,9 @@ def _safe_get_store():
 def cluster_customers_upsert(body: dict):
     """worker push 客户记录 (idempotent by canonical_source+id).
 
-    Body: {canonical_id, canonical_source, primary_name?, age_band?, gender?,
-           country?, interests?, ai_profile?, status?, worker_id?, device_id?}
+    Body: {canonical_id, canonical_source, customer_id?, primary_name?, age_band?,
+           gender?, country?, interests?, ai_profile?, status?, worker_id?, device_id?}
+    customer_id 可由 worker 端 UUIDv5 预生成 (compute_customer_id), 不传则主控生成.
     Response: {customer_id}
     """
     if not _is_coordinator_role():
@@ -1453,6 +1454,7 @@ def cluster_customers_upsert(body: dict):
         status=body.get("status"),
         worker_id=body.get("worker_id"),
         device_id=body.get("device_id"),
+        customer_id=body.get("customer_id"),
     )
     return {"customer_id": cid}
 
@@ -1640,3 +1642,23 @@ def cluster_customers_funnel(days: int = 7):
         raise HTTPException(400, "central store 仅在 coordinator 节点可用")
     store = _safe_get_store()
     return store.funnel_stats(days=min(max(1, days), 90))
+
+
+@router.get("/cluster/customers/push/metrics",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_push_metrics():
+    """worker 侧 push counter + retry queue 状态 + drain thread 状态.
+
+    每个 worker 节点都暴露自己的 metrics (per-process). coordinator 想要
+    集群级聚合可以遍历各 worker 拉.
+    """
+    try:
+        from src.host.central_push_client import get_push_metrics
+        from src.host.central_push_drain import get_drain_status
+        return {
+            "metrics": get_push_metrics(),
+            "drain": get_drain_status(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[push_metrics] %s", exc)
+        raise HTTPException(500, str(exc))

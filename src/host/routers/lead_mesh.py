@@ -613,3 +613,119 @@ def api_blocked_peers(reason: str = Query(...),
                                  date=date or None)
     return {"reason": reason, "days": days, "date": date or "",
              "count": len(peers), "peers": peers}
+
+
+# ─── PR-6 真人客服接管 ───────────────────────────────────────────────
+
+@router.post("/handoffs/{handoff_id}/assign")
+def api_handoff_assign(handoff_id: str, body: Dict[str, Any] = Body(...)):
+    """真人按"我接手".
+
+    Body: {username, peer_name?, device_id?, takeover_ttl_sec?}
+    peer_name + device_id 给了, 同时调 ai_takeover_state.mark_taken_over
+    暂停 worker AI 自动回 (PR-7 ai_takeover_state 模块).
+    """
+    username = (body.get("username") or "").strip()
+    if not username:
+        raise HTTPException(400, "username 必填")
+    try:
+        from src.host.lead_mesh.customer_service import assign_to_human
+        return assign_to_human(
+            handoff_id, username,
+            peer_name_hint=body.get("peer_name") or "",
+            device_id_hint=body.get("device_id") or "",
+            takeover_ttl_sec=float(body.get("takeover_ttl_sec") or 3600.0),
+        )
+    except KeyError:
+        raise HTTPException(404, f"handoff {handoff_id} not found")
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/handoffs/{handoff_id}/reply")
+def api_handoff_reply(handoff_id: str, body: Dict[str, Any] = Body(...)):
+    """真人后台输入消息 (PR-6 阶段先记录, PR-6.5 接 worker 实发).
+
+    Body: {username, text, sent_via_worker?, meta?}
+    """
+    username = (body.get("username") or "").strip()
+    text = (body.get("text") or "").strip()
+    if not username or not text:
+        raise HTTPException(400, "username / text 必填")
+    try:
+        from src.host.lead_mesh.customer_service import record_human_reply
+        return record_human_reply(
+            handoff_id, username, text,
+            sent_via_worker=bool(body.get("sent_via_worker", False)),
+            extra_meta=body.get("meta"),
+        )
+    except KeyError:
+        raise HTTPException(404, f"handoff {handoff_id} not found")
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/handoffs/{handoff_id}/note")
+def api_handoff_note(handoff_id: str, body: Dict[str, Any] = Body(...)):
+    """真人加内部备注 (不发给客户).
+
+    Body: {username, note}
+    """
+    username = (body.get("username") or "").strip()
+    note = (body.get("note") or "").strip()
+    if not username or not note:
+        raise HTTPException(400, "username / note 必填")
+    try:
+        from src.host.lead_mesh.customer_service import record_internal_note
+        return record_internal_note(handoff_id, username, note)
+    except KeyError:
+        raise HTTPException(404, f"handoff {handoff_id} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/handoffs/{handoff_id}/outcome")
+def api_handoff_outcome(handoff_id: str, body: Dict[str, Any] = Body(...)):
+    """真人标结果. converted/lost 终态会释放 ai 接管.
+
+    Body: {username, outcome (converted|lost|pending_followup),
+           notes?, peer_name?, device_id?}
+    """
+    username = (body.get("username") or "").strip()
+    outcome = (body.get("outcome") or "").strip()
+    if not username or not outcome:
+        raise HTTPException(400, "username / outcome 必填")
+    try:
+        from src.host.lead_mesh.customer_service import record_outcome
+        return record_outcome(
+            handoff_id, username, outcome,
+            notes=body.get("notes") or "",
+            peer_name_hint=body.get("peer_name") or "",
+            device_id_hint=body.get("device_id") or "",
+        )
+    except KeyError:
+        raise HTTPException(404, f"handoff {handoff_id} not found")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/handoffs/{handoff_id}/full")
+def api_handoff_full(handoff_id: str):
+    """读 handoff 全字段 (含 replies / notes / outcome). 给真人后台详情页用."""
+    from src.host.lead_mesh.customer_service import get_handoff_full
+    rec = get_handoff_full(handoff_id)
+    if not rec:
+        raise HTTPException(404, f"handoff {handoff_id} not found")
+    return rec
+
+
+@router.get("/handoffs/assigned/{username}")
+def api_handoffs_assigned_to(username: str, limit: int = Query(50, ge=1, le=500)):
+    """列出某 username 当前接管中的 handoff (outcome 还没标的)."""
+    from src.host.lead_mesh.customer_service import list_assigned_to_user
+    rows = list_assigned_to_user(username, limit=limit)
+    return {"username": username, "count": len(rows), "handoffs": rows}

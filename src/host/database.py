@@ -680,6 +680,19 @@ _MIGRATIONS = [
     " ON fb_alert_history(fired_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_alert_type_fired"
     " ON fb_alert_history(alert_type, fired_at DESC)",
+
+    # ─── PR-6 真人后台扩展: lead_handoffs 加 7 列 ────────────────────
+    "ALTER TABLE lead_handoffs ADD COLUMN assigned_to_username TEXT DEFAULT ''",
+    "ALTER TABLE lead_handoffs ADD COLUMN assigned_at TEXT DEFAULT ''",
+    "ALTER TABLE lead_handoffs ADD COLUMN customer_service_replies_json TEXT DEFAULT '[]'",
+    "ALTER TABLE lead_handoffs ADD COLUMN internal_notes_json TEXT DEFAULT '[]'",
+    "ALTER TABLE lead_handoffs ADD COLUMN outcome TEXT DEFAULT ''",
+    "ALTER TABLE lead_handoffs ADD COLUMN outcome_notes TEXT DEFAULT ''",
+    "ALTER TABLE lead_handoffs ADD COLUMN outcome_at TEXT DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_assigned"
+    " ON lead_handoffs(assigned_to_username, state)",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_outcome"
+    " ON lead_handoffs(outcome, outcome_at DESC) WHERE outcome != ''",
 ]
 
 

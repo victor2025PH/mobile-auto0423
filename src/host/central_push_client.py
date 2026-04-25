@@ -55,6 +55,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -65,6 +66,64 @@ logger = logging.getLogger(__name__)
 DEFAULT_HTTP_TIMEOUT = 10.0
 DEFAULT_RETRY_TIMES = 3
 DEFAULT_RETRY_BACKOFF = 1.5  # 1.5x 每次
+
+# 失败队列指数 backoff: attempts=1 → 30s, =2 → 60s, =3 → 120s ... 上限 1h
+DRAIN_BACKOFF_BASE_SEC = 30.0
+DRAIN_BACKOFF_MULTIPLIER = 2.0
+DRAIN_BACKOFF_MAX_SEC = 3600.0
+# 超过此次数移到死信表
+DEAD_LETTER_THRESHOLD = 100
+
+# ── module-level metrics counters ─────────────────────────────────────
+_metrics_lock = threading.Lock()
+_metrics: Dict[str, int] = {
+    "push_total": 0,            # 所有 push 调用 (sync + async)
+    "push_success": 0,          # 成功 (HTTP 2xx)
+    "push_failure": 0,          # 失败 (5xx / network / 4xx)
+    "push_4xx": 0,              # 4xx 业务错误 (单独计, 不重试)
+    "push_async_enqueue": 0,    # fire_and_forget 提交到 executor
+    "drain_attempts": 0,        # drain 调用次数
+    "drain_success": 0,         # drain 内成功 push 的条数
+    "drain_failure": 0,         # drain 内仍失败的条数
+    "dead_letter_total": 0,     # 累计移到死信表的条数
+}
+
+
+def _metric_inc(name: str, n: int = 1) -> None:
+    with _metrics_lock:
+        _metrics[name] = _metrics.get(name, 0) + n
+
+
+def get_push_metrics() -> Dict[str, Any]:
+    """快照 push 失败队列状态 + counters. 暴露到 /cluster/customers/push/metrics."""
+    with _metrics_lock:
+        snapshot = dict(_metrics)
+    try:
+        store = get_retry_store()
+        snapshot["queue_pending"] = store.pending_count()
+        snapshot["queue_due_now"] = store.pending_count_due()
+        snapshot["dead_letter_pending"] = store.dead_letter_count()
+    except Exception:  # noqa: BLE001
+        snapshot["queue_pending"] = -1
+    return snapshot
+
+
+def reset_push_metrics_for_tests() -> None:
+    """仅测试用. 清零 counters."""
+    with _metrics_lock:
+        for k in _metrics:
+            _metrics[k] = 0
+
+# UUIDv5 namespace: worker 离线时也能算出确定性 customer_id, 主控收到 push
+# 时若已存在 (canonical_source, canonical_id) 则 ON CONFLICT 走 update 路径,
+# customer_id 保持为首次写入时的值 (PK 不变).
+_CUSTOMER_NS = uuid.uuid5(uuid.NAMESPACE_DNS, "openclaw.l2.customer")
+
+
+def compute_customer_id(canonical_source: str, canonical_id: str) -> str:
+    """对 (source, id) 算确定性 UUIDv5, worker 离线也能不阻塞算 customer_id."""
+    name = f"{canonical_source}:{canonical_id}"
+    return str(uuid.uuid5(_CUSTOMER_NS, name))
 
 # ── retry queue 路径 (本地 SQLite, 失败缓存) ────────────────────────
 _DEFAULT_QUEUE_DB = os.environ.get(
@@ -95,6 +154,7 @@ def _http_post_json(
     headers = {"Content-Type": "application/json"}
     headers.update(_api_key_header())
 
+    _metric_inc("push_total")
     last_exc: Optional[Exception] = None
     delay = 0.5
     for attempt in range(retries + 1):
@@ -102,10 +162,13 @@ def _http_post_json(
             req = _ureq.Request(url, data=data, method="POST", headers=headers)
             with _ureq.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
+            _metric_inc("push_success")
             return json.loads(raw)
         except _uerr.HTTPError as e:
             # 4xx 不重试 (业务错误)
             if 400 <= e.code < 500:
+                _metric_inc("push_4xx")
+                _metric_inc("push_failure")
                 try:
                     detail = e.read().decode("utf-8", errors="replace")
                 except Exception:
@@ -118,12 +181,20 @@ def _http_post_json(
             time.sleep(delay)
             delay *= DEFAULT_RETRY_BACKOFF
 
+    _metric_inc("push_failure")
     raise RuntimeError(f"central push failed after {retries + 1}: {last_exc}")
 
 
 # ── 本地 SQLite retry queue ──────────────────────────────────────────
 class EnqueueRetryStore:
-    """worker 离线时把 push 写本地 SQLite, 恢复后扫表回补."""
+    """worker 离线时把 push 写本地 SQLite, 后台 drain 线程扫表回补.
+
+    特性:
+    - 指数 backoff: 失败时计算 next_retry_at = now + base × multiplier^attempts
+    - 死信表 push_dead_letter: attempts > DEAD_LETTER_THRESHOLD 移过去
+    - drain 锁优化: 取出 N 条 → 释放锁 → push → 再拿锁更新, 不阻塞 enqueue
+    - schema 平滑升级: __init__ 检测 next_retry_at 列缺失就 ALTER ADD
+    """
 
     def __init__(self, db_path: Optional[str] = None):
         self._db_path = Path(db_path or _DEFAULT_QUEUE_DB)
@@ -142,48 +213,128 @@ class EnqueueRetryStore:
                 )
                 """
             )
+            # v1 → v2: 加 next_retry_at 列 (旧 worker 升级用)
+            cols = {r[1] for r in c.execute("PRAGMA table_info(push_queue)")}
+            if "next_retry_at" not in cols:
+                c.execute(
+                    "ALTER TABLE push_queue ADD COLUMN next_retry_at REAL NOT NULL DEFAULT 0"
+                )
+            # 死信表
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS push_dead_letter (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    enqueued_at REAL NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    last_error TEXT,
+                    moved_at REAL NOT NULL
+                )
+                """
+            )
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_push_queue_due "
+                "ON push_queue(next_retry_at)"
+            )
 
     def _conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(str(self._db_path), timeout=5.0)
         c.execute("PRAGMA journal_mode=WAL")
         return c
 
+    @staticmethod
+    def _backoff(attempts: int) -> float:
+        """指数 backoff. attempts=0 → 30s, 1 → 60s, 2 → 120s, ... 上限 1h."""
+        delay = DRAIN_BACKOFF_BASE_SEC * (DRAIN_BACKOFF_MULTIPLIER ** attempts)
+        return min(delay, DRAIN_BACKOFF_MAX_SEC)
+
     def enqueue(self, path: str, body: Dict[str, Any]) -> int:
+        now = time.time()
         with self._lock, self._conn() as c:
             cur = c.execute(
-                "INSERT INTO push_queue (path, body, enqueued_at) VALUES (?, ?, ?)",
-                (path, json.dumps(body), time.time()),
+                "INSERT INTO push_queue (path, body, enqueued_at, next_retry_at) "
+                "VALUES (?, ?, ?, ?)",
+                (path, json.dumps(body), now, now),  # 立即可重试
             )
             return cur.lastrowid or 0
 
-    def drain(self, limit: int = 100) -> int:
-        """try push N pending items. 返回成功数."""
+    def drain(self, limit: int = 100, now: Optional[float] = None) -> int:
+        """扫 next_retry_at <= now 的条目尝试 push. 返回成功数.
+
+        锁优化: SELECT 后释放锁让 enqueue 可进, push 完再加锁更新/删除.
+        失败的设 next_retry_at = now + backoff(attempts), 不重复占用资源.
+        attempts > DEAD_LETTER_THRESHOLD 移到死信表.
+        """
+        _metric_inc("drain_attempts")
+        now = now if now is not None else time.time()
         with self._lock, self._conn() as c:
             rows = c.execute(
                 "SELECT id, path, body, attempts FROM push_queue "
-                "ORDER BY id LIMIT ?",
-                (limit,),
+                "WHERE next_retry_at <= ? "
+                "ORDER BY next_retry_at, id LIMIT ?",
+                (now, limit),
             ).fetchall()
+
         ok = 0
         for row in rows:
             qid, path, body_str, attempts = row
             try:
                 _http_post_json(path, json.loads(body_str), retries=1)
+                # 成功: 删除条目
                 with self._lock, self._conn() as c:
                     c.execute("DELETE FROM push_queue WHERE id = ?", (qid,))
+                _metric_inc("drain_success")
                 ok += 1
             except Exception as e:  # noqa: BLE001
-                with self._lock, self._conn() as c:
-                    c.execute(
-                        "UPDATE push_queue SET attempts = ?, last_error = ? "
-                        "WHERE id = ?",
-                        (attempts + 1, str(e)[:300], qid),
+                new_attempts = attempts + 1
+                err = str(e)[:300]
+                if new_attempts > DEAD_LETTER_THRESHOLD:
+                    # 移到死信表
+                    with self._lock, self._conn() as c:
+                        c.execute(
+                            "INSERT INTO push_dead_letter "
+                            "(path, body, enqueued_at, attempts, last_error, moved_at) "
+                            "SELECT path, body, enqueued_at, ?, ?, ? "
+                            "FROM push_queue WHERE id = ?",
+                            (new_attempts, err, time.time(), qid),
+                        )
+                        c.execute("DELETE FROM push_queue WHERE id = ?", (qid,))
+                    _metric_inc("dead_letter_total")
+                    logger.warning(
+                        "[central_push] item id=%d 累计失败 %d 次, 移至死信表. "
+                        "last_error: %s", qid, new_attempts, err,
                     )
+                else:
+                    next_retry = time.time() + self._backoff(new_attempts)
+                    with self._lock, self._conn() as c:
+                        c.execute(
+                            "UPDATE push_queue SET attempts = ?, last_error = ?, "
+                            "next_retry_at = ? WHERE id = ?",
+                            (new_attempts, err, next_retry, qid),
+                        )
+                    _metric_inc("drain_failure")
         return ok
 
     def pending_count(self) -> int:
+        """等待中的所有条目 (含未到 next_retry_at 的)."""
         with self._conn() as c:
             row = c.execute("SELECT COUNT(*) FROM push_queue").fetchone()
+            return int(row[0]) if row else 0
+
+    def pending_count_due(self, now: Optional[float] = None) -> int:
+        """到达重试时间, 当前 drain 会扫到的条目数."""
+        now = now if now is not None else time.time()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM push_queue WHERE next_retry_at <= ?",
+                (now,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def dead_letter_count(self) -> int:
+        with self._conn() as c:
+            row = c.execute("SELECT COUNT(*) FROM push_dead_letter").fetchone()
             return int(row[0]) if row else 0
 
 
@@ -224,6 +375,7 @@ def _push_with_retry_queue(path: str, body: Dict[str, Any]) -> Optional[Dict[str
         logger.warning("[central_push] %s failed: %s, queue locally", path, exc)
         try:
             get_retry_store().enqueue(path, body)
+            _metric_inc("push_async_enqueue")
         except Exception as q_exc:  # noqa: BLE001
             logger.error("[central_push] enqueue local 也失败: %s", q_exc)
         return None
@@ -242,13 +394,21 @@ def upsert_customer(
     status: Optional[str] = None,
     worker_id: Optional[str] = None,
     device_id: Optional[str] = None,
-    fire_and_forget: bool = False,
-) -> Optional[str]:
-    """upsert. fire_and_forget=True 不阻塞业务, 返回 None.
+    customer_id: Optional[str] = None,
+    fire_and_forget: bool = True,
+) -> str:
+    """upsert. 默认 fire_and_forget — worker 端用 UUIDv5 自算 customer_id,
+    push 走异步队列, 主控离线时 worker 不阻塞.
 
+    customer_id 不传时按 (canonical_source, canonical_id) 算 UUIDv5;
+    传了就用传的 (用于跨次调用复用).
+
+    返回 customer_id (worker 端自算或调用方自传, sync 模式回退到主控返回值).
     sync 模式失败 raise; fire_and_forget 模式失败 enqueue 本地 retry queue.
     """
+    cid = customer_id or compute_customer_id(canonical_source, canonical_id)
     body = {k: v for k, v in dict(
+        customer_id=cid,
         canonical_id=canonical_id, canonical_source=canonical_source,
         primary_name=primary_name, age_band=age_band, gender=gender,
         country=country, interests=interests, ai_profile=ai_profile,
@@ -258,9 +418,9 @@ def upsert_customer(
         _get_async_executor().submit(
             _push_with_retry_queue, "/cluster/customers/upsert", body,
         )
-        return None
+        return cid
     res = _http_post_json("/cluster/customers/upsert", body)
-    return res.get("customer_id")
+    return res.get("customer_id") or cid
 
 
 def record_event(
