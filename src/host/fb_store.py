@@ -821,6 +821,124 @@ def get_peer_name_reject_history(*, hours_window: int = 168,
                 "error": str(e)[:120]}
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 20.1.9.1 (2026-04-25): fb_alert_history — 跨进程 alert 触发历史
+# ═══════════════════════════════════════════════════════════════════════
+
+def record_alert_fired(alert: Dict[str, Any], *,
+                          region: str = "",
+                          context: Optional[Dict[str, Any]] = None) -> int:
+    """写一条 alert 触发记录到 fb_alert_history.
+
+    alert: {type, severity, message, ...}
+    region: per-region alert (Phase 20.1.9.2 用), overall alert 留空字符串
+    context: 触发时的关键 funnel 数字, 写 context_json 备查
+    返插入 id, 失败返 0.
+    """
+    try:
+        import json as _j
+        atype = str(alert.get("type") or "")
+        sev = str(alert.get("severity") or "")
+        msg = str(alert.get("message") or "")
+        if not atype:
+            return 0
+        ctx_str = ""
+        if context:
+            try:
+                ctx_str = _j.dumps(context, ensure_ascii=False)
+            except Exception:
+                ctx_str = ""
+        with _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO fb_alert_history"
+                " (alert_type, severity, message, region, context_json)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (atype, sev, msg, region or "", ctx_str or "{}"))
+            return int(cur.lastrowid or 0)
+    except Exception as e:
+        logger.debug("[alert_history] write 失败: %s", e)
+        return 0
+
+
+def get_alert_history(*, hours_window: int = 168,
+                         alert_type: Optional[str] = None,
+                         severity: Optional[str] = None,
+                         region: Optional[str] = None,
+                         limit: int = 200,
+                         by_day: bool = False) -> Dict[str, Any]:
+    """读 fb_alert_history.
+
+    返:
+      {
+        total: int,
+        by_type: {type: count},
+        by_severity: {sev: count},
+        by_day: {date: count}     # by_day=True 时
+        samples: [{...recent N}],
+      }
+    """
+    if hours_window <= 0:
+        return {"total": 0, "by_type": {}, "by_severity": {}, "samples": []}
+    try:
+        clauses = ["fired_at >= datetime('now', ?)"]
+        params: list = [f"-{int(hours_window)} hours"]
+        if alert_type:
+            clauses.append("alert_type = ?")
+            params.append(alert_type)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        if region is not None:  # 显式空字符串 = "只看 overall"
+            clauses.append("region = ?")
+            params.append(region)
+        where = " AND ".join(clauses)
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM fb_alert_history WHERE {where}",
+                params).fetchone()
+            total = int(count_row["n"]) if count_row else 0
+
+            type_rows = conn.execute(
+                f"SELECT alert_type, COUNT(*) AS n FROM fb_alert_history"
+                f" WHERE {where} GROUP BY alert_type",
+                params).fetchall()
+            sev_rows = conn.execute(
+                f"SELECT severity, COUNT(*) AS n FROM fb_alert_history"
+                f" WHERE {where} GROUP BY severity",
+                params).fetchall()
+
+            samples = conn.execute(
+                f"SELECT id, alert_type, severity, message, region,"
+                f" context_json, fired_at FROM fb_alert_history"
+                f" WHERE {where} ORDER BY fired_at DESC LIMIT ?",
+                params + [max(1, min(int(limit or 200), 2000))]
+            ).fetchall()
+
+            day_map: Dict[str, int] = {}
+            if by_day:
+                day_rows = conn.execute(
+                    f"SELECT substr(fired_at, 1, 10) AS d, COUNT(*) AS n"
+                    f" FROM fb_alert_history WHERE {where}"
+                    f" GROUP BY substr(fired_at, 1, 10)"
+                    f" ORDER BY d DESC",
+                    params).fetchall()
+                day_map = {r["d"]: int(r["n"]) for r in day_rows}
+
+        return {
+            "total": total,
+            "hours_window": hours_window,
+            "by_type": {r["alert_type"]: int(r["n"]) for r in type_rows},
+            "by_severity": {r["severity"]: int(r["n"]) for r in sev_rows},
+            "by_day": day_map,
+            "samples": [dict(r) for r in samples],
+        }
+    except Exception as e:
+        logger.debug("[alert_history] read 失败: %s", e)
+        return {"total": 0, "by_type": {}, "by_severity": {},
+                "samples": [], "error": str(e)[:120]}
+
+
 def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
                          template_id: str = "",
                          preset_key: str = "",

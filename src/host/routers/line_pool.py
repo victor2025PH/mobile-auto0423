@@ -106,6 +106,24 @@ def api_blacklist_reload():
     return {"ok": True, "extra_count": n}
 
 
+@router.get("/stats/alert-history")
+def api_alert_history(
+        hours_window: int = Query(default=168, ge=1, le=720),
+        alert_type: Optional[str] = Query(default=None),
+        severity: Optional[str] = Query(default=None),
+        region: Optional[str] = Query(default=None),
+        limit: int = Query(default=200, ge=1, le=2000),
+        by_day: bool = Query(default=True)):
+    """Phase 20.1.9.1: 跨进程 alert 触发历史 (DB fb_alert_history).
+
+    by_day=true 返 by_day dict 看每日 alert 频率趋势.
+    """
+    from src.host.fb_store import get_alert_history
+    return get_alert_history(
+        hours_window=hours_window, alert_type=alert_type,
+        severity=severity, region=region, limit=limit, by_day=by_day)
+
+
 @router.get("/stats/daily-summary")
 def api_daily_summary_view(
         date: Optional[str] = Query(default=None,

@@ -665,6 +665,21 @@ _MIGRATIONS = [
     " ON peer_name_reject_log(at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_peer_reject_event"
     " ON peer_name_reject_log(event_type, at DESC)",
+    # Phase 20.1.9.1 (2026-04-25): alert 触发历史 — 跨进程持久化, 用于
+    # 回顾 7-30d alert 频率 / 分布 / 是否反复同一 type.
+    "CREATE TABLE IF NOT EXISTS fb_alert_history ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " alert_type TEXT NOT NULL DEFAULT '',"
+    " severity TEXT NOT NULL DEFAULT '',"
+    " message TEXT NOT NULL DEFAULT '',"
+    " region TEXT NOT NULL DEFAULT '',"        # per-region alert 用 (Phase 20.1.9.2)
+    " context_json TEXT NOT NULL DEFAULT '{}',"
+    " fired_at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_alert_fired_at"
+    " ON fb_alert_history(fired_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_alert_type_fired"
+    " ON fb_alert_history(alert_type, fired_at DESC)",
 ]
 
 

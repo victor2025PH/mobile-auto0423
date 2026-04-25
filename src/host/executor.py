@@ -1125,19 +1125,34 @@ def _save_alert_state(state: Dict[str, str]) -> None:
             pass
 
 
+def _alert_state_key(a: Dict[str, Any]) -> str:
+    """Phase 20.1.9.2: state key = type + (":region" if region 非空).
+
+    region 非空时 cooldown / history 按 (type, region) 独立, 同 type 不同 region
+    互不抑制. 用于 per-region replied_rate_low 等场景.
+    """
+    rg = (a.get("region") or "").strip()
+    base = a.get("type") or ""
+    return f"{base}:{rg}" if rg else base
+
+
 def _detect_referral_alerts(funnel: Dict[str, Any],
                               reject_total: int,
                               alert_send_threshold: float = 0.3,
                               alert_reject_threshold: int = 10,
                               alert_reply_threshold: float = 0.2,
-                              alert_reply_min_sent: int = 10
+                              alert_reply_min_sent: int = 10,
+                              *,
+                              region_label: str = ""
                               ) -> List[Dict[str, Any]]:
     """共用 alert 检测逻辑 (4 类规则). daily_summary + hourly_check 都调.
 
     Phase 20.1.8.2: 加 replied_rate_low — sent 多但 reply rate < 阈值, 文案
     /persona 信号失效预警.
+    Phase 20.1.9.2: region_label 非空时, 每条 alert 自动 tag region 字段;
+    cooldown / history 按 (type, region) 独立 state_key.
 
-    返 list of {type, severity, message}. 无 alert 返空 list.
+    返 list of {type, severity, message, region?}. 无 alert 返空 list.
     """
     alerts: List[Dict[str, Any]] = []
     if (funnel.get("planned", 0) >= 5
@@ -1177,6 +1192,12 @@ def _detect_referral_alerts(funnel: Dict[str, Any],
                               f"(sent={sent_n}, replied={replied_n}); "
                               "文案/persona 可能失效"),
             })
+    # Phase 20.1.9.2: region_label 非空时给所有 alerts 打 region 标签
+    if region_label:
+        for a in alerts:
+            a["region"] = region_label
+            # message 加前缀方便人眼区分
+            a["message"] = f"[{region_label}] {a['message']}"
     return alerts
 
 
@@ -1201,7 +1222,8 @@ def _filter_alerts_by_cooldown(alerts: List[Dict[str, Any]],
                 else _ALERT_DEFAULT_SEVERITY_COOLDOWNS)
     out: List[Dict[str, Any]] = []
     for a in alerts:
-        last_iso = state.get(a["type"], "")
+        # Phase 20.1.9.2: state_key = type + (:region if any) 区分 per-region
+        last_iso = state.get(_alert_state_key(a), "")
         # 选 cooldown: severity 优先, 没匹配用全局 cooldown_hours
         sev = (a.get("severity") or "").lower()
         eff_cd = sev_map.get(sev, cooldown_hours)
@@ -1217,13 +1239,30 @@ def _filter_alerts_by_cooldown(alerts: List[Dict[str, Any]],
 
 
 def _record_alerts_fired(alerts: List[Dict[str, Any]],
-                            state: Dict[str, str]) -> Dict[str, str]:
-    """更新 alert_state.json — 把刚 fire 的 alerts 时间戳写入."""
+                            state: Dict[str, str],
+                            *,
+                            history_context: Optional[Dict[str, Any]] = None
+                            ) -> Dict[str, str]:
+    """更新 alert_state.json + 写 fb_alert_history (Phase 20.1.9.1).
+
+    state file 用于 cooldown 抑制 (in-memory + 单文件); history 表用于跨进程
+    历史回顾 / 趋势分析. 两路并存, 失败互不影响.
+
+    history_context 是触发时 funnel 等上下文 dict, 写入 fb_alert_history.context_json.
+    """
     import datetime as _dt
     now_iso = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     new_state = dict(state)
     for a in alerts:
-        new_state[a["type"]] = now_iso
+        # Phase 20.1.9.2: state_key 含 region 后缀
+        new_state[_alert_state_key(a)] = now_iso
+        # Phase 20.1.9.1: 同步写 history (失败 silent)
+        try:
+            from src.host.fb_store import record_alert_fired
+            record_alert_fired(a, region=str(a.get("region") or ""),
+                                 context=history_context)
+        except Exception as e:
+            logger.debug("[alert_history] hook 失败: %s", e)
     return new_state
 
 
@@ -1290,8 +1329,18 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
                 webhook_sent = True
             except Exception as e:
                 logger.warning("[hourly_alert] webhook 失败: %s", e)
-        # 状态写文件 (即使 webhook 失败也写, 避免反复尝试)
-        new_state = _record_alerts_fired(fire_now, state)
+        # 状态写文件 + 历史 DB (即使 webhook 失败也写, 避免反复尝试)
+        hist_ctx = {
+            "hours_window": hours_window,
+            "funnel": {"planned": funnel.get("planned", 0),
+                          "sent": funnel.get("sent", 0),
+                          "replied": funnel.get("replied", 0),
+                          "send_rate": funnel.get("send_rate", 0)},
+            "reject_total": rej_total,
+            "source": "hourly_check",
+        }
+        new_state = _record_alerts_fired(fire_now, state,
+                                            history_context=hist_ctx)
         _save_alert_state(new_state)
 
     return True, "", {
@@ -1367,6 +1416,64 @@ def _compute_reply_latency_stats(hours_window: int = 24) -> Dict[str, Any]:
     return out
 
 
+def _compute_latency_anomaly(today_latency: Dict[str, Any],
+                                lookback_days: int = 7,
+                                min_baseline_samples: int = 3,
+                                z_threshold: float = 2.0
+                                ) -> Optional[Dict[str, Any]]:
+    """Phase 20.1.9.3 (2026-04-25): 7d daily_summary 历史 vs 今天 latency.
+
+    读 logs/daily_summary_YYYYMMDD.json 历史 (排除今天), 拿
+    summary.reply_latency.avg_min 序列, 算 stdev + z-score.
+
+    返:
+      {avg_baseline, stdev, samples, z, anomaly}  -- 有数据时
+      None -- 历史样本数 < min_baseline_samples 或 today 没数据
+    """
+    try:
+        today_avg = today_latency.get("avg_min") if today_latency else None
+        if today_avg is None:
+            return None
+        import datetime as _dt
+        import json as _j
+        from pathlib import Path as _Path
+        import statistics as _stats
+        baseline: List[float] = []
+        for i in range(1, lookback_days + 1):
+            d = (_dt.datetime.utcnow() - _dt.timedelta(days=i)).strftime("%Y%m%d")
+            p = _Path("logs") / f"daily_summary_{d}.json"
+            if not p.exists():
+                continue
+            try:
+                with p.open(encoding="utf-8") as f:
+                    data = _j.load(f) or {}
+                avg = data.get("reply_latency", {}).get("avg_min")
+                if isinstance(avg, (int, float)) and avg >= 0:
+                    baseline.append(float(avg))
+            except Exception:
+                continue
+        if len(baseline) < min_baseline_samples:
+            return None
+        avg_b = sum(baseline) / len(baseline)
+        std = _stats.pstdev(baseline) if len(baseline) >= 2 else 0.0
+        z: Optional[float] = None
+        anomaly = False
+        if std > 0:
+            z = (today_avg - avg_b) / std
+            anomaly = abs(z) > z_threshold
+        return {
+            "samples": len(baseline),
+            "avg_baseline": round(avg_b, 2),
+            "stdev": round(std, 3),
+            "z": round(z, 3) if z is not None else None,
+            "anomaly": anomaly,
+            "today_avg": today_avg,
+        }
+    except Exception as e:
+        logger.debug("[latency_anomaly] 失败: %s", e)
+        return None
+
+
 def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
     """Phase 18 / 19 (2026-04-25): 每日 referral 闭环健康摘要 + 趋势 + 告警.
 
@@ -1437,8 +1544,57 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         alert_reply_threshold=alert_reply_threshold,
         alert_reply_min_sent=alert_reply_min_sent)
 
+    # Phase 20.1.9.2: per-region alert 检测 (jp/it 各自跑 detection)
+    # reject 是全 region 共用的, 只查 overall, region 维度不重复算
+    for rg, rg_funnel in by_region.items():
+        if not rg_funnel:
+            continue
+        try:
+            rg_alerts = _detect_referral_alerts(
+                rg_funnel, 0,  # reject 不重复
+                alert_send_threshold, alert_reject_threshold,
+                alert_reply_threshold=alert_reply_threshold,
+                alert_reply_min_sent=alert_reply_min_sent,
+                region_label=rg)
+            # 滤掉 reject_rate_high (全局 alert 已含, region 层不重复)
+            rg_alerts = [a for a in rg_alerts
+                          if a.get("type") != "reject_rate_high"]
+            alerts.extend(rg_alerts)
+        except Exception as e:
+            logger.debug("[daily_summary] region %s alert 失败: %s", rg, e)
+
     # Phase 20.1.7.2: reply latency 统计 (从 wa_referral_replied.meta.latency_seconds)
     latency_stats = _compute_reply_latency_stats(hours_window=hours_window)
+
+    # Phase 20.1.9.3: latency anomaly z-score (read 7d daily_summary history)
+    latency_anomaly = _compute_latency_anomaly(latency_stats)
+    if latency_anomaly and latency_anomaly.get("anomaly"):
+        alerts.append({
+            "type": "latency_anomaly",
+            "severity": "warning",
+            "message": (
+                f"reply latency avg={latency_stats.get('avg_min')}min, "
+                f"|z|={abs(latency_anomaly['z']):.2f} > 2 vs 7d avg "
+                f"{latency_anomaly['avg_baseline']:.1f}min "
+                f"(stdev={latency_anomaly['stdev']:.1f})"),
+        })
+
+    # Phase 20.1.9.1: 把 daily summary 检出的 alerts 也写到 fb_alert_history,
+    # 不参与 cooldown (daily 一天就触发一次, 没必要抑制), 只持久化便于回溯.
+    if alerts:
+        try:
+            from src.host.fb_store import record_alert_fired as _rec_alert
+            ds_ctx = {
+                "hours_window": hours_window,
+                "funnel": funnel,
+                "reject_total": rej_history_total,
+                "source": "daily_summary",
+            }
+            for a in alerts:
+                _rec_alert(a, region=str(a.get("region") or ""),
+                            context=ds_ctx)
+        except Exception as e:
+            logger.debug("[alert_history] daily_summary 写入失败: %s", e)
 
     summary: Dict[str, Any] = {
         "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1447,6 +1603,7 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         "by_region": by_region,
         "top_5_accounts": ranking,
         "reply_latency": latency_stats,
+        "latency_anomaly": latency_anomaly,
         "peer_name_rejects": {
             "live_total": rej_live.get("total", 0),
             "live_by_event_type": rej_live.get("by_event_type", {}),
