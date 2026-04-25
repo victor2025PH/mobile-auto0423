@@ -6175,6 +6175,17 @@ class FacebookAutomation(BaseAutomation):
         """
         reply = None
         decision = "skip"
+        # PR-7: 真人接管中的 peer 不走 AI 自动回复, 留给真人在后台手动发
+        try:
+            from src.host.ai_takeover_state import is_taken_over
+            if is_taken_over(peer_name, did):
+                log.info(
+                    "[ai_reply] peer=%s device=%s 真人接管中, AI 不自动回",
+                    peer_name, did,
+                )
+                return None, "human_takeover"
+        except Exception:
+            pass
         target_lang = ""
         ab_style_hint = ""
         # P0 2026-04-23: incoming 侧语言检测,用于:
@@ -6303,6 +6314,15 @@ class FacebookAutomation(BaseAutomation):
             # return None, "skip" — 生产 auto_reply 从未真正生成 reply。
             # 真机 dry-run (scripts/messenger_production_dryrun.py) 发现。
             profile = UserProfile(username=peer_name, bio="", source="fb_inbox")
+            # PR-7: 从 persona 配置取 bot_persona (如 jp_female_midlife → jp_caring_male)
+            # 让 ChatBrain stage='referral' 时注入"日本男性关爱"调性
+            _bot_persona = ""
+            try:
+                from src.ai.referral_gate import load_persona_config
+                _bot_persona = (load_persona_config(persona_key)
+                                .get("bot_persona") or "")
+            except Exception:
+                pass
             result = brain.generate_reply(
                 lead_id=peer_name,
                 incoming_message=incoming_text,
@@ -6312,6 +6332,7 @@ class FacebookAutomation(BaseAutomation):
                 contact_info=_contact_for_brain,
                 source="inbox",
                 ab_style_hint=ab_style_hint.strip(),
+                bot_persona=_bot_persona or None,
             )
             if result and result.message:
                 reply = result.message
@@ -6350,8 +6371,26 @@ class FacebookAutomation(BaseAutomation):
                         lead_score=lead_score_val,
                         has_contact=has_contact,
                         config=_gate_cfg,
+                        # PR-7: 让关键词触发 / 拒绝词命中 / persona min_turns 真生效
+                        incoming_text=incoming_text or "",
+                        persona_key=persona_key,
                     )
                     decision = "wa_referral" if gate.refer else "reply"
+                    # PR-7: 拒绝词命中 → 写 referral_rejected_at 触发 7 天冷却
+                    # gate.reasons 含 "拒绝引流关键词命中" 时即拒绝路径
+                    if any("拒绝引流关键词命中" in r for r in gate.reasons):
+                        try:
+                            from src.host.fb_store import record_contact_event
+                            record_contact_event(
+                                did, peer_name, "referral_rejected",
+                                meta={
+                                    "persona_key": persona_key or "",
+                                    "rejected_at": _now_iso(),
+                                    "incoming_text_snippet": (incoming_text or "")[:100],
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("[ai_reply] 写 referral_rejected 事件失败: %s", exc)
                     log.info(
                         "[ai_reply] peer=%s gate level=%s refer=%s score=%d "
                         "reasons=%s",
