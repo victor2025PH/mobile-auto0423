@@ -3,9 +3,13 @@
 > 两台电脑，两个 Claude，一个 monorepo。
 > **本文件是唯一的真实边界定义，任何跨边界修改必须先 PR 改本文件再 PR 改代码。**
 
-## 零、非本 repo 范围（防混淆）
+## 零、边界声明 + 非本 repo 范围（防混淆）
 
-本 repo = **Facebook / Messenger 移动端自动化 bot**（A greeting + B messenger chat）。下列内容**不属于本 repo**，去对应 repo 提需求：
+> **⚠ 2026-04-25 拓扑澄清更新**: 本 repo (`mobile-auto0423`) 全 A 写, B 不在本 repo 写代码 (B 在 `telegram-mtproto-ai` 自己的 repo 工作). 后续章节里出现的 "机器 B" / "B 独占" / "B 写" / "A+B 共用" / "B 不得修改" 等表述都是历史措辞 — **实际全 A 写**, 模块内分工 (greeting / inbox / lead_mesh / referral / 等) 仍有效但都是 A 内部模块边界, 不是跨 owner 边界.
+>
+> 跨 repo 协同 (4 接触面: `chat_messages.yaml` 文案口径 / event aggregate / 真机设备池 / Coordinator service) 详见 [`CROSS_REPO_TOPOLOGY.md`](CROSS_REPO_TOPOLOGY.md). 跨 repo 设备锁 + 注册中心 spec 见 [`COORDINATOR_SPEC.md`](COORDINATOR_SPEC.md).
+
+本 repo = **Facebook / Messenger 移动端自动化 bot**（greeting + messenger chat 全 A 模块）。下列内容**不属于本 repo**，去对应 repo 提需求：
 
 | 内容 | 实际归属 |
 |---|---|
@@ -453,3 +457,7 @@ record_contact_event(
   MessengerError + chat_memory + chat_intent + referral_gate + stranger auto-reply
 - 2026-04-23 A review 回复 — A 新增契约: MessengerError 分流矩阵 (§7.6) +
   device_section_lock section 命名 (§7.7) + greeting 归因双写 (§7.8)
+- 2026-04-25 拓扑澄清 — victor2025PH 澄清 B 不在本 repo 写代码, 历史 "双 owner 同 repo"
+  叙述全错. §零 加边界声明. 跨 repo 协同 4 接触面移到 `CROSS_REPO_TOPOLOGY.md` (PR #81).
+  跨 repo Coordinator service 实施 spec 见 `COORDINATOR_SPEC.md` (PR #82).
+  PR #79 / #80 (基于错误前提) 已 close.
