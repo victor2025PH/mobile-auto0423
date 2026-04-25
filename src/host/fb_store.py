@@ -994,10 +994,59 @@ def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
                 (device_id, peer_name, event_type, template_id or "",
                  preset_key or "", meta_str),
             )
-            return cur.lastrowid or 0
+            new_id = cur.lastrowid or 0
+        # Phase 20.2.x.1: wa_referral_replied 自动复活 referral_stale tag.
+        # connection 关闭后再调用, 避免嵌套连接锁竞争.
+        if event_type == CONTACT_EVT_WA_REFERRAL_REPLIED:
+            try:
+                _maybe_revive_stale_on_reply(peer_name)
+            except Exception as e:
+                logger.debug("[fb_contact_events] revive_stale hook 失败: %s", e)
+        return new_id
     except Exception as e:
         logger.debug("[fb_contact_events] 写入失败: %s", e)
         return 0
+
+
+def _maybe_revive_stale_on_reply(peer_name: str) -> bool:
+    """Phase 20.2.x.1 (2026-04-25): peer 真回复 → 自动从 canonical 移除
+    referral_stale tag + 清 stale_at meta.
+
+    幂等: 没 referral_stale tag 时啥都不做返 False.
+    """
+    if not peer_name:
+        return False
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        from src.host.lead_mesh import remove_canonical_tags
+        from src.host.lead_mesh import update_canonical_metadata
+        with _lm_connect() as conn:
+            row = conn.execute(
+                "SELECT li.canonical_id, lc.tags FROM lead_identities li"
+                " JOIN leads_canonical lc ON li.canonical_id=lc.canonical_id"
+                " WHERE li.platform='facebook' AND li.account_id=? LIMIT 1",
+                (f"fb:{peer_name}",)).fetchone()
+            if not row:
+                return False
+            tags = {t.strip() for t in (row["tags"] or "").split(",")
+                     if t.strip()}
+            if "referral_stale" not in tags:
+                return False
+            cid = row["canonical_id"]
+        # 关闭连接后调用 (内部各自再开 _connect 写)
+        remove_canonical_tags(cid, ["referral_stale"])
+        # 清 stale 相关 meta (写入 None 会被 update_canonical_metadata 过滤掉,
+        # 所以改写一个 marker 标识"已复活")
+        import datetime as _dt
+        update_canonical_metadata(
+            cid, {"referral_stale_revived_at":
+                    _dt.datetime.now(_dt.timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ")})
+        return True
+    except Exception as e:
+        logger.debug("[revive_stale] peer=%s 失败: %s",
+                       peer_name[:30], e)
+        return False
 
 
 def count_contact_events(device_id: Optional[str] = None, *,
@@ -1355,6 +1404,96 @@ def mark_stale_referrals(*, stale_hours: int = 48,
         "dry_run": dry_run,
         "samples": samples,
     }
+
+
+def list_stale_leads(*, limit: int = 200, offset: int = 0,
+                        include_dead: bool = True) -> Dict[str, Any]:
+    """Phase 20.2.x.3 (2026-04-25): 列当前 referral_stale tagged 的 lead.
+
+    返:
+      {
+        total: int,
+        results: [
+          {canonical_id, peer_name, persona_key, region,
+           stale_at, stale_age_hours_when_marked,
+           is_dead: bool, dead_reason},
+          ...
+        ]
+      }
+
+    include_dead=False 时只列还没升级 dead 的 (运营手动复查最有用的子集).
+    """
+    import datetime as _dt
+    import json as _json
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        clauses = ["tags LIKE '%referral_stale%'"]
+        if not include_dead:
+            clauses.append("tags NOT LIKE '%referral_dead%'")
+        where = " AND ".join(clauses)
+        with _lm_connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            count_row = conn.execute(
+                f"SELECT COUNT(*) AS n FROM leads_canonical WHERE {where}"
+            ).fetchone()
+            total = int(count_row["n"]) if count_row else 0
+            rows = conn.execute(
+                f"SELECT canonical_id, tags, metadata_json"
+                f" FROM leads_canonical WHERE {where}"
+                f" ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (max(1, min(int(limit or 200), 1000)),
+                  max(0, int(offset or 0)))
+            ).fetchall()
+            results: List[Dict[str, Any]] = []
+            now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+            for r in rows:
+                try:
+                    meta = _json.loads(r["metadata_json"] or "{}")
+                except Exception:
+                    meta = {}
+                tags = (r["tags"] or "")
+                # peer_name: 从 lead_identities 拉 fb 平台 account_id
+                peer_name = meta.get("referral_stale_peer_name", "")
+                if not peer_name:
+                    try:
+                        irow = conn.execute(
+                            "SELECT account_id FROM lead_identities"
+                            " WHERE canonical_id=? AND platform='facebook'"
+                            " LIMIT 1", (r["canonical_id"],)).fetchone()
+                        if irow:
+                            aid = irow["account_id"] or ""
+                            peer_name = aid[3:] if aid.startswith("fb:") else aid
+                    except Exception:
+                        pass
+                # 计算当前 stale 持续时间
+                stale_at = meta.get("referral_stale_at", "")
+                hours_since = None
+                if stale_at:
+                    try:
+                        ts = _dt.datetime.strptime(
+                            stale_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                            tzinfo=_dt.timezone.utc).timestamp()
+                        hours_since = round((now_ts - ts) / 3600, 1)
+                    except Exception:
+                        pass
+                results.append({
+                    "canonical_id": r["canonical_id"],
+                    "peer_name": peer_name,
+                    "persona_key": meta.get("l2_persona_key", ""),
+                    "region": meta.get("region", ""),
+                    "stale_at": stale_at,
+                    "stale_age_hours_when_marked":
+                        meta.get("referral_stale_age_hours_when_marked"),
+                    "hours_since_stale": hours_since,
+                    "is_dead": "referral_dead" in tags,
+                    "dead_reason": meta.get("referral_dead_reason", ""),
+                })
+        return {"total": total, "limit": limit, "offset": offset,
+                "results": results}
+    except Exception as e:
+        logger.debug("[list_stale_leads] 失败: %s", e)
+        return {"total": 0, "limit": limit, "offset": offset,
+                "results": [], "error": str(e)[:120]}
 
 
 def get_greeting_reply_rate_by_template(device_id: Optional[str] = None,

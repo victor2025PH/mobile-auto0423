@@ -1148,6 +1148,8 @@ def _detect_referral_alerts(funnel: Dict[str, Any],
                               alert_reject_threshold: int = 10,
                               alert_reply_threshold: float = 0.2,
                               alert_reply_min_sent: int = 10,
+                              alert_stale_threshold: float = 0.5,
+                              alert_stale_min_sent: int = 10,
                               *,
                               region_label: str = ""
                               ) -> List[Dict[str, Any]]:
@@ -1197,6 +1199,19 @@ def _detect_referral_alerts(funnel: Dict[str, Any],
                               f"< {alert_reply_threshold*100:.0f}% "
                               f"(sent={sent_n}, replied={replied_n}); "
                               "文案/persona 可能失效"),
+            })
+    # Phase 20.2.x.2: stale_rate_high — sent 多但 stale 占比高 (受众失活)
+    stale_n = int(funnel.get("stale", 0) or 0)
+    if sent_n >= alert_stale_min_sent and stale_n > 0:
+        stale_rate = stale_n / sent_n
+        if stale_rate >= alert_stale_threshold:
+            alerts.append({
+                "type": "stale_rate_high",
+                "severity": "warning",
+                "message": (f"stale_rate={stale_rate*100:.1f}% "
+                              f">= {alert_stale_threshold*100:.0f}% "
+                              f"(sent={sent_n}, stale={stale_n}); "
+                              "受众/时段可能不匹配"),
             })
     # Phase 20.1.9.2: region_label 非空时给所有 alerts 打 region 标签
     if region_label:
@@ -1291,6 +1306,9 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
     # Phase 20.1.8.2: replied_rate alert
     reply_thr = float(params.get("alert_reply_threshold", 0.2) or 0.2)
     reply_min_sent = int(params.get("alert_reply_min_sent", 10) or 10)
+    # Phase 20.2.x.2: stale_rate alert
+    stale_thr = float(params.get("alert_stale_threshold", 0.5) or 0.5)
+    stale_min_sent = int(params.get("alert_stale_min_sent", 10) or 10)
     severity_cd = params.get("severity_cooldowns")  # 可选 dict 覆盖默认
 
     from src.host.line_pool import referral_funnel
@@ -1303,7 +1321,9 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
     all_alerts = _detect_referral_alerts(
         funnel, rej_total, send_thr, reject_thr,
         alert_reply_threshold=reply_thr,
-        alert_reply_min_sent=reply_min_sent)
+        alert_reply_min_sent=reply_min_sent,
+        alert_stale_threshold=stale_thr,
+        alert_stale_min_sent=stale_min_sent)
 
     state = _load_alert_state()
     fire_now = _filter_alerts_by_cooldown(
@@ -1515,6 +1535,11 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         params.get("alert_reply_threshold", 0.2) or 0.2)
     alert_reply_min_sent = int(
         params.get("alert_reply_min_sent", 10) or 10)
+    # Phase 20.2.x.2: stale_rate alert
+    alert_stale_threshold = float(
+        params.get("alert_stale_threshold", 0.5) or 0.5)
+    alert_stale_min_sent = int(
+        params.get("alert_stale_min_sent", 10) or 10)
 
     from src.host.line_pool import (referral_funnel, account_ranking,
                                       recent_dispatch_log)
@@ -1548,7 +1573,9 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         funnel, rej_history_total,
         alert_send_threshold, alert_reject_threshold,
         alert_reply_threshold=alert_reply_threshold,
-        alert_reply_min_sent=alert_reply_min_sent)
+        alert_reply_min_sent=alert_reply_min_sent,
+        alert_stale_threshold=alert_stale_threshold,
+        alert_stale_min_sent=alert_stale_min_sent)
 
     # Phase 20.1.9.2: per-region alert 检测 (jp/it 各自跑 detection)
     # reject 是全 region 共用的, 只查 overall, region 维度不重复算
@@ -1561,6 +1588,8 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                 alert_send_threshold, alert_reject_threshold,
                 alert_reply_threshold=alert_reply_threshold,
                 alert_reply_min_sent=alert_reply_min_sent,
+                alert_stale_threshold=alert_stale_threshold,
+                alert_stale_min_sent=alert_stale_min_sent,
                 region_label=rg)
             # 滤掉 reject_rate_high (全局 alert 已含, region 层不重复)
             rg_alerts = [a for a in rg_alerts

@@ -106,6 +106,19 @@ def api_blacklist_reload():
     return {"ok": True, "extra_count": n}
 
 
+@router.get("/stats/stale-leads")
+def api_stale_leads(limit: int = Query(default=200, ge=1, le=1000),
+                       offset: int = Query(default=0, ge=0),
+                       include_dead: bool = Query(default=True)):
+    """Phase 20.2.x.3: 当前 referral_stale tagged 的 lead 列表.
+
+    include_dead=false 只列尚未升级 dead 的 (运营手动复查最有用的子集).
+    """
+    from src.host.fb_store import list_stale_leads
+    return list_stale_leads(limit=limit, offset=offset,
+                              include_dead=include_dead)
+
+
 @router.get("/stats/alert-history")
 def api_alert_history(
         hours_window: int = Query(default=168, ge=1, le=720),

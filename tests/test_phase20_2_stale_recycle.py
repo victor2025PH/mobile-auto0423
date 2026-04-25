@@ -247,3 +247,169 @@ class TestFunnelStale:
             "hours_window": 24, "write_file": False, "send_webhook": False,
             "regions": []})
         assert stats["summary"]["funnel"]["stale"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 20.2.x.1: 自动复活 referral_stale on wa_referral_replied
+# ═══════════════════════════════════════════════════════════════════
+
+class TestAutoReviveOnReply:
+    def test_replied_clears_stale_tag(self, tmp_db):
+        """seed stale tagged peer → 写 wa_referral_replied → tag 应被移除."""
+        from src.host.lead_mesh import (update_canonical_metadata,
+                                          get_dossier)
+        from src.host.fb_store import record_contact_event
+        cid = _seed_l2_lead("花子")
+        update_canonical_metadata(cid, {"referral_stale_at": "2026-04-01T0:0:0Z"},
+                                    tags=["referral_stale"])
+        # confirm tag exists
+        d = get_dossier(cid)
+        assert "referral_stale" in (d["canonical"]["tags"] or "")
+        # 写 wa_referral_replied (auto-revive trigger)
+        record_contact_event("D1", "花子", "wa_referral_replied",
+                               meta={"keyword_matched": "line"},
+                               skip_sanitize=True)
+        d2 = get_dossier(cid)
+        assert "referral_stale" not in (d2["canonical"]["tags"] or "")
+        # meta 应有 revived_at marker
+        assert d2["canonical"]["metadata"].get("referral_stale_revived_at")
+
+    def test_no_op_when_no_stale_tag(self, tmp_db):
+        """非 stale 的 peer 写 replied 不应出错."""
+        from src.host.fb_store import record_contact_event
+        _seed_l2_lead("花子")
+        # 没有 referral_stale tag
+        eid = record_contact_event("D1", "花子", "wa_referral_replied",
+                                      meta={"k": "v"},
+                                      skip_sanitize=True)
+        assert eid > 0  # 事件正常写入
+
+    def test_unknown_peer_silent(self, tmp_db):
+        """peer 不在 lead_identities 时 hook 应 silent 不报错."""
+        from src.host.fb_store import record_contact_event
+        eid = record_contact_event("D1", "ghost-xyz", "wa_referral_replied",
+                                      skip_sanitize=True)
+        assert eid > 0
+
+    def test_other_event_types_dont_trigger_hook(self, tmp_db):
+        """非 wa_referral_replied 不该调用 revive hook (省 SQL)."""
+        from src.host.lead_mesh import (update_canonical_metadata,
+                                          get_dossier)
+        from src.host.fb_store import record_contact_event
+        cid = _seed_l2_lead("花子")
+        update_canonical_metadata(cid, {"referral_stale_at": "x"},
+                                    tags=["referral_stale"])
+        # 写其他类型, tag 应保持
+        record_contact_event("D1", "花子", "wa_referral_sent",
+                               skip_sanitize=True)
+        d = get_dossier(cid)
+        assert "referral_stale" in (d["canonical"]["tags"] or "")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 20.2.x.2: stale_rate_high alert
+# ═══════════════════════════════════════════════════════════════════
+
+class TestStaleRateHighAlert:
+    def test_high_stale_triggers(self):
+        from src.host.executor import _detect_referral_alerts
+        # sent=12, stale=8 → 67% >= 50%
+        funnel = {"planned": 12, "sent": 12, "replied": 0, "stale": 8,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(funnel, 0)
+        types = {a["type"] for a in alerts}
+        assert "stale_rate_high" in types
+
+    def test_low_stale_no_alert(self):
+        from src.host.executor import _detect_referral_alerts
+        # sent=12, stale=2 → 17% < 50%
+        funnel = {"planned": 12, "sent": 12, "replied": 5, "stale": 2,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(funnel, 0)
+        types = {a["type"] for a in alerts}
+        assert "stale_rate_high" not in types
+
+    def test_too_few_sent_skipped(self):
+        from src.host.executor import _detect_referral_alerts
+        # sent=5 < min_sent=10
+        funnel = {"planned": 5, "sent": 5, "replied": 0, "stale": 5,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(funnel, 0)
+        types = {a["type"] for a in alerts}
+        assert "stale_rate_high" not in types
+
+    def test_threshold_overridable(self):
+        from src.host.executor import _detect_referral_alerts
+        # 30% stale, default 50% 不触发, 阈值降到 20% 应触发
+        funnel = {"planned": 10, "sent": 10, "replied": 0, "stale": 3,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(
+            funnel, 0, alert_stale_threshold=0.2)
+        types = {a["type"] for a in alerts}
+        assert "stale_rate_high" in types
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 20.2.x.3: GET /line-pool/stats/stale-leads
+# ═══════════════════════════════════════════════════════════════════
+
+class TestStaleLeadsEndpoint:
+    def _client(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from src.host.routers.line_pool import router
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    def test_empty_returns_empty_list(self, tmp_db):
+        c = self._client()
+        r = c.get("/line-pool/stats/stale-leads")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 0
+        assert body["results"] == []
+
+    def test_stale_lead_listed(self, tmp_db):
+        from src.host.lead_mesh import update_canonical_metadata
+        cid = _seed_l2_lead("花子")
+        update_canonical_metadata(cid, {
+            "referral_stale_at": "2026-04-23T05:00:00Z",
+            "referral_stale_peer_name": "花子",
+            "referral_stale_age_hours_when_marked": 50,
+        }, tags=["referral_stale"])
+        c = self._client()
+        r = c.get("/line-pool/stats/stale-leads")
+        body = r.json()
+        assert body["total"] == 1
+        assert body["results"][0]["peer_name"] == "花子"
+        assert body["results"][0]["is_dead"] is False
+        assert body["results"][0]["hours_since_stale"] is not None
+
+    def test_include_dead_flag(self, tmp_db):
+        from src.host.lead_mesh import update_canonical_metadata
+        cid = _seed_l2_lead("花子")
+        update_canonical_metadata(cid, {
+            "referral_stale_at": "2026-04-23T05:00:00Z",
+            "referral_dead_reason": "stale_no_reply",
+        }, tags=["referral_stale", "referral_dead"])
+        c = self._client()
+        # default include_dead=true → 看到 dead 的
+        r1 = c.get("/line-pool/stats/stale-leads")
+        assert r1.json()["total"] == 1
+        # include_dead=false → 看不到
+        r2 = c.get("/line-pool/stats/stale-leads?include_dead=false")
+        assert r2.json()["total"] == 0
+
+    def test_pagination(self, tmp_db):
+        from src.host.lead_mesh import update_canonical_metadata
+        for i in range(5):
+            cid = _seed_l2_lead(f"P{i}")
+            update_canonical_metadata(cid, {"referral_stale_at": "x"},
+                                        tags=["referral_stale"])
+        c = self._client()
+        r1 = c.get("/line-pool/stats/stale-leads?limit=2&offset=0")
+        assert r1.json()["total"] == 5
+        assert len(r1.json()["results"]) == 2
+        r2 = c.get("/line-pool/stats/stale-leads?limit=2&offset=2")
+        assert len(r2.json()["results"]) == 2
