@@ -240,17 +240,17 @@ class _HeartbeatThread(threading.Thread):
         self._ttl = ttl_sec
         self._max_lease = max_lease_sec
         self._base_url = base_url
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._failures = 0
         self._started_at = time.time()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self) -> None:
-        while not self._stop.is_set():
-            self._stop.wait(self._interval)
-            if self._stop.is_set():
+        while not self._stop_event.is_set():
+            self._stop_event.wait(self._interval)
+            if self._stop_event.is_set():
                 break
             # 安全网: 超过 max_lease 不再续期
             elapsed = time.time() - self._started_at
