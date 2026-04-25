@@ -26,6 +26,7 @@ jp_female_midlife:
   score_threshold: 3
   min_lead_score: 0
   min_peer_replies: 2
+  min_emotion_score: 0.5        # L3 情感综合分门槛: 聊得有温度才引
   channel_priority: [line]      # 只引 LINE, 不引 WA/Telegram
   trigger_keywords_lang: ja
   bot_persona: jp_caring_male   # AI 调性: 日本男性关爱型 (chat_brain 注入)
