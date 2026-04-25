@@ -40,13 +40,42 @@ perform action → insert record" 的整段关键区串行化。
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ── §13.2 静态设备分配 (2026-04-25 4 台规模 MVP) ────────────────────
+# 三方共享 yaml 在 D:\workspace\coord-board\device_assignment.yaml,
+# A/B 各读自己 repo key 拿到分配池. 升级到完整 Coordinator 时此函数
+# 替换为 coord_client.list_assigned_devices("a") 即可.
+_ASSIGNMENT_PATH = os.environ.get(
+    "DEVICE_ASSIGNMENT_PATH",
+    r"D:\workspace\coord-board\device_assignment.yaml",
+)
+
+
+def assigned_devices(repo_key: str = "a_repo") -> List[str]:
+    """读 device_assignment.yaml 返回本 repo 分到的 serial 列表.
+
+    yaml 缺失/解析失败/key 不存在 → 返回 [], caller 自己决定 fallback
+    (例如 A 历史行为是看 device_registry.json 全集).
+    """
+    try:
+        import yaml
+        with open(_ASSIGNMENT_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return list(data.get(repo_key) or [])
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[device_assignment] load %s failed: %s",
+                       _ASSIGNMENT_PATH, exc)
+        return []
 
 # ── 锁池 ──────────────────────────────────────────────────────────────
 # 一个 device/section 键对应一把 Lock。defaultdict 天然懒创建,
