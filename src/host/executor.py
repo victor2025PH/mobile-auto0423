@@ -2897,6 +2897,7 @@ def _fb_check_referral_replies(fb, resolved: str,
             record_contact_event(
                 resolved, peer_name, CONTACT_EVT_WA_REFERRAL_REPLIED,
                 meta={
+                    "platform": "facebook",  # TG R2 Q2 cross-repo namespace
                     "keyword_matched": kw,
                     "raw_excerpt": text[:200],
                     "sent_event_id": sent_meta.get("sent_event_id"),

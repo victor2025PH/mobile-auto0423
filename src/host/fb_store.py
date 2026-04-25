@@ -681,7 +681,7 @@ CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写 (实发)
 # Phase 11 (2026-04-25): A 写 — dispatcher 计划层, B 按 meta.dispatch_mode 执行
 CONTACT_EVT_LINE_DISPATCH_PLANNED = "line_dispatch_planned"
 # Phase 20.1 (2026-04-25): B 写 — Messenger inbox 检测到 referral 反馈关键词
-CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"
+CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"  # A 写 (executor 关键词匹配后)
 # Phase 20.2.1 (2026-04-25): A 写 — sent 后超 N 小时仍未 replied 自动打标
 CONTACT_EVT_REFERRAL_STALE = "referral_stale"
 
@@ -1381,7 +1381,8 @@ def mark_stale_referrals(*, stale_hours: int = 48,
                     record_contact_event(
                         p["device_id"], peer_name,
                         CONTACT_EVT_REFERRAL_STALE,
-                        meta={"sent_event_id": p.get("sent_event_id"),
+                        meta={"platform": "facebook",  # TG R2 Q2 namespace
+                              "sent_event_id": p.get("sent_event_id"),
                               "sent_at": p.get("sent_at"),
                               "age_hours": age_h,
                               "escalated_dead": should_escalate},
