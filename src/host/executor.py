@@ -1283,6 +1283,66 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
     }
 
 
+def _compute_reply_latency_stats(hours_window: int = 24) -> Dict[str, Any]:
+    """Phase 20.1.7.2 (2026-04-25): 从 wa_referral_replied 事件 meta 算 latency 统计.
+
+    返:
+      {
+        samples: int,                 # 有 latency_seconds 的样本数
+        avg_min: float | None,
+        median_min: float | None,
+        p95_min: float | None,
+        max_min: float | None,
+      }
+    全 None 表示窗口内没数据.
+    """
+    out: Dict[str, Any] = {
+        "samples": 0, "avg_min": None, "median_min": None,
+        "p95_min": None, "max_min": None,
+    }
+    try:
+        from src.host.fb_store import (list_recent_contact_events_by_types,
+                                          CONTACT_EVT_WA_REFERRAL_REPLIED)
+        import json as _j
+        rows = list_recent_contact_events_by_types(
+            [CONTACT_EVT_WA_REFERRAL_REPLIED],
+            hours=hours_window, limit=2000)
+        latencies_min: List[float] = []
+        for r in rows:
+            try:
+                m = _j.loads(r.get("meta_json") or "{}")
+            except Exception:
+                continue
+            lm = m.get("latency_min")
+            if isinstance(lm, (int, float)) and lm >= 0:
+                latencies_min.append(float(lm))
+        if not latencies_min:
+            return out
+        latencies_min.sort()
+        n = len(latencies_min)
+        # p95: 最少 20 样本才有意义, 否则用 max
+        if n >= 20:
+            p95_idx = max(0, min(n - 1, int(round(0.95 * (n - 1)))))
+            p95 = latencies_min[p95_idx]
+        else:
+            p95 = latencies_min[-1]
+        median_idx = n // 2
+        median = (latencies_min[median_idx]
+                   if n % 2 == 1
+                   else (latencies_min[median_idx - 1]
+                          + latencies_min[median_idx]) / 2.0)
+        out.update({
+            "samples": n,
+            "avg_min": round(sum(latencies_min) / n, 2),
+            "median_min": round(median, 2),
+            "p95_min": round(p95, 2),
+            "max_min": round(latencies_min[-1], 2),
+        })
+    except Exception as e:
+        logger.debug("[reply_latency] 计算失败: %s", e)
+    return out
+
+
 def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
     """Phase 18 / 19 (2026-04-25): 每日 referral 闭环健康摘要 + 趋势 + 告警.
 
@@ -1346,12 +1406,16 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         funnel, rej_history_total,
         alert_send_threshold, alert_reject_threshold)
 
+    # Phase 20.1.7.2: reply latency 统计 (从 wa_referral_replied.meta.latency_seconds)
+    latency_stats = _compute_reply_latency_stats(hours_window=hours_window)
+
     summary: Dict[str, Any] = {
         "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "hours_window": hours_window,
         "funnel": funnel,
         "by_region": by_region,
         "top_5_accounts": ranking,
+        "reply_latency": latency_stats,
         "peer_name_rejects": {
             "live_total": rej_live.get("total", 0),
             "live_by_event_type": rej_live.get("by_event_type", {}),
@@ -1523,6 +1587,13 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                                 f"{rg}={rf.get('planned',0)}/{rf.get('sent',0)}")
                     if rg_parts:
                         lines.append("by_region (planned/sent): " + ", ".join(rg_parts))
+                # Phase 20.1.7.2: reply latency
+                if latency_stats and latency_stats.get("samples", 0) > 0:
+                    lines.append(
+                        f"reply_latency: n={latency_stats['samples']} "
+                        f"avg={latency_stats['avg_min']:.1f}min "
+                        f"median={latency_stats['median_min']:.1f}min "
+                        f"p95={latency_stats['p95_min']:.1f}min")
                 lines.append(
                     f"reject_24h: history={rej_history_total} (live={rej_live.get('total', 0)})")
                 lines.append(
@@ -2381,26 +2452,87 @@ def _match_referral_keyword(text: str, region: str = "") -> str:
     return ""
 
 
+def _resolve_peer_regions(peer_names: List[str]) -> Dict[str, str]:
+    """Phase 20.1.7.1 (2026-04-25): batch peer_name → region map.
+
+    实现:
+      1. 一次 SQL 拉 fb:peer_name → canonical_id 映射 (lead_identities)
+      2. 对每个有 canonical_id 的 peer 调 line_pool._get_lead_region (3 级 fallback)
+      3. 没在 lead_identities 的 peer 返 ""
+
+    用于 _fb_check_referral_replies 选关键词组. 1 SQL batch + N×_get_lead_region,
+    pending peer 通常 < 50 条, 性能可接受.
+    """
+    if not peer_names:
+        return {}
+    out: Dict[str, str] = {}
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        from src.host.line_pool import _get_lead_region
+        placeholders = ",".join(["?"] * len(peer_names))
+        fb_keys = [f"fb:{n}" for n in peer_names]
+        with _lm_connect() as conn:
+            rows = conn.execute(
+                "SELECT account_id, canonical_id FROM lead_identities"
+                f" WHERE platform='facebook' AND account_id IN ({placeholders})",
+                fb_keys).fetchall()
+        peer_to_cid: Dict[str, str] = {}
+        for r in rows:
+            aid = r["account_id"] or ""
+            if aid.startswith("fb:"):
+                peer_to_cid[aid[3:]] = r["canonical_id"]
+        for pn in peer_names:
+            cid = peer_to_cid.get(pn)
+            out[pn] = _get_lead_region(cid) if cid else ""
+    except Exception as e:
+        logger.debug("[resolve_peer_regions] 失败: %s", e)
+    return {pn: out.get(pn, "") for pn in peer_names}
+
+
+def _parse_event_at(at_str: str) -> Optional[float]:
+    """Phase 20.1.7.2: parse fb_contact_events.at 列回 epoch 秒.
+
+    支持两种格式:
+      * SQLite datetime('now') 默认: 'YYYY-MM-DD HH:MM:SS' (空格)
+      * meta.sent_at 写的: 'YYYY-MM-DDTHH:MM:SSZ' (T+Z)
+
+    解析失败返 None.
+    """
+    if not at_str:
+        return None
+    import datetime as _dt
+    s = str(at_str).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return _dt.datetime.strptime(s, fmt).replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except Exception:
+            continue
+    return None
+
+
 def _fb_check_referral_replies(fb, resolved: str,
                                   params: Dict[str, Any]) -> tuple:
-    """Phase 20.1 (2026-04-25): 扫 Messenger inbox 找 referral 关键词反馈.
+    """Phase 20.1 / 20.1.7 (2026-04-25): 扫 Messenger inbox 找 referral 反馈.
 
     A 侧调度逻辑 (本函数):
       1. 拉 pending peers (wa_referral_sent 后 N 小时内未 replied)
-      2. 调 fb.check_messenger_inbox(referral_mode=True, peers_filter=names) — B 实
-      3. B 返 list of {peer_name, last_inbound_text, conv_id} (匹配 + 未匹配都返)
-      4. 本函数遍历 inbound_text, 关键词匹配 → 写 wa_referral_replied event
-      5. 返 stats {pending_count, scanned, replied_now, no_match}
+      2. Phase 20.1.7.1: batch 解析 peer → region 用于关键词路由
+      3. 调 fb.check_messenger_inbox(referral_mode=True, peers_filter=names) — B 实
+      4. B 返 list of {peer_name, last_inbound_text, conv_id} (匹配 + 未匹配都返)
+      5. 本函数遍历 inbound_text, 关键词匹配 (按该 peer 自己的 region) → 写 event
+      6. Phase 20.1.7.2: 写 event 时计算 latency_seconds 入 meta
 
     Params:
       hours_back: int = 48           pending 时间窗
       limit: int = 50                单次最多扫 peer 数
-      keyword_region: str = ""       优先用此 region 关键词组 (空走 default)
+      keyword_region: str = ""       OVERRIDE — 强制用此 region; 空 → 自动推断 per-peer
       max_messages_per_peer: int = 5  B 侧每个 peer 最多抓最近几条
     """
+    import datetime as _dt
     hours_back = int(params.get("hours_back", 48) or 48)
     limit = max(1, min(int(params.get("limit", 50) or 50), 500))
-    region_hint = str(params.get("keyword_region", "") or "").lower()
+    region_override = str(params.get("keyword_region", "") or "").lower()
     msgs_per_peer = max(1, min(
         int(params.get("max_messages_per_peer", 5) or 5), 20))
 
@@ -2420,6 +2552,13 @@ def _fb_check_referral_replies(fb, resolved: str,
         }
 
     peer_names = [p["peer_name"] for p in pending]
+
+    # Phase 20.1.7.1: 提前 batch 解析 region (一次 SQL + 多次 _get_lead_region)
+    if region_override:
+        # 全 force 用同一 region
+        peer_regions = {pn: region_override for pn in peer_names}
+    else:
+        peer_regions = _resolve_peer_regions(peer_names)
 
     # 步骤 2: 调 B 侧 inbox 检测 (尚未实装时 graceful)
     inbox_results: List[Dict[str, Any]] = []
@@ -2464,16 +2603,25 @@ def _fb_check_referral_replies(fb, resolved: str,
     replied_now = 0
     no_match = 0
     matches: List[Dict[str, Any]] = []
+    now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
     for conv in inbox_results:
         peer_name = (conv.get("peer_name") or "").strip()
         if not peer_name or peer_name not in pending_by_peer:
             continue
         text = conv.get("last_inbound_text") or ""
-        kw = _match_referral_keyword(text, region=region_hint)
+        # Phase 20.1.7.1: per-peer region (override 已在上面 force 全填好)
+        peer_region = peer_regions.get(peer_name, "")
+        kw = _match_referral_keyword(text, region=peer_region)
         if not kw:
             no_match += 1
             continue
         sent_meta = pending_by_peer[peer_name]
+        # Phase 20.1.7.2: latency = now - sent_at (秒)
+        sent_ts = _parse_event_at(sent_meta.get("sent_at") or "")
+        latency_sec = (round(now_ts - sent_ts, 1)
+                        if sent_ts and now_ts >= sent_ts else None)
+        latency_min = (round(latency_sec / 60.0, 2)
+                        if latency_sec is not None else None)
         try:
             record_contact_event(
                 resolved, peer_name, CONTACT_EVT_WA_REFERRAL_REPLIED,
@@ -2483,12 +2631,17 @@ def _fb_check_referral_replies(fb, resolved: str,
                     "sent_event_id": sent_meta.get("sent_event_id"),
                     "sent_at": sent_meta.get("sent_at"),
                     "conv_id": conv.get("conv_id") or "",
+                    "region": peer_region or None,
+                    "latency_seconds": latency_sec,
+                    "latency_min": latency_min,
                     "matched_by": "agent_a_phase20_1",
                 })
             replied_now += 1
             matches.append({
                 "peer_name": peer_name,
                 "keyword": kw,
+                "region": peer_region,
+                "latency_min": latency_min,
                 "excerpt": text[:80],
             })
         except Exception as e:

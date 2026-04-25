@@ -189,7 +189,38 @@ B 实装中有问题:
 ---
 
 **A 侧测试覆盖 (供 B 参考 mock 设计)**:
-`tests/test_phase20_1_referral_replies.py` 共 17 cases, 包含:
+`tests/test_phase20_1_referral_replies.py` 共 34 cases, 包含:
 - TestKeywordMatch: default/jp/empty 关键词命中
 - TestPendingPeers: get_pending_referral_peers 各分支
 - TestCheckReferralRepliesScheduler: 调度链路 (no_pending / no_match / match / legacy_signature_error / pending_filter / dedup / kwargs_propagated)
+- TestResolvePeerRegions: peer → canonical → region batch lookup (Phase 20.1.7.1)
+- TestAutoRegionRoutingInScheduler: 自动 region 路由 + override (Phase 20.1.7.1)
+- TestParseEventAt / TestLatencyInMeta: latency 写入 wa_referral_replied.meta (Phase 20.1.7.2)
+- TestReplyLatencyStats / TestDailySummaryWithLatency: avg/median/p95 latency 入 daily summary
+
+---
+
+## 8. Phase 20.1.7 增量 (2026-04-25 同日发布)
+
+### 20.1.7.1 自动 region 关键词路由
+- A 侧不再需要 caller 指定 `keyword_region`. 默认空时 → batch 解析 peer →
+  canonical → region (用 `_get_lead_region` 三级 fallback) → 选关键词组
+- caller 可仍传 `keyword_region: "jp"` 强制覆盖, 全 peer 用同 region
+- 没在 lead_identities 的 peer 退化用 default 关键词组 (兜底)
+- B 不需要任何改动: B 仍只返 conversation 文本, 关键词路由是 A 侧逻辑
+
+### 20.1.7.2 reply latency 指标
+- A 写 wa_referral_replied 时 meta 多两个字段:
+  - `latency_seconds`: 从 wa_referral_sent 到 wa_referral_replied 的秒数
+  - `latency_min`: 同上, 分钟 (round 2)
+- daily summary 新增 `summary.reply_latency`:
+  ```json
+  {"samples": N, "avg_min": ..., "median_min": ..., "p95_min": ..., "max_min": ...}
+  ```
+  n<20 时 p95 退化为 max (避免小样本 nearest-rank 失真)
+- webhook 摘要新加一行 (有样本时):
+  `reply_latency: n=12 avg=8.3min median=5.2min p95=24.1min`
+
+### B 不受影响
+20.1.7 全在 A 侧实现, B 侧 spec (本文档 §3) 不变, 只要 B 按 §3 返 conversations
+即可享受新功能.
