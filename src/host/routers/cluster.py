@@ -1299,3 +1299,114 @@ def cluster_download_file(body: dict):
     size_kb = round(dest_path.stat().st_size / 1024)
     logger.info("[下载文件] 完成: %s (%d KB)", dest_path.name, size_kb)
     return {"ok": True, "dest": str(dest_path), "size_kb": size_kb, "filename": dest_path.name}
+
+
+# ── Cluster Lock Service endpoints (200 设备跨机锁) ─────────────────────
+
+
+def _is_coordinator_role() -> bool:
+    """仅 coordinator 节点才暴露 lock service. worker 应通过 HTTP 调主控."""
+    try:
+        cfg_path = config_file("cluster.yaml")
+        if not cfg_path.exists():
+            return True  # standalone 默认按 coordinator 处理
+        import yaml
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return str(cfg.get("role", "standalone")).lower() in ("coordinator", "standalone")
+    except Exception:
+        return True
+
+
+@router.post("/cluster/lock/acquire", dependencies=[Depends(verify_api_key)])
+def cluster_lock_acquire(body: dict):
+    """申请跨 worker 设备锁.
+
+    Body: {worker_id, device_id, resource="default", priority=50,
+           ttl_sec=300, wait_timeout_sec=180}
+    Response: {granted: bool, lock_id?, wait_ms, evicted_lock?, reason?}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "lock service 仅在 coordinator 节点可用")
+    worker_id = (body.get("worker_id") or "").strip()
+    device_id = (body.get("device_id") or "").strip()
+    if not worker_id or not device_id:
+        raise HTTPException(400, "worker_id 和 device_id 必填")
+    resource = (body.get("resource") or "default").strip()
+    priority = int(body.get("priority") or 50)
+    ttl_sec = float(body.get("ttl_sec") or 300.0)
+    wait_timeout_sec = float(body.get("wait_timeout_sec") or 180.0)
+
+    from src.host.cluster_lock import get_lock_service
+    res = get_lock_service().acquire(
+        worker_id=worker_id,
+        device_id=device_id,
+        resource=resource,
+        priority=priority,
+        ttl_sec=ttl_sec,
+        wait_timeout_sec=wait_timeout_sec,
+    )
+    return {
+        "granted": res.granted,
+        "lock_id": res.lock_id,
+        "wait_ms": round(res.wait_ms, 1),
+        "evicted_lock": res.evicted_lock,
+        "reason": res.reason,
+    }
+
+
+@router.post("/cluster/lock/heartbeat", dependencies=[Depends(verify_api_key)])
+def cluster_lock_heartbeat(body: dict):
+    """续 lease.
+
+    Body: {lock_id, extend_ttl_sec?}
+    Response: {ok: bool, lock?: {...}}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "lock service 仅在 coordinator 节点可用")
+    lock_id = (body.get("lock_id") or "").strip()
+    if not lock_id:
+        raise HTTPException(400, "lock_id 必填")
+    extend = body.get("extend_ttl_sec")
+    extend_f = float(extend) if extend is not None else None
+
+    from src.host.cluster_lock import get_lock_service
+    lock = get_lock_service().heartbeat(lock_id, extend_ttl_sec=extend_f)
+    if lock is None:
+        return {"ok": False, "reason": "lock_not_found_or_expired"}
+    return {"ok": True, "lock": lock}
+
+
+@router.post("/cluster/lock/release", dependencies=[Depends(verify_api_key)])
+def cluster_lock_release(body: dict):
+    """释放锁.
+
+    Body: {lock_id}
+    Response: {ok: bool}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "lock service 仅在 coordinator 节点可用")
+    lock_id = (body.get("lock_id") or "").strip()
+    if not lock_id:
+        raise HTTPException(400, "lock_id 必填")
+
+    from src.host.cluster_lock import get_lock_service
+    ok = get_lock_service().release(lock_id)
+    return {"ok": ok}
+
+
+@router.get("/cluster/locks", dependencies=[Depends(verify_api_key)])
+def cluster_lock_list(worker_id: str = "", device_id: str = ""):
+    """列出当前 active locks. 可按 worker_id / device_id 过滤."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "lock service 仅在 coordinator 节点可用")
+    from src.host.cluster_lock import get_lock_service
+    svc = get_lock_service()
+    locks = svc.list_locks(
+        worker_id=worker_id or None,
+        device_id=device_id or None,
+    )
+    return {
+        "locks": locks,
+        "metrics": svc.metrics(),
+    }
