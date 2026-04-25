@@ -1128,9 +1128,14 @@ def _save_alert_state(state: Dict[str, str]) -> None:
 def _detect_referral_alerts(funnel: Dict[str, Any],
                               reject_total: int,
                               alert_send_threshold: float = 0.3,
-                              alert_reject_threshold: int = 10
+                              alert_reject_threshold: int = 10,
+                              alert_reply_threshold: float = 0.2,
+                              alert_reply_min_sent: int = 10
                               ) -> List[Dict[str, Any]]:
-    """共用 alert 检测逻辑 (3 类规则). daily_summary + hourly_check 都调.
+    """共用 alert 检测逻辑 (4 类规则). daily_summary + hourly_check 都调.
+
+    Phase 20.1.8.2: 加 replied_rate_low — sent 多但 reply rate < 阈值, 文案
+    /persona 信号失效预警.
 
     返 list of {type, severity, message}. 无 alert 返空 list.
     """
@@ -1158,6 +1163,20 @@ def _detect_referral_alerts(funnel: Dict[str, Any],
             "message": (f"planned={funnel['planned']} 但 sent=0, "
                           "检查 send_referral_replies 任务/账号"),
         })
+    # Phase 20.1.8.2: replied_rate_low — sent 够多但 reply 比率低
+    sent_n = int(funnel.get("sent", 0) or 0)
+    replied_n = int(funnel.get("replied", 0) or 0)
+    if sent_n >= alert_reply_min_sent:
+        reply_rate = replied_n / sent_n if sent_n else 0.0
+        if reply_rate < alert_reply_threshold:
+            alerts.append({
+                "type": "replied_rate_low",
+                "severity": "warning",
+                "message": (f"reply_rate={reply_rate*100:.1f}% "
+                              f"< {alert_reply_threshold*100:.0f}% "
+                              f"(sent={sent_n}, replied={replied_n}); "
+                              "文案/persona 可能失效"),
+            })
     return alerts
 
 
@@ -1224,6 +1243,9 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
     cooldown = int(params.get("cooldown_hours", 24) or 24)
     send_thr = float(params.get("alert_send_rate_threshold", 0.3) or 0.3)
     reject_thr = int(params.get("alert_reject_threshold", 10) or 10)
+    # Phase 20.1.8.2: replied_rate alert
+    reply_thr = float(params.get("alert_reply_threshold", 0.2) or 0.2)
+    reply_min_sent = int(params.get("alert_reply_min_sent", 10) or 10)
     severity_cd = params.get("severity_cooldowns")  # 可选 dict 覆盖默认
 
     from src.host.line_pool import referral_funnel
@@ -1234,7 +1256,9 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
     rej_total = rej_hist.get("total", 0)
 
     all_alerts = _detect_referral_alerts(
-        funnel, rej_total, send_thr, reject_thr)
+        funnel, rej_total, send_thr, reject_thr,
+        alert_reply_threshold=reply_thr,
+        alert_reply_min_sent=reply_min_sent)
 
     state = _load_alert_state()
     fire_now = _filter_alerts_by_cooldown(
@@ -1373,6 +1397,11 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         params.get("alert_send_rate_threshold", 0.3) or 0.3)
     alert_reject_threshold = int(
         params.get("alert_reject_threshold", 10) or 10)
+    # Phase 20.1.8.2: replied_rate alert
+    alert_reply_threshold = float(
+        params.get("alert_reply_threshold", 0.2) or 0.2)
+    alert_reply_min_sent = int(
+        params.get("alert_reply_min_sent", 10) or 10)
 
     from src.host.line_pool import (referral_funnel, account_ranking,
                                       recent_dispatch_log)
@@ -1400,11 +1429,13 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
             logger.debug("[daily_summary] per-region %s 失败: %s", rg, e)
             by_region[rg] = {}
 
-    # Phase 19.2 / 19.x.1: 共用 alert detection helper
+    # Phase 19.2 / 19.x.1 / 20.1.8.2: 共用 alert detection helper
     rej_history_total = rej_history.get("total", 0)
     alerts = _detect_referral_alerts(
         funnel, rej_history_total,
-        alert_send_threshold, alert_reject_threshold)
+        alert_send_threshold, alert_reject_threshold,
+        alert_reply_threshold=alert_reply_threshold,
+        alert_reply_min_sent=alert_reply_min_sent)
 
     # Phase 20.1.7.2: reply latency 统计 (从 wa_referral_replied.meta.latency_seconds)
     latency_stats = _compute_reply_latency_stats(hours_window=hours_window)
@@ -2452,25 +2483,57 @@ def _match_referral_keyword(text: str, region: str = "") -> str:
     return ""
 
 
-def _resolve_peer_regions(peer_names: List[str]) -> Dict[str, str]:
-    """Phase 20.1.7.1 (2026-04-25): batch peer_name → region map.
+# Phase 20.1.8.1: peer→region TTL 缓存 (减少 cron 重复 SQL).
+# key = peer_name (str), value = (region_str, expires_at_epoch).
+_PEER_REGION_CACHE: Dict[str, tuple] = {}
+_PEER_REGION_CACHE_TTL_SEC = 300  # 5 分钟
+
+
+def _peer_region_cache_clear() -> None:
+    """运维 / 测试: 强清缓存."""
+    _PEER_REGION_CACHE.clear()
+
+
+def _resolve_peer_regions(peer_names: List[str],
+                            use_cache: bool = True) -> Dict[str, str]:
+    """Phase 20.1.7.1 / 20.1.8.1 (2026-04-25): batch peer_name → region map.
 
     实现:
-      1. 一次 SQL 拉 fb:peer_name → canonical_id 映射 (lead_identities)
-      2. 对每个有 canonical_id 的 peer 调 line_pool._get_lead_region (3 级 fallback)
-      3. 没在 lead_identities 的 peer 返 ""
+      1. 先查缓存 (5min TTL): 命中的 peer 直接复用
+      2. 未命中的批量查 lead_identities (一次 SQL) → canonical_id
+      3. 对每个有 canonical_id 的 peer 调 line_pool._get_lead_region (3 级 fallback)
+      4. 写入缓存
 
-    用于 _fb_check_referral_replies 选关键词组. 1 SQL batch + N×_get_lead_region,
-    pending peer 通常 < 50 条, 性能可接受.
+    use_cache=False 时绕开缓存 (测试 / 运维强刷).
+
+    cache 设计:
+      * "" (没找到 region) 也缓存, TTL 内不再重查 (避免 ghost peer 反复查)
+      * cache 是进程内, 重启自动清除; 跨进程不共享 (cron 同进程跑, 够用)
     """
     if not peer_names:
         return {}
+    import time as _t
+    now = _t.time()
     out: Dict[str, str] = {}
+    miss: List[str] = []
+    if use_cache:
+        for pn in peer_names:
+            entry = _PEER_REGION_CACHE.get(pn)
+            if entry and entry[1] > now:
+                out[pn] = entry[0]
+            else:
+                miss.append(pn)
+    else:
+        miss = list(peer_names)
+
+    if not miss:
+        return out
+
     try:
         from src.host.lead_mesh.canonical import _connect as _lm_connect
         from src.host.line_pool import _get_lead_region
-        placeholders = ",".join(["?"] * len(peer_names))
-        fb_keys = [f"fb:{n}" for n in peer_names]
+        placeholders = ",".join(["?"] * len(miss))
+        fb_keys = [f"fb:{n}" for n in miss]
         with _lm_connect() as conn:
             rows = conn.execute(
                 "SELECT account_id, canonical_id FROM lead_identities"
@@ -2481,11 +2544,19 @@ def _resolve_peer_regions(peer_names: List[str]) -> Dict[str, str]:
             aid = r["account_id"] or ""
             if aid.startswith("fb:"):
                 peer_to_cid[aid[3:]] = r["canonical_id"]
-        for pn in peer_names:
+        expires = now + _PEER_REGION_CACHE_TTL_SEC
+        for pn in miss:
             cid = peer_to_cid.get(pn)
-            out[pn] = _get_lead_region(cid) if cid else ""
+            rg = _get_lead_region(cid) if cid else ""
+            out[pn] = rg
+            if use_cache:
+                _PEER_REGION_CACHE[pn] = (rg, expires)
     except Exception as e:
         logger.debug("[resolve_peer_regions] 失败: %s", e)
+        # miss 全部填 "" 兜底
+        for pn in miss:
+            out.setdefault(pn, "")
+    # 保 key 顺序一致
     return {pn: out.get(pn, "") for pn in peer_names}
 
 

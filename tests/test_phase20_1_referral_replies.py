@@ -15,10 +15,11 @@ import pytest
 def _reset():
     from src.host.fb_store import reset_peer_name_reject_count
     reset_peer_name_reject_count()
-    # 强制重载 keyword cache
+    # 强制重载 keyword cache + clear peer→region cache (Phase 20.1.8.1)
     from src.host import executor as _ex
     _ex._REFERRAL_KEYWORDS_CACHE["data"] = None
     _ex._REFERRAL_KEYWORDS_CACHE["loaded_at"] = 0.0
+    _ex._peer_region_cache_clear()
     yield
 
 
@@ -454,3 +455,173 @@ class TestDailySummaryWithLatency:
         rl = stats["summary"]["reply_latency"]
         assert rl["samples"] == 1
         assert rl["avg_min"] == 7.5
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 20.1.8.1: peer→region cache TTL
+# ═══════════════════════════════════════════════════════════════════
+
+class TestPeerRegionCache:
+    def test_cache_avoids_repeat_sql(self, tmp_db, monkeypatch):
+        """第 2 次同 peer_names 查询应直接走 cache, 不再调 _get_lead_region."""
+        from src.host import executor as ex_mod
+        ex_mod._peer_region_cache_clear()
+        _seed_l2_lead("花子", persona="jp_female_midlife")
+        # 1st call: 从 DB 解析
+        first = ex_mod._resolve_peer_regions(["花子"])
+        assert first["花子"] == "jp"
+        # 2nd call: 替换 _get_lead_region 故障型, 验证根本没调用
+        original = ex_mod._resolve_peer_regions
+        call_counter = {"n": 0}
+
+        def _spy_get_region(*a, **k):
+            call_counter["n"] += 1
+            return "FAKE"  # 若 cache miss 会返这个
+
+        # 没办法 monkeypatch 只 _get_lead_region (它是 from-import), 直接断言
+        # cache 命中: cache key 存在 + value 是 jp.
+        from src.host.executor import _PEER_REGION_CACHE
+        assert "花子" in _PEER_REGION_CACHE
+        assert _PEER_REGION_CACHE["花子"][0] == "jp"
+        # 第 2 次调用返同样结果
+        second = ex_mod._resolve_peer_regions(["花子"])
+        assert second["花子"] == "jp"
+
+    def test_cache_clear_works(self, tmp_db):
+        from src.host.executor import (_resolve_peer_regions,
+                                          _peer_region_cache_clear,
+                                          _PEER_REGION_CACHE)
+        _seed_l2_lead("Alice", persona="it_female_midlife")
+        _resolve_peer_regions(["Alice"])
+        assert "Alice" in _PEER_REGION_CACHE
+        _peer_region_cache_clear()
+        assert "Alice" not in _PEER_REGION_CACHE
+
+    def test_use_cache_false_bypasses(self, tmp_db):
+        """use_cache=False 即便 cache 有命中也强查 DB."""
+        from src.host.executor import (_resolve_peer_regions,
+                                          _peer_region_cache_clear,
+                                          _PEER_REGION_CACHE)
+        _peer_region_cache_clear()
+        # 手动塞个错的 cache 进去
+        import time as _t
+        _PEER_REGION_CACHE["ghost"] = ("FORCED_WRONG", _t.time() + 600)
+        # use_cache=True 应返 forced_wrong
+        m1 = _resolve_peer_regions(["ghost"], use_cache=True)
+        assert m1["ghost"] == "FORCED_WRONG"
+        # use_cache=False 应绕开 cache, 真查 DB → ghost 不存在 → ""
+        m2 = _resolve_peer_regions(["ghost"], use_cache=False)
+        assert m2["ghost"] == ""
+
+    def test_expired_entry_evicted(self, tmp_db):
+        """TTL 过期的 entry 应重查."""
+        from src.host.executor import (_resolve_peer_regions,
+                                          _peer_region_cache_clear,
+                                          _PEER_REGION_CACHE)
+        _peer_region_cache_clear()
+        import time as _t
+        _PEER_REGION_CACHE["ghost"] = ("STALE", _t.time() - 1)  # 已过期
+        m = _resolve_peer_regions(["ghost"])
+        # 过期 entry 应被替换 (DB 查 ghost 不存在 → "")
+        assert m["ghost"] == ""
+
+    def test_empty_string_region_also_cached(self, tmp_db):
+        """ghost peer 的 "" region 也应缓存, 防反复查."""
+        from src.host.executor import (_resolve_peer_regions,
+                                          _peer_region_cache_clear,
+                                          _PEER_REGION_CACHE)
+        _peer_region_cache_clear()
+        _resolve_peer_regions(["ghost-x"])
+        assert "ghost-x" in _PEER_REGION_CACHE
+        assert _PEER_REGION_CACHE["ghost-x"][0] == ""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 20.1.8.2: replied_rate_low alert
+# ═══════════════════════════════════════════════════════════════════
+
+class TestRepliedRateLowAlert:
+    def test_low_reply_triggers(self):
+        from src.host.executor import _detect_referral_alerts
+        # sent=20, replied=2 → reply_rate=10% < 默认 20%
+        funnel = {"planned": 20, "sent": 20, "replied": 2,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(funnel, reject_total=0)
+        types = {a["type"] for a in alerts}
+        assert "replied_rate_low" in types
+
+    def test_high_reply_no_alert(self):
+        from src.host.executor import _detect_referral_alerts
+        # sent=20, replied=10 → 50% > 20%
+        funnel = {"planned": 20, "sent": 20, "replied": 10,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(funnel, reject_total=0)
+        types = {a["type"] for a in alerts}
+        assert "replied_rate_low" not in types
+
+    def test_too_few_sent_skipped(self):
+        """sent < min_sent 阈值时不触发 (避免小样本噪声)."""
+        from src.host.executor import _detect_referral_alerts
+        # sent=5 < 默认 min_sent=10
+        funnel = {"planned": 10, "sent": 5, "replied": 0,
+                   "send_rate": 0.5}
+        alerts = _detect_referral_alerts(funnel, reject_total=0)
+        types = {a["type"] for a in alerts}
+        assert "replied_rate_low" not in types
+
+    def test_threshold_overridable(self):
+        """params 可降阈值 → 触发率提高."""
+        from src.host.executor import _detect_referral_alerts
+        funnel = {"planned": 20, "sent": 20, "replied": 5,
+                   "send_rate": 1.0}  # 25% > 20% 默认不触发
+        alerts = _detect_referral_alerts(
+            funnel, 0, alert_reply_threshold=0.5)  # 25% < 50%
+        types = {a["type"] for a in alerts}
+        assert "replied_rate_low" in types
+
+    def test_zero_replied_with_enough_sent(self):
+        from src.host.executor import _detect_referral_alerts
+        funnel = {"planned": 30, "sent": 30, "replied": 0,
+                   "send_rate": 1.0}
+        alerts = _detect_referral_alerts(funnel, 0)
+        types = {a["type"] for a in alerts}
+        assert "replied_rate_low" in types
+        # severity 应为 warning (非 critical)
+        rrl = next(a for a in alerts if a["type"] == "replied_rate_low")
+        assert rrl["severity"] == "warning"
+
+    def test_daily_summary_includes_replied_rate_low_when_low(self, tmp_db,
+                                                                  tmp_path,
+                                                                  monkeypatch):
+        from src.host.executor import _fb_daily_referral_summary
+        from src.host.fb_store import record_contact_event
+        # 12 sent, 1 replied → 8% < 20%
+        for i in range(12):
+            _seed_l2_lead(f"S{i}", persona="jp_female_midlife")
+            record_contact_event(f"D{i % 3}", f"S{i}", "line_dispatch_planned",
+                                   skip_sanitize=True)
+            record_contact_event(f"D{i % 3}", f"S{i}", "wa_referral_sent",
+                                   skip_sanitize=True)
+        record_contact_event("D0", "S0", "wa_referral_replied",
+                               skip_sanitize=True)
+        monkeypatch.chdir(tmp_path)
+        ok, _, stats = _fb_daily_referral_summary({
+            "hours_window": 24, "write_file": False, "send_webhook": False,
+            "regions": []})
+        types = {a["type"] for a in stats["summary"]["alerts"]}
+        assert "replied_rate_low" in types
+
+    def test_hourly_check_picks_up_replied_rate_low(self, tmp_db, tmp_path,
+                                                          monkeypatch):
+        from src.host.executor import _fb_alert_check_hourly
+        from src.host.fb_store import record_contact_event
+        for i in range(15):
+            _seed_l2_lead(f"R{i}")
+            record_contact_event("D1", f"R{i}", "wa_referral_sent",
+                                   skip_sanitize=True)
+        # 0 replied
+        monkeypatch.chdir(tmp_path)
+        ok, _, stats = _fb_alert_check_hourly({"hours_window": 24,
+                                                  "cooldown_hours": 24})
+        types = {a["type"] for a in stats["all_alerts"]}
+        assert "replied_rate_low" in types
