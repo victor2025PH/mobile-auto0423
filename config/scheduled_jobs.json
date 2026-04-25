@@ -285,5 +285,18 @@
     },
     "enabled": false,
     "last_run": ""
+  },
+  {
+    "id": "mark_stale_referrals_daily",
+    "name": "Phase 20.2 SLA 死信回收 (每天 04:30, sent 48h 未 replied → stale, 7d → dead)",
+    "cron": "30 4 * * *",
+    "action": "facebook_mark_stale_referrals",
+    "params": {
+      "stale_hours": 48,
+      "escalate_to_dead_days": 7,
+      "limit": 500
+    },
+    "enabled": false,
+    "last_run": ""
   }
 ]

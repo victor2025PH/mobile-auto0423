@@ -682,6 +682,8 @@ CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写 (实发)
 CONTACT_EVT_LINE_DISPATCH_PLANNED = "line_dispatch_planned"
 # Phase 20.1 (2026-04-25): B 写 — Messenger inbox 检测到 referral 反馈关键词
 CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"
+# Phase 20.2.1 (2026-04-25): A 写 — sent 后超 N 小时仍未 replied 自动打标
+CONTACT_EVT_REFERRAL_STALE = "referral_stale"
 
 VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_ADD_FRIEND_SENT,
@@ -695,6 +697,7 @@ VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_WA_REFERRAL_SENT,
     CONTACT_EVT_LINE_DISPATCH_PLANNED,
     CONTACT_EVT_WA_REFERRAL_REPLIED,
+    CONTACT_EVT_REFERRAL_STALE,
 })
 
 
@@ -1150,6 +1153,208 @@ def get_pending_referral_peers(device_id: Optional[str] = None,
     except Exception as e:
         logger.debug("[get_pending_referral_peers] 失败: %s", e)
         return []
+
+
+def mark_stale_referrals(*, stale_hours: int = 48,
+                            escalate_to_dead_days: int = 7,
+                            device_id: Optional[str] = None,
+                            dry_run: bool = False,
+                            limit: int = 500) -> Dict[str, Any]:
+    """Phase 20.2.1 (2026-04-25): SLA 死信回收 — 标 stale + 升级 dead.
+
+    扫近 ``escalate_to_dead_days*24`` 小时内有 ``wa_referral_sent`` 但仍无
+    ``wa_referral_replied`` 的 peer:
+
+      * sent age >= stale_hours: tag canonical ``referral_stale``,
+        写 event ``referral_stale``, meta ``referral_stale_at`` / peer_name.
+        已标 stale 的 skip.
+      * sent age >= escalate_to_dead_days * 24h:
+        额外 tag ``referral_dead`` + meta dead_reason='stale_no_reply'
+
+    dry_run=True 时只统计不写入. 失败 silent (单条失败不中断).
+
+    返:
+      {
+        scanned: 候选 peer 总数,
+        marked_stale: 本次新打 stale 的数量,
+        escalated_dead: 本次升级 dead 的数量,
+        already_stale: 跳过 (已标),
+        no_canonical: peer 找不到 canonical 跳过,
+        dry_run: bool,
+        samples: [{peer_name, age_hours, action}, ...] 前 20 条预览,
+      }
+    """
+    import datetime as _dt
+    import json as _json
+    def _empty_stats():
+        return {"scanned": 0, "candidates": 0,
+                "marked_stale": 0, "escalated_dead": 0,
+                "already_stale": 0, "no_canonical": 0,
+                "dry_run": dry_run, "samples": []}
+
+    if stale_hours <= 0:
+        return _empty_stats()
+
+    # 拉满整个 escalation 窗口的 pending, 之后按 age 分类.
+    # 用 2x buffer 避免边缘 sent 漏网 (例如 stale_hours=48 escalate=7d 时
+    # 8 天前 sent 仍应被升级 dead)
+    lookback = max(stale_hours, escalate_to_dead_days * 24 * 2) + 1
+    pending = get_pending_referral_peers(
+        device_id=device_id, hours_back=lookback, limit=limit)
+    if not pending:
+        return _empty_stats()
+
+    now_ts = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    escalate_threshold_sec = escalate_to_dead_days * 24 * 3600
+    stale_threshold_sec = stale_hours * 3600
+
+    # 解析 sent_at → age_hours; 过滤掉 age 不达 stale 阈值的
+    # (pending 列表可能含很新的 sent, 那些不需要 mark)
+    candidates = []
+    for p in pending:
+        sent_at = p.get("sent_at") or ""
+        # 兼容 SQLite 默认 'YYYY-MM-DD HH:MM:SS' 与 ISO 'T...Z'
+        sent_ts: Optional[float] = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                sent_ts = _dt.datetime.strptime(
+                    sent_at, fmt).replace(
+                    tzinfo=_dt.timezone.utc).timestamp()
+                break
+            except Exception:
+                continue
+        if sent_ts is None:
+            continue
+        age_sec = now_ts - sent_ts
+        if age_sec < stale_threshold_sec:
+            continue
+        candidates.append((p, age_sec))
+
+    marked_stale = 0
+    escalated_dead = 0
+    already_stale = 0
+    no_canonical = 0
+    samples: List[Dict[str, Any]] = []
+
+    # 一次预查 canonical 拿当前 tags
+    if not candidates:
+        s = _empty_stats()
+        s["scanned"] = len(pending)
+        return s
+
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        from src.host.lead_mesh import update_canonical_metadata
+        # batch 查 canonical
+        peer_names = [p["peer_name"] for p, _ in candidates]
+        placeholders = ",".join(["?"] * len(peer_names))
+        fb_keys = [f"fb:{n}" for n in peer_names]
+        peer_to_canonical: Dict[str, Dict[str, Any]] = {}
+        with _lm_connect() as conn:
+            rows = conn.execute(
+                "SELECT li.account_id, li.canonical_id, lc.tags,"
+                " lc.metadata_json FROM lead_identities li"
+                " JOIN leads_canonical lc"
+                " ON li.canonical_id = lc.canonical_id"
+                f" WHERE li.platform='facebook' AND li.account_id IN ({placeholders})",
+                fb_keys).fetchall()
+            for r in rows:
+                aid = r["account_id"] or ""
+                if aid.startswith("fb:"):
+                    peer_to_canonical[aid[3:]] = {
+                        "canonical_id": r["canonical_id"],
+                        "tags": {t.strip() for t in
+                                  (r["tags"] or "").split(",") if t.strip()},
+                        "metadata": _json.loads(r["metadata_json"] or "{}"),
+                    }
+
+        now_iso = _dt.datetime.now(_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for p, age_sec in candidates:
+            peer_name = p["peer_name"]
+            cdata = peer_to_canonical.get(peer_name)
+            if not cdata:
+                no_canonical += 1
+                continue
+            cid = cdata["canonical_id"]
+            tags_set = cdata["tags"]
+            already = "referral_stale" in tags_set
+            already_dead = "referral_dead" in tags_set
+            should_escalate = (age_sec >= escalate_threshold_sec
+                                 and not already_dead)
+            age_h = round(age_sec / 3600, 1)
+
+            action = "noop"
+            if already:
+                already_stale += 1
+                # 已 stale 但满足 escalation 条件且没 dead: 升级
+                if should_escalate:
+                    action = "escalate_dead"
+                    escalated_dead += 1
+                else:
+                    samples.append({"peer_name": peer_name,
+                                       "age_hours": age_h,
+                                       "action": "already_stale"})
+                    continue
+            else:
+                action = "mark_stale"
+                marked_stale += 1
+                if should_escalate:
+                    action = "mark_stale_and_dead"
+                    escalated_dead += 1
+
+            samples.append({"peer_name": peer_name,
+                               "age_hours": age_h,
+                               "action": action})
+
+            if dry_run:
+                continue
+            try:
+                meta_patch: Dict[str, Any] = {}
+                tags_to_add: List[str] = []
+                if not already:
+                    meta_patch["referral_stale_at"] = now_iso
+                    meta_patch["referral_stale_peer_name"] = peer_name
+                    meta_patch["referral_stale_age_hours_when_marked"] = age_h
+                    tags_to_add.append("referral_stale")
+                if should_escalate:
+                    meta_patch["referral_dead_reason"] = "stale_no_reply"
+                    meta_patch["referral_dead_at"] = now_iso
+                    meta_patch["referral_dead_peer_name"] = peer_name
+                    if "referral_dead" not in tags_set:
+                        tags_to_add.append("referral_dead")
+                if meta_patch or tags_to_add:
+                    update_canonical_metadata(
+                        cid, meta_patch,
+                        tags=tags_to_add or None)
+                # 写 event 时间序列 (mark_stale 才写, escalation 不重复)
+                if not already:
+                    record_contact_event(
+                        p["device_id"], peer_name,
+                        CONTACT_EVT_REFERRAL_STALE,
+                        meta={"sent_event_id": p.get("sent_event_id"),
+                              "sent_at": p.get("sent_at"),
+                              "age_hours": age_h,
+                              "escalated_dead": should_escalate},
+                        skip_sanitize=True)
+            except Exception as e:
+                logger.debug("[mark_stale] peer=%s 失败: %s",
+                              peer_name[:30], e)
+    except Exception as e:
+        logger.warning("[mark_stale] 整体异常: %s", e)
+
+    # 限制 samples 大小防回包过大
+    samples = samples[:20]
+    return {
+        "scanned": len(pending),
+        "candidates": len(candidates),
+        "marked_stale": marked_stale,
+        "escalated_dead": escalated_dead,
+        "already_stale": already_stale,
+        "no_canonical": no_canonical,
+        "dry_run": dry_run,
+        "samples": samples,
+    }
 
 
 def get_greeting_reply_rate_by_template(device_id: Optional[str] = None,

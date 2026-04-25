@@ -69,6 +69,8 @@ class TaskType(str, Enum):
     FACEBOOK_ALERT_CHECK_HOURLY = "facebook_alert_check_hourly"
     # Phase 20.1 (2026-04-25): B 侧 inbox 检测 referral 回复
     FACEBOOK_CHECK_REFERRAL_REPLIES = "facebook_check_referral_replies"
+    # Phase 20.2 (2026-04-25): SLA 死信回收 — 标 stale + 升级 dead
+    FACEBOOK_MARK_STALE_REFERRALS = "facebook_mark_stale_referrals"
     # Instagram
     INSTAGRAM_BROWSE_FEED = "instagram_browse_feed"
     INSTAGRAM_SEARCH_LEADS = "instagram_search_leads"

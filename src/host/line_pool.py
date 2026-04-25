@@ -571,7 +571,8 @@ def referral_funnel(*, hours_window: int = 168,
     """
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     CONTACT_EVT_LINE_DISPATCH_PLANNED,
-                                    CONTACT_EVT_WA_REFERRAL_SENT)
+                                    CONTACT_EVT_WA_REFERRAL_SENT,
+                                    CONTACT_EVT_REFERRAL_STALE)
     CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"
 
     planned_rows = list_recent_contact_events_by_types(
@@ -582,6 +583,10 @@ def referral_funnel(*, hours_window: int = 168,
         hours=hours_window, limit=10000)
     replied_rows = list_recent_contact_events_by_types(
         [CONTACT_EVT_WA_REFERRAL_REPLIED],
+        hours=hours_window, limit=10000)
+    # Phase 20.2 (2026-04-25): SLA 死信回收 — 标过 stale 的 peer 数
+    stale_rows = list_recent_contact_events_by_types(
+        [CONTACT_EVT_REFERRAL_STALE],
         hours=hours_window, limit=10000)
 
     # Phase 19.3: region/persona 过滤 — 反查 canonical 看 metadata
@@ -646,6 +651,7 @@ def referral_funnel(*, hours_window: int = 168,
     planned_rows_f = _filter(planned_rows)
     sent_rows_f = _filter(sent_rows)
     replied_rows_f = _filter(replied_rows)
+    stale_rows_f = _filter(stale_rows)
 
     planned_peers = {r.get("peer_name") for r in planned_rows_f
                       if r.get("peer_name")}
@@ -653,26 +659,35 @@ def referral_funnel(*, hours_window: int = 168,
                     if r.get("peer_name")}
     replied_peers = {r.get("peer_name") for r in replied_rows_f
                        if r.get("peer_name")}
+    stale_peers = {r.get("peer_name") for r in stale_rows_f
+                     if r.get("peer_name")}
 
     n_planned = len(planned_peers)
     n_sent = len(sent_peers)
     n_replied = len(replied_peers)
+    n_stale = len(stale_peers)
     send_rate = (n_sent / n_planned) if n_planned else 0.0
     conv_rate = (n_replied / n_sent) if n_sent else 0.0
+    # Phase 20.2: stale_rate = stale / sent (sent 中失活比例)
+    stale_rate = (n_stale / n_sent) if n_sent else 0.0
     return {
         "hours_window": hours_window,
         "planned": n_planned,
         "sent": n_sent,
         "replied": n_replied,
+        "stale": n_stale,
         "send_rate": round(send_rate, 4),
         "conversion_rate": round(conv_rate, 4),
+        "stale_rate": round(stale_rate, 4),
         "raw_events": {
             "planned_events": len(planned_rows),
             "sent_events": len(sent_rows),
             "replied_events": len(replied_rows),
+            "stale_events": len(stale_rows),
             "filtered_planned": len(planned_rows_f),
             "filtered_sent": len(sent_rows_f),
             "filtered_replied": len(replied_rows_f),
+            "filtered_stale": len(stale_rows_f),
         },
         "region": region or "",
         "persona_key": persona_key or "",

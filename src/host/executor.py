@@ -1065,6 +1065,12 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_check_referral_replies":
             return _fb_check_referral_replies(fb, resolved, params)
 
+        # Phase 20.2 (2026-04-25): facebook_mark_stale_referrals
+        # 扫 sent 但 stale_hours 内仍未 replied 的 peer, 标 referral_stale,
+        # 超过 escalate_to_dead_days 天升级 referral_dead.
+        if task_type == "facebook_mark_stale_referrals":
+            return _fb_mark_stale_referrals(params)
+
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
     except Exception as e:
@@ -1737,11 +1743,19 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                 import urllib.request
                 # 标题: 有 alerts 加 🚨
                 title_prefix = "🚨 " if alerts else ""
+                # Phase 20.2: 加 stale 一行 (有 stale 才展示)
+                stale_n = funnel.get("stale", 0)
+                stale_line = ""
+                if stale_n > 0:
+                    stale_line = (f"stale_24h: {stale_n} "
+                                    f"({funnel.get('stale_rate', 0)*100:.1f}% of sent)")
                 lines = [
                     f"{title_prefix}*Referral 闭环 24h 摘要* ({summary['generated_at']})",
                     f"funnel: planned={funnel['planned']} sent={funnel['sent']} replied={funnel['replied']}",
                     f"send_rate={funnel['send_rate']*100:.1f}% conv_rate={funnel['conversion_rate']*100:.1f}%",
                 ]
+                if stale_line:
+                    lines.append(stale_line)
                 # Phase 19.1: trend
                 if trend:
                     arrow = lambda v: ("+" if v > 0 else "") + str(v)
@@ -2883,6 +2897,35 @@ def _fb_check_referral_replies(fb, resolved: str,
         "no_match": no_match,
         "matches": matches,
     }
+
+
+def _fb_mark_stale_referrals(params: Dict[str, Any]) -> tuple:
+    """Phase 20.2 (2026-04-25): SLA 死信回收 task wrapper.
+
+    扫整个 referral funnel, 把 sent N 小时未 replied 的 peer 标 referral_stale,
+    超 M 天升级 referral_dead. 跑完后会被 Phase 14 daily 回收链消化.
+
+    Params:
+      stale_hours: int = 48          多久未 replied 算 stale (建议 24-72)
+      escalate_to_dead_days: int = 7 多久 stale 后升级 dead
+      device_id: str = ""            可限制单 device, 默认全部
+      dry_run: bool = False          不写入只统计 (推预览安全)
+      limit: int = 500
+    """
+    stale_hours = int(params.get("stale_hours", 48) or 48)
+    esc_days = int(params.get("escalate_to_dead_days", 7) or 7)
+    device_id = (params.get("device_id") or "").strip() or None
+    dry_run = bool(params.get("dry_run", False))
+    limit = max(1, min(int(params.get("limit", 500) or 500), 5000))
+
+    from src.host.fb_store import mark_stale_referrals
+    stats = mark_stale_referrals(
+        stale_hours=stale_hours,
+        escalate_to_dead_days=esc_days,
+        device_id=device_id,
+        dry_run=dry_run,
+        limit=limit)
+    return True, "", stats
 
 
 _FB_CAMPAIGN_DEFAULT_STEPS = ["warmup", "group_engage", "extract_members",
