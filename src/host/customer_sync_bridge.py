@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 
 CANONICAL_SOURCE = "facebook_name"
 CHANNEL_FACEBOOK = "facebook"
+CHANNEL_MESSENGER = "messenger"
+
+# status 状态机 (与 store SQL 守卫一致):
+# in_funnel < in_messenger < in_line < accepted_by_human < converted/lost
+STATUS_IN_FUNNEL = "in_funnel"
+STATUS_IN_MESSENGER = "in_messenger"
+STATUS_IN_LINE = "in_line"
 
 
 def _build_canonical_id(device_id: str, peer_name: str) -> str:
@@ -60,8 +67,12 @@ def _ensure_customer(
     peer_name: str,
     *,
     ai_profile: Optional[Dict[str, Any]] = None,
+    status: Optional[str] = None,
 ) -> Optional[str]:
-    """upsert_customer + 返回 customer_id (deterministic UUIDv5)."""
+    """upsert_customer + 返回 customer_id (deterministic UUIDv5).
+
+    status 传了主控会按状态机守卫单调升级 (终态 + 人工接管态不可降级).
+    """
     try:
         from src.host.central_push_client import upsert_customer
         return upsert_customer(
@@ -71,6 +82,7 @@ def _ensure_customer(
             worker_id=_safe_worker_id() or None,
             device_id=device_id,
             ai_profile=ai_profile,
+            status=status,
             fire_and_forget=True,
         )
     except Exception as exc:  # noqa: BLE001
@@ -185,3 +197,235 @@ def sync_greeting_sent(
     except Exception as exc:  # noqa: BLE001
         logger.debug("[customer_sync] greeting push failed: %s", exc)
     return cid
+
+
+# ── Messenger 入站 / 出站 / 引流 / handoff ────────────────────────────
+
+def _detect_lang_safe(text: str) -> Optional[str]:
+    """调 lang_detect 失败/为空时返 None, 不阻塞 push."""
+    if not text:
+        return None
+    try:
+        from src.ai.lang_detect import detect_language
+        v = (detect_language(text) or "").strip()
+        return v or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def sync_messenger_incoming(
+    device_id: str,
+    peer_name: str,
+    *,
+    content: str,
+    content_lang: Optional[str] = None,
+    peer_type: str = "friend",
+) -> Optional[str]:
+    """对方发来 messenger 消息. 入站时升级 status='in_messenger'
+    (主控状态机守卫: 已是 in_line/接管态/终态不会被降级).
+
+    peer_type: 'friend' (check_messenger_inbox) / 'stranger' (check_message_requests).
+    """
+    if not device_id or not peer_name or not content:
+        return None
+    cid = _ensure_customer(
+        device_id, peer_name, status=STATUS_IN_MESSENGER,
+    )
+    if not cid:
+        return None
+    lang = content_lang or _detect_lang_safe(content)
+    worker_id = _safe_worker_id()
+    try:
+        from src.host.central_push_client import record_event, record_chat
+        record_event(
+            customer_id=cid,
+            event_type="message_received",
+            worker_id=worker_id,
+            device_id=device_id,
+            meta={"peer_type": peer_type, "msg_len": len(content)},
+            fire_and_forget=True,
+        )
+        record_chat(
+            customer_id=cid,
+            channel=CHANNEL_MESSENGER,
+            direction="incoming",
+            content=content,
+            content_lang=lang,
+            ai_generated=False,
+            worker_id=worker_id or None,
+            device_id=device_id,
+            meta={"peer_type": peer_type},
+            fire_and_forget=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] messenger_incoming push failed: %s", exc)
+    return cid
+
+
+def sync_messenger_outgoing(
+    device_id: str,
+    peer_name: str,
+    *,
+    content: str,
+    ai_decision: str = "reply",
+    ai_generated: bool = True,
+    template_id: Optional[str] = None,
+    content_lang: Optional[str] = None,
+    intent_tag: Optional[str] = None,
+) -> Optional[str]:
+    """B worker AI 回复 / 模板回复发出后调.
+
+    ai_decision: 'reply' (AI 生成) / 'wa_referral' (引流话术) / 'skip' (不回, 一般不调本函数).
+    ai_generated 跟 ai_decision 解耦: ChatBrain 生成的是 True; 模板/snippet 是 False.
+    """
+    if not device_id or not peer_name or not content:
+        return None
+    cid = _ensure_customer(
+        device_id, peer_name, status=STATUS_IN_MESSENGER,
+    )
+    if not cid:
+        return None
+    lang = content_lang or _detect_lang_safe(content)
+    worker_id = _safe_worker_id()
+    try:
+        from src.host.central_push_client import record_event, record_chat
+        record_event(
+            customer_id=cid,
+            event_type="messenger_message_sent",
+            worker_id=worker_id,
+            device_id=device_id,
+            meta={
+                "ai_decision": ai_decision,
+                "ai_generated": ai_generated,
+                "template_id": template_id or "",
+                "intent_tag": intent_tag or "",
+                "msg_len": len(content),
+            },
+            fire_and_forget=True,
+        )
+        record_chat(
+            customer_id=cid,
+            channel=CHANNEL_MESSENGER,
+            direction="outgoing",
+            content=content,
+            content_lang=lang,
+            ai_generated=ai_generated,
+            template_id=template_id,
+            worker_id=worker_id or None,
+            device_id=device_id,
+            meta={
+                "ai_decision": ai_decision,
+                "intent_tag": intent_tag or "",
+            },
+            fire_and_forget=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] messenger_outgoing push failed: %s", exc)
+    return cid
+
+
+def sync_wa_referral_sent(
+    device_id: str,
+    peer_name: str,
+    *,
+    channel: str,
+    content: Optional[str] = None,
+    content_lang: Optional[str] = None,
+    intent_tag: Optional[str] = None,
+) -> Optional[str]:
+    """引流话术发出 (WhatsApp / LINE / Telegram). channel = 'whatsapp'/'line'/'telegram'.
+
+    刻意**不**升级 status — wa_referral 是"我发了话术", 客户没必跟过去;
+    真正交接给人工要看 sync_handoff_to_line. 只记 event, 不写 chat
+    (chat 已由 sync_messenger_outgoing 写过).
+    """
+    if not device_id or not peer_name:
+        return None
+    cid = _ensure_customer(device_id, peer_name)
+    if not cid:
+        return None
+    try:
+        from src.host.central_push_client import record_event
+        record_event(
+            customer_id=cid,
+            event_type="wa_referral_sent",
+            worker_id=_safe_worker_id(),
+            device_id=device_id,
+            meta={
+                "channel": channel,
+                "intent_tag": intent_tag or "",
+                "content_lang": content_lang or "",
+                "msg_len": len(content) if content else 0,
+            },
+            fire_and_forget=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] wa_referral push failed: %s", exc)
+    return cid
+
+
+def sync_handoff_to_line(
+    device_id: str,
+    peer_name: str,
+    *,
+    ai_summary: str,
+    from_stage: str = "messenger",
+    to_stage: str = "line",
+    meta: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """messenger → line (或类似) 真正发起人机交接 handoff.
+
+    升级客户 status='in_line'. 调 push_client.initiate_handoff (sync,
+    因为 handoff_id 业务层要留档).
+
+    ai_summary 强烈建议传 — 人工接管时第一眼看到这一段决定接不接.
+    PR-2 的 worker 端 ai_summary 是简化拼接 (persona + last_in/out),
+    L3 dashboard 实时拉时再补 LLM 总结.
+
+    返回 handoff_id (sync 调用; None 表示 push 失败 / 早退).
+    """
+    if not device_id or not peer_name or not ai_summary:
+        return None
+    cid = _ensure_customer(
+        device_id, peer_name, status=STATUS_IN_LINE,
+    )
+    if not cid:
+        return None
+    try:
+        from src.host.central_push_client import initiate_handoff
+        return initiate_handoff(
+            customer_id=cid,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            initiating_worker_id=_safe_worker_id(),
+            initiating_device_id=device_id,
+            ai_summary=ai_summary,
+            meta=meta,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] handoff initiate failed: %s", exc)
+        return None
+
+
+def build_simple_summary(
+    *,
+    persona_key: Optional[str] = None,
+    intent_tag: Optional[str] = None,
+    last_incoming: Optional[str] = None,
+    last_outgoing: Optional[str] = None,
+    max_snippet: int = 80,
+) -> str:
+    """简易 ai_summary 拼接 (PR-2 不调 LLM, L3 dashboard 拉时再补).
+
+    格式: 'persona=hostess_jp | intent=referral | last_in: ... | last_out: ...'
+    """
+    parts = []
+    if persona_key:
+        parts.append(f"persona={persona_key}")
+    if intent_tag:
+        parts.append(f"intent={intent_tag}")
+    if last_incoming:
+        parts.append(f"last_in: {last_incoming[:max_snippet]}")
+    if last_outgoing:
+        parts.append(f"last_out: {last_outgoing[:max_snippet]}")
+    return " | ".join(parts) or "(no context)"

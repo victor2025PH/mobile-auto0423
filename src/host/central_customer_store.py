@@ -168,7 +168,18 @@ class CentralCustomerStore:
                     country = COALESCE(EXCLUDED.country, customers.country),
                     interests = COALESCE(EXCLUDED.interests, customers.interests),
                     ai_profile = customers.ai_profile || EXCLUDED.ai_profile,
-                    status = COALESCE(EXCLUDED.status, customers.status),
+                    -- status 状态机: 终态/人工接管态不可由 worker push 降级,
+                    -- in_line 不可回 messenger; 其它走单调升级 (in_funnel <
+                    -- in_messenger < in_line) 或 EXCLUDED 覆盖.
+                    status = CASE
+                        WHEN customers.status IN ('accepted_by_human', 'converted', 'lost')
+                            THEN customers.status
+                        WHEN customers.status = 'in_line' AND EXCLUDED.status = 'in_messenger'
+                            THEN customers.status
+                        WHEN customers.status = 'in_messenger' AND EXCLUDED.status = 'in_funnel'
+                            THEN customers.status
+                        ELSE COALESCE(EXCLUDED.status, customers.status)
+                    END,
                     last_worker_id = COALESCE(EXCLUDED.last_worker_id, customers.last_worker_id),
                     last_device_id = COALESCE(EXCLUDED.last_device_id, customers.last_device_id)
                 RETURNING customer_id::text
