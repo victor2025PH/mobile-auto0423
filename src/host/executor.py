@@ -1054,11 +1054,206 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_send_referral_replies":
             return _fb_send_referral_replies(fb, resolved, params)
 
+        # Phase 19.x.1 (2026-04-25): facebook_alert_check_hourly
+        # 轻量 alert 检测 + 状态抑制 (24h 内同 alert 不重发).
+        if task_type == "facebook_alert_check_hourly":
+            return _fb_alert_check_hourly(params)
+
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
     except Exception as e:
         logger.exception("Facebook 任务执行异常: %s", task_type)
         return False, f"{task_type} 异常: {e}", None
+
+
+# Phase 19.x.1 (2026-04-25): alert detection + state suppression
+# 抽出来给 daily_summary + hourly_check 共用.
+
+_ALERT_STATE_PATH = "logs/alert_state.json"
+_ALERT_DEFAULT_COOLDOWN_HOURS = 24
+
+
+def _load_alert_state() -> Dict[str, str]:
+    """logs/alert_state.json: {alert_type: last_fired_iso}."""
+    import json as _json
+    from pathlib import Path as _Path
+    p = _Path(_ALERT_STATE_PATH)
+    if not p.exists():
+        return {}
+    try:
+        with p.open(encoding="utf-8") as f:
+            data = _json.load(f) or {}
+        return {k: str(v) for k, v in data.items() if isinstance(k, str)}
+    except Exception as e:
+        logger.debug("[alert_state] load 失败: %s", e)
+        return {}
+
+
+def _save_alert_state(state: Dict[str, str]) -> None:
+    """原子写 (tmp + rename) 避免半写."""
+    import json as _json
+    import os as _os
+    from pathlib import Path as _Path
+    p = _Path(_ALERT_STATE_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            _json.dump(state, f, ensure_ascii=False, indent=2)
+        # atomic rename (Windows 可能要先删旧)
+        if p.exists():
+            _os.replace(str(tmp), str(p))
+        else:
+            tmp.rename(p)
+    except Exception as e:
+        logger.debug("[alert_state] save 失败: %s", e)
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _detect_referral_alerts(funnel: Dict[str, Any],
+                              reject_total: int,
+                              alert_send_threshold: float = 0.3,
+                              alert_reject_threshold: int = 10
+                              ) -> List[Dict[str, Any]]:
+    """共用 alert 检测逻辑 (3 类规则). daily_summary + hourly_check 都调.
+
+    返 list of {type, severity, message}. 无 alert 返空 list.
+    """
+    alerts: List[Dict[str, Any]] = []
+    if (funnel.get("planned", 0) >= 5
+            and funnel.get("send_rate", 0) < alert_send_threshold):
+        alerts.append({
+            "type": "send_rate_low",
+            "severity": "warning",
+            "message": (f"send_rate={funnel['send_rate']*100:.1f}% "
+                          f"< {alert_send_threshold*100:.0f}% "
+                          f"(planned={funnel['planned']})"),
+        })
+    if reject_total >= alert_reject_threshold:
+        alerts.append({
+            "type": "reject_rate_high",
+            "severity": "warning",
+            "message": (f"reject_history={reject_total} "
+                          f"(阈值={alert_reject_threshold})"),
+        })
+    if funnel.get("planned", 0) >= 5 and funnel.get("sent", 0) == 0:
+        alerts.append({
+            "type": "no_dispatched",
+            "severity": "critical",
+            "message": (f"planned={funnel['planned']} 但 sent=0, "
+                          "检查 send_referral_replies 任务/账号"),
+        })
+    return alerts
+
+
+def _filter_alerts_by_cooldown(alerts: List[Dict[str, Any]],
+                                  state: Dict[str, str],
+                                  cooldown_hours: int = _ALERT_DEFAULT_COOLDOWN_HOURS
+                                  ) -> List[Dict[str, Any]]:
+    """Phase 19.x.1: 根据 alert_state 抑制重复.
+
+    只返 "应该真发 webhook" 的 alerts. 已在 cooldown 内的同 type 跳过.
+    """
+    import datetime as _dt
+    now = _dt.datetime.utcnow()
+    out: List[Dict[str, Any]] = []
+    for a in alerts:
+        last_iso = state.get(a["type"], "")
+        if last_iso:
+            try:
+                last_dt = _dt.datetime.strptime(last_iso, "%Y-%m-%dT%H:%M:%SZ")
+                if (now - last_dt).total_seconds() < cooldown_hours * 3600:
+                    continue
+            except Exception:
+                pass
+        out.append(a)
+    return out
+
+
+def _record_alerts_fired(alerts: List[Dict[str, Any]],
+                            state: Dict[str, str]) -> Dict[str, str]:
+    """更新 alert_state.json — 把刚 fire 的 alerts 时间戳写入."""
+    import datetime as _dt
+    now_iso = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_state = dict(state)
+    for a in alerts:
+        new_state[a["type"]] = now_iso
+    return new_state
+
+
+def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
+    """Phase 19.x.1: 每小时 lightweight alert 检测.
+
+    比 daily summary 轻 — 只跑 funnel + reject_history, 不写 daily_summary 文件.
+    检测出 alerts 后用 alert_state.json 抑制 24h 内重复, 仅新触发才 webhook.
+
+    Params:
+      hours_window: int = 24
+      cooldown_hours: int = 24 (重复抑制)
+      alert_send_rate_threshold: float = 0.3
+      alert_reject_threshold: int = 10
+    """
+    hours_window = int(params.get("hours_window", 24) or 24)
+    cooldown = int(params.get("cooldown_hours", 24) or 24)
+    send_thr = float(params.get("alert_send_rate_threshold", 0.3) or 0.3)
+    reject_thr = int(params.get("alert_reject_threshold", 10) or 10)
+
+    from src.host.line_pool import referral_funnel
+    from src.host.fb_store import get_peer_name_reject_history
+
+    funnel = referral_funnel(hours_window=hours_window)
+    rej_hist = get_peer_name_reject_history(hours_window=hours_window)
+    rej_total = rej_hist.get("total", 0)
+
+    all_alerts = _detect_referral_alerts(
+        funnel, rej_total, send_thr, reject_thr)
+
+    state = _load_alert_state()
+    fire_now = _filter_alerts_by_cooldown(all_alerts, state, cooldown)
+
+    webhook_sent = False
+    if fire_now:
+        # 发 webhook
+        import os as _os
+        webhook_url = _os.environ.get("OPENCLAW_SLACK_WEBHOOK_URL", "")
+        if webhook_url:
+            try:
+                import urllib.request
+                import json as _json
+                lines = [
+                    "🚨 *Referral Alert (hourly)*",
+                    f"hours_window: {hours_window}h",
+                    f"funnel: planned={funnel['planned']} sent={funnel['sent']} replied={funnel['replied']}",
+                ]
+                for a in fire_now:
+                    lines.append(f"  - [{a['severity']}] {a['type']}: {a['message']}")
+                req = urllib.request.Request(
+                    webhook_url,
+                    data=_json.dumps({"text": "\n".join(lines)}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                urllib.request.urlopen(req, timeout=10)
+                webhook_sent = True
+            except Exception as e:
+                logger.warning("[hourly_alert] webhook 失败: %s", e)
+        # 状态写文件 (即使 webhook 失败也写, 避免反复尝试)
+        new_state = _record_alerts_fired(fire_now, state)
+        _save_alert_state(new_state)
+
+    return True, "", {
+        "all_alerts": all_alerts,
+        "fired_now": fire_now,
+        "suppressed": len(all_alerts) - len(fire_now),
+        "webhook_sent": webhook_sent,
+        "funnel_summary": {
+            "planned": funnel.get("planned", 0),
+            "sent": funnel.get("sent", 0),
+            "replied": funnel.get("replied", 0),
+        },
+    }
 
 
 def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
@@ -1118,27 +1313,11 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
             logger.debug("[daily_summary] per-region %s 失败: %s", rg, e)
             by_region[rg] = {}
 
-    # Phase 19.2: alerts 阈值
-    alerts: List[Dict[str, Any]] = []
-    if funnel.get("planned", 0) >= 5 and funnel.get("send_rate", 0) < alert_send_threshold:
-        alerts.append({
-            "type": "send_rate_low",
-            "severity": "warning",
-            "message": f"send_rate={funnel['send_rate']*100:.1f}% < {alert_send_threshold*100:.0f}% (planned={funnel['planned']})",
-        })
+    # Phase 19.2 / 19.x.1: 共用 alert detection helper
     rej_history_total = rej_history.get("total", 0)
-    if rej_history_total >= alert_reject_threshold:
-        alerts.append({
-            "type": "reject_rate_high",
-            "severity": "warning",
-            "message": f"reject_history={rej_history_total} (24h阈值={alert_reject_threshold})",
-        })
-    if funnel.get("planned", 0) >= 5 and funnel.get("sent", 0) == 0:
-        alerts.append({
-            "type": "no_dispatched",
-            "severity": "critical",
-            "message": f"planned={funnel['planned']} 但 sent=0, 检查 send_referral_replies 任务/账号",
-        })
+    alerts = _detect_referral_alerts(
+        funnel, rej_history_total,
+        alert_send_threshold, alert_reject_threshold)
 
     summary: Dict[str, Any] = {
         "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1182,6 +1361,44 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
         logger.debug("[daily_summary] trend 计算失败: %s", e)
     summary["trend"] = trend
 
+    # Phase 19.x.2: trend_7d (7 天滚动平均)
+    trend_7d: Optional[Dict[str, Any]] = None
+    try:
+        days_data = []
+        for i in range(1, 8):
+            d_str = (_dt.datetime.utcnow() - _dt.timedelta(days=i)).strftime("%Y%m%d")
+            d_path = _Path("logs") / f"daily_summary_{d_str}.json"
+            if d_path.exists():
+                try:
+                    with d_path.open(encoding="utf-8") as f:
+                        days_data.append(_json.load(f).get("funnel", {}))
+                except Exception:
+                    pass
+        if len(days_data) >= 3:
+            avg_planned = sum(d.get("planned", 0) for d in days_data) / len(days_data)
+            avg_sent = sum(d.get("sent", 0) for d in days_data) / len(days_data)
+            avg_replied = sum(d.get("replied", 0) for d in days_data) / len(days_data)
+            avg_send_rate = sum(d.get("send_rate", 0) or 0 for d in days_data) / len(days_data)
+            today_planned = funnel.get("planned", 0)
+            today_sent = funnel.get("sent", 0)
+            today_replied = funnel.get("replied", 0)
+            trend_7d = {
+                "samples": len(days_data),
+                "avg_planned": round(avg_planned, 2),
+                "avg_sent": round(avg_sent, 2),
+                "avg_replied": round(avg_replied, 2),
+                "avg_send_rate": round(avg_send_rate, 4),
+                "ratio_planned": (round(today_planned / avg_planned, 3)
+                                    if avg_planned else None),
+                "ratio_sent": (round(today_sent / avg_sent, 3)
+                                 if avg_sent else None),
+                "ratio_replied": (round(today_replied / avg_replied, 3)
+                                    if avg_replied else None),
+            }
+    except Exception as e:
+        logger.debug("[daily_summary] trend_7d 计算失败: %s", e)
+    summary["trend_7d"] = trend_7d
+
     written_to = ""
     if write_file:
         try:
@@ -1218,6 +1435,15 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                         f"planned {arrow(trend['planned_delta'])}, "
                         f"sent {arrow(trend['sent_delta'])}, "
                         f"replied {arrow(trend['replied_delta'])}")
+                # Phase 19.x.2: trend_7d
+                if trend_7d:
+                    rs = trend_7d.get("ratio_sent")
+                    rp = trend_7d.get("ratio_planned")
+                    lines.append(
+                        f"vs 7d avg ({trend_7d['samples']} samples): "
+                        f"planned ratio={rp if rp is not None else 'n/a'}, "
+                        f"sent ratio={rs if rs is not None else 'n/a'} "
+                        f"(avg={trend_7d['avg_planned']:.1f}/{trend_7d['avg_sent']:.1f})")
                 # Phase 19.3: per-region
                 if by_region:
                     rg_parts = []
