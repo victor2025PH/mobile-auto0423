@@ -104,13 +104,17 @@ class TestBatchReviveEndpoint:
     def test_batch_revive_partial_success(self, tmp_db, client):
         cid_a = _seed_dead("PeerA")
         cid_b = _seed_dead("PeerB")
+        # 用完整 36 字符 fake UUID 触发"找到但不是 dead" → skipped 路径
+        # (Phase 12.5 后短串走 prefix 查询, 找不到归 errors; 这里测 skipped)
+        full_fake = "ffffffff-ffff-ffff-ffff-ffffffffffff"
         r = client.post("/lead-mesh/leads/revive-referral-batch", json={
-            "canonical_ids": [cid_a, cid_b, "nonexistent-id"],
+            "canonical_ids": [cid_a, cid_b, full_fake],
             "actor": "operator_ui_batch",
         })
         assert r.status_code == 200, r.text
         data = r.json()
         assert data["revived"] == 2
+        # full_fake 在 DB 不存在, revive_referral 返 False → skipped++
         assert data["skipped"] == 1
         assert sorted(data["revived_ids"]) == sorted([cid_a, cid_b])
 

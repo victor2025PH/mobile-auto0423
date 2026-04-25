@@ -26,6 +26,7 @@ from .canonical import (  # noqa
     remove_canonical_tags,
     revive_referral,
     list_l2_verified_leads,
+    count_l2_verified_leads,
 )
 from .journey import append_journey, get_journey, count_actions  # noqa
 from .dossier import get_dossier, search_leads  # noqa

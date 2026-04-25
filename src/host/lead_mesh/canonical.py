@@ -618,6 +618,39 @@ def revive_referral(canonical_id: str, *,
         return False
 
 
+def count_l2_verified_leads(
+    *, include_tags: Optional[List[str]] = None,
+    exclude_tags: Optional[List[str]] = None,
+) -> int:
+    """Phase 12.5: 数 l2_verified leads (带可选 tag 过滤). SQL 层只能算 tag-LIKE,
+    其它 metadata 过滤 (age/gender/...) 不算 — 给 UI 显示总页范围用,
+    精度 OK. 性能: 单 COUNT, 几十毫秒.
+    """
+    sql_parts = ["tags LIKE '%l2_verified%'", "merged_into IS NULL"]
+    if include_tags:
+        for t in include_tags:
+            t_clean = t.strip().replace("%", "")
+            if t_clean:
+                # 用参数化避免注入. 但 LIKE 模式拼 % 必须 inline (SQLite ?
+                # 不展开为 LIKE pattern). 再用 simple 字符 whitelist.
+                if all(c.isalnum() or c in "_-:" for c in t_clean):
+                    sql_parts.append(f"tags LIKE '%{t_clean}%'")
+    if exclude_tags:
+        for t in exclude_tags:
+            t_clean = t.strip().replace("%", "")
+            if t_clean and all(c.isalnum() or c in "_-:" for c in t_clean):
+                sql_parts.append(f"tags NOT LIKE '%{t_clean}%'")
+    sql = ("SELECT COUNT(*) AS n FROM leads_canonical"
+           " WHERE " + " AND ".join(sql_parts))
+    try:
+        with _connect() as conn:
+            row = conn.execute(sql).fetchone()
+        return int(row["n"] if row else 0)
+    except Exception as e:
+        logger.warning("[canonical] count_l2_verified 失败: %s", e)
+        return 0
+
+
 def list_l2_verified_leads(
     *, age_band: Optional[str] = None,
     gender: Optional[str] = None,

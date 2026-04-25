@@ -120,6 +120,8 @@ def api_list_l2_verified_leads(
         min_score: float = Query(default=0, ge=0, le=100),
         limit: int = Query(default=50, ge=1, le=1000),
         offset: int = Query(default=0, ge=0, description="Phase 12.4 分页"),
+        with_total: bool = Query(default=False,
+            description="Phase 12.5: True 时多返 total (SQL COUNT, 仅按 tag)"),
         include_tags: Optional[List[str]] = Query(
             default=None,
             description="tags 必须全部包含, 例 ['line_referred']"),
@@ -142,8 +144,13 @@ def api_list_l2_verified_leads(
         offset=offset,
         include_tags=include_tags, exclude_tags=exclude_tags,
     )
-    return {"count": len(rows), "results": rows, "offset": offset,
-            "limit": limit}
+    out = {"count": len(rows), "results": rows, "offset": offset,
+           "limit": limit}
+    if with_total:
+        from src.host.lead_mesh.canonical import count_l2_verified_leads
+        out["total"] = count_l2_verified_leads(
+            include_tags=include_tags, exclude_tags=exclude_tags)
+    return out
 
 
 @router.post("/leads/{canonical_id}/revive-referral")
@@ -186,11 +193,60 @@ def api_revive_referral_batch(body: Dict[str, Any] = Body(...)):
 
     actor = (body.get("actor") or "operator_ui").strip() or "operator_ui"
     from src.host.lead_mesh import revive_referral
+    from src.host.lead_mesh.canonical import _connect
+
+    # Phase 12.5: 短 token (< 36 字符 UUID 长度) 视为 prefix, 自动 LIKE 展开.
+    # 用 parameterized query 防 SQL injection. 至少 3 字符避免 'a' 匹配过多.
+    expanded: List[str] = []
+    errors: List[Dict[str, str]] = []
+    UUID_LEN = 36
+    PREFIX_MIN = 3
+    for token in seen:
+        if len(token) >= UUID_LEN:
+            # 完整 canonical_id, 直传
+            expanded.append(token)
+            continue
+        if len(token) < PREFIX_MIN:
+            errors.append({"canonical_id": token,
+                            "reason": f"prefix 太短 (<{PREFIX_MIN} 字符)"})
+            continue
+        try:
+            with _connect() as conn:
+                rows = conn.execute(
+                    "SELECT canonical_id FROM leads_canonical"
+                    " WHERE canonical_id LIKE ? LIMIT 5",
+                    (token + "%",),
+                ).fetchall()
+        except Exception as e:
+            errors.append({"canonical_id": token,
+                            "reason": f"prefix 查询异常: {str(e)[:100]}"})
+            continue
+        if not rows:
+            errors.append({"canonical_id": token,
+                            "reason": "prefix 无匹配"})
+            continue
+        if len(rows) > 1:
+            errors.append({
+                "canonical_id": token,
+                "reason": (f"prefix 歧义 ({len(rows)} 个匹配, "
+                            f"e.g. {rows[0]['canonical_id'][:12]}, "
+                            f"{rows[1]['canonical_id'][:12]}, ...)"
+                            " — 请扩展 prefix 长度"),
+            })
+            continue
+        expanded.append(rows[0]["canonical_id"])
+
+    # 去重 expanded (展开后可能两个 prefix 指向同一 cid)
+    seen2 = []
+    seen2_set = set()
+    for c in expanded:
+        if c not in seen2_set:
+            seen2_set.add(c)
+            seen2.append(c)
 
     revived_ids: List[str] = []
-    errors: List[Dict[str, str]] = []
     skipped = 0
-    for cid in seen:
+    for cid in seen2:
         try:
             ok = revive_referral(cid, actor=actor)
             if ok:
@@ -202,6 +258,7 @@ def api_revive_referral_batch(body: Dict[str, Any] = Body(...)):
     return {
         "revived": len(revived_ids), "skipped": skipped,
         "errors": errors[:50], "revived_ids": revived_ids,
+        "expanded_count": len(seen2),
     }
 
 

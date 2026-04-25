@@ -137,7 +137,9 @@ class TestL2VerifiedApi:
         r = client.get("/lead-mesh/leads/l2-verified")
         assert r.status_code == 200, r.text
         data = r.json()
-        assert data == {"count": 0, "results": []}
+        assert data["count"] == 0
+        assert data["results"] == []
+        # Phase 12.4 起 API 多带 offset/limit echo (向后兼容增量字段)
 
     def test_api_returns_seeded(self, tmp_db, client):
         _seed_l2_lead("A花子", age="40s", gender="female",

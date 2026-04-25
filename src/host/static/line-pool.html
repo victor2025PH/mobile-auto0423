@@ -82,6 +82,7 @@
       <div><label>limit</label><br>
         <input id="dr_limit" type="number" value="5" style="width:60px"></div>
       <button onclick="onDryRun()">▶ 跑预览 (零写入)</button>
+      <button class="sec" onclick="clearDryRunStorage()" title="清空保存的表单值">×</button>
       <span class="muted" id="dr_status"></span>
     </div>
     <div id="dr_dispatch_block" style="margin-top:8px; display:none">
@@ -216,6 +217,49 @@ if (API_KEY) localStorage.setItem("OPENCLAW_API_KEY", API_KEY);
 
 function $(id) { return document.getElementById(id); }
 
+// Phase 12.5: Loading state helper
+function setLoading(tbodyId, colspan = 6) {
+  const tb = $(tbodyId);
+  if (tb) tb.innerHTML = `<tr><td colspan="${colspan}" class="muted" style="text-align:center;padding:12px">⏳ 加载中...</td></tr>`;
+}
+
+// Phase 12.5: Dry Run 表单 sticky 工具
+const DR_FIELDS = ["dr_device", "dr_hours", "dr_region",
+                    "dr_persona", "dr_limit"];
+const DR_LS_PREFIX = "lp_dryrun_";
+
+function loadDryRunSticky() {
+  for (const id of DR_FIELDS) {
+    const v = localStorage.getItem(DR_LS_PREFIX + id);
+    if (v != null && $(id)) $(id).value = v;
+  }
+}
+
+function bindDryRunSticky() {
+  for (const id of DR_FIELDS) {
+    const el = $(id);
+    if (!el) continue;
+    el.addEventListener("change", () => {
+      try {
+        localStorage.setItem(DR_LS_PREFIX + id, el.value);
+      } catch (e) { /* private mode? ignore */ }
+    });
+  }
+}
+
+function clearDryRunStorage() {
+  for (const id of DR_FIELDS) {
+    try { localStorage.removeItem(DR_LS_PREFIX + id); } catch (e) {}
+  }
+  // 重置默认值
+  if ($("dr_device")) $("dr_device").value = "";
+  if ($("dr_hours")) $("dr_hours").value = "24";
+  if ($("dr_region")) $("dr_region").value = "jp";
+  if ($("dr_persona")) $("dr_persona").value = "jp_female_midlife";
+  if ($("dr_limit")) $("dr_limit").value = "5";
+  $("dr_status").textContent = "已清空表单 ✓";
+}
+
 function headers() {
   const h = {"Content-Type": "application/json"};
   if (API_KEY) h["X-API-Key"] = API_KEY;
@@ -241,12 +285,13 @@ async function reload() {
   if ($("q_owner").value) params.set("owner_device_id", $("q_owner").value);
   params.set("limit", "500");
   params.set("includes_24h_stats", "true");
+  setLoading("tbl", 11);
   try {
     const data = await api("/line-pool?" + params);
     render(data.results || []);
     $("count_label").textContent = `共 ${data.count} 条`;
   } catch (e) {
-    alert("加载失败: " + e.message);
+    $("tbl").innerHTML = `<tr><td colspan="11" style="color:var(--danger)">加载失败: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 
@@ -356,6 +401,7 @@ async function onUploadCsv() {
 }
 
 async function reloadLog() {
+  setLoading("log_tbl", 8);
   try {
     const data = await api("/line-pool/dispatch-log?limit=100");
     const body = $("log_tbl");
@@ -389,17 +435,25 @@ function prevDeadPage() { if (_deadPage > 0) { _deadPage--; reloadDeadPeers(); }
 function nextDeadPage() { _deadPage++; reloadDeadPeers(); }
 
 async function reloadDeadPeers() {
+  setLoading("dead_tbl", 7);
   try {
     const offset = _deadPage * _deadPageSize;
     const data = await api(
       `/lead-mesh/leads/l2-verified?include_tags=referral_dead`
-      + `&limit=${_deadPageSize}&offset=${offset}`);
+      + `&limit=${_deadPageSize}&offset=${offset}`
+      + `&with_total=true`);
     const body = $("dead_tbl");
     body.innerHTML = "";
     const rows = data.results || [];
     _currentDeadIds = rows.map(r => r.canonical_id);
+    const total = data.total != null ? data.total : "?";
     $("dead_count_label").textContent =
-      `本页 ${rows.length} 条 (offset=${offset})`;
+      `本页 ${rows.length} / 共 ${total} 条 (offset=${offset})`;
+    // Phase 12.5: 大量 dead 时给 warning, 防止"全部复活"集中再失败
+    if (typeof total === "number" && total > 50) {
+      $("dead_count_label").textContent +=
+        " — 建议小批量复活 (一次性恢复 50+ 后 dispatcher 集中重试可能再 cooldown)";
+    }
     for (const r of rows) {
       const meta = r.metadata || {};
       // fail counts 汇总: metadata 里 referral_fail_count_* 字段
@@ -532,6 +586,9 @@ async function _runTaskAndPoll(taskType, deviceId, params) {
   throw new Error("task " + tid + " timeout");
 }
 
+// Phase 12.5: 启动顺序 — 先恢复 sticky 表单, 再 reload 各表
+loadDryRunSticky();
+bindDryRunSticky();
 reload();
 reloadLog();
 reloadDeadPeers();
