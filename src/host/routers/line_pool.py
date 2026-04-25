@@ -65,6 +65,33 @@ def api_account_ranking(hours_window: int = Query(default=168, ge=1, le=720),
                                              limit=limit)}
 
 
+@router.get("/stats/peer-name-rejects")
+def api_peer_name_reject_metrics():
+    """Phase 17.1: peer_name sanitize reject 计数 + by_event_type + 最近样本.
+
+    运维查"sanitize 拦了多少 / 哪种事件最多 / 最近被拦的具体文本".
+    counter 模块级进程内存活, 重启清零.
+    """
+    from src.host.fb_store import get_peer_name_reject_metrics
+    return get_peer_name_reject_metrics()
+
+
+@router.post("/stats/peer-name-rejects/reset")
+def api_peer_name_reject_reset():
+    """Phase 17.1: 重置 reject 计数器 (运维 / 测试)."""
+    from src.host.fb_store import reset_peer_name_reject_count
+    reset_peer_name_reject_count()
+    return {"ok": True}
+
+
+@router.post("/stats/peer-name-blacklist/reload")
+def api_blacklist_reload():
+    """Phase 17.1: force reload config/peer_name_blacklist.yaml (绕开 5min TTL)."""
+    from src.app_automation.facebook import FacebookAutomation
+    n = FacebookAutomation.reload_extra_blacklist()
+    return {"ok": True, "extra_count": n}
+
+
 @router.get("/{account_id}")
 def api_get_line_account(account_id: int):
     row = lp.get_by_id(account_id)

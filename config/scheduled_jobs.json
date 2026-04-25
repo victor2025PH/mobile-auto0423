@@ -217,7 +217,7 @@
       "write_contact_event": true,
       "event_type": "line_dispatch_planned"
     },
-    "enabled": false,
+    "enabled": true,
     "last_run": ""
   },
   {
@@ -231,7 +231,7 @@
       "strict_device_match": true,
       "limit": 10
     },
-    "enabled": false,
+    "enabled": true,
     "last_run": ""
   },
   {
@@ -243,7 +243,7 @@
       "days": 7,
       "limit": 500
     },
-    "enabled": false,
+    "enabled": true,
     "last_run": ""
   }
 ]

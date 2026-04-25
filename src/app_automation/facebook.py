@@ -5807,6 +5807,57 @@ class FacebookAutomation(BaseAutomation):
         "Mehr", "altro",  # de/it
     )
 
+    # Phase 17.1 (2026-04-25): yaml 热加载黑名单缓存
+    # config/peer_name_blacklist.yaml 改完 5 分钟内自动生效 (无需重启).
+    _BLACKLIST_YAML_CACHE = {
+        "extra": frozenset(),     # 从 yaml 读到的 lower-case set
+        "loaded_at": 0.0,
+    }
+    _BLACKLIST_YAML_TTL_SEC = 300  # 5 min
+
+    @staticmethod
+    def _load_extra_blacklist() -> "frozenset[str]":
+        """Phase 17.1: 读 config/peer_name_blacklist.yaml 的 extra_blacklist.
+
+        TTL 5 min 缓存. yaml 不存在 / 解析失败 → 返空 set. 不影响内置规则.
+        """
+        import time as _t
+        cache = FacebookAutomation._BLACKLIST_YAML_CACHE
+        now = _t.time()
+        if now - cache.get("loaded_at", 0) < FacebookAutomation._BLACKLIST_YAML_TTL_SEC:
+            return cache.get("extra", frozenset())
+        try:
+            from pathlib import Path
+            import yaml
+            here = Path(__file__).resolve().parent.parent.parent
+            yaml_path = here / "config" / "peer_name_blacklist.yaml"
+            if yaml_path.exists():
+                with yaml_path.open(encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                items = data.get("extra_blacklist") or []
+                if isinstance(items, list):
+                    extra = frozenset(
+                        str(s).strip().lower()
+                        for s in items
+                        if s and isinstance(s, str)
+                    )
+                else:
+                    extra = frozenset()
+            else:
+                extra = frozenset()
+        except Exception as e:
+            log.debug("[blacklist_yaml] load 失败 (返空): %s", e)
+            extra = frozenset()
+        cache["extra"] = extra
+        cache["loaded_at"] = now
+        return extra
+
+    @staticmethod
+    def reload_extra_blacklist() -> int:
+        """运维 / 测试 force reload yaml 黑名单. 返加载条数."""
+        FacebookAutomation._BLACKLIST_YAML_CACHE["loaded_at"] = 0.0
+        return len(FacebookAutomation._load_extra_blacklist())
+
     @staticmethod
     def _is_valid_peer_name(text: str) -> bool:
         """Phase 15 / 15.1: peer_name 多层 sanitize.
@@ -5843,8 +5894,12 @@ class FacebookAutomation(BaseAutomation):
                 return False
         except Exception:
             pass
-        # 黑名单
-        if s.lower() in FacebookAutomation._MESSENGER_UI_TEXT_BLACKLIST:
+        # 黑名单 (内置 + yaml 热加载)
+        sl = s.lower()
+        if sl in FacebookAutomation._MESSENGER_UI_TEXT_BLACKLIST:
+            return False
+        # Phase 17.1: yaml 黑名单 (运营自加, 5 min TTL)
+        if sl in FacebookAutomation._load_extra_blacklist():
             return False
         # 消息预览
         for hint in FacebookAutomation._MESSENGER_PREVIEW_HINTS:

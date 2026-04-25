@@ -695,19 +695,52 @@ VALID_CONTACT_EVENT_TYPES = frozenset({
 })
 
 
-# Phase 16 (2026-04-25): record_contact_event 入口 peer_name sanitize
-# 计数器 (轻量监控). 任何 caller bypass list 函数都会被本入口拦截.
+# Phase 16 / 17.1 (2026-04-25): record_contact_event 入口 peer_name sanitize
+# 计数器 + by-reason / by-event_type 细分 (轻量监控, 进程内存活).
 _PEER_NAME_REJECT_COUNTER = {"count": 0}
+_PEER_NAME_REJECT_BY_EVENT: Dict[str, int] = {}
+_PEER_NAME_REJECT_RECENT: List[Dict[str, Any]] = []  # 最近 50 条样本
+_PEER_NAME_REJECT_RECENT_CAP = 50
 
 
 def get_peer_name_reject_count() -> int:
-    """Phase 16 metrics: 返累计 peer_name reject 数 (用于诊断)."""
+    """Phase 16 metrics: 累计 peer_name reject 数."""
     return int(_PEER_NAME_REJECT_COUNTER.get("count", 0) or 0)
 
 
+def get_peer_name_reject_metrics() -> Dict[str, Any]:
+    """Phase 17.1 metrics: by-event_type 细分 + 最近 50 条 reject 样本."""
+    return {
+        "total": get_peer_name_reject_count(),
+        "by_event_type": dict(_PEER_NAME_REJECT_BY_EVENT),
+        "recent": list(_PEER_NAME_REJECT_RECENT),
+    }
+
+
 def reset_peer_name_reject_count() -> None:
-    """测试 / 运维 reset."""
+    """测试 / 运维 reset (清所有 reject 计数 + 样本)."""
     _PEER_NAME_REJECT_COUNTER["count"] = 0
+    _PEER_NAME_REJECT_BY_EVENT.clear()
+    _PEER_NAME_REJECT_RECENT.clear()
+
+
+def _record_peer_name_reject(peer_name: str, event_type: str,
+                                device_id: str = "") -> None:
+    """Phase 17.1: 记 reject 一条 (内部用)."""
+    _PEER_NAME_REJECT_COUNTER["count"] = \
+        _PEER_NAME_REJECT_COUNTER.get("count", 0) + 1
+    _PEER_NAME_REJECT_BY_EVENT[event_type] = \
+        _PEER_NAME_REJECT_BY_EVENT.get(event_type, 0) + 1
+    # ring buffer 最近 N 条
+    sample = {
+        "peer_name": peer_name[:40],
+        "event_type": event_type,
+        "device_id": device_id[:12],
+        "ts": _now_iso(),
+    }
+    _PEER_NAME_REJECT_RECENT.append(sample)
+    if len(_PEER_NAME_REJECT_RECENT) > _PEER_NAME_REJECT_RECENT_CAP:
+        _PEER_NAME_REJECT_RECENT.pop(0)
 
 
 def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
@@ -729,21 +762,19 @@ def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
     """
     if not device_id or not peer_name or not event_type:
         return 0
-    # Phase 16: peer_name sanitize (defense-in-depth)
+    # Phase 16/17.1: peer_name sanitize + by-event_type 细分 metrics
     if not skip_sanitize:
         try:
             from src.app_automation.facebook import FacebookAutomation
             if not FacebookAutomation._is_valid_peer_name(peer_name):
-                _PEER_NAME_REJECT_COUNTER["count"] = \
-                    _PEER_NAME_REJECT_COUNTER.get("count", 0) + 1
+                _record_peer_name_reject(peer_name, event_type, device_id)
                 logger.warning(
                     "[fb_contact_events] reject invalid peer_name=%r"
-                    " event_type=%s device=%s (count=%d)",
+                    " event_type=%s device=%s (total=%d)",
                     peer_name[:40], event_type, device_id[:12],
-                    _PEER_NAME_REJECT_COUNTER["count"])
+                    get_peer_name_reject_count())
                 return 0
         except Exception:
-            # sanitize 异常不阻塞 caller (保守放行)
             pass
     if event_type not in VALID_CONTACT_EVENT_TYPES:
         logger.warning("[fb_contact_events] 未知 event_type=%s, 仍写入但请检查拼写", event_type)
