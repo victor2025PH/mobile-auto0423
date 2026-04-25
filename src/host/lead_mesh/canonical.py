@@ -532,14 +532,18 @@ def remove_canonical_tags(canonical_id: str, tags: List[str]) -> bool:
         return False
 
 
-def revive_referral(canonical_id: str) -> bool:
-    """Phase 12.3: 给"已死" peer 第二次机会 —
+def revive_referral(canonical_id: str, *,
+                    actor: str = "operator") -> bool:
+    """Phase 12.3/12.4: 给"已死" peer 第二次机会 —
       - 去 referral_dead tag
       - 清 metadata.referral_dead_reason / at / peer_name
       - 清 metadata.referral_fail_count_* (每种错误码的累计计数)
+      - Phase 12.4: 写 lead_journey(action='referral_revived', actor=...)
+        作为 audit trail, data 带清理前的 dead_reason + fail counts 快照.
 
-    运营手动触发 (UI) 或 scheduled 任务 auto expire 触发. 已 revive 的
-    peer 再被 dispatcher 扫到可重新 plan → 用户再给一次机会.
+    ``actor`` 用于 journey 审计: ``"operator"`` (默认, 手动/UI), ``"operator_ui"``,
+    ``"scheduled_7d_auto"`` (cron task), ``"human:<username>"`` 等. 格式与
+    append_journey 一致.
 
     返 True 表示确实执行了清理 (peer 原本有 referral_dead).
     """
@@ -560,18 +564,26 @@ def revive_referral(canonical_id: str) -> bool:
                 meta = json.loads(row["metadata_json"] or "{}")
             except Exception:
                 meta = {}
+            # 清理前快照 (供 journey 审计)
+            snapshot = {
+                "had_dead_tag": had_dead,
+                "dead_reason": meta.get("referral_dead_reason"),
+                "dead_at": meta.get("referral_dead_at"),
+                "fail_counts": {
+                    k: v for k, v in meta.items()
+                    if k.startswith("referral_fail_count_")
+                },
+            }
             # 清 metadata 字段
             dirty = False
             for k in ("referral_dead_reason", "referral_dead_at",
                        "referral_dead_peer_name"):
                 if meta.pop(k, None) is not None:
                     dirty = True
-            # 清所有 referral_fail_count_<code>
             for k in list(meta.keys()):
                 if k.startswith("referral_fail_count_"):
                     meta.pop(k, None)
                     dirty = True
-            # 去 tag
             if had_dead:
                 tags_set.discard("referral_dead")
             if dirty or had_dead:
@@ -582,7 +594,24 @@ def revive_referral(canonical_id: str) -> bool:
                      ",".join(sorted(tags_set)),
                      canonical_id),
                 )
-        return had_dead or dirty
+
+        did_something = had_dead or dirty
+
+        # Phase 12.4: 写 journey audit (成功 revive 才写, 不破坏现有行为).
+        if did_something:
+            try:
+                from .journey import append_journey
+                append_journey(
+                    canonical_id=canonical_id,
+                    actor=actor or "operator",
+                    action="referral_revived",
+                    platform="system",
+                    data=snapshot,
+                )
+            except Exception as _e:
+                logger.debug("[canonical] revive journey 写失败(忽略): %s", _e)
+
+        return did_something
     except Exception as e:
         logger.warning("[canonical] revive_referral 失败 cid=%s: %s",
                          canonical_id[:12] if canonical_id else "", e)
@@ -597,6 +626,7 @@ def list_l2_verified_leads(
     platform: Optional[str] = None,
     min_score: float = 0,
     limit: int = 50,
+    offset: int = 0,
     include_tags: Optional[List[str]] = None,
     exclude_tags: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
@@ -612,14 +642,19 @@ def list_l2_verified_leads(
             metadata (dict), tags (list), l2_score, l2_verified_at}, ...]
     """
     limit = max(1, min(int(limit or 50), 1000))
-    # SQL 预筛: tag 含 l2_verified + 未被合并. 其它过滤在 Python 层.
+    offset = max(0, int(offset or 0))
+    # SQL 预筛: tag 含 l2_verified + 未被合并. 其它过滤 (metadata 字段 /
+    # tag AND/NOT) 都在 Python 层. 先拉 (offset + limit) * 4 行做缓冲,
+    # 过滤完再在 Python 层切 [offset : offset+limit]. offset 小的话 (<500)
+    # 性能够用.
+    fetch_n = (offset + limit) * 4
     sql = (
         "SELECT canonical_id, primary_name, tags, metadata_json, updated_at"
         "  FROM leads_canonical"
         " WHERE tags LIKE '%l2_verified%' AND merged_into IS NULL"
         " ORDER BY updated_at DESC LIMIT ?"
     )
-    args: List[Any] = [limit * 4]  # 多拉一些, Python 层再筛/切
+    args: List[Any] = [fetch_n]
 
     out: List[Dict[str, Any]] = []
     try:
@@ -692,10 +727,16 @@ def list_l2_verified_leads(
             "l2_score": score_v,
             "l2_verified_at": meta.get("l2_verified_at") or "",
         })
-        if len(out) >= limit:
-            break
+        # Phase 12.4: 不 break early, 跑完 fetch_n 行再 sort + offset slice.
+        # SQL ORDER BY updated_at DESC 在同秒 tie 下不保证顺序, 早退会切到
+        # 错误的 row 子集. fetch_n=(offset+limit)*4 已 cap 内存压力.
     # 排序: 先按 l2_verified_at 新 → 旧, 再按 l2_score 高 → 低 (主键); Python
     # sort stable 保证同 score 下仍按 verified_at 新的在前.
     out.sort(key=lambda x: x["l2_verified_at"], reverse=True)
     out.sort(key=lambda x: x["l2_score"], reverse=True)
+    # Phase 12.4: 应用 offset (排序后切, 保证页与页之间顺序一致)
+    if offset:
+        out = out[offset:offset + limit]
+    else:
+        out = out[:limit]
     return out

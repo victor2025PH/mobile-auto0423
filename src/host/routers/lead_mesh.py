@@ -119,6 +119,7 @@ def api_list_l2_verified_leads(
                                          description="'facebook' / ..."),
         min_score: float = Query(default=0, ge=0, le=100),
         limit: int = Query(default=50, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0, description="Phase 12.4 分页"),
         include_tags: Optional[List[str]] = Query(
             default=None,
             description="tags 必须全部包含, 例 ['line_referred']"),
@@ -138,21 +139,70 @@ def api_list_l2_verified_leads(
         age_band=age_band, gender=gender,
         is_japanese=is_japanese, persona_key=persona_key,
         platform=platform, min_score=min_score, limit=limit,
+        offset=offset,
         include_tags=include_tags, exclude_tags=exclude_tags,
     )
-    return {"count": len(rows), "results": rows}
+    return {"count": len(rows), "results": rows, "offset": offset,
+            "limit": limit}
 
 
 @router.post("/leads/{canonical_id}/revive-referral")
-def api_revive_referral(canonical_id: str):
+def api_revive_referral(canonical_id: str,
+                         body: Dict[str, Any] = Body(default={})):
     """Phase 12.3: 给 peer 第二次机会 — 去 referral_dead tag + 清 fail counters.
 
-    运营在 UI 点"恢复"按钮触发. 或 scheduled task line_pool_recycle_dead_peers
-    按 dead_at 年龄自动调.
+    Body 可选 ``actor`` (默认 ``operator_ui``, 写 journey 审计).
     """
     from src.host.lead_mesh import revive_referral
-    ok = revive_referral(canonical_id)
+    actor = (body.get("actor") or "operator_ui").strip() or "operator_ui"
+    ok = revive_referral(canonical_id, actor=actor)
     return {"ok": ok, "canonical_id": canonical_id}
+
+
+@router.post("/leads/revive-referral-batch")
+def api_revive_referral_batch(body: Dict[str, Any] = Body(...)):
+    """Phase 12.4: 批量给多个 peer revive referral. 单条异常不中断.
+
+    Body: {canonical_ids: [...], actor?: "operator_ui"}
+    Returns: {revived: N, skipped: M, errors: [...], revived_ids: [...]}.
+    """
+    cids = body.get("canonical_ids") or []
+    if not isinstance(cids, list):
+        raise HTTPException(400, "canonical_ids 必须是 list")
+    if not cids:
+        return {"revived": 0, "skipped": 0, "errors": [],
+                "revived_ids": []}
+    # 去重 + 去空
+    seen = []
+    seen_set = set()
+    for c in cids:
+        if not isinstance(c, str):
+            continue
+        c2 = c.strip()
+        if not c2 or c2 in seen_set:
+            continue
+        seen_set.add(c2)
+        seen.append(c2)
+
+    actor = (body.get("actor") or "operator_ui").strip() or "operator_ui"
+    from src.host.lead_mesh import revive_referral
+
+    revived_ids: List[str] = []
+    errors: List[Dict[str, str]] = []
+    skipped = 0
+    for cid in seen:
+        try:
+            ok = revive_referral(cid, actor=actor)
+            if ok:
+                revived_ids.append(cid)
+            else:
+                skipped += 1
+        except Exception as e:
+            errors.append({"canonical_id": cid, "reason": str(e)[:200]})
+    return {
+        "revived": len(revived_ids), "skipped": skipped,
+        "errors": errors[:50], "revived_ids": revived_ids,
+    }
 
 
 @router.post("/leads/{canonical_id}/untag")

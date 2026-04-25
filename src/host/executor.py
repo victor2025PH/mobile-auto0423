@@ -1103,7 +1103,8 @@ def _line_pool_recycle_dead_peers(params: Dict[str, Any]) -> tuple:
             revived_ids.append(r["canonical_id"])
             continue
         try:
-            if revive_referral(r["canonical_id"]):
+            if revive_referral(r["canonical_id"],
+                                actor="scheduled_7d_auto"):
                 revived_ids.append(r["canonical_id"])
         except Exception as e:
             logger.debug("[recycle] revive %s 失败: %s",

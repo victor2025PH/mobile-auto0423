@@ -65,7 +65,44 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>LINE Pool 管理 <span class="badge">Phase 11</span></h1>
+  <h1>LINE Pool 管理 <span class="badge">Phase 11+12</span></h1>
+
+  <!-- ── Dry Run 预览 (Phase 12.4) ── -->
+  <div class="panel">
+    <h2>Dry Run 预览 — 启用 scheduled 前看一眼会发什么</h2>
+    <div class="toolbar">
+      <div><label>device_id</label><br>
+        <input id="dr_device" placeholder="8DWOF6CYY5R8YHX8" style="width:200px"></div>
+      <div><label>hours_window</label><br>
+        <input id="dr_hours" type="number" value="24" style="width:80px"></div>
+      <div><label>region</label><br>
+        <input id="dr_region" value="jp" style="width:60px"></div>
+      <div><label>persona_key</label><br>
+        <input id="dr_persona" value="jp_female_midlife" style="width:160px"></div>
+      <div><label>limit</label><br>
+        <input id="dr_limit" type="number" value="5" style="width:60px"></div>
+      <button onclick="onDryRun()">▶ 跑预览 (零写入)</button>
+      <span class="muted" id="dr_status"></span>
+    </div>
+    <div id="dr_dispatch_block" style="margin-top:8px; display:none">
+      <h3 style="font-size:12px; color:var(--muted); margin:6px 0">① 派发计划 (line_dispatch_from_reply)</h3>
+      <table>
+        <thead><tr>
+          <th>peer</th><th>line_id</th><th>age</th><th>gender</th><th>template</th>
+        </tr></thead>
+        <tbody id="dr_dispatch_tbl"></tbody>
+      </table>
+    </div>
+    <div id="dr_send_block" style="margin-top:8px; display:none">
+      <h3 style="font-size:12px; color:var(--muted); margin:6px 0">② 实际会发送 (send_referral_replies)</h3>
+      <table>
+        <thead><tr>
+          <th>peer</th><th>line_id</th><th>err_code</th><th>would_send_template</th>
+        </tr></thead>
+        <tbody id="dr_send_tbl"></tbody>
+      </table>
+    </div>
+  </div>
 
   <!-- ── 单条新增 ── -->
   <div class="panel">
@@ -135,11 +172,14 @@
     </table>
   </div>
 
-  <!-- ── 已死 peers (referral_dead) ── Phase 12.3 -->
+  <!-- ── 已死 peers (referral_dead) ── Phase 12.3+12.4 -->
   <div class="panel">
     <h2>已死 peers (referral_dead) — 点"恢复"给第二次机会</h2>
     <div class="row" style="margin-bottom:6px">
       <button class="sec" onclick="reloadDeadPeers()">刷新</button>
+      <button class="sec" onclick="prevDeadPage()">‹ 上一页</button>
+      <button class="sec" onclick="nextDeadPage()">下一页 ›</button>
+      <button class="danger" onclick="onReviveAllOnPage()">⤴ 复活当前页全部</button>
       <span class="muted" id="dead_count_label">—</span>
     </div>
     <table>
@@ -340,14 +380,26 @@ async function reloadLog() {
   } catch (e) { alert(e.message); }
 }
 
-// Phase 12.3: dead peers (referral_dead) 管理
+// Phase 12.3 + 12.4: dead peers (referral_dead) 管理
+let _deadPage = 0;
+const _deadPageSize = 50;
+let _currentDeadIds = [];
+
+function prevDeadPage() { if (_deadPage > 0) { _deadPage--; reloadDeadPeers(); } }
+function nextDeadPage() { _deadPage++; reloadDeadPeers(); }
+
 async function reloadDeadPeers() {
   try {
-    const data = await api("/lead-mesh/leads/l2-verified?include_tags=referral_dead&limit=200");
+    const offset = _deadPage * _deadPageSize;
+    const data = await api(
+      `/lead-mesh/leads/l2-verified?include_tags=referral_dead`
+      + `&limit=${_deadPageSize}&offset=${offset}`);
     const body = $("dead_tbl");
     body.innerHTML = "";
     const rows = data.results || [];
-    $("dead_count_label").textContent = `共 ${rows.length} 条`;
+    _currentDeadIds = rows.map(r => r.canonical_id);
+    $("dead_count_label").textContent =
+      `本页 ${rows.length} 条 (offset=${offset})`;
     for (const r of rows) {
       const meta = r.metadata || {};
       // fail counts 汇总: metadata 里 referral_fail_count_* 字段
@@ -375,10 +427,109 @@ async function onRevive(cid) {
                 "(dispatcher 下次会重新评估这个 peer)")) return;
   try {
     const r = await api(`/lead-mesh/leads/${cid}/revive-referral`,
-                         {method: "POST"});
+                         {method: "POST",
+                          body: JSON.stringify({actor: "operator_ui"})});
     if (!r.ok) alert("未恢复: 目标可能不存在或本来就不是 dead");
     await reloadDeadPeers();
   } catch (e) { alert(e.message); }
+}
+
+// Phase 12.4: 批量复活当前页所有
+async function onReviveAllOnPage() {
+  if (_currentDeadIds.length === 0) {
+    alert("当前页没有 dead peer"); return;
+  }
+  if (!confirm("确认把当前页 " + _currentDeadIds.length + " 个 dead peer 全部复活?")) return;
+  try {
+    const r = await api("/lead-mesh/leads/revive-referral-batch",
+      {method: "POST",
+       body: JSON.stringify({canonical_ids: _currentDeadIds,
+                              actor: "operator_ui_batch"})});
+    alert(`已复活: ${r.revived} 条; 跳过: ${r.skipped} 条; 错误: ${(r.errors||[]).length}`);
+    await reloadDeadPeers();
+  } catch (e) { alert(e.message); }
+}
+
+// Phase 12.4: Dry Run 预览面板
+async function onDryRun() {
+  const dev = $("dr_device").value.trim();
+  if (!dev) { alert("device_id 必填"); return; }
+  const params = {
+    hours_window: Number($("dr_hours").value) || 24,
+    region: $("dr_region").value.trim() || null,
+    persona_key: $("dr_persona").value.trim() || null,
+    limit: Number($("dr_limit").value) || 5,
+    dry_run: true,
+    require_l2_verified: true,
+    write_contact_event: false,
+  };
+  $("dr_status").textContent = "running ① dispatcher ...";
+  $("dr_dispatch_block").style.display = "none";
+  $("dr_send_block").style.display = "none";
+  let stats1, stats2;
+  try {
+    stats1 = await _runTaskAndPoll("facebook_line_dispatch_from_reply",
+                                     dev, params);
+  } catch (e) { alert("① 失败: " + e.message); $("dr_status").textContent = ""; return; }
+  // 渲染 ①
+  const dispBody = $("dr_dispatch_tbl"); dispBody.innerHTML = "";
+  for (const d of (stats1.dispatches || [])) {
+    const meta = d.metadata || {};
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(d.peer_name)}</td>
+      <td><code>${escapeHtml(d.line_id || "")}</code></td>
+      <td class="muted">${escapeHtml(meta.age_band || "")}</td>
+      <td class="muted">${escapeHtml(meta.gender || "")}</td>
+      <td class="muted" style="max-width:380px;overflow:hidden;text-overflow:ellipsis;font-size:11px">${escapeHtml(d.message_template || "")}</td>
+    `;
+    dispBody.appendChild(tr);
+  }
+  $("dr_dispatch_block").style.display = "block";
+  $("dr_status").textContent = `① scanned=${stats1.scanned} dispatched=${stats1.dispatched} filtered=${stats1.filtered_out}; running ② sender ...`;
+
+  // ② send_referral
+  try {
+    stats2 = await _runTaskAndPoll("facebook_send_referral_replies", dev, {
+      hours_window: params.hours_window, dry_run: true,
+      strict_device_match: false,  // 预览不做设备过滤, 看全
+      max_retry: 0, min_interval_sec: 0, max_interval_sec: 0,
+      limit: params.limit,
+    });
+  } catch (e) { alert("② 失败: " + e.message); return; }
+  const sendBody = $("dr_send_tbl"); sendBody.innerHTML = "";
+  for (const o of (stats2.outcomes || [])) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(o.peer_name)}</td>
+      <td><code>${escapeHtml(o.line_id || "")}</code></td>
+      <td class="muted">${escapeHtml(o.err_code || "")}</td>
+      <td class="muted" style="max-width:380px;overflow:hidden;text-overflow:ellipsis;font-size:11px">${escapeHtml(o.would_send_template || "")}</td>
+    `;
+    sendBody.appendChild(tr);
+  }
+  $("dr_send_block").style.display = "block";
+  $("dr_status").textContent = `① dispatched=${stats1.dispatched} ② would_send=${(stats2.outcomes||[]).filter(x=>x.err_code==='dry_run').length}/${stats2.scanned}`;
+}
+
+async function _runTaskAndPoll(taskType, deviceId, params) {
+  const ret = await api("/tasks", {method: "POST",
+    body: JSON.stringify({type: taskType, device_id: deviceId, params})});
+  const tid = ret.task_id;
+  if (!tid) throw new Error("no task_id: " + JSON.stringify(ret));
+  // poll
+  const t0 = Date.now();
+  while (Date.now() - t0 < 90000) {
+    await new Promise(r => setTimeout(r, 1500));
+    const t = await api(`/tasks/${tid}`);
+    if (["completed", "failed", "error", "timeout"].includes(t.status)) {
+      if (t.status !== "completed") {
+        throw new Error(`task ${tid} ${t.status}: ${t.error || ""}`);
+      }
+      return t.result || {};
+    }
+  }
+  throw new Error("task " + tid + " timeout");
 }
 
 reload();
