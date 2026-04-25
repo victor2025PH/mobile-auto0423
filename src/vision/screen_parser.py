@@ -49,6 +49,10 @@ class XMLElement:
     long_clickable: bool = False
     index: int = 0
     depth: int = 0
+    # Phase 17 (2026-04-25): 父节点引用 (在 list 中的索引 + class). 默认 -1
+    # 表示无父 (root). 用于 ListView 行级匹配等结构敏感场景.
+    parent_index: int = -1
+    parent_class: str = ""
 
     @property
     def center(self) -> Tuple[int, int]:
@@ -145,9 +149,11 @@ class XMLParser:
         return elements
 
     @staticmethod
-    def _walk(node: ET.Element, out: List[XMLElement], depth: int):
+    def _walk(node: ET.Element, out: List[XMLElement], depth: int,
+              parent_idx: int = -1, parent_cls: str = ""):
         bs = node.get("bounds", "")
         m = _BOUNDS_RE.match(bs)
+        my_idx_in_out = -1
         if m:
             out.append(XMLElement(
                 resource_id=node.get("resource-id", ""),
@@ -165,9 +171,19 @@ class XMLParser:
                 long_clickable=node.get("long-clickable", "false") == "true",
                 index=int(node.get("index", 0)),
                 depth=depth,
+                # Phase 17 父节点引用
+                parent_index=parent_idx,
+                parent_class=parent_cls,
             ))
+            my_idx_in_out = len(out) - 1
+        # 给 children 传当前节点 (有 bounds) 或祖父节点 (本 node 没 bounds 跳过)
+        next_parent_idx = my_idx_in_out if my_idx_in_out >= 0 else parent_idx
+        next_parent_cls = (node.get("class", "")
+                            if my_idx_in_out >= 0 else parent_cls)
         for child in node:
-            XMLParser._walk(child, out, depth + 1)
+            XMLParser._walk(child, out, depth + 1,
+                            parent_idx=next_parent_idx,
+                            parent_cls=next_parent_cls)
 
     @staticmethod
     def find_at_coordinate(elements: List[XMLElement],

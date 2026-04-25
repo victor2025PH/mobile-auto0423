@@ -726,12 +726,12 @@ def reset_peer_name_reject_count() -> None:
 
 def _record_peer_name_reject(peer_name: str, event_type: str,
                                 device_id: str = "") -> None:
-    """Phase 17.1: 记 reject 一条 (内部用)."""
+    """Phase 17.1 / 18: 记 reject 一条 (内存 ring buffer + DB 持久化)."""
     _PEER_NAME_REJECT_COUNTER["count"] = \
         _PEER_NAME_REJECT_COUNTER.get("count", 0) + 1
     _PEER_NAME_REJECT_BY_EVENT[event_type] = \
         _PEER_NAME_REJECT_BY_EVENT.get(event_type, 0) + 1
-    # ring buffer 最近 N 条
+    # ring buffer 最近 N 条 (进程内, 重启清零)
     sample = {
         "peer_name": peer_name[:40],
         "event_type": event_type,
@@ -741,6 +741,81 @@ def _record_peer_name_reject(peer_name: str, event_type: str,
     _PEER_NAME_REJECT_RECENT.append(sample)
     if len(_PEER_NAME_REJECT_RECENT) > _PEER_NAME_REJECT_RECENT_CAP:
         _PEER_NAME_REJECT_RECENT.pop(0)
+    # Phase 18: DB 持久化 (异常不阻塞 caller)
+    try:
+        with _connect() as conn:
+            conn.execute(
+                "INSERT INTO peer_name_reject_log"
+                " (peer_name, event_type, device_id) VALUES (?,?,?)",
+                (peer_name[:40], event_type, device_id[:24]),
+            )
+    except Exception as e:
+        logger.debug("[peer_name_reject] DB 写失败 (忽略): %s", e)
+
+
+def get_peer_name_reject_history(*, hours_window: int = 168,
+                                    limit: int = 1000,
+                                    by_day: bool = False
+                                    ) -> Dict[str, Any]:
+    """Phase 18: 跨进程重启可查 reject 历史.
+
+    返回 {total, by_day?: {date: count}, by_event_type: {evt: count}, samples: [...]}.
+
+    by_day=True 时多带 by_day dict (供 daily summary task 用).
+    """
+    if hours_window <= 0:
+        return {"total": 0, "by_event_type": {}, "samples": []}
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            offset = f"-{int(hours_window)} hours"
+            # 总数
+            total = conn.execute(
+                "SELECT COUNT(*) AS n FROM peer_name_reject_log"
+                " WHERE at >= datetime('now', ?)",
+                (offset,),
+            ).fetchone()
+            total_n = int(total["n"] if total else 0)
+            # by event_type
+            by_evt = {
+                r["event_type"]: int(r["n"])
+                for r in conn.execute(
+                    "SELECT event_type, COUNT(*) AS n FROM peer_name_reject_log"
+                    " WHERE at >= datetime('now', ?)"
+                    " GROUP BY event_type ORDER BY n DESC",
+                    (offset,),
+                ).fetchall()
+            }
+            # 样本
+            samples = [dict(r) for r in conn.execute(
+                "SELECT peer_name, event_type, device_id, at"
+                " FROM peer_name_reject_log"
+                " WHERE at >= datetime('now', ?)"
+                " ORDER BY id DESC LIMIT ?",
+                (offset, max(1, min(int(limit or 1000), 5000))),
+            ).fetchall()]
+            out: Dict[str, Any] = {
+                "total": total_n,
+                "by_event_type": by_evt,
+                "samples": samples,
+                "hours_window": hours_window,
+            }
+            if by_day:
+                out["by_day"] = {
+                    r["d"]: int(r["n"])
+                    for r in conn.execute(
+                        "SELECT date(at) AS d, COUNT(*) AS n"
+                        " FROM peer_name_reject_log"
+                        " WHERE at >= datetime('now', ?)"
+                        " GROUP BY date(at) ORDER BY d",
+                        (offset,),
+                    ).fetchall()
+                }
+            return out
+    except Exception as e:
+        logger.debug("[peer_name_reject] history 查询异常: %s", e)
+        return {"total": 0, "by_event_type": {}, "samples": [],
+                "error": str(e)[:120]}
 
 
 def record_contact_event(device_id: str, peer_name: str, event_type: str, *,

@@ -1036,6 +1036,12 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_recycle_dead_peers":
             return _line_pool_recycle_dead_peers(params)
 
+        # Phase 18 (2026-04-25): facebook_daily_referral_summary
+        # 组装 funnel + ranking + reject metrics, 写 logs/daily_summary_YYYYMMDD.json
+        # 可选 webhook (env SLACK_WEBHOOK_URL).
+        if task_type == "facebook_daily_referral_summary":
+            return _fb_daily_referral_summary(params)
+
         # Phase 11 (2026-04-25): fb_line_dispatch_from_reply
         # 扫近 N 小时 contact_events (greeting_replied/message_received) → 按
         # canonical.metadata (l2_verified / persona 匹配) 过滤 → allocate LINE
@@ -1053,6 +1059,116 @@ def _execute_facebook(manager, resolved, task_type, params):
     except Exception as e:
         logger.exception("Facebook 任务执行异常: %s", task_type)
         return False, f"{task_type} 异常: {e}", None
+
+
+def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
+    """Phase 18 (2026-04-25): 每日 referral 闭环健康摘要.
+
+    组装:
+      - funnel (planned/sent/replied)
+      - account_ranking top 5
+      - peer_name reject metrics (by_event_type + by_day)
+      - dispatch_log 最近 24h 计数 by status
+
+    输出:
+      1. logs/daily_summary_YYYYMMDD.json
+      2. 可选 Slack webhook (env OPENCLAW_SLACK_WEBHOOK_URL)
+      3. 返 stats dict
+
+    Params:
+      hours_window: int = 24
+      write_file: bool = True
+      send_webhook: bool = True (但需 env var 才真发)
+    """
+    import datetime as _dt
+    import json as _json
+    from pathlib import Path as _Path
+
+    hours_window = int(params.get("hours_window", 24) or 24)
+    write_file = bool(params.get("write_file", True))
+    send_webhook = bool(params.get("send_webhook", True))
+
+    from src.host.line_pool import (referral_funnel, account_ranking,
+                                      recent_dispatch_log)
+    from src.host.fb_store import (get_peer_name_reject_history,
+                                     get_peer_name_reject_metrics)
+
+    funnel = referral_funnel(hours_window=hours_window)
+    ranking = account_ranking(hours_window=hours_window, limit=5)
+    rej_history = get_peer_name_reject_history(
+        hours_window=hours_window, limit=20, by_day=True)
+    rej_live = get_peer_name_reject_metrics()
+    log_recent = recent_dispatch_log(limit=200)
+    log_status_count: Dict[str, int] = {}
+    for r in log_recent:
+        st = r.get("status") or "?"
+        log_status_count[st] = log_status_count.get(st, 0) + 1
+
+    summary: Dict[str, Any] = {
+        "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hours_window": hours_window,
+        "funnel": funnel,
+        "top_5_accounts": ranking,
+        "peer_name_rejects": {
+            "live_total": rej_live.get("total", 0),
+            "live_by_event_type": rej_live.get("by_event_type", {}),
+            "history_total": rej_history.get("total", 0),
+            "history_by_day": rej_history.get("by_day", {}),
+            "history_by_event": rej_history.get("by_event_type", {}),
+        },
+        "dispatch_log_status": log_status_count,
+        "dispatch_log_total_24h": len(log_recent),
+    }
+
+    written_to = ""
+    if write_file:
+        try:
+            today = _dt.datetime.utcnow().strftime("%Y%m%d")
+            logs_dir = _Path("logs")
+            logs_dir.mkdir(exist_ok=True)
+            fpath = logs_dir / f"daily_summary_{today}.json"
+            with fpath.open("w", encoding="utf-8") as f:
+                _json.dump(summary, f, ensure_ascii=False, indent=2)
+            written_to = str(fpath)
+            logger.info("[daily_summary] 写文件: %s", fpath)
+        except Exception as e:
+            logger.warning("[daily_summary] 写文件失败: %s", e)
+
+    webhook_sent = False
+    if send_webhook:
+        import os as _os
+        webhook_url = _os.environ.get("OPENCLAW_SLACK_WEBHOOK_URL", "")
+        if webhook_url:
+            try:
+                import urllib.request
+                import urllib.error
+                # 简短文本格式给 Slack/通知
+                lines = [
+                    f"*Referral 闭环 24h 摘要* ({summary['generated_at']})",
+                    f"funnel: planned={funnel['planned']} sent={funnel['sent']} replied={funnel['replied']}",
+                    f"send_rate={funnel['send_rate']*100:.1f}% conv_rate={funnel['conversion_rate']*100:.1f}%",
+                    f"reject_24h: total={rej_history.get('total', 0)} (live={rej_live.get('total', 0)})",
+                    f"top accounts: " + ", ".join(
+                        f"{a['line_id']}={a['success_rate']*100:.0f}%"
+                        for a in ranking[:3]),
+                    f"dispatch_log_status: {log_status_count}",
+                ]
+                req = urllib.request.Request(
+                    webhook_url,
+                    data=_json.dumps({"text": "\n".join(lines)}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST")
+                urllib.request.urlopen(req, timeout=10)
+                webhook_sent = True
+                logger.info("[daily_summary] webhook 发送成功")
+            except Exception as e:
+                logger.warning("[daily_summary] webhook 发送失败: %s", e)
+
+    return True, "", {
+        "summary": summary,
+        "written_to": written_to,
+        "webhook_sent": webhook_sent,
+    }
 
 
 def _line_pool_recycle_dead_peers(params: Dict[str, Any]) -> tuple:

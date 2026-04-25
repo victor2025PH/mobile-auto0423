@@ -245,5 +245,18 @@
     },
     "enabled": true,
     "last_run": ""
+  },
+  {
+    "id": "daily_referral_summary_2355",
+    "name": "Referral 闭环每日摘要 (23:55, 写 logs/daily_summary + 可选 Slack)",
+    "cron": "55 23 * * *",
+    "action": "facebook_daily_referral_summary",
+    "params": {
+      "hours_window": 24,
+      "write_file": true,
+      "send_webhook": true
+    },
+    "enabled": false,
+    "last_run": ""
   }
 ]

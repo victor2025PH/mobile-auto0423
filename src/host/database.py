@@ -650,6 +650,21 @@ _MIGRATIONS = [
     " ON line_dispatch_log(line_account_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_line_dispatch_canonical"
     " ON line_dispatch_log(canonical_id, created_at DESC)",
+
+    # ── Phase 18 (2026-04-25): peer_name reject 持久化日志 ──
+    # 跨进程重启可查的 reject 历史 (上一阶段进程内 ring buffer 重启清零).
+    # 用于 daily summary + 趋势分析 + 调 sanitize 规则.
+    "CREATE TABLE IF NOT EXISTS peer_name_reject_log ("
+    " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " peer_name TEXT NOT NULL DEFAULT '',"          # 被拦的 peer (前 40 字符)
+    " event_type TEXT NOT NULL DEFAULT '',"
+    " device_id TEXT NOT NULL DEFAULT '',"
+    " at TEXT NOT NULL DEFAULT (datetime('now'))"
+    ")",
+    "CREATE INDEX IF NOT EXISTS idx_peer_reject_at"
+    " ON peer_name_reject_log(at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_peer_reject_event"
+    " ON peer_name_reject_log(event_type, at DESC)",
 ]
 
 

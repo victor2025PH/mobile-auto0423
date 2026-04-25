@@ -69,11 +69,25 @@ def api_account_ranking(hours_window: int = Query(default=168, ge=1, le=720),
 def api_peer_name_reject_metrics():
     """Phase 17.1: peer_name sanitize reject 计数 + by_event_type + 最近样本.
 
-    运维查"sanitize 拦了多少 / 哪种事件最多 / 最近被拦的具体文本".
-    counter 模块级进程内存活, 重启清零.
+    数据为进程内 (counter 模块级, 重启清零). 跨重启历史查
+    /stats/peer-name-rejects/history.
     """
     from src.host.fb_store import get_peer_name_reject_metrics
     return get_peer_name_reject_metrics()
+
+
+@router.get("/stats/peer-name-rejects/history")
+def api_peer_name_reject_history(
+        hours_window: int = Query(default=168, ge=1, le=720),
+        limit: int = Query(default=200, ge=1, le=5000),
+        by_day: bool = Query(default=True)):
+    """Phase 18: 跨进程持久化 reject 历史 (DB peer_name_reject_log).
+
+    by_day=true 时返 by_day dict {date: count} 看每日趋势.
+    """
+    from src.host.fb_store import get_peer_name_reject_history
+    return get_peer_name_reject_history(
+        hours_window=hours_window, limit=limit, by_day=by_day)
 
 
 @router.post("/stats/peer-name-rejects/reset")

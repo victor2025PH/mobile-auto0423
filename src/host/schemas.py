@@ -65,6 +65,7 @@ class TaskType(str, Enum):
     FACEBOOK_LINE_DISPATCH_FROM_REPLY = "facebook_line_dispatch_from_reply"
     FACEBOOK_SEND_REFERRAL_REPLIES = "facebook_send_referral_replies"
     FACEBOOK_RECYCLE_DEAD_PEERS = "facebook_recycle_dead_peers"
+    FACEBOOK_DAILY_REFERRAL_SUMMARY = "facebook_daily_referral_summary"
     # Instagram
     INSTAGRAM_BROWSE_FEED = "instagram_browse_feed"
     INSTAGRAM_SEARCH_LEADS = "instagram_search_leads"

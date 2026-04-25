@@ -5817,36 +5817,75 @@ class FacebookAutomation(BaseAutomation):
 
     @staticmethod
     def _load_extra_blacklist() -> "frozenset[str]":
-        """Phase 17.1: 读 config/peer_name_blacklist.yaml 的 extra_blacklist.
+        """Phase 17.1 / 18: 读 config/peer_name_blacklist.yaml 的 extra_blacklist.
 
-        TTL 5 min 缓存. yaml 不存在 / 解析失败 → 返空 set. 不影响内置规则.
+        TTL 5 min 缓存. yaml 不存在 → 返空 (静默, 不警告). 解析/schema 错
+        → logger.error visible warning + 返空 (不抛, 主流程不受影响).
+
+        Phase 18 schema 校验:
+          - 顶层必须是 dict (不是 list/scalar)
+          - extra_blacklist 必须是 list 或缺省 (不能是 dict/scalar/None)
+          - 每个 item 必须是 str (非 str 跳过 + warning)
         """
         import time as _t
         cache = FacebookAutomation._BLACKLIST_YAML_CACHE
         now = _t.time()
         if now - cache.get("loaded_at", 0) < FacebookAutomation._BLACKLIST_YAML_TTL_SEC:
             return cache.get("extra", frozenset())
+        extra: frozenset = frozenset()
         try:
             from pathlib import Path
             import yaml
             here = Path(__file__).resolve().parent.parent.parent
             yaml_path = here / "config" / "peer_name_blacklist.yaml"
-            if yaml_path.exists():
+            if not yaml_path.exists():
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            try:
                 with yaml_path.open(encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                items = data.get("extra_blacklist") or []
-                if isinstance(items, list):
-                    extra = frozenset(
-                        str(s).strip().lower()
-                        for s in items
-                        if s and isinstance(s, str)
-                    )
-                else:
-                    extra = frozenset()
-            else:
-                extra = frozenset()
+                    data = yaml.safe_load(f)
+            except Exception as e:
+                log.error("[blacklist_yaml] YAML 解析失败 (退化空 set): %s", e)
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            # Phase 18: schema 校验
+            if data is None:
+                # 空文件 — 合法
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            if not isinstance(data, dict):
+                log.error("[blacklist_yaml] 顶层必须是 dict, 实际 %s, 退化空 set",
+                            type(data).__name__)
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            items = data.get("extra_blacklist")
+            if items is None:
+                # 缺 key — 合法
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            if not isinstance(items, list):
+                log.error("[blacklist_yaml] extra_blacklist 必须是 list, "
+                            "实际 %s, 退化空 set", type(items).__name__)
+                cache["extra"] = extra
+                cache["loaded_at"] = now
+                return extra
+            valid_items = []
+            for i, s in enumerate(items):
+                if not isinstance(s, str):
+                    log.warning("[blacklist_yaml] item[%d] 不是 str (%s), skip",
+                                  i, type(s).__name__)
+                    continue
+                s2 = s.strip().lower()
+                if s2:
+                    valid_items.append(s2)
+            extra = frozenset(valid_items)
         except Exception as e:
-            log.debug("[blacklist_yaml] load 失败 (返空): %s", e)
+            log.error("[blacklist_yaml] 未预期异常 (退化空): %s", e)
             extra = frozenset()
         cache["extra"] = extra
         cache["loaded_at"] = now
@@ -5926,13 +5965,21 @@ class FacebookAutomation(BaseAutomation):
             return False
         return True
 
+    # Phase 17: ListView 行级匹配, 限定父容器 class 必须含这些关键字
+    _MESSENGER_LIST_CONTAINERS = (
+        "RecyclerView", "ListView", "ScrollView", "LinearLayout",
+    )
+
     def _list_messenger_conversations(self, d, max_n: int) -> List[Dict]:
         """从 Messenger 主列表 dump 当前可见对话。返回 [{name, unread, bounds}].
 
-        Phase 15 (2026-04-25): peer_name 抓取改用 _is_valid_peer_name 多层
-        sanitize (黑名单 + 长度 + 句尾标点 + ASCII 单词按钮启发式), 防止
-        "查看翻译"/"Reply"/"Mark as read" 等 UI 文本被当成 peer 写入
-        fb_contact_events, 进而污染 dispatcher 数据流.
+        Phase 17 (2026-04-25): 结构敏感 ListView 行级匹配.
+        旧实现 flat scan 所有 clickable element + sanitize 兜底;
+        现实现优先用 parent_class 过滤 — peer 行的父容器必含 RecyclerView/
+        ListView/ScrollView/LinearLayout. 不匹配父容器的 element (顶部工具栏
+        按钮 / 底部 navigation tab) 直接跳过.
+
+        旧 sanitize 仍作为内层兜底 (双层防御).
         """
         try:
             xml = d.dump_hierarchy()
@@ -5952,7 +5999,17 @@ class FacebookAutomation(BaseAutomation):
             text = (el.text or "").strip()
             if not el.clickable:
                 continue
-            # Phase 15: 单一 sanitize 入口
+            # Phase 17: 父容器结构过滤 (老 XMLParser 没 parent_class 则
+            # parent_class="" 跳过此 check 退化为旧行为, 不破兼容).
+            parent_cls = getattr(el, "parent_class", "") or ""
+            if parent_cls:
+                # 新 parser 提供了 parent_class — 必须父容器含 list 关键字
+                in_list = any(kw in parent_cls
+                               for kw in
+                               FacebookAutomation._MESSENGER_LIST_CONTAINERS)
+                if not in_list:
+                    continue
+            # Phase 15-16 字符串 sanitize 兜底
             if not FacebookAutomation._is_valid_peer_name(text):
                 continue
             if text in seen:
