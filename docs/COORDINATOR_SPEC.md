@@ -2,6 +2,8 @@
 
 > 同机简化版 of TG-MTProto Round 3 提议. A-sibling 接手实施 (Step 6).
 
+> ⚠ **2026-04-25 用户澄清后**: 主控本机当前**只有 4 台真机** (不是之前估的 21). **§3-§12 完整 Coordinator service 是按 21 台 / 跨机设计, 4 台规模 over-engineered**. **sibling 实施前必读 §13** — 4 设备规模轻量替代方案 (静态分配 / flock 兜底), 估时 ~30 min vs §11 ~1.5 人天 (45x).
+
 ## 1. Why
 
 - A (mobile-auto0423) 跑 facebook 任务, B (telegram-mtproto-ai) 跑 telegram/LINE/独立 messenger 任务
@@ -157,4 +159,84 @@ uvicorn main:app --host 127.0.0.1 --port 9810
 - Event bus / actor identity 推到 Phase 2 — 不阻塞核心锁能力
 - 客户端 fallback local threading.Lock — coordinator 挂掉业务不停
 
-— A-main (2026-04-25, 由 A-sibling 接手实施)
+## 13. 4 设备规模简化路径 (优先实施, 替代 §3-§12)
+
+**用户 2026-04-25 澄清**: 主控本机只有 4 台真机, 同机 3 个 Claude session. **§3-§12 完整 Coordinator 是按 21 台 / 跨机设计, 4 台规模过度**. 推荐 sibling 实施前先评估以下方案:
+
+### 13.1 候选方案对比
+
+| 方案 | 工作量 | 跨进程? | 推荐度 | 适合规模 |
+|---|---|---|---|---|
+| A. 静态设备分配 | 5 min | 无需锁 | ⭐⭐⭐ MVP 首推 | 4-10 台同机 |
+| B. flock 文件锁 | ~30 行 | ✅ | ⭐⭐ 借用兜底 | 4-30 台同机 |
+| C. SQLite advisory | ~80 行 | ✅ | ⭐ | 30-100 台 |
+| D. 完整 §3-§12 Coordinator | ~1.5 人天 | ✅ | ⭐ 大场景 | 100+ 台 / 跨机 |
+
+### 13.2 方案 A 静态设备分配 (5 min, 推荐 MVP)
+
+新文件 `D:\workspace\coord-board\device_assignment.yaml`:
+
+```yaml
+# 4 台真机分配 (2026-04-25 当前规模)
+a_repo:
+  - 4HUSIB4TBQC69TJZ   # Redmi Note 13 5G
+  - CACAVKLNU8SGO74D   # Redmi Note 13 5G
+b_repo:
+  - 8DWOF6CYY5R8YHX8   # 待手机授权 ADB
+  - IJ8HZLORS485PJWW   # 待手机授权 ADB
+```
+
+A 端启动时:
+
+```python
+import yaml
+ASSIGNMENT_PATH = r"D:\workspace\coord-board\device_assignment.yaml"
+with open(ASSIGNMENT_PATH) as f:
+    pool = yaml.safe_load(f)["a_repo"]
+# A 调度只看 pool 里设备
+```
+
+B 端同样读 `b_repo`. **零锁需求, 各跑各的设备**.
+
+### 13.3 方案 B flock 兜底 (借用场景, ~30 行)
+
+A/B 临时借用对方设备时, OS 文件锁:
+
+```python
+import portalocker  # pip install portalocker (跨 Win/Linux)
+
+LOCK_DIR = r"D:\workspace\coord-board\locks"
+def acquire_device(serial):
+    import os
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    f = open(rf"{LOCK_DIR}\{serial}.lock", "w")
+    portalocker.lock(f, portalocker.LOCK_EX | portalocker.LOCK_NB)
+    return f  # f.close() 自动释放, 进程死锁 OS 自动 unflock
+
+def release_device(f):
+    portalocker.unlock(f)
+    f.close()
+```
+
+OS 自动释放, 不需要 TTL / heartbeat / 心跳维持.
+
+### 13.4 升级到 §3-§12 完整 Coordinator 的条件
+
+只在以下场景才需要:
+- 真机扩到 30+ 台 (本机 USB 物理上限)
+- 跨机协调 (多电脑 / 云手机)
+- 需要 event bus / actor identity / metrics 等高级特性
+
+**4 台同机阶段不需要**.
+
+### 13.5 sibling 实施顺序建议 (替代 §11)
+
+1. **评估**: 4 台够吗? 业务需要 event bus 吗? 大概率: 不需要 → 走 13.2
+2. **实施 13.2**: 5 min 写 yaml + 8 行 Python 加载 (A/B 各改一处)
+3. **跑一周**: 监控设备利用率
+4. **不均时实施 13.3 flock 借用**: 30 行代码
+5. **更复杂时再回 §11 完整 Coordinator MVP**
+
+**估时**: 13.2+13.3 总 ~30 min vs §11 ~1.5 人天 (45x 速度).
+
+— A-main (2026-04-25, 由 A-sibling 接手实施 — 优先评估 §13)
