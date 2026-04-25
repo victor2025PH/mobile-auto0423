@@ -106,6 +106,32 @@ def api_blacklist_reload():
     return {"ok": True, "extra_count": n}
 
 
+@router.get("/stats/daily-summary")
+def api_daily_summary_view(
+        date: Optional[str] = Query(default=None,
+                                       description="YYYYMMDD, 缺省=今天 UTC")):
+    """Phase 19.x.3.3: 直接服务缓存的 logs/daily_summary_YYYYMMDD.json.
+
+    用于 webhook → 链接打开看完整摘要 (含 trend / trend_7d / by_region /
+    alerts). 文件不存在返 404.
+    """
+    import datetime as _dt
+    import json as _json
+    from pathlib import Path as _Path
+    if not date:
+        date = _dt.datetime.utcnow().strftime("%Y%m%d")
+    if not (date.isdigit() and len(date) == 8):
+        raise HTTPException(400, "date 必须是 YYYYMMDD 格式")
+    fpath = _Path("logs") / f"daily_summary_{date}.json"
+    if not fpath.exists():
+        raise HTTPException(404, f"daily_summary_{date}.json 不存在")
+    try:
+        with fpath.open("r", encoding="utf-8") as f:
+            return _json.load(f)
+    except Exception as e:
+        raise HTTPException(500, f"读取失败: {e}")
+
+
 @router.get("/{account_id}")
 def api_get_line_account(account_id: int):
     row = lp.get_by_id(account_id)

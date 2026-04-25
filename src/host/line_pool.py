@@ -485,6 +485,74 @@ def seed_from_config(config_path: Optional[str] = None,
     return result
 
 
+def _infer_region_from_persona(persona_key: str) -> str:
+    """persona_key 前缀 → region 推断 (jp_*→jp, it_*→it, fr_*→fr ...)."""
+    if not persona_key:
+        return ""
+    pk = persona_key.lower()
+    for prefix in ("jp", "it", "fr", "de", "es", "us", "kr", "cn", "tw"):
+        if pk.startswith(f"{prefix}_"):
+            return prefix
+    return ""
+
+
+def _get_lead_region(canonical_id: str) -> str:
+    """Phase 19.x.3.4: 三级 region 解析 (返 "" 表示未知).
+
+    顺序:
+      1) leads_canonical.metadata.region (直接字段)
+      2) metadata.l2_persona_key 前缀推断 (jp_/it_/fr_ ...)
+      3) line_dispatch_log JOIN line_accounts.region (该 lead 最近一次分发的账号 region)
+
+    任一级返非空字符串就停, 否则继续下一级. 全 miss 返 "".
+    """
+    if not canonical_id:
+        return ""
+    import json as _json
+    # Level 1+2: leads_canonical metadata
+    try:
+        from src.host.lead_mesh.canonical import _connect as _lm_connect
+        with _lm_connect() as conn:
+            cur = conn.execute(
+                "SELECT metadata_json FROM leads_canonical"
+                " WHERE canonical_id=? LIMIT 1",
+                (canonical_id,))
+            row = cur.fetchone()
+            if row:
+                try:
+                    meta = _json.loads(row["metadata_json"] or "{}")
+                except Exception:
+                    meta = {}
+                # L1: 直接字段
+                rg = (meta.get("region") or "").strip().lower()
+                if rg:
+                    return rg
+                # L2: persona_key 前缀
+                pk = meta.get("l2_persona_key", "") or ""
+                inferred = _infer_region_from_persona(pk)
+                if inferred:
+                    return inferred
+    except Exception as e:
+        logger.debug("[get_lead_region] L1/L2 失败 cid=%s: %s", canonical_id, e)
+    # Level 3: dispatch_log JOIN line_accounts (最近 1 条)
+    try:
+        with _connect() as conn:
+            cur = conn.execute(
+                "SELECT la.region FROM line_dispatch_log dl"
+                " JOIN line_accounts la ON dl.line_account_id=la.id"
+                " WHERE dl.canonical_id=?"
+                " ORDER BY dl.created_at DESC LIMIT 1",
+                (canonical_id,))
+            row = cur.fetchone()
+            if row:
+                rg = (row["region"] or "").strip().lower()
+                if rg:
+                    return rg
+    except Exception as e:
+        logger.debug("[get_lead_region] L3 失败 cid=%s: %s", canonical_id, e)
+    return ""
+
+
 def referral_funnel(*, hours_window: int = 168,
                       region: Optional[str] = None,
                       persona_key: Optional[str] = None) -> Dict[str, Any]:
@@ -535,7 +603,7 @@ def referral_funnel(*, hours_window: int = 168,
                     placeholders = ",".join(["?"] * len(cand))
                     # account_id 格式 fb:peer_name (与 dispatcher resolve_identity 一致)
                     fb_keys = [f"fb:{n}" for n in cand]
-                    q = ("SELECT li.account_id, lc.metadata_json"
+                    q = ("SELECT li.account_id, li.canonical_id, lc.metadata_json"
                          " FROM lead_identities li"
                          " JOIN leads_canonical lc"
                          " ON li.canonical_id = lc.canonical_id"
@@ -551,17 +619,17 @@ def referral_funnel(*, hours_window: int = 168,
                         if persona_key:
                             if meta.get("l2_persona_key") != persona_key:
                                 continue
-                        # region: leads_canonical metadata 没存 region (line_account
-                        # 才有). 这里我们用 persona_key 推 region:
-                        # jp_female_midlife → jp; it_female_midlife → it
+                        # Phase 19.x.3.4: region 用 3-level 解析
+                        # L1 metadata.region → L2 persona prefix → L3 dispatch_log JOIN
                         if region:
+                            rg_meta = (meta.get("region") or "").strip().lower()
                             pk = meta.get("l2_persona_key", "") or ""
-                            inferred_region = ""
-                            if pk.startswith("jp_"):
-                                inferred_region = "jp"
-                            elif pk.startswith("it_"):
-                                inferred_region = "it"
-                            if inferred_region != region:
+                            rg_persona = _infer_region_from_persona(pk)
+                            rg_eff = rg_meta or rg_persona
+                            # L3 fallback: 上面都空才查 dispatch_log
+                            if not rg_eff:
+                                rg_eff = _get_lead_region(row["canonical_id"])
+                            if rg_eff != region:
                                 continue
                         # 反推 peer_name (account_id = fb:NAME)
                         aid = row["account_id"] or ""

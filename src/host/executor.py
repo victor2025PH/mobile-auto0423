@@ -1071,6 +1071,12 @@ def _execute_facebook(manager, resolved, task_type, params):
 
 _ALERT_STATE_PATH = "logs/alert_state.json"
 _ALERT_DEFAULT_COOLDOWN_HOURS = 24
+# Phase 19.x.3.1: severity-based cooldown (critical 重要应较早重发)
+_ALERT_DEFAULT_SEVERITY_COOLDOWNS = {
+    "critical": 4,
+    "warning": 24,
+    "info": 48,
+}
 
 
 def _load_alert_state() -> Dict[str, str]:
@@ -1151,21 +1157,33 @@ def _detect_referral_alerts(funnel: Dict[str, Any],
 
 def _filter_alerts_by_cooldown(alerts: List[Dict[str, Any]],
                                   state: Dict[str, str],
-                                  cooldown_hours: int = _ALERT_DEFAULT_COOLDOWN_HOURS
+                                  cooldown_hours: int = _ALERT_DEFAULT_COOLDOWN_HOURS,
+                                  severity_cooldowns: Optional[Dict[str, int]] = None
                                   ) -> List[Dict[str, Any]]:
-    """Phase 19.x.1: 根据 alert_state 抑制重复.
+    """Phase 19.x.1 / 19.x.3.1: 根据 alert_state + severity 抑制重复.
 
-    只返 "应该真发 webhook" 的 alerts. 已在 cooldown 内的同 type 跳过.
+    Phase 19.x.3.1: cooldown 按 severity 分级 (critical 4h / warning 24h /
+    info 48h). 没指定 severity 退化用 cooldown_hours 兜底.
+
+    severity_cooldowns 可被 caller 完全覆盖默认 dict.
+
+    只返 "应该真发 webhook" 的 alerts. cooldown 内同 type 跳过.
     """
     import datetime as _dt
     now = _dt.datetime.utcnow()
+    sev_map = (severity_cooldowns
+                if severity_cooldowns is not None
+                else _ALERT_DEFAULT_SEVERITY_COOLDOWNS)
     out: List[Dict[str, Any]] = []
     for a in alerts:
         last_iso = state.get(a["type"], "")
+        # 选 cooldown: severity 优先, 没匹配用全局 cooldown_hours
+        sev = (a.get("severity") or "").lower()
+        eff_cd = sev_map.get(sev, cooldown_hours)
         if last_iso:
             try:
                 last_dt = _dt.datetime.strptime(last_iso, "%Y-%m-%dT%H:%M:%SZ")
-                if (now - last_dt).total_seconds() < cooldown_hours * 3600:
+                if (now - last_dt).total_seconds() < eff_cd * 3600:
                     continue
             except Exception:
                 pass
@@ -1200,6 +1218,7 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
     cooldown = int(params.get("cooldown_hours", 24) or 24)
     send_thr = float(params.get("alert_send_rate_threshold", 0.3) or 0.3)
     reject_thr = int(params.get("alert_reject_threshold", 10) or 10)
+    severity_cd = params.get("severity_cooldowns")  # 可选 dict 覆盖默认
 
     from src.host.line_pool import referral_funnel
     from src.host.fb_store import get_peer_name_reject_history
@@ -1212,7 +1231,9 @@ def _fb_alert_check_hourly(params: Dict[str, Any]) -> tuple:
         funnel, rej_total, send_thr, reject_thr)
 
     state = _load_alert_state()
-    fire_now = _filter_alerts_by_cooldown(all_alerts, state, cooldown)
+    fire_now = _filter_alerts_by_cooldown(
+        all_alerts, state, cooldown_hours=cooldown,
+        severity_cooldowns=severity_cd if isinstance(severity_cd, dict) else None)
 
     webhook_sent = False
     if fire_now:
@@ -1375,19 +1396,55 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                 except Exception:
                     pass
         if len(days_data) >= 3:
-            avg_planned = sum(d.get("planned", 0) for d in days_data) / len(days_data)
-            avg_sent = sum(d.get("sent", 0) for d in days_data) / len(days_data)
-            avg_replied = sum(d.get("replied", 0) for d in days_data) / len(days_data)
-            avg_send_rate = sum(d.get("send_rate", 0) or 0 for d in days_data) / len(days_data)
+            import statistics as _stats
+            n = len(days_data)
+            planned_vals = [d.get("planned", 0) for d in days_data]
+            sent_vals = [d.get("sent", 0) for d in days_data]
+            replied_vals = [d.get("replied", 0) for d in days_data]
+            avg_planned = sum(planned_vals) / n
+            avg_sent = sum(sent_vals) / n
+            avg_replied = sum(replied_vals) / n
+            avg_send_rate = sum(d.get("send_rate", 0) or 0 for d in days_data) / n
             today_planned = funnel.get("planned", 0)
             today_sent = funnel.get("sent", 0)
             today_replied = funnel.get("replied", 0)
+
+            # Phase 19.x.3.2: stdev + z-score (population stdev; n=1 时 0)
+            def _safe_stdev(vals):
+                try:
+                    return _stats.pstdev(vals) if len(vals) >= 2 else 0.0
+                except Exception:
+                    return 0.0
+
+            std_p = _safe_stdev(planned_vals)
+            std_s = _safe_stdev(sent_vals)
+            std_r = _safe_stdev(replied_vals)
+
+            def _z(today, avg, std):
+                if std and std > 0:
+                    return round((today - avg) / std, 3)
+                return None
+
+            z_p = _z(today_planned, avg_planned, std_p)
+            z_s = _z(today_sent, avg_sent, std_s)
+            z_r = _z(today_replied, avg_replied, std_r)
+            # 异常: 任一 |z| > 2 (≈ 95% 置信区间外)
+            anomaly = any(z is not None and abs(z) > 2
+                           for z in (z_p, z_s, z_r))
+
             trend_7d = {
                 "samples": len(days_data),
                 "avg_planned": round(avg_planned, 2),
                 "avg_sent": round(avg_sent, 2),
                 "avg_replied": round(avg_replied, 2),
                 "avg_send_rate": round(avg_send_rate, 4),
+                "stdev_planned": round(std_p, 3),
+                "stdev_sent": round(std_s, 3),
+                "stdev_replied": round(std_r, 3),
+                "z_planned": z_p,
+                "z_sent": z_s,
+                "z_replied": z_r,
+                "anomaly": anomaly,
                 "ratio_planned": (round(today_planned / avg_planned, 3)
                                     if avg_planned else None),
                 "ratio_sent": (round(today_sent / avg_sent, 3)
@@ -1435,15 +1492,22 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                         f"planned {arrow(trend['planned_delta'])}, "
                         f"sent {arrow(trend['sent_delta'])}, "
                         f"replied {arrow(trend['replied_delta'])}")
-                # Phase 19.x.2: trend_7d
+                # Phase 19.x.2 / 19.x.3.2: trend_7d + anomaly z-score
                 if trend_7d:
                     rs = trend_7d.get("ratio_sent")
                     rp = trend_7d.get("ratio_planned")
+                    anomaly_mark = "⚠ " if trend_7d.get("anomaly") else ""
                     lines.append(
-                        f"vs 7d avg ({trend_7d['samples']} samples): "
+                        f"{anomaly_mark}vs 7d avg ({trend_7d['samples']} samples): "
                         f"planned ratio={rp if rp is not None else 'n/a'}, "
                         f"sent ratio={rs if rs is not None else 'n/a'} "
                         f"(avg={trend_7d['avg_planned']:.1f}/{trend_7d['avg_sent']:.1f})")
+                    if trend_7d.get("anomaly"):
+                        z_p = trend_7d.get("z_planned")
+                        z_s = trend_7d.get("z_sent")
+                        lines.append(
+                            f"  └ anomaly detected: z_planned={z_p}, z_sent={z_s} "
+                            f"(|z| > 2 = 95% 置信区间外)")
                 # Phase 19.3: per-region
                 if by_region:
                     rg_parts = []
@@ -1466,6 +1530,14 @@ def _fb_daily_referral_summary(params: Dict[str, Any]) -> tuple:
                     lines.append("⚠ *ALERTS:*")
                     for a in alerts:
                         lines.append(f"  - [{a['severity']}] {a['type']}: {a['message']}")
+
+                # Phase 19.x.3.3: dashboard URL link (env 没设就跳过)
+                dash_base = _os.environ.get("OPENCLAW_DASHBOARD_BASE_URL", "").rstrip("/")
+                if dash_base:
+                    today_str = _dt.datetime.utcnow().strftime("%Y%m%d")
+                    lines.append("")
+                    lines.append(
+                        f"📊 详情: {dash_base}/line-pool/stats/daily-summary?date={today_str}")
 
                 req = urllib.request.Request(
                     webhook_url,
