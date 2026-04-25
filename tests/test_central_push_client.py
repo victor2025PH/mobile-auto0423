@@ -57,37 +57,70 @@ def mock_http(reset_state, monkeypatch):
     return s
 
 
+# ── deterministic UUID ───────────────────────────────────────────────
+def test_compute_customer_id_deterministic():
+    """同 (source, id) 总返回同一 UUID, 不同输入返回不同 UUID."""
+    a = cli.compute_customer_id("facebook", "fb_001")
+    b = cli.compute_customer_id("facebook", "fb_001")
+    c = cli.compute_customer_id("facebook", "fb_002")
+    d = cli.compute_customer_id("line", "fb_001")
+    assert a == b
+    assert a != c
+    assert a != d
+    # UUID format
+    import uuid as _uuid
+    _uuid.UUID(a)
+
+
 # ── upsert ────────────────────────────────────────────────────────────
 def test_upsert_customer_sync(mock_http):
     cid = cli.upsert_customer(
         canonical_id="fb_001", canonical_source="facebook",
         primary_name="Alice", worker_id="w1",
+        fire_and_forget=False,
     )
     assert cid == "cust-mock-1"
     assert len(mock_http.calls) == 1
     assert mock_http.calls[0]["path"] == "/cluster/customers/upsert"
     assert mock_http.calls[0]["body"]["canonical_id"] == "fb_001"
+    # body 也带了 worker 算的 customer_id (主控 ON CONFLICT 决定真值)
+    assert mock_http.calls[0]["body"]["customer_id"] == \
+        cli.compute_customer_id("facebook", "fb_001")
 
 
 def test_upsert_customer_strips_none_fields(mock_http):
     cli.upsert_customer(
         canonical_id="x", canonical_source="facebook",
         primary_name=None, worker_id="w1",
+        fire_and_forget=False,
     )
     body = mock_http.calls[0]["body"]
     assert "primary_name" not in body  # None 被 strip
     assert body["canonical_id"] == "x"
 
 
-def test_upsert_fire_and_forget(mock_http):
-    res = cli.upsert_customer(
+def test_upsert_default_async_returns_deterministic_id(mock_http):
+    """默认 fire_and_forget=True, 返回 worker 算的 UUIDv5, 不依赖主控."""
+    cid = cli.upsert_customer(
         canonical_id="fnf", canonical_source="facebook",
-        worker_id="w1", fire_and_forget=True,
+        worker_id="w1",
     )
-    assert res is None  # fire_and_forget 不返
-    # 等异步线程跑完
+    expected = cli.compute_customer_id("facebook", "fnf")
+    assert cid == expected
     time.sleep(0.3)
     assert len(mock_http.calls) == 1
+
+
+def test_upsert_explicit_customer_id_passthrough(mock_http):
+    """传了 customer_id 就用调用方给的, 不算 UUIDv5."""
+    cid = cli.upsert_customer(
+        canonical_id="x", canonical_source="facebook",
+        customer_id="00000000-0000-0000-0000-000000001234",
+        worker_id="w1",
+    )
+    assert cid == "00000000-0000-0000-0000-000000001234"
+    time.sleep(0.3)
+    assert mock_http.calls[0]["body"]["customer_id"] == cid
 
 
 # ── event ────────────────────────────────────────────────────────────
@@ -205,7 +238,8 @@ def test_4xx_error_no_retry(reset_state, monkeypatch):
     with pytest.raises(RuntimeError, match="HTTP 400"):
         cli.upsert_customer(
             canonical_id="bad", canonical_source="facebook",
-            worker_id="w1",  # sync
+            worker_id="w1",
+            fire_and_forget=False,  # sync 才会 raise
         )
     # 应只调 1 次 (因为 mock 已经替换整 _http_post_json)
     assert call_count[0] == 1

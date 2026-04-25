@@ -138,21 +138,29 @@ class CentralCustomerStore:
         status: Optional[str] = None,
         worker_id: Optional[str] = None,
         device_id: Optional[str] = None,
+        customer_id: Optional[str] = None,
     ) -> str:
         """upsert by (canonical_source, canonical_id), 返回 customer_id (UUID 字符串).
 
         已存在: 更新非 None 字段, 保留旧值; status 字段只在显式传入时覆盖.
+
+        customer_id 给了就用 worker 端算的 UUIDv5; 没给主控用 gen_random_uuid().
+        ON CONFLICT 路径 PK 不变, 总是返回首次写入时的 customer_id.
         """
         ai_profile = ai_profile or {}
         with self._cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO customers (
+                    customer_id,
                     canonical_id, canonical_source, primary_name, age_band,
                     gender, country, interests, ai_profile,
                     status, last_worker_id, last_device_id
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb,
-                          COALESCE(%s, 'in_funnel'), %s, %s)
+                ) VALUES (
+                    COALESCE(%s::uuid, gen_random_uuid()),
+                    %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    COALESCE(%s, 'in_funnel'), %s, %s
+                )
                 ON CONFLICT (canonical_source, canonical_id) DO UPDATE SET
                     primary_name = COALESCE(EXCLUDED.primary_name, customers.primary_name),
                     age_band = COALESCE(EXCLUDED.age_band, customers.age_band),
@@ -166,6 +174,7 @@ class CentralCustomerStore:
                 RETURNING customer_id::text
                 """,
                 (
+                    customer_id,
                     canonical_id, canonical_source, primary_name, age_band,
                     gender, country, interests, json.dumps(ai_profile),
                     status, worker_id, device_id,

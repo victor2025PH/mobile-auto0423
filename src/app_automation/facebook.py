@@ -2599,6 +2599,19 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             pass
+        # L2 中央客户画像双写 (fire_and_forget, 失败不影响主流程)
+        try:
+            from src.host.customer_sync_bridge import sync_friend_request_sent
+            sync_friend_request_sent(
+                device_id, target_name,
+                status=status,
+                persona_key=persona_key,
+                preset_key=preset_key,
+                source=source,
+                note=note,
+            )
+        except Exception:
+            pass
         # Phase 6.A: Lead Mesh journey 同步写
         action = ("friend_requested" if status == "sent"
                   else "friend_request_risk")
@@ -3601,6 +3614,20 @@ class FacebookAutomation(BaseAutomation):
                 preset_key=preset_key or "",
                 meta={"persona_key": persona_key or "", "phase": eff_phase,
                       "msg_len": len(greeting or "")},
+            )
+        except Exception:
+            pass
+        # L2 中央客户画像双写 (fire_and_forget)
+        try:
+            from src.host.customer_sync_bridge import sync_greeting_sent
+            sync_greeting_sent(
+                did, profile_name,
+                greeting=greeting or "",
+                template_id=template_id,
+                preset_key=preset_key,
+                persona_key=persona_key,
+                phase=eff_phase,
+                fallback=False,
             )
         except Exception:
             pass

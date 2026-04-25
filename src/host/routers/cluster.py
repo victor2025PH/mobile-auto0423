@@ -1429,8 +1429,9 @@ def _safe_get_store():
 def cluster_customers_upsert(body: dict):
     """worker push 客户记录 (idempotent by canonical_source+id).
 
-    Body: {canonical_id, canonical_source, primary_name?, age_band?, gender?,
-           country?, interests?, ai_profile?, status?, worker_id?, device_id?}
+    Body: {canonical_id, canonical_source, customer_id?, primary_name?, age_band?,
+           gender?, country?, interests?, ai_profile?, status?, worker_id?, device_id?}
+    customer_id 可由 worker 端 UUIDv5 预生成 (compute_customer_id), 不传则主控生成.
     Response: {customer_id}
     """
     if not _is_coordinator_role():
@@ -1453,6 +1454,7 @@ def cluster_customers_upsert(body: dict):
         status=body.get("status"),
         worker_id=body.get("worker_id"),
         device_id=body.get("device_id"),
+        customer_id=body.get("customer_id"),
     )
     return {"customer_id": cid}
 
