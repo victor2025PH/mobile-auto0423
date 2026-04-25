@@ -17,9 +17,11 @@ def _fast_mode():
 
 def _seed_event(device_id, peer_name, event_type, preset_key=""):
     from src.host.fb_store import record_contact_event
+    # Phase 16: skip_sanitize for fake peer names (Alice/Bob/A/B/C)
     return record_contact_event(device_id, peer_name, event_type,
                                   preset_key=preset_key,
-                                  meta={"via": "test"})
+                                  meta={"via": "test"},
+                                  skip_sanitize=True)
 
 
 def _seed_l2_lead(name: str, *, extra_tags=None, extra_meta=None) -> str:

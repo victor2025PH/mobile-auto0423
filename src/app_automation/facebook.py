@@ -5800,6 +5800,13 @@ class FacebookAutomation(BaseAutomation):
         "…",
     )
 
+    # Phase 16: 截断标记 — Messenger preview 末尾常带 "更多" / "more" / "もっと見る"
+    # 表示原文被截断, peer_name 不会带这种.
+    _MESSENGER_TRUNCATION_MARKERS = (
+        "更多", "more", "もっと見る", "もっと",
+        "Mehr", "altro",  # de/it
+    )
+
     @staticmethod
     def _is_valid_peer_name(text: str) -> bool:
         """Phase 15 / 15.1: peer_name 多层 sanitize.
@@ -5842,6 +5849,12 @@ class FacebookAutomation(BaseAutomation):
         # 消息预览
         for hint in FacebookAutomation._MESSENGER_PREVIEW_HINTS:
             if hint in s:
+                return False
+        # Phase 16: 截断标记 (Messenger preview "... 更多" 等)
+        for marker in FacebookAutomation._MESSENGER_TRUNCATION_MARKERS:
+            # 只 ban 句末 / 包尾的截断标记, 不 ban 含 "more" 的真名 (罕见但
+            # 假设 Maro = 真名末位 "more" 实际不会出现; 保守只 ban 末尾匹配)
+            if s.endswith(marker) or s.endswith(" " + marker):
                 return False
         # 句尾标点
         if s[-1] in ".!?,。!?、,…":

@@ -17,6 +17,7 @@ def _seed_planned_event(device_id, peer_name, *,
                           line_id="along2026", line_account_id=1,
                           canonical_id="", original_device_id=""):
     from src.host.fb_store import record_contact_event
+    # Phase 16: skip_sanitize for fake peer names
     return record_contact_event(
         device_id, peer_name, "line_dispatch_planned",
         preset_key=f"line_pool:{line_account_id}",
@@ -24,7 +25,8 @@ def _seed_planned_event(device_id, peer_name, *,
               "dispatch_mode": "messenger_text",
               "message_template": f"LINE: {line_id}",
               "canonical_id": canonical_id,
-              "original_device_id": original_device_id or device_id})
+              "original_device_id": original_device_id or device_id},
+        skip_sanitize=True)
 
 
 class TestSimulatedDuration:

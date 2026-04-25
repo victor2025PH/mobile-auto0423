@@ -296,8 +296,10 @@ def _seed_l2_lead(name: str, *, age: str = "40s", gender: str = "female",
 
 def _seed_reply_event(device_id: str, peer_name: str, event_type: str):
     from src.host.fb_store import record_contact_event
+    # Phase 16: 测试 fixture 用 fake 名字 (Alice/Anonymous/U0..) 走 skip_sanitize
     return record_contact_event(device_id, peer_name, event_type,
-                                  meta={"via": "test"})
+                                  meta={"via": "test"},
+                                  skip_sanitize=True)
 
 
 class TestDispatcher:

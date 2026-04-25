@@ -55,6 +55,7 @@ def _seed_planned_event(device_id: str, peer_name: str, *,
                          canonical_id: str = "",
                          original_device_id: str = "") -> int:
     from src.host.fb_store import record_contact_event
+    # Phase 16: 测试 fake peer 名 (Alice/U0...) 走 skip_sanitize bypass
     return record_contact_event(
         device_id, peer_name, "line_dispatch_planned",
         preset_key=f"line_pool:{line_account_id}",
@@ -62,7 +63,8 @@ def _seed_planned_event(device_id: str, peer_name: str, *,
               "dispatch_mode": "messenger_text",
               "message_template": f"LINE: {line_id}",
               "canonical_id": canonical_id,
-              "original_device_id": original_device_id or device_id})
+              "original_device_id": original_device_id or device_id},
+        skip_sanitize=True)
 
 
 # ═══════════════════════════════════════════════════════════════════

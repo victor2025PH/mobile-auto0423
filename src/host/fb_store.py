@@ -695,22 +695,56 @@ VALID_CONTACT_EVENT_TYPES = frozenset({
 })
 
 
+# Phase 16 (2026-04-25): record_contact_event 入口 peer_name sanitize
+# 计数器 (轻量监控). 任何 caller bypass list 函数都会被本入口拦截.
+_PEER_NAME_REJECT_COUNTER = {"count": 0}
+
+
+def get_peer_name_reject_count() -> int:
+    """Phase 16 metrics: 返累计 peer_name reject 数 (用于诊断)."""
+    return int(_PEER_NAME_REJECT_COUNTER.get("count", 0) or 0)
+
+
+def reset_peer_name_reject_count() -> None:
+    """测试 / 运维 reset."""
+    _PEER_NAME_REJECT_COUNTER["count"] = 0
+
+
 def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
                          template_id: str = "",
                          preset_key: str = "",
-                         meta: Optional[Dict[str, Any]] = None) -> int:
+                         meta: Optional[Dict[str, Any]] = None,
+                         skip_sanitize: bool = False) -> int:
     """记录一条接触事件。
 
     ``event_type`` 不在 ``VALID_CONTACT_EVENT_TYPES`` 时会记 warn log 但仍然写入
     (允许 B 扩展新类型,但提醒可能拼写错误)。
 
-    ``meta`` 会被 JSON 序列化为 meta_json; 不强约束 schema, 允许放:
-      * ``reply_to_template_id`` (B 写 greeting_replied 时放)
-      * ``reply_ms_after`` (B 写 greeting_replied 时放, 对方回复距 greeting 发出的毫秒数)
-      * ``decision`` / ``lang_detected`` 等任意辅助字段
+    Phase 16 defense-in-depth: peer_name 进入 _is_valid_peer_name 校验
+    (UI 文本/消息预览/测试残留). 不合法 logger.warning + reject_count++ +
+    return 0 (不写入). ``skip_sanitize=True`` 仅供必要场景 (e.g. e2e 测试
+    seed 已知 fixture data) 显式 bypass; 默认 False 保护生产.
+
+    ``meta`` 会被 JSON 序列化为 meta_json.
     """
     if not device_id or not peer_name or not event_type:
         return 0
+    # Phase 16: peer_name sanitize (defense-in-depth)
+    if not skip_sanitize:
+        try:
+            from src.app_automation.facebook import FacebookAutomation
+            if not FacebookAutomation._is_valid_peer_name(peer_name):
+                _PEER_NAME_REJECT_COUNTER["count"] = \
+                    _PEER_NAME_REJECT_COUNTER.get("count", 0) + 1
+                logger.warning(
+                    "[fb_contact_events] reject invalid peer_name=%r"
+                    " event_type=%s device=%s (count=%d)",
+                    peer_name[:40], event_type, device_id[:12],
+                    _PEER_NAME_REJECT_COUNTER["count"])
+                return 0
+        except Exception:
+            # sanitize 异常不阻塞 caller (保守放行)
+            pass
     if event_type not in VALID_CONTACT_EVENT_TYPES:
         logger.warning("[fb_contact_events] 未知 event_type=%s, 仍写入但请检查拼写", event_type)
     meta_str = ""

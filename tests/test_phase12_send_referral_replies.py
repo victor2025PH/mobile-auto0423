@@ -50,6 +50,7 @@ def _seed_planned_event(device_id: str, peer_name: str, *,
             "canonical_id": canonical_id,
             "original_device_id": original_device_id or device_id,
         },
+        skip_sanitize=True,  # Phase 16: 测试 fake peer 名 bypass
     )
 
 

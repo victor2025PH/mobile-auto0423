@@ -49,8 +49,10 @@ def _seed_l2_lead(name: str, *, persona: str = "jp_female_midlife",
 
 def _seed_reply_event(device_id, peer_name, event_type="greeting_replied"):
     from src.host.fb_store import record_contact_event
+    # Phase 16: skip_sanitize for fake peer names in tests
     return record_contact_event(device_id, peer_name, event_type,
-                                  meta={"via": "test"})
+                                  meta={"via": "test"},
+                                  skip_sanitize=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
