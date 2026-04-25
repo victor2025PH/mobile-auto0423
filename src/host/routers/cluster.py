@@ -1410,3 +1410,233 @@ def cluster_lock_list(worker_id: str = "", device_id: str = ""):
         "locks": locks,
         "metrics": svc.metrics(),
     }
+
+
+# ── L2 中央客户画像 API (worker → 主控 push, 主控统一查询) ─────────────
+
+
+def _safe_get_store():
+    """延迟加载 store (PG 不可达时不阻塞 import)."""
+    try:
+        from src.host.central_customer_store import get_store
+        return get_store()
+    except Exception as exc:
+        logger.exception("[central_store] init failed: %s", exc)
+        raise HTTPException(503, f"central store unavailable: {exc}")
+
+
+@router.post("/cluster/customers/upsert", dependencies=[Depends(verify_api_key)])
+def cluster_customers_upsert(body: dict):
+    """worker push 客户记录 (idempotent by canonical_source+id).
+
+    Body: {canonical_id, canonical_source, primary_name?, age_band?, gender?,
+           country?, interests?, ai_profile?, status?, worker_id?, device_id?}
+    Response: {customer_id}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    canonical_id = (body.get("canonical_id") or "").strip()
+    canonical_source = (body.get("canonical_source") or "").strip()
+    if not canonical_id or not canonical_source:
+        raise HTTPException(400, "canonical_id 和 canonical_source 必填")
+
+    store = _safe_get_store()
+    cid = store.upsert_customer(
+        canonical_id=canonical_id,
+        canonical_source=canonical_source,
+        primary_name=body.get("primary_name"),
+        age_band=body.get("age_band"),
+        gender=body.get("gender"),
+        country=body.get("country"),
+        interests=body.get("interests"),
+        ai_profile=body.get("ai_profile"),
+        status=body.get("status"),
+        worker_id=body.get("worker_id"),
+        device_id=body.get("device_id"),
+    )
+    return {"customer_id": cid}
+
+
+@router.post("/cluster/customers/{customer_id}/events/push",
+             dependencies=[Depends(verify_api_key)])
+def cluster_customers_event_push(customer_id: str, body: dict):
+    """worker push 业务事件.
+
+    Body: {event_type, worker_id, device_id?, meta?}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    event_type = (body.get("event_type") or "").strip()
+    worker_id = (body.get("worker_id") or "").strip()
+    if not event_type or not worker_id:
+        raise HTTPException(400, "event_type 和 worker_id 必填")
+
+    store = _safe_get_store()
+    eid = store.record_event(
+        customer_id=customer_id,
+        event_type=event_type,
+        worker_id=worker_id,
+        device_id=body.get("device_id"),
+        meta=body.get("meta"),
+    )
+    return {"event_id": eid}
+
+
+@router.post("/cluster/customers/{customer_id}/chats/push",
+             dependencies=[Depends(verify_api_key)])
+def cluster_customers_chat_push(customer_id: str, body: dict):
+    """worker push 聊天 msg.
+
+    Body: {channel, direction, content, content_lang?, ai_generated?,
+           template_id?, worker_id?, device_id?, meta?}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    channel = (body.get("channel") or "").strip()
+    direction = (body.get("direction") or "").strip()
+    content = body.get("content") or ""
+    if not channel or not direction or not content:
+        raise HTTPException(400, "channel / direction / content 必填")
+
+    store = _safe_get_store()
+    try:
+        cid = store.record_chat(
+            customer_id=customer_id, channel=channel, direction=direction,
+            content=content,
+            content_lang=body.get("content_lang"),
+            ai_generated=bool(body.get("ai_generated", False)),
+            template_id=body.get("template_id"),
+            worker_id=body.get("worker_id"),
+            device_id=body.get("device_id"),
+            meta=body.get("meta"),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"chat_id": cid}
+
+
+@router.post("/cluster/customers/{customer_id}/handoff/initiate",
+             dependencies=[Depends(verify_api_key)])
+def cluster_customers_handoff_initiate(customer_id: str, body: dict):
+    """worker 引流 handoff (例: messenger → line, 等人工接管).
+
+    Body: {from_stage, to_stage, initiating_worker_id, initiating_device_id?,
+           ai_summary?, meta?}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    from_stage = (body.get("from_stage") or "").strip()
+    to_stage = (body.get("to_stage") or "").strip()
+    iw = (body.get("initiating_worker_id") or "").strip()
+    if not from_stage or not to_stage or not iw:
+        raise HTTPException(400, "from_stage / to_stage / initiating_worker_id 必填")
+
+    store = _safe_get_store()
+    hid = store.initiate_handoff(
+        customer_id=customer_id,
+        from_stage=from_stage, to_stage=to_stage,
+        initiating_worker_id=iw,
+        initiating_device_id=body.get("initiating_device_id"),
+        ai_summary=body.get("ai_summary"),
+        meta=body.get("meta"),
+    )
+    return {"handoff_id": hid}
+
+
+@router.post("/cluster/customers/handoff/{handoff_id}/accept",
+             dependencies=[Depends(verify_api_key)])
+def cluster_handoff_accept(handoff_id: str, body: dict):
+    """L3 人工接管. body: {accepted_by_human}.
+
+    Idempotent: 已接管返回 {accepted: false} 表已被别人抢.
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    abh = (body.get("accepted_by_human") or "").strip()
+    if not abh:
+        raise HTTPException(400, "accepted_by_human 必填")
+
+    store = _safe_get_store()
+    ok = store.accept_handoff(handoff_id=handoff_id, accepted_by_human=abh)
+    return {"accepted": ok}
+
+
+@router.post("/cluster/customers/handoff/{handoff_id}/complete",
+             dependencies=[Depends(verify_api_key)])
+def cluster_handoff_complete(handoff_id: str, body: dict):
+    """完成 handoff. body: {outcome: 'converted'|'lost'|'timeout'}."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    outcome = (body.get("outcome") or "").strip()
+    if not outcome:
+        raise HTTPException(400, "outcome 必填")
+    store = _safe_get_store()
+    try:
+        ok = store.complete_handoff(handoff_id=handoff_id, outcome=outcome)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"completed": ok}
+
+
+@router.get("/cluster/customers", dependencies=[Depends(verify_api_key)])
+def cluster_customers_list(
+    status: str = "",
+    country: str = "",
+    worker_id: str = "",
+    limit: int = 100,
+    offset: int = 0,
+):
+    """L3 dashboard / 业务工具列表."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {
+        "customers": store.list_customers(
+            status=status or None,
+            country=country or None,
+            worker_id=worker_id or None,
+            limit=min(max(1, limit), 500),
+            offset=max(0, offset),
+        ),
+    }
+
+
+@router.get("/cluster/customers/{customer_id}",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_detail(customer_id: str,
+                             include_events: int = 50,
+                             include_chats: int = 100):
+    """L3 客户详情 (画像 + 事件 + 聊天 + handoffs)."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    cust = store.get_customer(
+        customer_id=customer_id,
+        include_events=min(max(0, include_events), 1000),
+        include_chats=min(max(0, include_chats), 1000),
+    )
+    if not cust:
+        raise HTTPException(404, "customer not found")
+    return cust
+
+
+@router.get("/cluster/customers/handoff/pending",
+            dependencies=[Depends(verify_api_key)])
+def cluster_handoff_pending(limit: int = 100):
+    """L3 人工接管面板: 待接管 handoff 列表."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {
+        "handoffs": store.list_pending_handoffs(limit=min(max(1, limit), 500)),
+    }
+
+
+@router.get("/cluster/customers/funnel/stats",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_funnel(days: int = 7):
+    """L3 dashboard 漏斗统计."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return store.funnel_stats(days=min(max(1, days), 90))
