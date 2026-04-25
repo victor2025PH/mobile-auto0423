@@ -5802,32 +5802,41 @@ class FacebookAutomation(BaseAutomation):
 
     @staticmethod
     def _is_valid_peer_name(text: str) -> bool:
-        """Phase 15: peer_name 多层 sanitize.
+        """Phase 15 / 15.1: peer_name 多层 sanitize.
 
-        过滤掉 Messenger UI 按钮文本 ("查看翻译"/"Mark as read"/...) 和
-        消息预览片段 ("Alice: hi..."), 保留真用户 display name.
+        过滤 Messenger UI 按钮文本 ("查看翻译" / "Reply") + 消息预览片段
+        ("Alice: hi...") + 测试残留 ("p0"/"Alice"/"Bob") + 全 emoji 串.
+        保留真用户 display name (中/日/英全名).
 
         过滤规则 (任一命中即 reject):
-          1. 空 / 纯空白
-          2. 长度 < 2 或 > 30 (UI 按钮通常 > 4 但日文姓名 2-15, 30 兜底)
-          3. 全数字 / 全标点 (不可能是名字)
-          4. 出现在 _MESSENGER_UI_TEXT_BLACKLIST (multi-locale)
-          5. 含 _MESSENGER_PREVIEW_HINTS (": " / "..." / "…") = 消息预览
-          6. 句尾标点 . ! ? , 。 ! ? , ・ (display name 通常不带)
-          7. 全是 ASCII 单词且开头大写跟随小写 (典型按钮 "Reply" / "More")
-             — 但允许 "John Smith" 这种空格分隔多词 (有空格 + 名字 pattern)
+          1. 空 / 长度 < 2 或 > 30
+          2. 全数字 / 全标点 / 全 emoji (Unicode So 类)
+          3. 出现在 _MESSENGER_UI_TEXT_BLACKLIST
+          4. 含 _MESSENGER_PREVIEW_HINTS (": " / "..." / "…")
+          5. 句尾标点 (display name 不带)
+          6. ASCII 单词首大写后小写 + 长度<=12 = 按钮启发式
+          7. (Phase 15.1) ASCII 短串 ≤ 4 字符且含数字 = 测试残留/编号 ban
+             (例 "p0"/"a1"/"X3"; 但放过 "alice"/"bob" 之类纯字母)
         """
         if not text:
             return False
         s = text.strip()
         if len(s) < 2 or len(s) > 30:
             return False
-        # 全数字 / 全标点 / 单字符 emoji
         if s.isdigit():
             return False
+        # 全 ASCII 标点 + 非汉字 (基本平面外字符也排) 视为不合法
         if all(not c.isalnum() and ord(c) < 0x4E00 for c in s):
             return False
-        # 黑名单 (lower 比较)
+        # Phase 15.1: 全 emoji (Unicode 类 So/Sk + ZWJ) ban
+        try:
+            import unicodedata as _ud
+            if all(_ud.category(c).startswith(("S",)) or c in "‍️"
+                   for c in s):
+                return False
+        except Exception:
+            pass
+        # 黑名单
         if s.lower() in FacebookAutomation._MESSENGER_UI_TEXT_BLACKLIST:
             return False
         # 消息预览
@@ -5837,13 +5846,15 @@ class FacebookAutomation(BaseAutomation):
         # 句尾标点
         if s[-1] in ".!?,。!?、,…":
             return False
-        # 单词 ASCII button 启发: 只 1 个英文单词 + 首字母大写 + 长度 <= 12
-        # (e.g. "Reply" "Send" "More" "Translate" 等)
+        # ASCII 单词按钮启发
         if (s.replace(" ", "").isascii()
                 and " " not in s
                 and len(s) <= 12
                 and s[0].isupper()
                 and s[1:].islower()):
+            return False
+        # Phase 15.1: ASCII 短串 (<=4) 且含数字 — 测试残留 (p0/p1/X3)
+        if len(s) <= 4 and s.isascii() and any(c.isdigit() for c in s):
             return False
         return True
 
@@ -6290,6 +6301,11 @@ class FacebookAutomation(BaseAutomation):
         """从 FB Friends 页 dump 当前可见好友请求。
 
         启发式:扫描页面所有 textView,查找带"X mutual friends"模式的卡片。
+
+        Phase 15.1 (2026-04-25): peer_name 走 _is_valid_peer_name 校验,
+        过滤 UI 文本 / 消息预览 / 测试残留 (与 _list_messenger_conversations
+        共享 sanitize 逻辑). cleanup 报告显示 add_friend_accepted 210 条脏行,
+        说明本 method 也漏过 UI 文本进入 contact_events.
         """
         items: List[Dict] = []
         try:
@@ -6300,19 +6316,24 @@ class FacebookAutomation(BaseAutomation):
             return items
         for el in elements:
             text = (el.text or "").strip()
-            if not text or len(text) < 2 or len(text) > 60:
-                continue
             if " mutual friend" in text.lower() or text.lower().endswith("mutual"):
                 import re as _re
                 m = _re.search(r"(\d+)\s+mutual", text.lower())
                 count = int(m.group(1)) if m else 0
+                # 抠 name 部分 (去掉 mutual 行 / 项目符号 / 多行)
+                name_part = text.split(" •")[0].split("\n")[0].strip()
+                # mutual line 提取的 name 部分单独 sanitize
+                if not FacebookAutomation._is_valid_peer_name(name_part):
+                    continue
                 items.append({
-                    "name": text.split(" •")[0].split("\n")[0],
+                    "name": name_part,
                     "mutual_friends": count,
                 })
                 if len(items) >= max_n:
                     break
             elif el.clickable and len(text.split()) <= 4:
+                if not FacebookAutomation._is_valid_peer_name(text):
+                    continue
                 items.append({"name": text, "mutual_friends": 0})
                 if len(items) >= max_n:
                     break

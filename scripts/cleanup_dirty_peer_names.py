@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--device", default=None,
                      help="只处理某 device_id (默认全部)")
     ap.add_argument("--limit", type=int, default=10000)
+    ap.add_argument("--since-days", type=int, default=0,
+                     help="Phase 15.1: 只处理近 N 天数据 (避免误删历史业务)")
     args = ap.parse_args()
 
     from src.app_automation.facebook import FacebookAutomation
@@ -56,10 +58,16 @@ def main():
     valid = FacebookAutomation._is_valid_peer_name
 
     sql = "SELECT id, device_id, peer_name, event_type, at FROM fb_contact_events"
+    where = []
     sql_args = []
     if args.device:
-        sql += " WHERE device_id = ?"
+        where.append("device_id = ?")
         sql_args.append(args.device)
+    if args.since_days > 0:
+        where.append("at >= datetime('now', ?)")
+        sql_args.append(f"-{int(args.since_days)} days")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY id ASC LIMIT ?"
     sql_args.append(args.limit)
 
@@ -78,6 +86,7 @@ def main():
 
     print(f"# Phase 15 cleanup — DB={os.environ.get('DB_PATH', '(default)')}")
     print(f"# device_filter={args.device or '(全部)'}")
+    print(f"# since_days={args.since_days or '(全历史)'}")
     print(f"# 扫描 limit={args.limit}, 找到脏行 {len(dirty_ids)} 条")
     print()
     print("by event_type:")
