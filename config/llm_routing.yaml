@@ -16,7 +16,7 @@ llm:
   primary:
     backend: ollama_central
     base_url: http://192.168.0.118:11434
-    model: qwen2.5:7b
+    model: qwen2.5:latest        # 主控实际加载的 7b 文本模型
     timeout: 30
     health_check_interval: 60
 
@@ -35,12 +35,17 @@ llm:
     recovery_check_interval: 120
 
   per_task_override:
+    # 主控 ollama 已加载: qwen2.5vl:7b / qwen2.5:latest / gemma4:latest /
+    # gemma4-uncensored:latest / nomic-embed-text:latest
     ai_greeting:
-      primary_model: qwen2.5:7b
+      primary_model: qwen2.5:latest             # 中文/日文 fast text
       fallback_model: claude-haiku-4-5-20251001
     handoff_summary:
-      primary_model: qwen2.5:14b
+      primary_model: qwen2.5:latest             # 当前没装 14b, 用 7b 占位
       fallback_model: claude-sonnet-4-6
     persona_classify:
-      primary_model: qwen2.5vl:7b
+      primary_model: qwen2.5vl:7b               # vision-language (现 L2 VLM)
+      fallback_model: claude-sonnet-4-6
+    handoff_uncensored:                          # 引流话术防过滤
+      primary_model: gemma4-uncensored:latest
       fallback_model: claude-sonnet-4-6
