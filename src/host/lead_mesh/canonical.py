@@ -498,6 +498,97 @@ def update_canonical_metadata(canonical_id: str,
         return False
 
 
+def remove_canonical_tags(canonical_id: str, tags: List[str]) -> bool:
+    """Phase 12.3: 从 leads_canonical.tags 里去掉指定 tag (不改 metadata).
+
+    和 update_canonical_metadata 的 tags 参数只加不减的语义互补.
+    """
+    if not canonical_id or not tags:
+        return False
+    strip = {t.strip() for t in tags if t and t.strip()}
+    if not strip:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT tags FROM leads_canonical WHERE canonical_id=?",
+                (canonical_id,),
+            ).fetchone()
+            if not row:
+                return False
+            existing = {t.strip() for t in
+                         (row["tags"] or "").split(",") if t.strip()}
+            remain = existing - strip
+            if remain == existing:
+                return False  # 没变化
+            conn.execute(
+                "UPDATE leads_canonical SET tags=?,"
+                " updated_at=datetime('now') WHERE canonical_id=?",
+                (",".join(sorted(remain)), canonical_id),
+            )
+            return True
+    except Exception as e:
+        logger.warning("[canonical] remove_tags 失败: %s", e)
+        return False
+
+
+def revive_referral(canonical_id: str) -> bool:
+    """Phase 12.3: 给"已死" peer 第二次机会 —
+      - 去 referral_dead tag
+      - 清 metadata.referral_dead_reason / at / peer_name
+      - 清 metadata.referral_fail_count_* (每种错误码的累计计数)
+
+    运营手动触发 (UI) 或 scheduled 任务 auto expire 触发. 已 revive 的
+    peer 再被 dispatcher 扫到可重新 plan → 用户再给一次机会.
+
+    返 True 表示确实执行了清理 (peer 原本有 referral_dead).
+    """
+    if not canonical_id:
+        return False
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json, tags FROM leads_canonical"
+                " WHERE canonical_id=?", (canonical_id,),
+            ).fetchone()
+            if not row:
+                return False
+            tags_set = {t.strip() for t in
+                         (row["tags"] or "").split(",") if t.strip()}
+            had_dead = "referral_dead" in tags_set
+            try:
+                meta = json.loads(row["metadata_json"] or "{}")
+            except Exception:
+                meta = {}
+            # 清 metadata 字段
+            dirty = False
+            for k in ("referral_dead_reason", "referral_dead_at",
+                       "referral_dead_peer_name"):
+                if meta.pop(k, None) is not None:
+                    dirty = True
+            # 清所有 referral_fail_count_<code>
+            for k in list(meta.keys()):
+                if k.startswith("referral_fail_count_"):
+                    meta.pop(k, None)
+                    dirty = True
+            # 去 tag
+            if had_dead:
+                tags_set.discard("referral_dead")
+            if dirty or had_dead:
+                conn.execute(
+                    "UPDATE leads_canonical SET metadata_json=?, tags=?,"
+                    " updated_at=datetime('now') WHERE canonical_id=?",
+                    (json.dumps(meta, ensure_ascii=False),
+                     ",".join(sorted(tags_set)),
+                     canonical_id),
+                )
+        return had_dead or dirty
+    except Exception as e:
+        logger.warning("[canonical] revive_referral 失败 cid=%s: %s",
+                         canonical_id[:12] if canonical_id else "", e)
+        return False
+
+
 def list_l2_verified_leads(
     *, age_band: Optional[str] = None,
     gender: Optional[str] = None,

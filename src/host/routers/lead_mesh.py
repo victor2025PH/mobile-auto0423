@@ -143,6 +143,29 @@ def api_list_l2_verified_leads(
     return {"count": len(rows), "results": rows}
 
 
+@router.post("/leads/{canonical_id}/revive-referral")
+def api_revive_referral(canonical_id: str):
+    """Phase 12.3: 给 peer 第二次机会 — 去 referral_dead tag + 清 fail counters.
+
+    运营在 UI 点"恢复"按钮触发. 或 scheduled task line_pool_recycle_dead_peers
+    按 dead_at 年龄自动调.
+    """
+    from src.host.lead_mesh import revive_referral
+    ok = revive_referral(canonical_id)
+    return {"ok": ok, "canonical_id": canonical_id}
+
+
+@router.post("/leads/{canonical_id}/untag")
+def api_untag(canonical_id: str, body: Dict[str, Any] = Body(...)):
+    """Phase 12.3 通用 untag: body {tags: [...]}. 返 {ok: bool}."""
+    from src.host.lead_mesh import remove_canonical_tags
+    tags = body.get("tags") or []
+    if not isinstance(tags, list):
+        raise HTTPException(400, "tags 必须是 list")
+    ok = remove_canonical_tags(canonical_id, tags)
+    return {"ok": ok, "canonical_id": canonical_id, "removed": tags}
+
+
 # 动态路径(path param) 必须在所有同前缀静态路径之后
 @router.get("/leads/{canonical_id}")
 def api_get_dossier(canonical_id: str, journey_limit: int = 100):

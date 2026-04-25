@@ -1029,6 +1029,13 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_campaign_run":
             return _run_facebook_campaign(fb, resolved, params)
 
+        # Phase 12.3 (2026-04-25): facebook_recycle_dead_peers
+        # 扫 canonical 含 referral_dead tag 且 referral_dead_at 早于 now - days,
+        # 去 tag + 清 counter → peer 再次可被 dispatcher plan.
+        # 前缀用 facebook_ 让 executor 路由把它送到 Facebook 分支 (函数本身不依赖 fb).
+        if task_type == "facebook_recycle_dead_peers":
+            return _line_pool_recycle_dead_peers(params)
+
         # Phase 11 (2026-04-25): fb_line_dispatch_from_reply
         # 扫近 N 小时 contact_events (greeting_replied/message_received) → 按
         # canonical.metadata (l2_verified / persona 匹配) 过滤 → allocate LINE
@@ -1046,6 +1053,68 @@ def _execute_facebook(manager, resolved, task_type, params):
     except Exception as e:
         logger.exception("Facebook 任务执行异常: %s", task_type)
         return False, f"{task_type} 异常: {e}", None
+
+
+def _line_pool_recycle_dead_peers(params: Dict[str, Any]) -> tuple:
+    """Phase 12.3 (2026-04-25): 把"死太久"的 referral_dead peer 自动复活.
+
+    扫所有带 referral_dead tag 的 canonical, metadata.referral_dead_at 早于
+    ``now - days`` 的 → revive_referral (去 tag + 清 counter). 给 peer
+    第二次机会 (FB 可能已经解开对该 peer 的发消息限制).
+
+    Params:
+      days: int = 7           # 多少天前标 dead 的才 recycle
+      dry_run: bool = False   # 只列, 不真做
+      limit: int = 500        # 每轮最多处理多少条 (防 DB 爆)
+    """
+    days = max(1, int(params.get("days", 7) or 7))
+    dry_run = bool(params.get("dry_run", False))
+    limit = max(1, min(int(params.get("limit", 500) or 500), 5000))
+
+    from src.host.lead_mesh import (list_l2_verified_leads,
+                                     revive_referral)
+    import datetime as _dt
+
+    # list_l2_verified_leads 只返 l2_verified 的; dead peers 大部分也是 L2 verified
+    # (因为只有 L2 过的才会被 dispatcher plan + 之后被标 dead). 这里
+    # include_tags=['referral_dead'] 精准定位, limit 放大一点.
+    cutoff = _dt.datetime.utcnow() - _dt.timedelta(days=days)
+
+    rows = list_l2_verified_leads(
+        include_tags=["referral_dead"], limit=limit,
+    )
+
+    revived_ids: List[str] = []
+    skipped_young: int = 0
+    for r in rows:
+        dead_at_iso = r.get("metadata", {}).get("referral_dead_at") or ""
+        if dead_at_iso:
+            try:
+                dead_dt = _dt.datetime.strptime(
+                    dead_at_iso, "%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                dead_dt = None
+            if dead_dt and dead_dt > cutoff:
+                # 还没到 days 天, skip
+                skipped_young += 1
+                continue
+        # 没 dead_at_iso (老数据) 或已够久 → revive
+        if dry_run:
+            revived_ids.append(r["canonical_id"])
+            continue
+        try:
+            if revive_referral(r["canonical_id"]):
+                revived_ids.append(r["canonical_id"])
+        except Exception as e:
+            logger.debug("[recycle] revive %s 失败: %s",
+                          r["canonical_id"][:12], e)
+
+    return True, "", {
+        "scanned": len(rows), "revived": len(revived_ids),
+        "skipped_young": skipped_young,
+        "revived_canonical_ids": revived_ids[:50],  # cap response size
+        "days_threshold": days, "dry_run": dry_run,
+    }
 
 
 def _fb_line_dispatch_from_reply(resolved: str,
@@ -1088,6 +1157,13 @@ def _fb_line_dispatch_from_reply(resolved: str,
         dispatch_mode = "messenger_text"
     event_type = (params.get("event_type")
                    or "line_dispatch_planned").strip()
+    # Phase 12.3: 通用 tags 过滤 (AND 包含 / NOT 排除)
+    include_tags = {t.strip() for t in (params.get("include_tags") or [])
+                     if isinstance(t, str) and t.strip()}
+    exclude_tags = {t.strip() for t in (params.get("exclude_tags") or [])
+                     if isinstance(t, str) and t.strip()}
+    # Phase 12.3: dry_run — 不 allocate 不写 log 不写 event, 只列候选
+    dry_run = bool(params.get("dry_run", False))
 
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     CONTACT_EVT_GREETING_REPLIED,
@@ -1186,6 +1262,13 @@ def _fb_line_dispatch_from_reply(resolved: str,
         if "referral_dead" in tags_set:
             filtered_out += 1
             continue
+        # Phase 12.3: 通用 include/exclude_tags 过滤
+        if include_tags and not include_tags.issubset(tags_set):
+            filtered_out += 1
+            continue
+        if exclude_tags and (exclude_tags & tags_set):
+            filtered_out += 1
+            continue
         try:
             if float(meta.get("l2_score", 0) or 0) < min_score:
                 filtered_out += 1
@@ -1196,18 +1279,40 @@ def _fb_line_dispatch_from_reply(resolved: str,
             filtered_out += 1
             continue
 
-        # 分配 LINE 账号
-        acc = _lp.allocate(
-            region=region or None,
-            persona_key=persona_key or None,
-            owner_device_id=device_id or None,
-            canonical_id=cid, peer_name=peer_name,
-            source_device_id=device_id, source_event_id=event_id,
-        )
-        if acc is None:
-            no_account += 1
-            seen_canonical.add(cid)
-            continue
+        # 分配 LINE 账号 — dry_run 模式只预览选中账号, 不更新 DB.
+        # NB: list_accounts 的 owner_device_id 是精确匹配, allocate 实际用
+        # "OR empty (通用池)" 语义. 预览时不过滤 owner, 再在 Python 层筛一次
+        # 保持与 allocate 行为一致.
+        if dry_run:
+            from src.host.line_pool import list_accounts as _lp_list
+            cand_all = _lp_list(
+                status="active", region=region or None,
+                persona_key=persona_key or None,
+                limit=20,
+            )
+            candidates = [
+                c for c in cand_all
+                if not device_id
+                    or c.get("owner_device_id", "") == ""
+                    or c.get("owner_device_id") == device_id
+            ]
+            if not candidates:
+                no_account += 1
+                seen_canonical.add(cid)
+                continue
+            acc = candidates[0]
+        else:
+            acc = _lp.allocate(
+                region=region or None,
+                persona_key=persona_key or None,
+                owner_device_id=device_id or None,
+                canonical_id=cid, peer_name=peer_name,
+                source_device_id=device_id, source_event_id=event_id,
+            )
+            if acc is None:
+                no_account += 1
+                seen_canonical.add(cid)
+                continue
 
         seen_canonical.add(cid)
 
@@ -1249,7 +1354,7 @@ def _fb_line_dispatch_from_reply(resolved: str,
         }
         dispatches.append(dispatch)
 
-        if write_ce and record_contact_event is not None:
+        if write_ce and record_contact_event is not None and not dry_run:
             try:
                 record_contact_event(
                     device_id or resolved, peer_name,
@@ -1272,6 +1377,7 @@ def _fb_line_dispatch_from_reply(resolved: str,
         "filtered_out": filtered_out,
         "no_account": no_account,
         "dispatches": dispatches,
+        "dry_run": dry_run,
     }
     return True, "", stats
 
@@ -1399,6 +1505,8 @@ def _fb_send_referral_replies(fb, resolved: str,
     max_retry = max(0, int(params.get("max_retry", 2) or 0))
     retry_iv = float(params.get("retry_interval_sec", 10) or 0)
     fallback_direct_send = bool(params.get("fallback_line_direct_send", True))
+    # Phase 12.3: dry_run — 不真发, 只列 matched planned events + 会发什么 template.
+    dry_run = bool(params.get("dry_run", False))
 
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     record_contact_event,
@@ -1485,6 +1593,20 @@ def _fb_send_referral_replies(fb, resolved: str,
 
         # Phase 12.0.1 in-task retry: 瞬时错误 retry 最多 max_retry 次,
         # 永久错误立即 failed. raise_on_error=True 拿到 MessengerError.code.
+        # Phase 12.3 dry_run: 不调 fb.send_message, 只记"会发" 不实发, 不 mark outcome
+        if dry_run:
+            outcomes.append({
+                "peer_name": peer_name, "line_account_id": line_account_id,
+                "line_id": meta.get("line_id"),
+                "planned_event_id": ev.get("id"),
+                "sent": None, "err_code": "dry_run",
+                "note": "dry_run_would_send",
+                "effective_mode": effective_mode,
+                "would_send_template": message_template,
+            })
+            processed_count += 1
+            continue
+
         ok = False
         err_note = ""
         err_code = ""
@@ -1604,6 +1726,7 @@ def _fb_send_referral_replies(fb, resolved: str,
         "skipped_device": skipped_device,
         "skipped_mode": skipped_mode,
         "outcomes": outcomes,
+        "dry_run": dry_run,
     }
     return True, "", stats
 

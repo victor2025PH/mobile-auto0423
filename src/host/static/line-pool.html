@@ -135,6 +135,23 @@
     </table>
   </div>
 
+  <!-- ── 已死 peers (referral_dead) ── Phase 12.3 -->
+  <div class="panel">
+    <h2>已死 peers (referral_dead) — 点"恢复"给第二次机会</h2>
+    <div class="row" style="margin-bottom:6px">
+      <button class="sec" onclick="reloadDeadPeers()">刷新</button>
+      <span class="muted" id="dead_count_label">—</span>
+    </div>
+    <table>
+      <thead><tr>
+        <th>canonical</th><th>peer</th><th>platform</th>
+        <th>dead_reason</th><th>dead_at</th>
+        <th>fail counts</th><th></th>
+      </tr></thead>
+      <tbody id="dead_tbl"></tbody>
+    </table>
+  </div>
+
   <!-- ── 最近分发日志 ── -->
   <div class="panel">
     <h2>最近分发日志 (dispatch_log)</h2>
@@ -210,9 +227,7 @@ function render(rows) {
       <td class="muted">${r.last_used_at || "—"}</td>
       <td class="muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${escapeHtml(r.notes || "")}</td>
       <td>
-        <button class="sec" onclick="onToggle(${r.id}, '${r.status}')">
-          ${r.status === "active" ? "停用" : "启用"}
-        </button>
+        ${btnForStatus(r.id, r.status)}
         <button class="danger" onclick="onDelete(${r.id})">删</button>
       </td>
     `;
@@ -225,6 +240,20 @@ function render(rows) {
 function escapeHtml(s) {
   return String(s || "").replace(/[&<>"']/g,
     c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// Phase 12.3: 按当前 status 返回合适的 toggle 按钮 HTML.
+//   active   → "停用"  (toggle -> disabled)
+//   cooldown → "恢复"  (toggle -> active, 一键解封)
+//   disabled → "启用"  (toggle -> active)
+//   banned   → "启用"  (operator 确认后才给 active)
+function btnForStatus(id, status) {
+  const toActive = (status === "cooldown" || status === "disabled" || status === "banned");
+  const label = status === "active" ? "停用"
+              : status === "cooldown" ? "恢复"
+              : "启用";
+  const next = toActive ? "active" : "disabled";
+  return `<button class="sec" onclick="onSetStatus(${id}, '${next}')">${label}</button>`;
 }
 
 async function onAdd() {
@@ -247,8 +276,7 @@ async function onAdd() {
   } catch (e) { alert(e.message); }
 }
 
-async function onToggle(id, cur) {
-  const next = cur === "active" ? "disabled" : "active";
+async function onSetStatus(id, next) {
   try {
     await api(`/line-pool/${id}`, {method: "PUT",
       body: JSON.stringify({status: next})});
@@ -312,8 +340,50 @@ async function reloadLog() {
   } catch (e) { alert(e.message); }
 }
 
+// Phase 12.3: dead peers (referral_dead) 管理
+async function reloadDeadPeers() {
+  try {
+    const data = await api("/lead-mesh/leads/l2-verified?include_tags=referral_dead&limit=200");
+    const body = $("dead_tbl");
+    body.innerHTML = "";
+    const rows = data.results || [];
+    $("dead_count_label").textContent = `共 ${rows.length} 条`;
+    for (const r of rows) {
+      const meta = r.metadata || {};
+      // fail counts 汇总: metadata 里 referral_fail_count_* 字段
+      const failCounts = Object.keys(meta)
+        .filter(k => k.startsWith("referral_fail_count_"))
+        .map(k => `${k.replace("referral_fail_count_","")}:${meta[k]}`)
+        .join(", ");
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="muted" style="font-family:ui-monospace">${escapeHtml(r.canonical_id.slice(0,12))}</td>
+        <td>${escapeHtml(r.display_name)}</td>
+        <td class="muted">${escapeHtml(r.platform)}</td>
+        <td><span class="pill banned">${escapeHtml(meta.referral_dead_reason || "?")}</span></td>
+        <td class="muted" style="font-size:11px">${escapeHtml(meta.referral_dead_at || "")}</td>
+        <td class="muted" style="font-size:11px">${escapeHtml(failCounts)}</td>
+        <td><button class="sec" onclick="onRevive('${r.canonical_id}')">恢复</button></td>
+      `;
+      body.appendChild(tr);
+    }
+  } catch (e) { alert(e.message); }
+}
+
+async function onRevive(cid) {
+  if (!confirm("确认把 " + cid.slice(0,12) + " 从 referral_dead 恢复?\n" +
+                "(dispatcher 下次会重新评估这个 peer)")) return;
+  try {
+    const r = await api(`/lead-mesh/leads/${cid}/revive-referral`,
+                         {method: "POST"});
+    if (!r.ok) alert("未恢复: 目标可能不存在或本来就不是 dead");
+    await reloadDeadPeers();
+  } catch (e) { alert(e.message); }
+}
+
 reload();
 reloadLog();
+reloadDeadPeers();
 </script>
 </body>
 </html>
