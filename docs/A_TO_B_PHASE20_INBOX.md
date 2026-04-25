@@ -224,3 +224,55 @@ B 实装中有问题:
 ### B 不受影响
 20.1.7 全在 A 侧实现, B 侧 spec (本文档 §3) 不变, 只要 B 按 §3 返 conversations
 即可享受新功能.
+
+---
+
+## 9. Phase 20.3 (2026-04-25): Mock B Messenger 联调脚手架
+
+A 侧已经放好一套 `FakeBMessenger` 在 `tests/_fakes.py`, 可让 A 侧无需 B 实装就能
+e2e 测试整个 referral 闭环. B 侧实施时**强烈建议**反向参考这套 mock — 它的接口
+即是 §3 spec 的实装版本.
+
+### 9.1 fake 接口契约 (一字不差对应 §3)
+
+```python
+class FakeBMessenger:
+    def check_messenger_inbox(
+        self, *,
+        auto_reply: bool = False,
+        referral_mode: bool = False,
+        peers_filter: Optional[List[str]] = None,
+        max_messages_per_peer: int = 5,
+        device_id: str = "",
+        max_conversations: int = 20,
+        **kwargs) -> Dict[str, Any]:
+        # referral_mode=False → {"messenger_active": True}
+        # referral_mode=True → {"messenger_active": True, "conversations": [...]}
+        # 每条 conversation = {peer_name, last_inbound_text, last_inbound_time, conv_id}
+```
+
+B 实装时**必须接受**这些 kwargs (即便不用), 否则 `_fb_check_referral_replies`
+会捕到 TypeError 并报错 "B 侧 check_messenger_inbox 还没支持 referral_mode 参数".
+
+### 9.2 端到端联调步骤
+
+A 侧已经有 `tests/test_phase20_3_e2e_full_loop.py` 跑通 6 个场景 (12 cases):
+
+| 场景 | 验证 |
+|---|---|
+| 1. 部分回复 | 5 sent / 3 replied → conv_rate 0.6 / 沉默 peer 仍在 pending |
+| 2. 多 region | jp `友達追加` + it `aggiungi` 各自走对应关键词组 |
+| 3. latency 分布 | 不同 sent age → avg/median 计算正确 |
+| 4. stale → revive | mark stale → reply 自动移除 stale tag |
+| 5. daily summary | 跑完整链路, 验 funnel/by_region/reply_latency 全字段 |
+| 6. 大量 stale | 触发 replied_rate_low + stale_rate_high alert |
+
+B 实装后: 把 `FakeBMessenger` 替换为真的 `FacebookAutomation` 实例, 跑同样
+场景应得到相同结果. 任一场景 fail 说明 B 实装与 §3 spec 偏离.
+
+### 9.3 B 侧的反向 mock
+
+B 侧应该写**自己的** mock — `FakeFbContactStore`, 模拟 A 侧 record_contact_event /
+get_pending_referral_peers / mark_stale_referrals 的行为, 用于测试 B 侧
+check_messenger_inbox 实装. 这样 A/B 双方都有独立 e2e 测试, 联调时只是
+"换实装", 不应再发现接口分歧.
