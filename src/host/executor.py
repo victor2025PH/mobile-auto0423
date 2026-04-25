@@ -1719,6 +1719,26 @@ def _fb_send_referral_replies(fb, resolved: str,
             "became_dead": became_dead,
         })
 
+    # Phase 12.6: simulated_duration_ms 估算真跑预计耗时 (dry_run 也算, 给
+    # 运营直观感受 "启用后每轮要多久"). 估算:
+    #   (would_send - 1) * avg_interval_sec * 1000 ← rate-limit sleep
+    #   + would_send * estimated_send_ms            ← 每条 send 估 8s 平均
+    # 注: retry 开销省略 (transient 错误概率低, 估算偏保守下界).
+    would_send_n = (sent + failed
+                     if not dry_run
+                     else sum(1 for o in outcomes
+                               if o.get("err_code") == "dry_run"))
+    avg_iv = (min_iv + max_iv) / 2.0
+    # estimated_send_ms 允许 caller 覆盖 (真机测后调)
+    est_send_ms = int(params.get("estimated_send_ms", 8000) or 8000)
+    if would_send_n > 0:
+        sim_ms = int(max(0, would_send_n - 1) * avg_iv * 1000
+                      + would_send_n * est_send_ms)
+    else:
+        sim_ms = 0
+    m, s = divmod(sim_ms // 1000, 60)
+    sim_human = f"约 {m} 分 {s} 秒" if m else f"约 {s} 秒"
+
     stats = {
         "scanned": len(events),
         "sent": sent,
@@ -1728,6 +1748,8 @@ def _fb_send_referral_replies(fb, resolved: str,
         "skipped_mode": skipped_mode,
         "outcomes": outcomes,
         "dry_run": dry_run,
+        "simulated_duration_ms": sim_ms,
+        "simulated_duration_human": sim_human,
     }
     return True, "", stats
 

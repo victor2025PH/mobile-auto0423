@@ -159,6 +159,7 @@
         <input id="q_owner" placeholder="" style="width:160px">
       </div>
       <button class="sec" onclick="reload()">刷新</button>
+      <button class="sec" onclick="exportPoolCsv()">⬇ CSV</button>
       <span class="muted flex-1" style="text-align:right"
             id="count_label">—</span>
     </div>
@@ -178,9 +179,10 @@
     <h2>已死 peers (referral_dead) — 点"恢复"给第二次机会</h2>
     <div class="row" style="margin-bottom:6px">
       <button class="sec" onclick="reloadDeadPeers()">刷新</button>
-      <button class="sec" onclick="prevDeadPage()">‹ 上一页</button>
-      <button class="sec" onclick="nextDeadPage()">下一页 ›</button>
-      <button class="danger" onclick="onReviveAllOnPage()">⤴ 复活当前页全部</button>
+      <button class="sec" id="btn_dead_prev" onclick="prevDeadPage()">‹ 上一页</button>
+      <button class="sec" id="btn_dead_next" onclick="nextDeadPage()">下一页 ›</button>
+      <button class="danger" id="btn_revive_all" onclick="onReviveAllOnPage()">⤴ 复活当前页全部</button>
+      <button class="sec" onclick="exportDeadCsv()">⬇ CSV</button>
       <span class="muted" id="dead_count_label">—</span>
     </div>
     <table>
@@ -198,6 +200,7 @@
     <h2>最近分发日志 (dispatch_log)</h2>
     <div class="row" style="margin-bottom:6px">
       <button class="sec" onclick="reloadLog()">刷新日志</button>
+      <button class="sec" onclick="exportLogCsv()">⬇ CSV</button>
     </div>
     <table>
       <thead><tr>
@@ -221,6 +224,99 @@ function $(id) { return document.getElementById(id); }
 function setLoading(tbodyId, colspan = 6) {
   const tb = $(tbodyId);
   if (tb) tb.innerHTML = `<tr><td colspan="${colspan}" class="muted" style="text-align:center;padding:12px">⏳ 加载中...</td></tr>`;
+}
+
+// Phase 12.6: 按钮 disable 状态 (防连点)
+function setBtnBusy(id, busy, busyLabel = "处理中...") {
+  const b = $(id);
+  if (!b) return;
+  if (busy) {
+    b.dataset._origLabel = b.textContent;
+    b.textContent = busyLabel;
+    b.disabled = true;
+  } else {
+    if (b.dataset._origLabel) b.textContent = b.dataset._origLabel;
+    b.disabled = false;
+  }
+}
+
+// Phase 12.6: CSV 导出辅助. UTF-8 BOM 防 Excel 乱码.
+function _csvEscape(v) {
+  if (v == null) return "";
+  const s = String(v);
+  if (s.includes(",") || s.includes("\"") || s.includes("\n")) {
+    return "\"" + s.replace(/"/g, "\"\"") + "\"";
+  }
+  return s;
+}
+
+function downloadCsv(filename, headers, rows) {
+  const BOM = "﻿";  // UTF-8 BOM
+  const lines = [headers.map(_csvEscape).join(",")];
+  for (const r of rows) {
+    lines.push(headers.map(h => _csvEscape(r[h])).join(","));
+  }
+  const blob = new Blob([BOM + lines.join("\n")], {type: "text/csv"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function _ts() {
+  const d = new Date();
+  return d.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+}
+
+async function exportPoolCsv() {
+  try {
+    const data = await api("/line-pool?limit=2000&includes_24h_stats=true");
+    const headers = ["id", "line_id", "region", "persona_key",
+                      "owner_device_id", "status", "daily_cap",
+                      "used_24h", "times_used", "last_used_at", "notes",
+                      "created_at", "updated_at"];
+    downloadCsv(`line_pool_${_ts()}.csv`, headers, data.results || []);
+  } catch (e) { alert(e.message); }
+}
+
+async function exportLogCsv() {
+  try {
+    const data = await api("/line-pool/dispatch-log?limit=2000");
+    const headers = ["id", "created_at", "line_account_id", "line_id",
+                      "canonical_id", "peer_name", "source_device_id",
+                      "source_event_id", "status", "note"];
+    downloadCsv(`dispatch_log_${_ts()}.csv`, headers, data.results || []);
+  } catch (e) { alert(e.message); }
+}
+
+async function exportDeadCsv() {
+  try {
+    const data = await api(
+      "/lead-mesh/leads/l2-verified?include_tags=referral_dead&limit=2000");
+    // 扁平化 metadata 里关键字段
+    const rows = (data.results || []).map(r => ({
+      canonical_id: r.canonical_id,
+      display_name: r.display_name,
+      platform: r.platform,
+      dead_reason: (r.metadata || {}).referral_dead_reason,
+      dead_at: (r.metadata || {}).referral_dead_at,
+      age_band: (r.metadata || {}).age_band,
+      gender: (r.metadata || {}).gender,
+      l2_score: r.l2_score,
+      fail_counts: Object.keys(r.metadata || {})
+        .filter(k => k.startsWith("referral_fail_count_"))
+        .map(k => `${k.replace("referral_fail_count_","")}:${r.metadata[k]}`)
+        .join("|"),
+    }));
+    const headers = ["canonical_id", "display_name", "platform",
+                      "dead_reason", "dead_at", "age_band", "gender",
+                      "l2_score", "fail_counts"];
+    downloadCsv(`dead_peers_${_ts()}.csv`, headers, rows);
+  } catch (e) { alert(e.message); }
 }
 
 // Phase 12.5: Dry Run 表单 sticky 工具
@@ -447,13 +543,24 @@ async function reloadDeadPeers() {
     const rows = data.results || [];
     _currentDeadIds = rows.map(r => r.canonical_id);
     const total = data.total != null ? data.total : "?";
-    $("dead_count_label").textContent =
-      `本页 ${rows.length} / 共 ${total} 条 (offset=${offset})`;
-    // Phase 12.5: 大量 dead 时给 warning, 防止"全部复活"集中再失败
+    let label = `本页 ${rows.length} / 共 ${total} 条 (offset=${offset})`;
+    // Phase 12.5: 大量 dead 时给 warning
     if (typeof total === "number" && total > 50) {
-      $("dead_count_label").textContent +=
+      label +=
         " — 建议小批量复活 (一次性恢复 50+ 后 dispatcher 集中重试可能再 cooldown)";
     }
+    // Phase 12.6: 末尾提示 + 翻页按钮 disable
+    if ($("btn_dead_prev")) $("btn_dead_prev").disabled = (_deadPage === 0);
+    if ($("btn_dead_next")) {
+      const atEnd = (typeof total === "number"
+                      && offset + rows.length >= total);
+      $("btn_dead_next").disabled = atEnd;
+      if (atEnd && offset > 0) label += " · 已到末尾";
+    }
+    if ($("btn_revive_all")) {
+      $("btn_revive_all").disabled = (rows.length === 0);
+    }
+    $("dead_count_label").textContent = label;
     for (const r of rows) {
       const meta = r.metadata || {};
       // fail counts 汇总: metadata 里 referral_fail_count_* 字段
@@ -488,12 +595,13 @@ async function onRevive(cid) {
   } catch (e) { alert(e.message); }
 }
 
-// Phase 12.4: 批量复活当前页所有
+// Phase 12.4 + 12.6: 批量复活当前页所有
 async function onReviveAllOnPage() {
   if (_currentDeadIds.length === 0) {
     alert("当前页没有 dead peer"); return;
   }
   if (!confirm("确认把当前页 " + _currentDeadIds.length + " 个 dead peer 全部复活?")) return;
+  setBtnBusy("btn_revive_all", true, "⏳ 复活中...");
   try {
     const r = await api("/lead-mesh/leads/revive-referral-batch",
       {method: "POST",
@@ -501,13 +609,20 @@ async function onReviveAllOnPage() {
                               actor: "operator_ui_batch"})});
     alert(`已复活: ${r.revived} 条; 跳过: ${r.skipped} 条; 错误: ${(r.errors||[]).length}`);
     await reloadDeadPeers();
-  } catch (e) { alert(e.message); }
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    setBtnBusy("btn_revive_all", false);
+  }
 }
 
-// Phase 12.4: Dry Run 预览面板
+// Phase 12.4 + 12.6: Dry Run 预览面板
 async function onDryRun() {
   const dev = $("dr_device").value.trim();
   if (!dev) { alert("device_id 必填"); return; }
+  // Phase 12.6: 防连点
+  const btn = document.querySelector("button[onclick='onDryRun()']");
+  if (btn) { btn.disabled = true; btn.dataset._orig = btn.textContent; btn.textContent = "▶ 跑中..."; }
   const params = {
     hours_window: Number($("dr_hours").value) || 24,
     region: $("dr_region").value.trim() || null,
@@ -524,7 +639,13 @@ async function onDryRun() {
   try {
     stats1 = await _runTaskAndPoll("facebook_line_dispatch_from_reply",
                                      dev, params);
-  } catch (e) { alert("① 失败: " + e.message); $("dr_status").textContent = ""; return; }
+  } catch (e) {
+    alert("① 失败: " + e.message);
+    $("dr_status").textContent = "";
+    const b1 = document.querySelector("button[onclick='onDryRun()']");
+    if (b1) { b1.disabled = false; if (b1.dataset._orig) b1.textContent = b1.dataset._orig; }
+    return;
+  }
   // 渲染 ①
   const dispBody = $("dr_dispatch_tbl"); dispBody.innerHTML = "";
   for (const d of (stats1.dispatches || [])) {
@@ -550,7 +671,12 @@ async function onDryRun() {
       max_retry: 0, min_interval_sec: 0, max_interval_sec: 0,
       limit: params.limit,
     });
-  } catch (e) { alert("② 失败: " + e.message); return; }
+  } catch (e) {
+    alert("② 失败: " + e.message);
+    const b2 = document.querySelector("button[onclick='onDryRun()']");
+    if (b2) { b2.disabled = false; if (b2.dataset._orig) b2.textContent = b2.dataset._orig; }
+    return;
+  }
   const sendBody = $("dr_send_tbl"); sendBody.innerHTML = "";
   for (const o of (stats2.outcomes || [])) {
     const tr = document.createElement("tr");
@@ -563,7 +689,18 @@ async function onDryRun() {
     sendBody.appendChild(tr);
   }
   $("dr_send_block").style.display = "block";
-  $("dr_status").textContent = `① dispatched=${stats1.dispatched} ② would_send=${(stats2.outcomes||[]).filter(x=>x.err_code==='dry_run').length}/${stats2.scanned}`;
+  // Phase 12.6: 加上 simulated_duration_human 让运营看真跑耗时预估
+  const simH = stats2.simulated_duration_human || "?";
+  const simMs = stats2.simulated_duration_ms || 0;
+  $("dr_status").textContent =
+    `① dispatched=${stats1.dispatched} ② would_send=${(stats2.outcomes||[]).filter(x=>x.err_code==='dry_run').length}/${stats2.scanned}`
+    + ` · 真跑预计: ${simH} (${simMs}ms)`;
+  // 按钮恢复
+  const btn2 = document.querySelector("button[onclick='onDryRun()']");
+  if (btn2) {
+    btn2.disabled = false;
+    if (btn2.dataset._orig) btn2.textContent = btn2.dataset._orig;
+  }
 }
 
 async function _runTaskAndPoll(taskType, deviceId, params) {
