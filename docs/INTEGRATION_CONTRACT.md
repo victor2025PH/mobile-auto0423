@@ -420,6 +420,43 @@ App 操作时必须先拿 `messenger_active` 锁; A 的 `send_message` fallback 
 
 ---
 
+## 七点七之二、真机设备独占声明（2026-04-25 B 在 HANDOFF doc 建议）
+
+- `mobile-auto0423` 独占 historical Redmi 集群的全部 adb serial (实际 2026-04-25 在线 2 台 device + 2 台 unauthorized 待授权)
+- `telegram-mtproto-ai` 独占其 `config/config.yaml::messenger_rpa.accounts.*` 里声明的 serial (历史 `bg_phone_{1,2}`, victor 已搬本机 USB)
+- 两方 serial 清单**禁止交集**; victor2025PH 新增设备时在其中一方注册不两注册
+- **物理隔离** (A/B 各跑各的 device pool) 是 4 设备规模的首选 (见 [`COORDINATOR_SPEC.md §13`](COORDINATOR_SPEC.md))
+- 当扩到云手机 / 跨 repo 借用场景时, 走 Coordinator distributed lock (`messenger_active` 等 section)
+
+设备分配落地: `D:\workspace\coord-board\device_assignment.yaml` (sibling 重启后写, 见 `COORDINATOR_SPEC.md §13.2`)
+
+---
+
+## 七点七之三、跨 repo BI 去重契约（2026-04-25 B 在 HANDOFF doc §三-2 提议）
+
+跨 repo 转化漏斗 BI aggregate 用**双键 + 比例计算**, 不要单计或单键去重:
+
+| 事件 | 表 (owner) | 语义 |
+|---|---|---|
+| `wa_referral_replied` (`meta.platform="facebook"`) | A 的 `fb_contact_events` | "意向表达": peer 在 FB 回复 referral 关键词 (OK / 加 LINE / 友達追加) |
+| `first_text_received` | B 的 `journey_events` | "成交触达": peer 真到 LINE/TG 主动发首条 |
+
+**BI dashboard 跨表 aggregate 规则**:
+
+```
+转化率 = COUNT(first_text_received WHERE peer_canonical_id IN sent_referrals)
+       / COUNT(wa_referral_replied)
+```
+
+- **不要**单计任一事件作转化数
+- **不要**按 `peer_canonical_id` 单键去重把两个事件合并
+- 跨表 join 用 `(peer_canonical_id, source_platform)` **双键**, `source_platform` 取自各表的 `meta.platform` / `platform_tag`
+- 两者比例 = "回了 OK 但没真到 LINE" 的流失率, 比 raw funnel 更有业务价值
+
+B 的 `journey_events` 已有 `first_text_received / handoff_accepted / handoff_issued`, 加 `platform_tag` 字段对齐 A 的 `meta.platform` 枚举 (`facebook` / `line` / `telegram` / `messenger_rpa`).
+
+---
+
 ## 七点八、greeting 回复归因双写（2026-04-23 A 机 PR #6 review 补充）
 
 为让 Phase 5 的 `/facebook/greeting-reply-rate` 能按 template_id 算 A/B 回复率,
