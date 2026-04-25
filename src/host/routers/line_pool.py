@@ -48,6 +48,23 @@ def api_dispatch_log(limit: int = Query(default=100, ge=1, le=1000)):
     return {"results": lp.recent_dispatch_log(limit=limit)}
 
 
+@router.get("/stats/referral-funnel")
+def api_referral_funnel(hours_window: int = Query(default=168, ge=1, le=720),
+                          region: Optional[str] = Query(default=None),
+                          persona_key: Optional[str] = Query(default=None)):
+    """Phase 13: referral 闭环漏斗 4 层数字."""
+    return lp.referral_funnel(hours_window=hours_window,
+                                region=region, persona_key=persona_key)
+
+
+@router.get("/stats/account-ranking")
+def api_account_ranking(hours_window: int = Query(default=168, ge=1, le=720),
+                          limit: int = Query(default=50, ge=1, le=500)):
+    """Phase 13: per-LINE-account 成功率排名."""
+    return {"results": lp.account_ranking(hours_window=hours_window,
+                                             limit=limit)}
+
+
 @router.get("/{account_id}")
 def api_get_line_account(account_id: int):
     row = lp.get_by_id(account_id)

@@ -1165,6 +1165,24 @@ def _fb_line_dispatch_from_reply(resolved: str,
                      if isinstance(t, str) and t.strip()}
     # Phase 12.3: dry_run — 不 allocate 不写 log 不写 event, 只列候选
     dry_run = bool(params.get("dry_run", False))
+    # Phase 13: verbose_dry_run — 逐 event 诊断, stats.per_event_decisions
+    # 列每条 event 为何 dispatched / skipped
+    verbose_dry_run = bool(params.get("verbose_dry_run", False))
+    per_event_decisions: List[Dict[str, Any]] = []
+
+    def _rec_decision(ev_, reason_, extra_=None):
+        """Phase 13: 只在 verbose_dry_run=True 时追加决策记录."""
+        if not verbose_dry_run:
+            return
+        d = {
+            "event_id": ev_.get("id"),
+            "peer_name": ev_.get("peer_name"),
+            "event_type": ev_.get("event_type"),
+            "decision": reason_,
+        }
+        if extra_:
+            d.update(extra_)
+        per_event_decisions.append(d)
 
     from src.host.fb_store import (list_recent_contact_events_by_types,
                                     CONTACT_EVT_GREETING_REPLIED,
@@ -1205,6 +1223,7 @@ def _fb_line_dispatch_from_reply(resolved: str,
         event_id = str(ev.get("id") or "")
         if not peer_name:
             filtered_out += 1
+            _rec_decision(ev, "skipped_no_peer_name")
             continue
 
         try:
@@ -1214,10 +1233,13 @@ def _fb_line_dispatch_from_reply(resolved: str,
                 display_name=peer_name)
         except Exception:
             filtered_out += 1
+            _rec_decision(ev, "skipped_resolve_identity_fail")
             continue
 
         if cid in seen_canonical:
             filtered_out += 1
+            _rec_decision(ev, "skipped_seen_canonical_in_batch",
+                           {"canonical_id": cid})
             continue
 
         # 去重: dedupe_hours 内已有 line_dispatch_log 就跳
@@ -1232,6 +1254,8 @@ def _fb_line_dispatch_from_reply(resolved: str,
             if prev:
                 seen_canonical.add(cid)
                 filtered_out += 1
+                _rec_decision(ev, "skipped_dedupe_24h",
+                               {"canonical_id": cid})
                 continue
         except Exception:
             pass
@@ -1258,26 +1282,42 @@ def _fb_line_dispatch_from_reply(resolved: str,
 
         if require_l2 and "l2_verified" not in tags_set:
             filtered_out += 1
+            _rec_decision(ev, "skipped_not_l2_verified",
+                           {"canonical_id": cid, "tags": sorted(tags_set)})
             continue
         # Phase 12.2: peer 被标 referral_dead 跳过 (永久 fail 过, 再试浪费)
         if "referral_dead" in tags_set:
             filtered_out += 1
+            _rec_decision(ev, "skipped_referral_dead",
+                           {"canonical_id": cid,
+                            "dead_reason": meta.get("referral_dead_reason")})
             continue
         # Phase 12.3: 通用 include/exclude_tags 过滤
         if include_tags and not include_tags.issubset(tags_set):
             filtered_out += 1
+            _rec_decision(ev, "skipped_include_tags_miss",
+                           {"required": sorted(include_tags),
+                            "actual": sorted(tags_set)})
             continue
         if exclude_tags and (exclude_tags & tags_set):
             filtered_out += 1
+            _rec_decision(ev, "skipped_exclude_tags_hit",
+                           {"excluded_hit": sorted(exclude_tags & tags_set)})
             continue
         try:
             if float(meta.get("l2_score", 0) or 0) < min_score:
                 filtered_out += 1
+                _rec_decision(ev, "skipped_l2_score_below_min",
+                               {"score": meta.get("l2_score"),
+                                "min_score": min_score})
                 continue
         except (TypeError, ValueError):
             pass
         if persona_key and meta.get("l2_persona_key") != persona_key:
             filtered_out += 1
+            _rec_decision(ev, "skipped_persona_mismatch",
+                           {"lead_persona": meta.get("l2_persona_key"),
+                            "filter_persona": persona_key})
             continue
 
         # 分配 LINE 账号 — dry_run 模式只预览选中账号, 不更新 DB.
@@ -1300,6 +1340,9 @@ def _fb_line_dispatch_from_reply(resolved: str,
             if not candidates:
                 no_account += 1
                 seen_canonical.add(cid)
+                _rec_decision(ev, "skipped_no_account_dry",
+                               {"canonical_id": cid, "filter_region": region,
+                                "filter_persona": persona_key})
                 continue
             acc = candidates[0]
         else:
@@ -1313,6 +1356,9 @@ def _fb_line_dispatch_from_reply(resolved: str,
             if acc is None:
                 no_account += 1
                 seen_canonical.add(cid)
+                _rec_decision(ev, "skipped_no_account_allocate",
+                               {"canonical_id": cid,
+                                "reason": "no_match_or_all_capped"})
                 continue
 
         seen_canonical.add(cid)
@@ -1354,6 +1400,10 @@ def _fb_line_dispatch_from_reply(resolved: str,
             },
         }
         dispatches.append(dispatch)
+        _rec_decision(ev, "dispatched",
+                       {"canonical_id": cid,
+                        "line_account_id": acc["id"],
+                        "line_id": acc["line_id"]})
 
         if write_ce and record_contact_event is not None and not dry_run:
             try:
@@ -1380,6 +1430,8 @@ def _fb_line_dispatch_from_reply(resolved: str,
         "dispatches": dispatches,
         "dry_run": dry_run,
     }
+    if verbose_dry_run:
+        stats["per_event_decisions"] = per_event_decisions
     return True, "", stats
 
 

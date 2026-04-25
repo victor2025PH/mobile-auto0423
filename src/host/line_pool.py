@@ -485,6 +485,119 @@ def seed_from_config(config_path: Optional[str] = None,
     return result
 
 
+def referral_funnel(*, hours_window: int = 168,
+                      region: Optional[str] = None,
+                      persona_key: Optional[str] = None) -> Dict[str, Any]:
+    """Phase 13: referral 漏斗聚合 4 层统计.
+
+    planned    = line_dispatch_planned contact_events 独立 peer 数
+    sent       = wa_referral_sent contact_events 独立 peer 数
+    replied    = wa_referral_replied contact_events 独立 peer 数 (B 写, 当前应为 0)
+    conversion_rate = replied / sent
+    send_rate       = sent / planned
+
+    region/persona_key 精细过滤留 Phase 13.1 (当前 peer→canonical 反查成本高).
+    """
+    from src.host.fb_store import (list_recent_contact_events_by_types,
+                                    CONTACT_EVT_LINE_DISPATCH_PLANNED,
+                                    CONTACT_EVT_WA_REFERRAL_SENT)
+    CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"
+
+    planned_rows = list_recent_contact_events_by_types(
+        [CONTACT_EVT_LINE_DISPATCH_PLANNED],
+        hours=hours_window, limit=10000)
+    sent_rows = list_recent_contact_events_by_types(
+        [CONTACT_EVT_WA_REFERRAL_SENT],
+        hours=hours_window, limit=10000)
+    replied_rows = list_recent_contact_events_by_types(
+        [CONTACT_EVT_WA_REFERRAL_REPLIED],
+        hours=hours_window, limit=10000)
+    planned_peers = {r.get("peer_name") for r in planned_rows
+                      if r.get("peer_name")}
+    sent_peers = {r.get("peer_name") for r in sent_rows
+                    if r.get("peer_name")}
+    replied_peers = {r.get("peer_name") for r in replied_rows
+                       if r.get("peer_name")}
+
+    n_planned = len(planned_peers)
+    n_sent = len(sent_peers)
+    n_replied = len(replied_peers)
+    send_rate = (n_sent / n_planned) if n_planned else 0.0
+    conv_rate = (n_replied / n_sent) if n_sent else 0.0
+    return {
+        "hours_window": hours_window,
+        "planned": n_planned,
+        "sent": n_sent,
+        "replied": n_replied,
+        "send_rate": round(send_rate, 4),
+        "conversion_rate": round(conv_rate, 4),
+        "raw_events": {
+            "planned_events": len(planned_rows),
+            "sent_events": len(sent_rows),
+            "replied_events": len(replied_rows),
+        },
+        "region": region or "",
+        "persona_key": persona_key or "",
+    }
+
+
+def account_ranking(*, hours_window: int = 168,
+                      limit: int = 50) -> List[Dict[str, Any]]:
+    """Phase 13: per-LINE-account 引流表现排名.
+
+    按 success_rate = sent / (sent+failed) desc, 同 rate 按 total_dispatched desc.
+    排除 line_account_id=0 的 skipped-log (allocate 失败占位).
+    """
+    with _connect() as conn:
+        accounts = {
+            r["id"]: _row_to_dict(r)
+            for r in conn.execute("SELECT * FROM line_accounts").fetchall()
+        }
+        rows = conn.execute(
+            "SELECT line_account_id, status, COUNT(*) AS n"
+            " FROM line_dispatch_log"
+            " WHERE created_at >= datetime('now', ?)"
+            " GROUP BY line_account_id, status",
+            (f"-{int(hours_window)} hours",),
+        ).fetchall()
+
+    per_acc: Dict[int, Dict[str, int]] = {}
+    for r in rows:
+        aid = r["line_account_id"]
+        if aid not in per_acc:
+            per_acc[aid] = {"sent": 0, "failed": 0, "planned": 0,
+                             "skipped": 0}
+        per_acc[aid][r["status"]] = int(r["n"])
+
+    out: List[Dict[str, Any]] = []
+    for aid, stats in per_acc.items():
+        if aid == 0:
+            continue
+        acc = accounts.get(aid)
+        if not acc:
+            continue
+        sent = stats.get("sent", 0)
+        failed = stats.get("failed", 0)
+        planned = stats.get("planned", 0)
+        total = sent + failed
+        success_rate = (sent / total) if total else 0.0
+        out.append({
+            "line_account_id": aid,
+            "line_id": acc["line_id"],
+            "region": acc["region"],
+            "persona_key": acc["persona_key"],
+            "status": acc["status"],
+            "planned": planned,
+            "sent": sent,
+            "failed": failed,
+            "total_dispatched": total,
+            "success_rate": round(success_rate, 4),
+            "last_used_at": acc["last_used_at"],
+        })
+    out.sort(key=lambda x: (-x["success_rate"], -x["total_dispatched"]))
+    return out[:max(1, min(int(limit or 50), 500))]
+
+
 def recent_dispatch_log(limit: int = 100) -> List[Dict[str, Any]]:
     limit = max(1, min(int(limit or 100), 1000))
     with _connect() as conn:
