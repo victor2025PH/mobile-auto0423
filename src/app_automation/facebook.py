@@ -6090,6 +6090,17 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             log.debug("[inbox] 写库失败", exc_info=True)
+        # L2 中央客户画像双写 — 入站消息升级 status='in_messenger'
+        try:
+            from src.host.customer_sync_bridge import sync_messenger_incoming
+            sync_messenger_incoming(
+                did, conv["name"],
+                content=incoming_text or "",
+                content_lang=lang or None,
+                peer_type=peer_type,
+            )
+        except Exception:
+            pass
 
         # P7 §7.1 greeting_replied: 对方一 incoming 就尝试标记最近 7 天未回
         # 的 greeting 行 (P0 的 mark_greeting_replied_back 幂等, 已标则跳过)。
@@ -6407,6 +6418,19 @@ class FacebookAutomation(BaseAutomation):
             )
         except Exception:
             pass
+        # L2 双写 — AI 回复 / 模板回复 push 到中央
+        try:
+            from src.host.customer_sync_bridge import sync_messenger_outgoing
+            sync_messenger_outgoing(
+                did, peer_name,
+                content=reply,
+                ai_decision=decision,
+                ai_generated=(decision == "reply"),
+                content_lang=target_lang or detected_incoming_lang or None,
+                intent_tag=intent_tag,
+            )
+        except Exception:
+            pass
 
         # P0 2026-04-23: 跨 bot 归因 — 回写 replied_at
         #   1) 被 B 刚回复的最近一条 incoming 行
@@ -6434,6 +6458,18 @@ class FacebookAutomation(BaseAutomation):
                     "intent": intent_tag,  # P4 意图信号
                 },
             )
+            # L2 双写 — 引流话术发出 (不升级 status, 等真发起 handoff 才升)
+            try:
+                from src.host.customer_sync_bridge import sync_wa_referral_sent
+                sync_wa_referral_sent(
+                    did, peer_name,
+                    channel=_r_channel or "unknown",
+                    content=reply,
+                    content_lang=target_lang or detected_incoming_lang or None,
+                    intent_tag=intent_tag,
+                )
+            except Exception:
+                pass
 
         # P10b L3 结构化记忆 — LLM 抽取 extracted_facts 写 fb_contact_events。
         # 默认 config.enabled=False, 不激活则 zero cost (gate 首行就 skip,

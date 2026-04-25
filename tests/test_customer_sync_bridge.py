@@ -172,3 +172,174 @@ def test_record_event_exception_does_not_propagate(monkeypatch):
 
     cid = bridge.sync_friend_request_sent("d1", "Alice", status="sent")
     assert cid == "cust-x"
+
+
+# ── messenger 入站 ───────────────────────────────────────────────────
+def test_messenger_incoming_writes_event_chat_and_upgrades_status(mock_pc):
+    cid = bridge.sync_messenger_incoming(
+        "d1", "Alice",
+        content="こんにちは!",
+        peer_type="stranger",
+    )
+    assert cid == "cust-uuid-mocked"
+
+    upsert_kwargs = mock_pc.upsert_customer.call_args.kwargs
+    assert upsert_kwargs["status"] == "in_messenger"
+
+    evt_kwargs = mock_pc.record_event.call_args.kwargs
+    assert evt_kwargs["event_type"] == "message_received"
+    assert evt_kwargs["meta"]["peer_type"] == "stranger"
+
+    chat_kwargs = mock_pc.record_chat.call_args.kwargs
+    assert chat_kwargs["channel"] == "messenger"
+    assert chat_kwargs["direction"] == "incoming"
+    assert chat_kwargs["ai_generated"] is False
+
+
+def test_messenger_incoming_auto_lang_detect(mock_pc, monkeypatch):
+    """content_lang 不传时调 detect_language."""
+    monkeypatch.setattr(bridge, "_detect_lang_safe", lambda t: "ja")
+    bridge.sync_messenger_incoming("d1", "Alice", content="こんにちは")
+    chat_kwargs = mock_pc.record_chat.call_args.kwargs
+    assert chat_kwargs["content_lang"] == "ja"
+
+
+def test_messenger_incoming_explicit_lang_overrides_detect(mock_pc, monkeypatch):
+    """content_lang 显式传入时不调 detect_language."""
+    detect_called = []
+    monkeypatch.setattr(
+        bridge, "_detect_lang_safe",
+        lambda t: detect_called.append(t) or "WRONG",
+    )
+    bridge.sync_messenger_incoming(
+        "d1", "Alice", content="hi", content_lang="zh",
+    )
+    chat_kwargs = mock_pc.record_chat.call_args.kwargs
+    assert chat_kwargs["content_lang"] == "zh"
+    assert detect_called == []  # 显式 lang 走短路
+
+
+def test_messenger_incoming_empty_content_early_return(mock_pc):
+    assert bridge.sync_messenger_incoming("d1", "Alice", content="") is None
+    mock_pc.upsert_customer.assert_not_called()
+
+
+# ── messenger 出站 ───────────────────────────────────────────────────
+def test_messenger_outgoing_ai_reply_default_ai_generated_true(mock_pc):
+    cid = bridge.sync_messenger_outgoing(
+        "d1", "Alice",
+        content="今晩はカレーにする?",
+        ai_decision="reply",
+        intent_tag="invite_dinner",
+    )
+    assert cid == "cust-uuid-mocked"
+
+    upsert_kwargs = mock_pc.upsert_customer.call_args.kwargs
+    assert upsert_kwargs["status"] == "in_messenger"
+
+    evt_kwargs = mock_pc.record_event.call_args.kwargs
+    assert evt_kwargs["event_type"] == "messenger_message_sent"
+    assert evt_kwargs["meta"]["ai_decision"] == "reply"
+    assert evt_kwargs["meta"]["ai_generated"] is True
+    assert evt_kwargs["meta"]["intent_tag"] == "invite_dinner"
+
+    chat_kwargs = mock_pc.record_chat.call_args.kwargs
+    assert chat_kwargs["direction"] == "outgoing"
+    assert chat_kwargs["ai_generated"] is True
+
+
+def test_messenger_outgoing_template_path_ai_generated_false(mock_pc):
+    """模板/snippet 回复 ai_generated=False."""
+    bridge.sync_messenger_outgoing(
+        "d1", "Alice",
+        content="hi from template",
+        ai_decision="reply",
+        ai_generated=False,
+        template_id="jp:5",
+    )
+    chat_kwargs = mock_pc.record_chat.call_args.kwargs
+    assert chat_kwargs["ai_generated"] is False
+    assert chat_kwargs["template_id"] == "jp:5"
+
+
+# ── wa_referral ──────────────────────────────────────────────────────
+def test_wa_referral_does_not_upgrade_status(mock_pc):
+    """wa_referral 只记 event, 不升级 status (handoff_to_line 才升)."""
+    bridge.sync_wa_referral_sent(
+        "d1", "Alice",
+        channel="line",
+        content="加我 LINE: xxx",
+        intent_tag="referral_line",
+    )
+    upsert_kwargs = mock_pc.upsert_customer.call_args.kwargs
+    assert upsert_kwargs["status"] is None  # 不传 status
+
+    evt_kwargs = mock_pc.record_event.call_args.kwargs
+    assert evt_kwargs["event_type"] == "wa_referral_sent"
+    assert evt_kwargs["meta"]["channel"] == "line"
+    assert evt_kwargs["meta"]["intent_tag"] == "referral_line"
+
+    # 不写 chat (chat 已由 messenger_outgoing 写过)
+    mock_pc.record_chat.assert_not_called()
+
+
+# ── handoff_to_line ──────────────────────────────────────────────────
+def test_handoff_to_line_upgrades_status_and_calls_initiate(mock_pc, monkeypatch):
+    import src.host.central_push_client as _cp
+    monkeypatch.setattr(_cp, "initiate_handoff", lambda **kw: "ho-uuid-mocked")
+
+    hid = bridge.sync_handoff_to_line(
+        "d1", "Alice",
+        ai_summary="persona=hostess_jp | last_in: 加我LINE | last_out: 我的ID...",
+    )
+    assert hid == "ho-uuid-mocked"
+
+    upsert_kwargs = mock_pc.upsert_customer.call_args.kwargs
+    assert upsert_kwargs["status"] == "in_line"
+
+
+def test_handoff_to_line_empty_ai_summary_early_return(mock_pc):
+    """ai_summary 必填 — 没传不发起 handoff."""
+    assert bridge.sync_handoff_to_line("d1", "Alice", ai_summary="") is None
+    mock_pc.upsert_customer.assert_not_called()
+
+
+# ── build_simple_summary ─────────────────────────────────────────────
+def test_build_simple_summary_full_fields():
+    s = bridge.build_simple_summary(
+        persona_key="hostess_jp",
+        intent_tag="invite_line",
+        last_incoming="LINE 教えて",
+        last_outgoing="OK!",
+    )
+    assert "persona=hostess_jp" in s
+    assert "intent=invite_line" in s
+    assert "last_in: LINE 教えて" in s
+    assert "last_out: OK!" in s
+
+
+def test_build_simple_summary_truncates_snippet():
+    long_text = "x" * 500
+    s = bridge.build_simple_summary(last_incoming=long_text, max_snippet=80)
+    assert "x" * 80 in s
+    assert "x" * 81 not in s
+
+
+def test_build_simple_summary_empty_fields_returns_no_context():
+    assert bridge.build_simple_summary() == "(no context)"
+
+
+# ── lang_detect 故障静默 ─────────────────────────────────────────────
+def test_detect_lang_safe_returns_none_on_exception(monkeypatch):
+    """detect_language 抛异常时 _detect_lang_safe 静默返 None."""
+    import src.ai.lang_detect as _ld
+    monkeypatch.setattr(
+        _ld, "detect_language",
+        lambda t: (_ for _ in ()).throw(RuntimeError("oops")),
+    )
+    assert bridge._detect_lang_safe("any") is None
+
+
+def test_detect_lang_safe_empty_text_returns_none():
+    assert bridge._detect_lang_safe("") is None
+    assert bridge._detect_lang_safe(None) is None  # type: ignore
