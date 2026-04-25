@@ -89,3 +89,7 @@ scripts/vlm_eval_dataset/screenshots/*
 
 # Claude Code session state (scheduled_tasks.lock 等), 不入库
 .claude/
+
+# Debug screenshots from interactive sessions (root-level and subdirs)
+**/real_*.png
+**/screen_*.png

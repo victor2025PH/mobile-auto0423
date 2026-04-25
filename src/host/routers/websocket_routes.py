@@ -124,7 +124,7 @@ async def ws_group_control(ws: WebSocket):
             except Exception:
                 break
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async def _handle_messages():
         while True:

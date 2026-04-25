@@ -322,7 +322,7 @@ async def list_devices():
     from ..schemas import DeviceListItem
 
     manager = get_device_manager(_config_path)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, manager.discover_devices)
     pool = get_worker_pool()
     problem_map = {}
@@ -388,7 +388,7 @@ async def devices_list_meta():
     from src.device_control.device_manager import DeviceStatus, get_device_manager
 
     manager = get_device_manager(_config_path)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, manager.discover_devices)
     all_devs = manager.get_all_devices()
     n_connected = sum(1 for d in all_devs if d.status == DeviceStatus.CONNECTED)

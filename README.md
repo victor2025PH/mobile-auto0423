@@ -1,8 +1,12 @@
 # OpenClaw 手机集群自动化系统
 
+[![tests](https://github.com/victor2025PH/mobile-auto0423/actions/workflows/tests.yml/badge.svg)](https://github.com/victor2025PH/mobile-auto0423/actions/workflows/tests.yml)
+
 ## 项目简介
 
 基于 ADB + uiautomator2 的分布式手机集群管理与自动化平台。支持多 Worker 节点、24/7 无人值守运行、AI 驱动的智能操控。
+
+**相关仓库**: [`victor2025PH/telegram-mtproto-ai`](https://github.com/victor2025PH/telegram-mtproto-ai) — 配套的 contacts/handoff 跨平台主骨架（含 Telegram/LINE/Android Messenger RPA runner）。两 repo 代码独立，通过 contacts 子系统的 Messenger→LINE 引流主线业务衔接。详见 [`docs/INTEGRATION_CONTRACT.md §零`](docs/INTEGRATION_CONTRACT.md)。
 
 ## 版本: v1.1.0
 

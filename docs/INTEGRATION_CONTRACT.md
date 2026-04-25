@@ -3,6 +3,29 @@
 > 两台电脑，两个 Claude，一个 monorepo。
 > **本文件是唯一的真实边界定义，任何跨边界修改必须先 PR 改本文件再 PR 改代码。**
 
+## 零、边界声明 + 非本 repo 范围（防混淆）
+
+> **⚠ 2026-04-25 拓扑澄清更新**: 本 repo (`mobile-auto0423`) 全 A 写, B 不在本 repo 写代码 (B 在 `telegram-mtproto-ai` 自己的 repo 工作). 后续章节里出现的 "机器 B" / "B 独占" / "B 写" / "A+B 共用" / "B 不得修改" 等表述都是历史措辞 — **实际全 A 写**, 模块内分工 (greeting / inbox / lead_mesh / referral / 等) 仍有效但都是 A 内部模块边界, 不是跨 owner 边界.
+>
+> 跨 repo 协同 (4 接触面: `chat_messages.yaml` 文案口径 / event aggregate / 真机设备池 / Coordinator service) 详见 [`CROSS_REPO_TOPOLOGY.md`](CROSS_REPO_TOPOLOGY.md). 跨 repo 设备锁 + 注册中心 spec 见 [`COORDINATOR_SPEC.md`](COORDINATOR_SPEC.md).
+
+本 repo = **Facebook / Messenger 移动端自动化 bot**（greeting + messenger chat 全 A 模块）。下列内容**不属于本 repo**，去对应 repo 提需求：
+
+| 内容 | 实际归属 |
+|---|---|
+| contacts / handoff 跨平台 Contact / HandoffToken 子系统 | `github.com/victor2025PH/telegram-mtproto-ai` |
+| Telegram / LINE RPA runner | `telegram-mtproto-ai` |
+| **Android Messenger RPA runner**（adb + UIAutomator 驱动手机 Messenger App） | `telegram-mtproto-ai/src/integrations/messenger_rpa/` |
+| skill_manager / KB / trigger / 回复生成的主体 | `telegram-mtproto-ai` |
+
+**"Messenger"歧义说明**：
+- **本 repo 的 Messenger** = 通过 **FB App / Messenger App 的 UI 自动化**（`facebook.py::send_message` / `check_messenger_inbox` 等），走 mobile-auto0423 自己的 VLM Level 4 fallback 栈。
+- **telegram-mtproto-ai 的 Messenger** = 一个**完全独立的** Android RPA runner，走 adb + UIAutomator + combined_vision。
+
+两套实现**代码不共享、运行时互相独立**。只是通过 `contacts` 子系统在业务语义层衔接（Messenger→LINE 引流主线）。
+
+---
+
 ## 一、协同模型
 
 ```
@@ -397,6 +420,43 @@ App 操作时必须先拿 `messenger_active` 锁; A 的 `send_message` fallback 
 
 ---
 
+## 七点七之二、真机设备独占声明（2026-04-25 B 在 HANDOFF doc 建议）
+
+- `mobile-auto0423` 独占 historical Redmi 集群的全部 adb serial (实际 2026-04-25 在线 2 台 device + 2 台 unauthorized 待授权)
+- `telegram-mtproto-ai` 独占其 `config/config.yaml::messenger_rpa.accounts.*` 里声明的 serial (历史 `bg_phone_{1,2}`, victor 已搬本机 USB)
+- 两方 serial 清单**禁止交集**; victor2025PH 新增设备时在其中一方注册不两注册
+- **物理隔离** (A/B 各跑各的 device pool) 是 4 设备规模的首选 (见 [`COORDINATOR_SPEC.md §13`](COORDINATOR_SPEC.md))
+- 当扩到云手机 / 跨 repo 借用场景时, 走 Coordinator distributed lock (`messenger_active` 等 section)
+
+设备分配落地: `D:\workspace\coord-board\device_assignment.yaml` (sibling 重启后写, 见 `COORDINATOR_SPEC.md §13.2`)
+
+---
+
+## 七点七之三、跨 repo BI 去重契约（2026-04-25 B 在 HANDOFF doc §三-2 提议）
+
+跨 repo 转化漏斗 BI aggregate 用**双键 + 比例计算**, 不要单计或单键去重:
+
+| 事件 | 表 (owner) | 语义 |
+|---|---|---|
+| `wa_referral_replied` (`meta.platform="facebook"`) | A 的 `fb_contact_events` | "意向表达": peer 在 FB 回复 referral 关键词 (OK / 加 LINE / 友達追加) |
+| `first_text_received` | B 的 `journey_events` | "成交触达": peer 真到 LINE/TG 主动发首条 |
+
+**BI dashboard 跨表 aggregate 规则**:
+
+```
+转化率 = COUNT(first_text_received WHERE peer_canonical_id IN sent_referrals)
+       / COUNT(wa_referral_replied)
+```
+
+- **不要**单计任一事件作转化数
+- **不要**按 `peer_canonical_id` 单键去重把两个事件合并
+- 跨表 join 用 `(peer_canonical_id, source_platform)` **双键**, `source_platform` 取自各表的 `meta.platform` / `platform_tag`
+- 两者比例 = "回了 OK 但没真到 LINE" 的流失率, 比 raw funnel 更有业务价值
+
+B 的 `journey_events` 已有 `first_text_received / handoff_accepted / handoff_issued`, 加 `platform_tag` 字段对齐 A 的 `meta.platform` 枚举 (`facebook` / `line` / `telegram` / `messenger_rpa`).
+
+---
+
 ## 七点八、greeting 回复归因双写（2026-04-23 A 机 PR #6 review 补充）
 
 为让 Phase 5 的 `/facebook/greeting-reply-rate` 能按 template_id 算 A/B 回复率,
@@ -434,3 +494,7 @@ record_contact_event(
   MessengerError + chat_memory + chat_intent + referral_gate + stranger auto-reply
 - 2026-04-23 A review 回复 — A 新增契约: MessengerError 分流矩阵 (§7.6) +
   device_section_lock section 命名 (§7.7) + greeting 归因双写 (§7.8)
+- 2026-04-25 拓扑澄清 — victor2025PH 澄清 B 不在本 repo 写代码, 历史 "双 owner 同 repo"
+  叙述全错. §零 加边界声明. 跨 repo 协同 4 接触面移到 `CROSS_REPO_TOPOLOGY.md` (PR #81).
+  跨 repo Coordinator service 实施 spec 见 `COORDINATOR_SPEC.md` (PR #82).
+  PR #79 / #80 (基于错误前提) 已 close.

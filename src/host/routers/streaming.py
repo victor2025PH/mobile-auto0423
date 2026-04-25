@@ -296,7 +296,7 @@ async def stream_ws(websocket: WebSocket, device_id: str):
                 await websocket.send_bytes(frame)
             logger.info("[stream_ws] Replayed %d init frames to new client", len(replay_frames))
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         async def _read_controls():
             """Listen for control messages (binary or JSON) from browser."""
