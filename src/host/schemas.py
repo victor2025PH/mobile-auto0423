@@ -67,6 +67,8 @@ class TaskType(str, Enum):
     FACEBOOK_RECYCLE_DEAD_PEERS = "facebook_recycle_dead_peers"
     FACEBOOK_DAILY_REFERRAL_SUMMARY = "facebook_daily_referral_summary"
     FACEBOOK_ALERT_CHECK_HOURLY = "facebook_alert_check_hourly"
+    # Phase 20.1 (2026-04-25): B 侧 inbox 检测 referral 回复
+    FACEBOOK_CHECK_REFERRAL_REPLIES = "facebook_check_referral_replies"
     # Instagram
     INSTAGRAM_BROWSE_FEED = "instagram_browse_feed"
     INSTAGRAM_SEARCH_LEADS = "instagram_search_leads"

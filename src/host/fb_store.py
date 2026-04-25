@@ -680,6 +680,8 @@ CONTACT_EVT_MESSAGE_RECEIVED = "message_received"          # B 写,对方主动 
 CONTACT_EVT_WA_REFERRAL_SENT = "wa_referral_sent"          # B 写 (实发)
 # Phase 11 (2026-04-25): A 写 — dispatcher 计划层, B 按 meta.dispatch_mode 执行
 CONTACT_EVT_LINE_DISPATCH_PLANNED = "line_dispatch_planned"
+# Phase 20.1 (2026-04-25): B 写 — Messenger inbox 检测到 referral 反馈关键词
+CONTACT_EVT_WA_REFERRAL_REPLIED = "wa_referral_replied"
 
 VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_ADD_FRIEND_SENT,
@@ -692,6 +694,7 @@ VALID_CONTACT_EVENT_TYPES = frozenset({
     CONTACT_EVT_MESSAGE_RECEIVED,
     CONTACT_EVT_WA_REFERRAL_SENT,
     CONTACT_EVT_LINE_DISPATCH_PLANNED,
+    CONTACT_EVT_WA_REFERRAL_REPLIED,
 })
 
 
@@ -963,6 +966,71 @@ def list_contact_events_by_peer(device_id: str, peer_name: str,
             ).fetchall()
         return [dict(r) for r in rows]
     except Exception:
+        return []
+
+
+def get_pending_referral_peers(device_id: Optional[str] = None,
+                                  hours_back: int = 48,
+                                  limit: int = 200
+                                  ) -> List[Dict[str, Any]]:
+    """Phase 20.1 (2026-04-25): 待检 referral 反馈的 peer 列表.
+
+    返已发 ``wa_referral_sent`` 但 24-48h 内还没 ``wa_referral_replied``
+    的 peer (per device_id+peer_name 唯一). 给 B 侧 Messenger inbox 检测器
+    用作 ``peers_filter`` — 不必扫整个收件箱, 只看真有线索的对话.
+
+    时间窗口逻辑:
+      * 取最近 ``hours_back`` 小时的 wa_referral_sent 事件
+      * 排除已经写过 wa_referral_replied 的 (device_id, peer_name) 组合
+      * 按 sent_at DESC 排序 (最新 referral 优先回查)
+
+    返字段:
+      [{"device_id", "peer_name", "sent_at", "sent_event_id"}, ...]
+    """
+    if hours_back <= 0:
+        return []
+    sent_sql = (
+        "SELECT id AS sent_event_id, device_id, peer_name, at AS sent_at"
+        " FROM fb_contact_events"
+        " WHERE event_type=? AND at >= datetime('now', ?)")
+    params: list = [CONTACT_EVT_WA_REFERRAL_SENT, f"-{int(hours_back)} hours"]
+    if device_id:
+        sent_sql += " AND device_id=?"
+        params.append(device_id)
+    sent_sql += " ORDER BY at DESC LIMIT ?"
+    params.append(max(1, min(int(limit or 200), 2000)))
+
+    replied_sql = (
+        "SELECT DISTINCT device_id, peer_name FROM fb_contact_events"
+        " WHERE event_type=? AND at >= datetime('now', ?)")
+    rep_params: list = [CONTACT_EVT_WA_REFERRAL_REPLIED, f"-{int(hours_back)} hours"]
+    if device_id:
+        replied_sql += " AND device_id=?"
+        rep_params.append(device_id)
+
+    try:
+        with _connect() as conn:
+            conn.row_factory = __import__("sqlite3").Row
+            sent_rows = conn.execute(sent_sql, params).fetchall()
+            replied_rows = conn.execute(replied_sql, rep_params).fetchall()
+        replied_set = {(r["device_id"], r["peer_name"]) for r in replied_rows}
+        # de-dup by (device_id, peer_name) — 取最新 sent
+        seen = set()
+        out: List[Dict[str, Any]] = []
+        for r in sent_rows:
+            key = (r["device_id"], r["peer_name"])
+            if key in seen or key in replied_set:
+                continue
+            seen.add(key)
+            out.append({
+                "device_id": r["device_id"],
+                "peer_name": r["peer_name"],
+                "sent_at": r["sent_at"],
+                "sent_event_id": r["sent_event_id"],
+            })
+        return out
+    except Exception as e:
+        logger.debug("[get_pending_referral_peers] 失败: %s", e)
         return []
 
 

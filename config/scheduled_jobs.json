@@ -272,5 +272,18 @@
     },
     "enabled": false,
     "last_run": ""
+  },
+  {
+    "id": "check_referral_replies_15min",
+    "name": "Phase 20.1 Messenger inbox 找 referral 回复 (B 侧实装后启用)",
+    "cron": "*/15 * * * *",
+    "action": "facebook_check_referral_replies",
+    "params": {
+      "hours_back": 48,
+      "limit": 50,
+      "max_messages_per_peer": 5
+    },
+    "enabled": false,
+    "last_run": ""
   }
 ]

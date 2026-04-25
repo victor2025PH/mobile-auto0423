@@ -1059,6 +1059,12 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_alert_check_hourly":
             return _fb_alert_check_hourly(params)
 
+        # Phase 20.1 (2026-04-25): facebook_check_referral_replies
+        # 扫 wa_referral_sent 后 24-48h 内未 replied 的 peer, 走 B 侧 Messenger
+        # inbox 检测器, 命中关键词写 wa_referral_replied event.
+        if task_type == "facebook_check_referral_replies":
+            return _fb_check_referral_replies(fb, resolved, params)
+
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
     except Exception as e:
@@ -2307,6 +2313,195 @@ def _fb_send_referral_replies(fb, resolved: str,
         "simulated_duration_human": sim_human,
     }
     return True, "", stats
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 20.1 (2026-04-25): facebook_check_referral_replies
+# A 调度 + 关键词字典加载, 实际 UI 抓取由 B 侧 check_messenger_inbox
+# (referral_mode=True) 提供.
+# ═══════════════════════════════════════════════════════════════════════
+
+_REFERRAL_KEYWORDS_CACHE: Dict[str, Any] = {"loaded_at": 0.0, "data": None}
+_REFERRAL_KEYWORDS_TTL_SEC = 300  # 5 分钟
+
+
+def _load_referral_keywords(force: bool = False) -> Dict[str, List[str]]:
+    """读 config/referral_reply_keywords.yaml, 5min TTL 缓存.
+
+    返 dict: {region: [keyword, ...]}, 含 "default" 兜底组. 文件不存在或解析
+    失败返 {"default": []} (调用方应当 default 为 0 keyword → 全部不命中).
+    """
+    import time as _t
+    now = _t.time()
+    if (not force and _REFERRAL_KEYWORDS_CACHE["data"] is not None
+            and (now - _REFERRAL_KEYWORDS_CACHE["loaded_at"])
+            < _REFERRAL_KEYWORDS_TTL_SEC):
+        return _REFERRAL_KEYWORDS_CACHE["data"]
+    from pathlib import Path as _Path
+    out: Dict[str, List[str]] = {"default": []}
+    try:
+        import yaml as _yaml
+        # 项目根: src/host/executor.py → ../..
+        here = _Path(__file__).resolve().parent.parent.parent
+        ypath = here / "config" / "referral_reply_keywords.yaml"
+        if ypath.exists():
+            with ypath.open(encoding="utf-8") as f:
+                data = _yaml.safe_load(f) or {}
+            if isinstance(data, dict):
+                for region, words in data.items():
+                    if isinstance(words, list):
+                        out[str(region).lower()] = [
+                            str(w).strip().lower()
+                            for w in words if str(w).strip()]
+    except Exception as e:
+        logger.warning("[referral_keywords] load 失败: %s", e)
+    _REFERRAL_KEYWORDS_CACHE["data"] = out
+    _REFERRAL_KEYWORDS_CACHE["loaded_at"] = now
+    return out
+
+
+def _match_referral_keyword(text: str, region: str = "") -> str:
+    """在 text 中找首个匹配的关键词 (lowercased substring 匹配).
+
+    region 优先级: <region> > default. 匹配返关键词字符串, 不匹配返 ""."""
+    if not text:
+        return ""
+    txt = text.lower()
+    kws_map = _load_referral_keywords()
+    pools: List[List[str]] = []
+    if region:
+        pool = kws_map.get(region.lower())
+        if pool:
+            pools.append(pool)
+    pools.append(kws_map.get("default", []))
+    for pool in pools:
+        for kw in pool:
+            if kw and kw in txt:
+                return kw
+    return ""
+
+
+def _fb_check_referral_replies(fb, resolved: str,
+                                  params: Dict[str, Any]) -> tuple:
+    """Phase 20.1 (2026-04-25): 扫 Messenger inbox 找 referral 关键词反馈.
+
+    A 侧调度逻辑 (本函数):
+      1. 拉 pending peers (wa_referral_sent 后 N 小时内未 replied)
+      2. 调 fb.check_messenger_inbox(referral_mode=True, peers_filter=names) — B 实
+      3. B 返 list of {peer_name, last_inbound_text, conv_id} (匹配 + 未匹配都返)
+      4. 本函数遍历 inbound_text, 关键词匹配 → 写 wa_referral_replied event
+      5. 返 stats {pending_count, scanned, replied_now, no_match}
+
+    Params:
+      hours_back: int = 48           pending 时间窗
+      limit: int = 50                单次最多扫 peer 数
+      keyword_region: str = ""       优先用此 region 关键词组 (空走 default)
+      max_messages_per_peer: int = 5  B 侧每个 peer 最多抓最近几条
+    """
+    hours_back = int(params.get("hours_back", 48) or 48)
+    limit = max(1, min(int(params.get("limit", 50) or 50), 500))
+    region_hint = str(params.get("keyword_region", "") or "").lower()
+    msgs_per_peer = max(1, min(
+        int(params.get("max_messages_per_peer", 5) or 5), 20))
+
+    from src.host.fb_store import (get_pending_referral_peers,
+                                    record_contact_event,
+                                    CONTACT_EVT_WA_REFERRAL_REPLIED)
+
+    # 步骤 1: pending peers (限本设备)
+    pending = get_pending_referral_peers(device_id=resolved,
+                                          hours_back=hours_back,
+                                          limit=limit)
+    if not pending:
+        return True, "", {
+            "pending_count": 0, "scanned": 0,
+            "replied_now": 0, "no_match": 0,
+            "matches": [],
+        }
+
+    peer_names = [p["peer_name"] for p in pending]
+
+    # 步骤 2: 调 B 侧 inbox 检测 (尚未实装时 graceful)
+    inbox_results: List[Dict[str, Any]] = []
+    if not hasattr(fb, "check_messenger_inbox"):
+        return False, "facebook.check_messenger_inbox 尚未实现", {
+            "pending_count": len(pending), "scanned": 0,
+            "replied_now": 0, "no_match": 0,
+        }
+    try:
+        # B 侧 referral_mode 接口契约见 docs/A_TO_B_PHASE20_INBOX.md
+        scan_result = fb.check_messenger_inbox(
+            auto_reply=False,
+            referral_mode=True,
+            peers_filter=peer_names,
+            max_messages_per_peer=msgs_per_peer,
+            device_id=resolved,
+        )
+        # B 应返 {"conversations": [{"peer_name", "last_inbound_text", ...}, ...]}
+        # 旧版 B 不认这些 kwargs 时退化只返 messenger_active 状态
+        if isinstance(scan_result, dict):
+            inbox_results = scan_result.get("conversations") or []
+    except TypeError:
+        # B 还没扩 referral_mode 参数 → 直接报告未对齐
+        return False, ("B 侧 check_messenger_inbox 还没支持 referral_mode 参数, "
+                       "见 docs/A_TO_B_PHASE20_INBOX.md"), {
+            "pending_count": len(pending),
+            "scanned": 0,
+            "replied_now": 0,
+            "no_match": 0,
+        }
+    except Exception as e:
+        logger.warning("[referral_replies] check_messenger_inbox 失败: %s", e)
+        return False, f"check_messenger_inbox 异常: {e}", {
+            "pending_count": len(pending),
+            "scanned": 0,
+            "replied_now": 0,
+            "no_match": 0,
+        }
+
+    # 步骤 3-4: 遍历 + 关键词匹配 + 写 event
+    pending_by_peer = {p["peer_name"]: p for p in pending}
+    replied_now = 0
+    no_match = 0
+    matches: List[Dict[str, Any]] = []
+    for conv in inbox_results:
+        peer_name = (conv.get("peer_name") or "").strip()
+        if not peer_name or peer_name not in pending_by_peer:
+            continue
+        text = conv.get("last_inbound_text") or ""
+        kw = _match_referral_keyword(text, region=region_hint)
+        if not kw:
+            no_match += 1
+            continue
+        sent_meta = pending_by_peer[peer_name]
+        try:
+            record_contact_event(
+                resolved, peer_name, CONTACT_EVT_WA_REFERRAL_REPLIED,
+                meta={
+                    "keyword_matched": kw,
+                    "raw_excerpt": text[:200],
+                    "sent_event_id": sent_meta.get("sent_event_id"),
+                    "sent_at": sent_meta.get("sent_at"),
+                    "conv_id": conv.get("conv_id") or "",
+                    "matched_by": "agent_a_phase20_1",
+                })
+            replied_now += 1
+            matches.append({
+                "peer_name": peer_name,
+                "keyword": kw,
+                "excerpt": text[:80],
+            })
+        except Exception as e:
+            logger.warning("[referral_replies] 写 wa_referral_replied 失败 "
+                            "peer=%s: %s", peer_name, e)
+
+    return True, "", {
+        "pending_count": len(pending),
+        "scanned": len(inbox_results),
+        "replied_now": replied_now,
+        "no_match": no_match,
+        "matches": matches,
+    }
 
 
 _FB_CAMPAIGN_DEFAULT_STEPS = ["warmup", "group_engage", "extract_members",
