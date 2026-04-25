@@ -209,12 +209,94 @@ def _clear_wallpaper_error(did: str):
     except Exception:
         pass
 
+_HARDENED_SERIALS: set[str] = set()  # 进程级缓存
+_HARDEN_TTL_DAYS = 7  # 持久化跳过窗口：7 天内已硬化的设备不重复跑
+
+
+def _is_recently_hardened(did: str) -> bool:
+    """读 aliases.miui_hardened_at，TTL 内则跳过硬化。"""
+    try:
+        import datetime as _dt
+        ts_iso = _load_aliases().get(did, {}).get("miui_hardened_at")
+        if not ts_iso:
+            return False
+        ts = _dt.datetime.fromisoformat(ts_iso)
+        return (_dt.datetime.now() - ts).days < _HARDEN_TTL_DAYS
+    except Exception:
+        return False
+
+
+def _mark_hardened(did: str):
+    """写 aliases.miui_hardened_at，供下次跨进程跳过。"""
+    try:
+        import datetime as _dt
+        aliases = _load_aliases()
+        if did in aliases:
+            aliases[did]["miui_hardened_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+            _save_aliases(aliases)
+    except Exception:
+        pass
+
+
+def _ensure_hardened(did: str):
+    """统一硬化入口：进程内缓存 → 持久化检查 → 真正硬化 + 写时间戳。
+
+    幂等 + 多调用点共享。供 _deploy_wallpaper_smart / health_monitor._auto_deploy_wallpaper 使用。
+    仅 MIUI/Redmi/POCO 设备生效（is_miui_device 内部判断）。
+    """
+    if did in _HARDENED_SERIALS:
+        return
+    if _is_recently_hardened(did):
+        _HARDENED_SERIALS.add(did)
+        return
+    try:
+        from scripts.disable_miui_security_popups import harden_quietly
+        if harden_quietly(did):
+            _mark_hardened(did)
+            logger.info("[wp] MIUI 安全硬化已对 %s 生效", did[:8])
+    except Exception as e:
+        logger.debug("[wp] harden 跳过 %s: %s", did[:8], e)
+    _HARDENED_SERIALS.add(did)
+
+
+_IME_UNIFIED_SERIALS: set[str] = set()
+
+
+def _ensure_ime_unified(did: str):
+    """统一 IME 入口：把 default_input_method 切到 ATX 自带的 ADBKeyboard。
+
+    实时查 default_input_method 判断（不需要持久化字段，状态可直接观察）。
+    幂等。供 device-online 钩子调用，让新接入的机器自动统一 IME 用于 unicode 输入。
+    """
+    if did in _IME_UNIFIED_SERIALS:
+        return
+    try:
+        import subprocess as _sp
+        cf = getattr(_sp, "CREATE_NO_WINDOW", 0)
+        r = _sp.run(["adb", "-s", did, "shell",
+                     "settings get secure default_input_method"],
+                    capture_output=True, text=True, timeout=10, creationflags=cf)
+        cur = (r.stdout or "").strip()
+        if "com.github.uiautomator" in cur:
+            _IME_UNIFIED_SERIALS.add(did)
+            return
+    except Exception as e:
+        logger.debug("[ime] 检测 default_input_method 失败 %s: %s", did[:8], e)
+        return
+    try:
+        from scripts.unify_ime import unify_quietly
+        if unify_quietly(did):
+            logger.info("[ime] 输入法统一为 ADBKeyboard 已对 %s 生效", did[:8])
+    except Exception as e:
+        logger.debug("[ime] unify 跳过 %s: %s", did[:8], e)
+    _IME_UNIFIED_SERIALS.add(did)
+
+
 def _deploy_wallpaper_smart(manager, did: str, number: int, display_name: str = "") -> bool:
     """本地 ADB 优先部署壁纸，成功则记录 wallpaper_number；失败则代理到 Worker（Worker 侧自行记录）。"""
     from src.utils.wallpaper_generator import deploy_wallpaper
     if manager:
-        # deploy_wallpaper 内顺序：Root → Helper APK（可选）→ MIUI 自动化 → 打开相册。
-        # 勿在 Helper 缺失时提前 return：仓库常无 APK，MIUI 回退必须在本地执行。
+        _ensure_hardened(did)
         try:
             ok = deploy_wallpaper(manager, did, number, display_name=display_name)
             if ok:

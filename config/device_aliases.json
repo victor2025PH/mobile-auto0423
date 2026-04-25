@@ -209,29 +209,26 @@
     "display_name": "SM-S908E"
   },
   "4HUSIB4TBQC69TJZ": {
-    "number": 2,
-    "alias": "02号",
-    "display_name": "23106RN0DA"
-  },
-  "192.168.0.113:5555": {
-    "display_name": "192.168.",
-    "slot": 1,
-    "host_scope": "coordinator",
-    "host_name": "主控",
-    "host_label_short": "主控",
-    "display_label": "主控-01",
-    "alias": "主控-01",
-    "number": 1
-  },
-  "8DWOF6CYY5R8YHX8": {
-    "display_name": "8DWOF6CY",
+    "display_name": "4HUSIB4T",
     "slot": 2,
     "host_scope": "coordinator",
     "host_name": "主控",
     "host_label_short": "主控",
     "display_label": "主控-02",
     "alias": "主控-02",
-    "number": 2
+    "number": 2,
+    "miui_hardened_at": "2026-04-25T15:18:35"
+  },
+  "192.168.0.113:5555": {
+    "display_name": "192.168.",
+    "slot": 4,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-04",
+    "alias": "主控-04",
+    "number": 4,
+    "wallpaper_error": "deploy_failed"
   },
   "LVHIOZSWDAYLCELN": {
     "display_name": "LVHIOZSW",
@@ -242,5 +239,16 @@
     "display_label": "主控-03",
     "alias": "主控-03",
     "number": 3
+  },
+  "CACAVKLNU8SGO74D": {
+    "display_name": "CACAVKLN",
+    "slot": 1,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-01",
+    "alias": "主控-01",
+    "number": 1,
+    "miui_hardened_at": "2026-04-25T14:57:18"
   }
 }

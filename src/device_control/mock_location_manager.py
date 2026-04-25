@@ -425,7 +425,11 @@ def ensure_mock_app(serial: str) -> bool:
         if not apk_path.exists():
             continue
         log.info("[MockLoc] 尝试安装 APK: %s → %s", apk_path.name, serial)
-        out, rc = _adb(serial, "install", "-r", str(apk_path), timeout=120)
+        # 用 push + pm install 绕开 MIUI 14+ 的 securitycenter/AdbInstallActivity 拦截
+        from src.utils.safe_apk_install import safe_install_apk
+        success, out = safe_install_apk(
+            "adb", serial, str(apk_path), replace=True, timeout=120)
+        rc = 0 if success else 1
         if rc == 0 and "Success" in out:
             log.info("[MockLoc] APK 安装成功: %s", apk_cfg["package"])
             clear_device_cache(serial)
