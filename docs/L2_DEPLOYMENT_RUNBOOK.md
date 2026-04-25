@@ -1,8 +1,8 @@
 # L2 中央花名册 — Victor 部署清单
 
-> 目标：把 PR #88 / #89 / #90 真正部署起来，让 30 台手机的数据汇总到主电脑（192.168.0.118）。
+> 目标：把 PR #88-95 真正部署起来，让 30 台手机的数据汇总到主电脑（192.168.0.118）。
 >
-> 谁做：每一步前面写明 **[你做]** 还是 **[我做]**。"我做" 的步骤你只要发一句"开始第 X 步"，我就跑。
+> **2026-04-26 实际部署完成** — 详见末尾"实际部署历史"段。
 >
 > 总耗时：顺利约 1 小时。出问题最多 2 小时。
 
@@ -238,3 +238,69 @@ git checkout 5701388
 3. 哪台机器（主控 / W03 / W175）
 
 我会立刻定位。
+
+---
+
+## 实际部署历史 (2026-04-26)
+
+8 个 PR 实际合并 + 部署一气呵成跑通. 关键信息记录如下:
+
+### PR 合并最终路径
+
+原本计划 8 个栈式 PR 一个个 merge, 但 `--delete-branch` 把栈链断了 (PR #89 base 分支被删 → PR auto-close, #90-95 base 失效).
+
+修复: rebase #95 head 分支 (`feat/worker-l2-human-takeover-backend`) 去掉 #88 squash 重复部分, force push, 一次性 squash merge 把 #89-95 的 7 个 PR 改动合到 main.
+
+main 上现状:
+- `8066441` feat: L2 全栈合并 (PR #89-95) — 7 个 PR 一锅 squash
+- `a000fe1` feat: L2 中央客户画户 store (#88) — 单独 squash
+
+### 主电脑配置
+
+```bash
+# .env
+OPENCLAW_PG_HOST=127.0.0.1
+OPENCLAW_PG_PORT=5432
+OPENCLAW_PG_DB=openclaw
+OPENCLAW_PG_USER=openclaw_app
+OPENCLAW_PG_PASSWORD=openclaw_app_339b8f70   # 实际值在主控 .env
+OPENCLAW_PORT=8000                           # 跟 worker 期待的一致
+# OPENCLAW_API_KEY=xxx                       # 暂禁用走内网兼容, 后续启用
+```
+
+### 主控服务
+
+启动: `python server.py` (在 cwd D:\workspace\mobile-auto0423)
+- 启动前必须 `set -a && source .env && set +a` 加载环境变量
+- 主控 lifespan 自动启 drain 后台线程 (PR-3) + worker listener (仅 role=worker, 主控跳过)
+
+### Worker 节点
+
+```bash
+# 主控调一次 (api key 暂禁用所以无 header):
+curl -X POST http://192.168.0.103:8000/cluster/pull-update
+curl -X POST http://192.168.0.175:8000/cluster/pull-update
+# 每台返回 {"ok":true,"updated_files":826,"restarting":true} 即可
+```
+
+### 端到端验证
+
+跑 `python scripts/l2_e2e_smoke.py`, 期望 12/12 步骤 PASS (包括 PG 落库 / referral_gate / emotion_scorer / ai_takeover_state / customer_service 4 动作).
+
+### 验证 URL (浏览器打开)
+
+- 引流后台 (现有 + PR-6 客服动作扩展): http://192.168.0.118:8000/dashboard
+- L3 运营看板 (本次新): http://192.168.0.118:8000/static/l2-dashboard.html
+- push 队列指标: http://192.168.0.118:8000/cluster/customers/push/metrics
+
+### 测试基线
+
+185/185 PASS (PR #88-95 全 + PR-6.6 worker listener):
+- L2 push_client / drain / customer_sync_bridge / referral_gate / 触发器 / ai_takeover_state / emotion_scorer / customer_service / mesh listener
+- + 14 个 PG 真集成测试 (有真 PG 才能跑, .env 配好后跑通)
+
+### 已知 follow-up
+
+1. worker .env 同步 API_KEY (生产前重启 worker 启用安全模式)
+2. 30 分钟无操作自动归还接管队列 (客服上量后做)
+3. 真业务测试 (W03 真发好友请求, victor 拍板谁)

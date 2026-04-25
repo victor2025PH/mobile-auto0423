@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>L2 中央花名册 — 运营看板</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; padding:0; background:#0f172a; color:#e2e8f0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+  .topbar { background:#1e293b; padding:12px 24px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #334155; }
+  .topbar h1 { margin:0; font-size:18px; font-weight:600; }
+  .topbar .meta { font-size:12px; color:#94a3b8; }
+  .container { max-width:1280px; margin:0 auto; padding:20px; }
+  .stats-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:14px; margin-bottom:24px; }
+  .stat-card { background:#1e293b; border:1px solid #334155; border-radius:8px; padding:16px; }
+  .stat-card .label { font-size:11px; color:#94a3b8; text-transform:uppercase; letter-spacing:0.5px; }
+  .stat-card .value { font-size:28px; font-weight:700; margin-top:4px; }
+  .stat-card.green .value { color:#22c55e; }
+  .stat-card.amber .value { color:#f59e0b; }
+  .stat-card.red .value { color:#ef4444; }
+  .stat-card.cyan .value { color:#06b6d4; }
+  .panel { background:#1e293b; border:1px solid #334155; border-radius:8px; padding:18px; margin-bottom:18px; }
+  .panel h2 { margin:0 0 14px; font-size:15px; font-weight:600; color:#cbd5e1; }
+  .panel .actions { display:flex; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+  button { background:rgba(96,165,250,.15); color:#60a5fa; border:1px solid rgba(96,165,250,.4); border-radius:6px; padding:6px 14px; font-size:12px; cursor:pointer; }
+  button:hover { background:rgba(96,165,250,.25); }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th { text-align:left; padding:8px 6px; color:#94a3b8; font-weight:500; border-bottom:1px solid #334155; font-size:11px; text-transform:uppercase; }
+  td { padding:8px 6px; border-bottom:1px solid #1e293b; }
+  td.mono { font-family:ui-monospace, Menlo, monospace; font-size:11px; color:#94a3b8; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:12px; font-size:10px; font-weight:500; }
+  .pill.in_funnel { background:rgba(148,163,184,.2); color:#94a3b8; }
+  .pill.in_messenger { background:rgba(96,165,250,.2); color:#60a5fa; }
+  .pill.in_line { background:rgba(34,197,94,.2); color:#22c55e; }
+  .pill.accepted_by_human { background:rgba(168,85,247,.2); color:#a855f7; }
+  .pill.converted { background:rgba(34,197,94,.3); color:#22c55e; font-weight:600; }
+  .pill.lost { background:rgba(239,68,68,.2); color:#ef4444; }
+  .empty { text-align:center; padding:30px; color:#64748b; font-size:13px; }
+  .footer-note { color:#64748b; font-size:11px; padding:12px; border-top:1px dashed #334155; margin-top:18px; }
+  @media (max-width:640px) {
+    .container { padding:12px; }
+    .stat-card .value { font-size:22px; }
+  }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>📊 L2 中央花名册 — 运营看板</h1>
+  <div class="meta">主控 192.168.0.118 · <span id="last-update">未刷新</span> · <button onclick="refresh()" style="padding:4px 10px">🔄 刷新</button></div>
+</div>
+
+<div class="container">
+
+  <div class="stats-grid">
+    <div class="stat-card cyan">
+      <div class="label">客户总数</div>
+      <div class="value" id="stat-customers">—</div>
+    </div>
+    <div class="stat-card amber">
+      <div class="label">in_messenger 中</div>
+      <div class="value" id="stat-messenger">—</div>
+    </div>
+    <div class="stat-card amber">
+      <div class="label">in_line (已引)</div>
+      <div class="value" id="stat-line">—</div>
+    </div>
+    <div class="stat-card green">
+      <div class="label">accepted_by_human</div>
+      <div class="value" id="stat-accepted">—</div>
+    </div>
+    <div class="stat-card green">
+      <div class="label">已转化</div>
+      <div class="value" id="stat-converted">—</div>
+    </div>
+    <div class="stat-card red">
+      <div class="label">流失</div>
+      <div class="value" id="stat-lost">—</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>📥 待人工接管队列 (customer_handoffs.accepted_by_human IS NULL)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>handoff_id</th>
+          <th>客户名</th>
+          <th>persona / country</th>
+          <th>来源</th>
+          <th>AI 摘要</th>
+          <th>等待时长</th>
+        </tr>
+      </thead>
+      <tbody id="handoff-tbody">
+        <tr><td colspan="6" class="empty">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>👥 最近 50 个客户 (按更新时间倒序)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>customer_id</th>
+          <th>姓名</th>
+          <th>状态</th>
+          <th>worker</th>
+          <th>device</th>
+          <th>更新时间</th>
+        </tr>
+      </thead>
+      <tbody id="customers-tbody">
+        <tr><td colspan="6" class="empty">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>📈 7 天事件统计</h2>
+    <div id="events-stats" class="empty">加载中…</div>
+  </div>
+
+  <div class="panel" style="background:rgba(96,165,250,.05)">
+    <h2 style="color:#60a5fa">🔧 推送队列状态</h2>
+    <div id="push-metrics" class="empty">加载中…</div>
+  </div>
+
+  <div class="footer-note">
+    数据源 PostgreSQL <code>openclaw.db</code>. 数据每 30 秒自动刷新.
+    高亮入站接管 / 已加 LINE 的客户是真人接管漏斗的关键节点.
+  </div>
+</div>
+
+<script>
+const TIMER_MS = 30000;
+
+function fmtTime(s) {
+  if (!s) return '—';
+  try {
+    const d = new Date(s);
+    const now = new Date();
+    const diffMin = Math.floor((now - d) / 60000);
+    if (diffMin < 1) return '刚刚';
+    if (diffMin < 60) return diffMin + ' 分前';
+    if (diffMin < 1440) return Math.floor(diffMin / 60) + ' 小时前';
+    return Math.floor(diffMin / 1440) + ' 天前';
+  } catch (e) { return s; }
+}
+
+function safeText(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function fetchJson(url) {
+  const r = await fetch(url, { headers: { 'X-API-Key': localStorage.getItem('OPENCLAW_API_KEY') || '' } });
+  if (!r.ok) throw new Error(url + ' HTTP ' + r.status);
+  return r.json();
+}
+
+async function loadFunnel() {
+  try {
+    const data = await fetchJson('/cluster/customers/funnel/stats?days=30');
+    const cs = data.customers_by_status || {};
+    document.getElementById('stat-customers').innerText = Object.values(cs).reduce((a,b)=>a+b, 0);
+    document.getElementById('stat-messenger').innerText = cs.in_messenger || 0;
+    document.getElementById('stat-line').innerText = cs.in_line || 0;
+    document.getElementById('stat-accepted').innerText = cs.accepted_by_human || 0;
+    document.getElementById('stat-converted').innerText = cs.converted || 0;
+    document.getElementById('stat-lost').innerText = cs.lost || 0;
+
+    // 事件统计
+    const ev = data.events_by_type || {};
+    const evSorted = Object.entries(ev).sort((a, b) => b[1] - a[1]);
+    if (evSorted.length === 0) {
+      document.getElementById('events-stats').innerHTML = '<span class="empty">7 天内无事件</span>';
+    } else {
+      document.getElementById('events-stats').innerHTML = evSorted.map(([k, v]) =>
+        '<div style="display:inline-block;margin:4px 8px 4px 0;padding:5px 12px;background:rgba(148,163,184,.1);border-radius:6px;font-size:12px"><b style="color:#cbd5e1">' + safeText(k) + '</b> <span style="color:#06b6d4;font-weight:600">' + v + '</span></div>'
+      ).join('');
+    }
+  } catch (e) {
+    console.error('funnel:', e);
+  }
+}
+
+async function loadHandoffPending() {
+  try {
+    const data = await fetchJson('/cluster/customers/handoff/pending?limit=50');
+    const handoffs = data.handoffs || [];
+    if (handoffs.length === 0) {
+      document.getElementById('handoff-tbody').innerHTML = '<tr><td colspan="6" class="empty">没有待接管的 handoff</td></tr>';
+      return;
+    }
+    document.getElementById('handoff-tbody').innerHTML = handoffs.map(h =>
+      '<tr>' +
+      '<td class="mono">' + safeText((h.handoff_id || '').substring(0, 12)) + '…</td>' +
+      '<td><b>' + safeText(h.primary_name || '—') + '</b></td>' +
+      '<td>' + safeText((h.ai_profile && h.ai_profile.persona_key) || '—') + ' / ' + safeText(h.country || '—') + '</td>' +
+      '<td class="mono">' + safeText(h.from_stage || '—') + ' → ' + safeText(h.to_stage || '—') + '</td>' +
+      '<td style="font-size:11px;max-width:280px">' + safeText(h.ai_summary || '(无)') + '</td>' +
+      '<td>' + fmtTime(h.initiated_at) + '</td>' +
+      '</tr>'
+    ).join('');
+  } catch (e) {
+    document.getElementById('handoff-tbody').innerHTML = '<tr><td colspan="6" class="empty">加载失败: ' + safeText(e.message) + '</td></tr>';
+  }
+}
+
+async function loadCustomers() {
+  try {
+    const data = await fetchJson('/cluster/customers?limit=50');
+    const customers = data.customers || data || [];
+    if (customers.length === 0) {
+      document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">还没有客户记录 (worker 还没 push 过数据)</td></tr>';
+      return;
+    }
+    document.getElementById('customers-tbody').innerHTML = customers.map(c =>
+      '<tr>' +
+      '<td class="mono">' + safeText((c.customer_id || '').substring(0, 12)) + '…</td>' +
+      '<td><b>' + safeText(c.primary_name || '—') + '</b></td>' +
+      '<td><span class="pill ' + safeText(c.status) + '">' + safeText(c.status || 'in_funnel') + '</span></td>' +
+      '<td class="mono">' + safeText(c.last_worker_id || '—') + '</td>' +
+      '<td class="mono">' + safeText((c.last_device_id || '—').substring(0, 12)) + '</td>' +
+      '<td>' + fmtTime(c.updated_at) + '</td>' +
+      '</tr>'
+    ).join('');
+  } catch (e) {
+    document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">加载失败: ' + safeText(e.message) + '</td></tr>';
+  }
+}
+
+async function loadPushMetrics() {
+  try {
+    const data = await fetchJson('/cluster/customers/push/metrics');
+    const m = data.metrics || {};
+    const drain = data.drain || {};
+    document.getElementById('push-metrics').innerHTML = ''
+      + '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;font-size:12px">'
+      + '<div><span style="color:#94a3b8">push 总数:</span> <b>' + (m.push_total||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">成功:</span> <b style="color:#22c55e">' + (m.push_success||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">失败:</span> <b style="color:#ef4444">' + (m.push_failure||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">4xx 业务错:</span> <b style="color:#f59e0b">' + (m.push_4xx||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">异步入队:</span> <b>' + (m.push_async_enqueue||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">队列待 push:</span> <b style="color:#60a5fa">' + (m.queue_pending||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">drain 成功:</span> <b style="color:#22c55e">' + (m.drain_success||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">drain 失败:</span> <b style="color:#ef4444">' + (m.drain_failure||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">死信:</span> <b style="color:#ef4444">' + (m.dead_letter_pending||0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">drain 线程:</span> <b style="color:' + (drain.running ? '#22c55e' : '#ef4444') + '">' + (drain.running ? '运行中' : '停止') + '</b></div>'
+      + '<div><span style="color:#94a3b8">drain 周期:</span> <b>' + (drain.iterations || 0) + '</b></div>'
+      + '<div><span style="color:#94a3b8">本次 drained:</span> <b>' + (drain.last_drained || 0) + '</b></div>'
+      + '</div>';
+  } catch (e) {
+    document.getElementById('push-metrics').innerHTML = '<span class="empty">加载失败: ' + safeText(e.message) + '</span>';
+  }
+}
+
+async function refresh() {
+  document.getElementById('last-update').innerText = '刷新中…';
+  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadPushMetrics()]);
+  document.getElementById('last-update').innerText = '更新于 ' + new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, TIMER_MS);
+</script>
+</body>
+</html>

@@ -4,5 +4,29 @@
     "password": "8c021868f0f782f7e3d595d9253e490c4d3eede2f753ec75fdde521aec1972eb",
     "role": "admin",
     "display": "管理员"
+  },
+  {
+    "username": "agent_001",
+    "password": "pbkdf2:7e390f8fef29d1e28315fec2cef41684:44d22da65653886ddea129fe33de516e4740694f94793a214244860ef506605c",
+    "role": "customer_service",
+    "display": "客服-A001"
+  },
+  {
+    "username": "agent_002",
+    "password": "pbkdf2:58ca2802ee76cfa5e05af4b3d0aad257:72b3bfa52415c5437b645ccd828cc11e8f34517e7acce9d72fa4092ebba0f502",
+    "role": "customer_service",
+    "display": "客服-A002"
+  },
+  {
+    "username": "agent_003",
+    "password": "pbkdf2:0b26f0466255f094474ccb0166589ff9:4fe2c95e5ac48fb80216ca1593026285edc47eee6d882a1390767a4368ad1666",
+    "role": "customer_service",
+    "display": "客服-A003"
+  },
+  {
+    "username": "supervisor",
+    "password": "pbkdf2:0be7df8b71f21811bf2950c872ffd86c:2d59a85ea6ba9a06d1dcd322a7392fc712a27e4fa6c85eae99cd367b7262c332",
+    "role": "supervisor",
+    "display": "主管-Su1"
   }
 ]
