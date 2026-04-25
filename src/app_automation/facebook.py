@@ -5758,8 +5758,103 @@ class FacebookAutomation(BaseAutomation):
 
     # ── Inbox helpers (Sprint 2 P0 内部支持函数) ─────────────────────────
 
+    # ── Phase 15 (2026-04-25): peer_name UI 文本黑名单 ─────────────────
+    # 之前 _check_message_requests 把"查看翻译"等 Messenger UI 按钮文本当
+    # peer_name 写进了 fb_contact_events, dispatcher 拿这种"假 peer" 永远
+    # filter 不出合格 lead. 全方位 ban 各种 UI 词 + 多语言 (中/英/日/意).
+    _MESSENGER_UI_TEXT_BLACKLIST = frozenset(s.lower() for s in (
+        # tab/导航
+        "chats", "people", "stories", "calls", "messenger", "search",
+        "back", "home", "notifications", "menu", "settings", "marketplace",
+        "聊天", "联系人", "动态", "通讯录",
+        # 翻译 (核心 root cause)
+        "translate", "see translation", "tap to translate",
+        "translation", "翻译", "查看翻译", "点击翻译", "显示原文",
+        "翻訳", "翻訳を表示", "原文", "Vedi traduzione", "Tradurre",
+        # 操作按钮
+        "reply", "send", "more", "edit", "delete", "block", "report",
+        "回复", "发送", "更多", "编辑", "删除", "屏蔽", "举报", "更多选项",
+        "返信", "送信", "もっと見る", "編集", "削除", "ブロック", "通報",
+        "rispondi", "invia", "altro",
+        # 状态
+        "active now", "online", "offline", "typing", "seen",
+        "在线", "离线", "正在输入", "已读",
+        "オンライン", "入力中", "既読", "未読",
+        "online ora",
+        # 消息列表常见控件
+        "mark as read", "mark all as read", "filter", "filters",
+        "标为已读", "全部已读", "筛选", "过滤",
+        "既読にする", "全て既読",
+        # 列表头/empty state
+        "message requests", "spam", "archived", "new message",
+        "消息请求", "垃圾", "已存档", "新消息",
+        "メッセージリクエスト", "新規メッセージ",
+        # 表情符号 / 1 字符 reaction (避免抓 ✓✓ ❤ 等)
+        "✓", "✓✓", "❤", "👍", "•",
+    ))
+
+    # 含这些子串视为消息预览 (而非 peer 名)
+    _MESSENGER_PREVIEW_HINTS = (
+        ": ",   # "Alice: hello"
+        "...",   # 省略号预览
+        "…",
+    )
+
+    @staticmethod
+    def _is_valid_peer_name(text: str) -> bool:
+        """Phase 15: peer_name 多层 sanitize.
+
+        过滤掉 Messenger UI 按钮文本 ("查看翻译"/"Mark as read"/...) 和
+        消息预览片段 ("Alice: hi..."), 保留真用户 display name.
+
+        过滤规则 (任一命中即 reject):
+          1. 空 / 纯空白
+          2. 长度 < 2 或 > 30 (UI 按钮通常 > 4 但日文姓名 2-15, 30 兜底)
+          3. 全数字 / 全标点 (不可能是名字)
+          4. 出现在 _MESSENGER_UI_TEXT_BLACKLIST (multi-locale)
+          5. 含 _MESSENGER_PREVIEW_HINTS (": " / "..." / "…") = 消息预览
+          6. 句尾标点 . ! ? , 。 ! ? , ・ (display name 通常不带)
+          7. 全是 ASCII 单词且开头大写跟随小写 (典型按钮 "Reply" / "More")
+             — 但允许 "John Smith" 这种空格分隔多词 (有空格 + 名字 pattern)
+        """
+        if not text:
+            return False
+        s = text.strip()
+        if len(s) < 2 or len(s) > 30:
+            return False
+        # 全数字 / 全标点 / 单字符 emoji
+        if s.isdigit():
+            return False
+        if all(not c.isalnum() and ord(c) < 0x4E00 for c in s):
+            return False
+        # 黑名单 (lower 比较)
+        if s.lower() in FacebookAutomation._MESSENGER_UI_TEXT_BLACKLIST:
+            return False
+        # 消息预览
+        for hint in FacebookAutomation._MESSENGER_PREVIEW_HINTS:
+            if hint in s:
+                return False
+        # 句尾标点
+        if s[-1] in ".!?,。!?、,…":
+            return False
+        # 单词 ASCII button 启发: 只 1 个英文单词 + 首字母大写 + 长度 <= 12
+        # (e.g. "Reply" "Send" "More" "Translate" 等)
+        if (s.replace(" ", "").isascii()
+                and " " not in s
+                and len(s) <= 12
+                and s[0].isupper()
+                and s[1:].islower()):
+            return False
+        return True
+
     def _list_messenger_conversations(self, d, max_n: int) -> List[Dict]:
-        """从 Messenger 主列表 dump 当前可见对话。返回 [{name, unread, bounds}]。"""
+        """从 Messenger 主列表 dump 当前可见对话。返回 [{name, unread, bounds}].
+
+        Phase 15 (2026-04-25): peer_name 抓取改用 _is_valid_peer_name 多层
+        sanitize (黑名单 + 长度 + 句尾标点 + ASCII 单词按钮启发式), 防止
+        "查看翻译"/"Reply"/"Mark as read" 等 UI 文本被当成 peer 写入
+        fb_contact_events, 进而污染 dispatcher 数据流.
+        """
         try:
             xml = d.dump_hierarchy()
         except Exception:
@@ -5776,12 +5871,10 @@ class FacebookAutomation(BaseAutomation):
         seen = set()
         for el in elements:
             text = (el.text or "").strip()
-            if not text or len(text) < 2 or len(text) > 60:
-                continue
             if not el.clickable:
                 continue
-            if text.lower() in {"chats", "people", "stories", "calls",
-                                "messenger", "search", "back"}:
+            # Phase 15: 单一 sanitize 入口
+            if not FacebookAutomation._is_valid_peer_name(text):
                 continue
             if text in seen:
                 continue
