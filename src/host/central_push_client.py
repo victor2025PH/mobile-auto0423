@@ -55,6 +55,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -65,6 +66,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_HTTP_TIMEOUT = 10.0
 DEFAULT_RETRY_TIMES = 3
 DEFAULT_RETRY_BACKOFF = 1.5  # 1.5x 每次
+
+# UUIDv5 namespace: worker 离线时也能算出确定性 customer_id, 主控收到 push
+# 时若已存在 (canonical_source, canonical_id) 则 ON CONFLICT 走 update 路径,
+# customer_id 保持为首次写入时的值 (PK 不变).
+_CUSTOMER_NS = uuid.uuid5(uuid.NAMESPACE_DNS, "openclaw.l2.customer")
+
+
+def compute_customer_id(canonical_source: str, canonical_id: str) -> str:
+    """对 (source, id) 算确定性 UUIDv5, worker 离线也能不阻塞算 customer_id."""
+    name = f"{canonical_source}:{canonical_id}"
+    return str(uuid.uuid5(_CUSTOMER_NS, name))
 
 # ── retry queue 路径 (本地 SQLite, 失败缓存) ────────────────────────
 _DEFAULT_QUEUE_DB = os.environ.get(
@@ -242,13 +254,21 @@ def upsert_customer(
     status: Optional[str] = None,
     worker_id: Optional[str] = None,
     device_id: Optional[str] = None,
-    fire_and_forget: bool = False,
-) -> Optional[str]:
-    """upsert. fire_and_forget=True 不阻塞业务, 返回 None.
+    customer_id: Optional[str] = None,
+    fire_and_forget: bool = True,
+) -> str:
+    """upsert. 默认 fire_and_forget — worker 端用 UUIDv5 自算 customer_id,
+    push 走异步队列, 主控离线时 worker 不阻塞.
 
+    customer_id 不传时按 (canonical_source, canonical_id) 算 UUIDv5;
+    传了就用传的 (用于跨次调用复用).
+
+    返回 customer_id (worker 端自算或调用方自传, sync 模式回退到主控返回值).
     sync 模式失败 raise; fire_and_forget 模式失败 enqueue 本地 retry queue.
     """
+    cid = customer_id or compute_customer_id(canonical_source, canonical_id)
     body = {k: v for k, v in dict(
+        customer_id=cid,
         canonical_id=canonical_id, canonical_source=canonical_source,
         primary_name=primary_name, age_band=age_band, gender=gender,
         country=country, interests=interests, ai_profile=ai_profile,
@@ -258,9 +278,9 @@ def upsert_customer(
         _get_async_executor().submit(
             _push_with_retry_queue, "/cluster/customers/upsert", body,
         )
-        return None
+        return cid
     res = _http_post_json("/cluster/customers/upsert", body)
-    return res.get("customer_id")
+    return res.get("customer_id") or cid
 
 
 def record_event(
