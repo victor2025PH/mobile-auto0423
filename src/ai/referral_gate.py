@@ -59,6 +59,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "refer_cooldown_hours": 1,     # hard: 同 peer 再次引流的冷却期
     "ref_score_threshold": 0.5,    # soft: ChatBrain referral_score 门槛
     "rejection_cooldown_days": 0,  # hard: 客户明确拒绝后冷却天数 (0 = 禁用)
+    "min_emotion_score": 0.0,      # soft: L3 情感综合分门槛 (0 = 禁用)
+                                   # jp_female_midlife yaml 里设 0.5
+                                   # (聊得有温度才允许引)
 }
 
 
@@ -210,7 +213,8 @@ def should_refer(*,
                  config: Optional[Dict[str, Any]] = None,
                  now: Optional[_dt.datetime] = None,
                  incoming_text: str = "",
-                 persona_key: Optional[str] = None) -> GateDecision:
+                 persona_key: Optional[str] = None,
+                 emotion_overall: Optional[float] = None) -> GateDecision:
     """返回引流闸决策 — graceful, 永不抛。
 
     Args:
@@ -343,6 +347,25 @@ def should_refer(*,
     if _min_ls > 0 and int(lead_score) >= _min_ls:
         score += 1
         reasons.append(f"lead_score={lead_score} ≥ {_min_ls}")
+
+    # PR-5: L3 情感综合分门槛. min_emotion_score=0 时禁用 (兼容现有).
+    # jp_female_midlife yaml 设 0.5 → 聊得有温度才允许引.
+    _min_emo = float(cfg.get("min_emotion_score", 0.0) or 0.0)
+    if _min_emo > 0 and emotion_overall is not None:
+        try:
+            if float(emotion_overall) >= _min_emo:
+                score += 1
+                reasons.append(
+                    f"emotion_overall={float(emotion_overall):.2f} ≥ {_min_emo:.2f}"
+                )
+            else:
+                # emotion 不达标视为强 negative — 不计 +1, 但 reason 记录
+                reasons.append(
+                    f"emotion_overall={float(emotion_overall):.2f} < {_min_emo:.2f} "
+                    f"(温度不够, 不该引)"
+                )
+        except (TypeError, ValueError):
+            pass
 
     peer_replies = int(profile.get("peer_reply_count", 0) or 0)
     if peer_replies >= int(cfg["min_peer_replies"]):
