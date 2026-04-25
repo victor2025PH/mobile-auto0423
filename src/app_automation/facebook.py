@@ -6362,8 +6362,13 @@ class FacebookAutomation(BaseAutomation):
                     # gate 不可用降级到 pre-P5 行为
                     log.debug("[ai_reply] referral_gate 失败(降级): %s", e)
                     decision = "wa_referral" if (has_contact and ref_score > 0.5) else "reply"
-                # P1-1 + P1-5: 引流出站用 **首推渠道 + 对应 ID** 的本地化模板
-                if decision == "wa_referral" and _r_val:
+                # PR-4 (2026-04-26): AI 动态生成话术优先, 模板仅做兜底.
+                # 旧逻辑是模板覆盖 ChatBrain 的 reply, 但 ChatBrain 已能根据
+                # persona / 聊天历史 / 客户画像动态生成自然话术 (chat_brain.py
+                # _build_system_prompt stage='referral' + bot_persona='jp_caring_male'),
+                # 模板覆盖会让每次引流都是同一句, 容易被识别. 反转: 只在 AI 输出
+                # 为空 / 异常时才回退到模板.
+                if decision == "wa_referral" and _r_val and not (reply or "").strip():
                     try:
                         from .fb_content_assets import get_referral_snippet
                         snippet = get_referral_snippet(
@@ -6372,8 +6377,12 @@ class FacebookAutomation(BaseAutomation):
                         )
                         if snippet:
                             reply = snippet
+                            log.info(
+                                "[ai_reply] AI 话术为空, 兜底到模板 snippet "
+                                "(channel=%s persona=%s)", _r_channel, persona_key,
+                            )
                     except Exception as e:
-                        log.debug("[ai_reply] referral_snippet 覆盖失败: %s", e)
+                        log.debug("[ai_reply] referral_snippet 兜底也失败: %s", e)
         except Exception as e:
             log.debug("[ai_reply] 生成失败: %s", e)
             return None, "skip"
