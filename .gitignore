@@ -85,6 +85,9 @@ config/referral_receivers.yaml
 # 模板见 config/launch.env.example
 config/launch.env
 
+# 运营报告输出目录 (PR #112 daily snapshot / chat_review / weekly_report 产物)
+reports/
+
 # 本地真机调试产物 (截图 + hierarchy dump)
 debug/
 

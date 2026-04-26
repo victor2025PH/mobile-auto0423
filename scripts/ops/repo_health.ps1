@@ -11,7 +11,10 @@
 #   repo_health.bat
 #   repo_health.bat -Verbose
 
-param([switch]$Verbose)
+param(
+    [switch]$Verbose,
+    [switch]$Fetch
+)
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -24,9 +27,16 @@ Write-Host "==========================================="
 Write-Host "  OpenClaw Repo Health"
 Write-Host "==========================================="
 
-# ---- [1/6] Branch + commits ahead/behind main ----
+# ---- [1/6] Branch + commits ahead/behind main / origin/main ----
 Write-Host ""
 Write-Host "[1/6] Branch + commits"
+
+# -Fetch: pull latest origin refs first (5-10s network call, opt-in)
+if ($Fetch) {
+    Write-Host "   [INFO] git fetch origin main ..." -ForegroundColor DarkGray
+    & git fetch origin main 2>&1 | Out-Null
+}
+
 $branch = (& git branch --show-current 2>$null).Trim()
 if (-not $branch) {
     Write-Host "   [WARN] not on a branch (detached HEAD?)" -ForegroundColor Yellow
@@ -34,11 +44,22 @@ if (-not $branch) {
 } else {
     Write-Host ("   [OK]   branch: {0}" -f $branch) -ForegroundColor Green
     if ($branch -ne 'main') {
-        $ahead = (& git rev-list --count "main..HEAD" 2>$null)
-        $behind = (& git rev-list --count "HEAD..main" 2>$null)
-        if ($ahead) { Write-Host ("          {0} commit(s) ahead of main" -f $ahead) -ForegroundColor Cyan }
-        if ($behind -and $behind -ne '0') {
-            Write-Host ("          {0} commit(s) behind main (pull rebase recommended)" -f $behind) -ForegroundColor Yellow
+        $ahead  = ([int](& git rev-list --count "main..HEAD" 2>$null))
+        $behind = ([int](& git rev-list --count "HEAD..main" 2>$null))
+        if ($ahead -gt 0)  { Write-Host ("          {0} commit(s) ahead of main"  -f $ahead) -ForegroundColor Cyan }
+        if ($behind -gt 0) {
+            Write-Host ("          {0} commit(s) behind main (sync_with_main.bat -Rebase recommended)" -f $behind) -ForegroundColor Yellow
+            Bump-Exit 1
+        }
+    }
+    # Origin tracking: catch sibling-merged-PR cases the local main does not yet reflect
+    $hasOriginMain = (& git rev-parse --verify --quiet "refs/remotes/origin/main") 2>$null
+    if ($hasOriginMain) {
+        $localBehindOrigin = ([int](& git rev-list --count "main..origin/main" 2>$null))
+        if ($localBehindOrigin -gt 0) {
+            $hint = if ($Fetch) { 'just fetched' } else { 'last fetch may be stale; rerun with -Fetch' }
+            Write-Host ("          local main is {0} commit(s) behind origin/main ({1})" -f $localBehindOrigin, $hint) -ForegroundColor Yellow
+            Write-Host "                 (sibling Claude / collaborator merged a PR — see RUNBOOK 4fbee97 incident)" -ForegroundColor DarkYellow
             Bump-Exit 1
         }
     }
@@ -51,9 +72,15 @@ $_mod_pre = ($_dirty_pre | Where-Object { $_ -match '^\s*M' }).Count
 $_staged_pre = ($_dirty_pre | Where-Object { $_ -match '^[AMRD]' -and $_ -notmatch '^\?\?' }).Count
 if ($branch -eq 'main' -and ($_mod_pre -gt 0 -or $_staged_pre -gt 0)) {
     Write-Host "   [WARN] on main with uncommitted changes — CLAUDE.md says no direct commits to main." -ForegroundColor Yellow
-    Write-Host "          Fix:  git checkout -b feat-ops-yourname-`$(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkYellow
+    Write-Host "          Fix: branch_create.bat   (one-shot helper)" -ForegroundColor DarkYellow
     Bump-Exit 1
 }
+
+# Branch sanity (added 2026-04-26 after 4fbee97 incident):
+# CLAUDE.md says no direct commits to main. Detect "main + dirty/staged" early.
+$_dirty_pre = & git status --porcelain 2>$null
+$_mod_pre = ($_dirty_pre | Where-Object { $_ -match '^\s*M' }).Count
+$_staged_pre = ($_dirty_pre | Where-Object { $_ -match '^[AMRD]' -and $_ -notmatch '^\?\?' }).Count
 
 # ---- [2/6] Working tree dirty ----
 Write-Host ""
