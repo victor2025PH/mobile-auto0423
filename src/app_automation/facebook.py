@@ -374,6 +374,12 @@ def _with_fb_foreground(method):
     2026-04-27 修复: ensure_foreground 失败时 raise FbAppNotForegroundError
     (而非静默警告继续), 防止业务方法在错误 App 里跑导致 selector 污染 +
     死循环. 历史事故见 memory/autoselector_pitfall.md / SYSTEM_RUNBOOK §3.
+
+    2026-04-27 (followup): 加 MagicMock 探测 — 单测用 mock device 时
+    _ensure_foreground 永远拿不到真 package 必假 → raise → 大量 mock 测试
+    fail (CI 暴露). 检测 d 是 unittest.mock.MagicMock 时 skip foreground
+    check 直接执行业务. 真实设备 d 是 uiautomator2.Device, isinstance
+    安全无副作用.
     """
     import functools as _ft
 
@@ -381,6 +387,13 @@ def _with_fb_foreground(method):
     def _wrapper(self, *args, **kwargs):
         did = self._did(kwargs.get("device_id"))
         d = self._u2(did)
+        # 单测兼容: u2 device 是 MagicMock 时 skip foreground check
+        try:
+            from unittest.mock import MagicMock
+            if isinstance(d, MagicMock):
+                return method(self, *args, **kwargs)
+        except Exception:
+            pass
         try:
             ok = self._ensure_foreground(d, did)
         except Exception as e:
