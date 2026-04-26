@@ -300,93 +300,191 @@
       + '</div>';
   }
 
-  // PR-6 真人客服动作 — 调 PR-6 后端 4 个 API
+  // ── PR-6.5+: 真 modal 替代 prompt() (轻量内联实现) ──────────────
   function _lmCsCurrentUser() {
-    // 优先用当前 dashboard 登录的 username, fallback "human:dashboard"
+    // 优先 dashboard 登录的 username, 然后 localStorage, 最后弹 modal 让用户输
     try {
+      const stored = localStorage.getItem('oc_user') || localStorage.getItem('oc_cs_id') || '';
+      if (stored) return stored;
       const me = window.PlatShell && window.PlatShell.session && window.PlatShell.session.user;
-      return (me && me.username) || prompt('请输入你的客服 ID (username):', 'agent_zhang') || '';
-    } catch (e) { return prompt('请输入你的客服 ID (username):', 'agent_zhang') || ''; }
+      if (me && me.username) return me.username;
+    } catch (e) {}
+    return localStorage.getItem('oc_cs_id') || '';
   }
 
+  /* 通用 modal: title + 字段定义 + 提交回调.
+     fields: [{name, label, type:text|textarea|select|info, value, required, options:[]}]
+     onSubmit(data) 是 async, 异常会显示在 modal 内. */
+  function _lmModal(title, fields, onSubmit) {
+    return new Promise(function (resolve) {
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);'
+        + 'z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+      const card = document.createElement('div');
+      card.style.cssText = 'background:#1e293b;border:1px solid #475569;border-radius:14px;'
+        + 'width:100%;max-width:520px;box-shadow:0 24px 60px rgba(0,0,0,.6);overflow:hidden';
+      let bodyHtml = '<div style="padding:18px 22px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center">'
+        + '<h3 style="margin:0;font-size:16px;font-weight:600;color:#e2e8f0">' + _safe(title) + '</h3>'
+        + '<button data-act="close" style="background:none;border:1px solid #475569;color:#cbd5e1;padding:4px 12px;border-radius:6px;cursor:pointer">关闭 ✕</button>'
+        + '</div><form data-form="1" style="padding:22px"><div data-error style="display:none;margin-bottom:12px;padding:10px 14px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.4);border-radius:8px;color:#f87171;font-size:12px"></div>';
+      fields.forEach(function (f) {
+        if (f.type === 'info') {
+          bodyHtml += '<div style="font-size:12px;color:#94a3b8;margin-bottom:12px;padding:10px;background:rgba(148,163,184,.06);border-radius:6px">' + (f.html || _safe(f.value || '')) + '</div>';
+          return;
+        }
+        bodyHtml += '<div style="margin-bottom:14px">'
+          + '<label style="display:block;font-size:12px;color:#94a3b8;margin-bottom:6px">' + _safe(f.label) + (f.required ? ' <span style="color:#ef4444">*</span>' : '') + '</label>';
+        if (f.type === 'textarea') {
+          bodyHtml += '<textarea name="' + _safe(f.name) + '" rows="4" '
+            + 'style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:9px 12px;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical">'
+            + _safe(f.value || '') + '</textarea>';
+        } else if (f.type === 'select') {
+          bodyHtml += '<select name="' + _safe(f.name) + '" '
+            + 'style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:10px 12px;border-radius:8px;font-size:13px">';
+          (f.options || []).forEach(function (opt) {
+            bodyHtml += '<option value="' + _safe(opt.value) + '"' + (opt.value === f.value ? ' selected' : '') + '>' + _safe(opt.label) + '</option>';
+          });
+          bodyHtml += '</select>';
+        } else {
+          bodyHtml += '<input name="' + _safe(f.name) + '" type="text" '
+            + 'value="' + _safe(f.value || '') + '" '
+            + (f.placeholder ? 'placeholder="' + _safe(f.placeholder) + '" ' : '')
+            + 'style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:10px 12px;border-radius:8px;font-size:13px"/>';
+        }
+        if (f.hint) {
+          bodyHtml += '<div style="font-size:11px;color:#64748b;margin-top:4px">' + _safe(f.hint) + '</div>';
+        }
+        bodyHtml += '</div>';
+      });
+      bodyHtml += '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">'
+        + '<button type="button" data-act="cancel" style="padding:9px 18px;background:none;border:1px solid #475569;color:#cbd5e1;border-radius:8px;cursor:pointer;font-size:13px">取消</button>'
+        + '<button type="submit" data-act="submit" style="padding:9px 22px;background:#a855f7;border:none;color:#fff;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600">提交</button>'
+        + '</div></form>';
+      card.innerHTML = bodyHtml;
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+
+      const form = card.querySelector('[data-form]');
+      const errBox = card.querySelector('[data-error]');
+      function close(result) {
+        document.body.removeChild(overlay);
+        resolve(result);
+      }
+      card.querySelector('[data-act="close"]').onclick = function () { close(null); };
+      card.querySelector('[data-act="cancel"]').onclick = function () { close(null); };
+      overlay.onclick = function (e) { if (e.target === overlay) close(null); };
+      form.onsubmit = async function (e) {
+        e.preventDefault();
+        const data = {};
+        fields.forEach(function (f) {
+          if (f.type === 'info') return;
+          const el = form.querySelector('[name="' + f.name + '"]');
+          data[f.name] = el ? el.value : '';
+        });
+        for (let i = 0; i < fields.length; i++) {
+          const f = fields[i];
+          if (f.required && !((data[f.name] || '').trim())) {
+            errBox.textContent = '"' + f.label + '" 必填';
+            errBox.style.display = '';
+            return;
+          }
+        }
+        errBox.style.display = 'none';
+        try {
+          if (onSubmit) await onSubmit(data);
+          close(data);
+        } catch (err) {
+          errBox.textContent = '提交失败: ' + (err && err.message || err);
+          errBox.style.display = '';
+        }
+      };
+      // 自动 focus 第一个 input
+      setTimeout(function () {
+        const f = card.querySelector('input, textarea, select');
+        if (f) f.focus();
+      }, 100);
+    });
+  }
+
+  // ── PR-6 真人客服 4 个动作 (改成真 modal) ──────────────────────
   window.lmCsAssign = async function (handoffId) {
     const Shell = _shell();
     if (!Shell) return;
-    const username = _lmCsCurrentUser();
-    if (!username) return;
-    const peerName = prompt('客户姓名 (peer_name, 为空跳过 AI 暂停):', '') || '';
-    const deviceId = peerName ? (prompt('设备 ID (device_id):', '') || '') : '';
-    try {
-      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/assign', {
-        username: username,
-        peer_name: peerName,
-        device_id: deviceId,
-      });
-      showToast('✅ 接管成功 (AI 已暂停: ' + (peerName && deviceId ? '是' : '否') + ')', 'success');
+    await _lmModal('🙋 接手客户', [
+      { type: 'info', html: '接管后 worker 会自动暂停对该客户的 AI 自动回复, 由你手动回. 标"成交/流失"后释放.' },
+      { name: 'username', label: '客服 ID (username)', value: _lmCsCurrentUser() || 'agent_001', required: true, hint: '会记录到 lead_journey.actor = "human:<你>"' },
+      { name: 'peer_name', label: '客户姓名 (peer_name)', placeholder: '从聊天卡片可看到, 例: Yumi Tanaka', hint: '空 = 不调 ai_takeover_state.mark_taken_over (不推荐)' },
+      { name: 'device_id', label: '设备 ID (device_id)', placeholder: '例: 4HUSIB4TBQC69TJZ', hint: '客户在哪台手机上接触的, 留空跟 peer_name 同步留空' },
+    ], async function (data) {
+      try { localStorage.setItem('oc_cs_id', data.username); } catch (e) {}
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/assign', data);
+      showToast('✅ 接管成功' + ((data.peer_name && data.device_id) ? ' (AI 已暂停)' : ''), 'success');
       _lmRenderInbox();
-    } catch (e) {
-      showToast('接管失败: ' + (e.message || e), 'error');
-    }
+    });
   };
 
   window.lmCsReply = async function (handoffId) {
     const Shell = _shell();
     if (!Shell) return;
-    const username = _lmCsCurrentUser();
-    if (!username) return;
-    const text = prompt('输入要发送给客户的话:', '');
-    if (!text) return;
-    try {
+    await _lmModal('💬 回复客户', [
+      { type: 'info', html: '输入要发给客户的话. <b>勾选下面"真发"</b> 时会通过 worker 用对应物理手机发出 (PR-6.6); 否则只本地记录.' },
+      { name: 'username', label: '你的客服 ID', value: _lmCsCurrentUser() || 'agent_001', required: true },
+      { name: 'text', label: '消息内容', type: 'textarea', required: true, placeholder: '例: もちろんです、よかったらLINEでもっとお話しませんか？' },
+      { name: 'sent_via_worker', label: '是否真发', type: 'select', value: 'false',
+        options: [
+          { value: 'false', label: '只记录 (不真发)' },
+          { value: 'true', label: '真发到客户手机 (需 worker listener)' },
+        ] },
+    ], async function (data) {
+      try { localStorage.setItem('oc_cs_id', data.username); } catch (e) {}
       await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/reply', {
-        username: username, text: text, sent_via_worker: false,
+        username: data.username, text: data.text,
+        sent_via_worker: data.sent_via_worker === 'true',
       });
-      showToast('💬 回复已记录 (PR-6.6 后真发到客户手机)', 'success');
+      showToast('💬 ' + (data.sent_via_worker === 'true' ? '已通过 worker 发出' : '已本地记录'), 'success');
       _lmRenderInbox();
-    } catch (e) {
-      showToast('回复失败: ' + (e.message || e), 'error');
-    }
+    });
   };
 
   window.lmCsNote = async function (handoffId) {
     const Shell = _shell();
     if (!Shell) return;
-    const username = _lmCsCurrentUser();
-    if (!username) return;
-    const note = prompt('输入内部备注 (不发给客户):', '');
-    if (!note) return;
-    try {
-      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/note', {
-        username: username, note: note,
-      });
+    await _lmModal('📝 加内部备注', [
+      { type: 'info', html: '内部备注不发给客户, 给同事 / 主管看' },
+      { name: 'username', label: '你的客服 ID', value: _lmCsCurrentUser() || 'agent_001', required: true },
+      { name: 'note', label: '备注内容', type: 'textarea', required: true,
+        placeholder: '例: 客户提到孩子, 关注亲子话题, 优先' },
+    ], async function (data) {
+      try { localStorage.setItem('oc_cs_id', data.username); } catch (e) {}
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/note', data);
       showToast('📝 备注已记录', 'success');
       _lmRenderInbox();
-    } catch (e) {
-      showToast('备注失败: ' + (e.message || e), 'error');
-    }
+    });
   };
 
   window.lmCsOutcome = async function (handoffId) {
     const Shell = _shell();
     if (!Shell) return;
-    const username = _lmCsCurrentUser();
-    if (!username) return;
-    const choice = prompt('标记结果:\n  1 = 成交 (converted)\n  2 = 流失 (lost)\n  3 = 待跟进 (pending_followup)\n输入 1/2/3:', '');
-    const outcomeMap = {'1': 'converted', '2': 'lost', '3': 'pending_followup'};
-    const outcome = outcomeMap[choice];
-    if (!outcome) { showToast('无效选项', 'warn'); return; }
-    const notes = prompt('原因 / 备注 (可选):', '') || '';
-    const peerName = prompt('客户姓名 (释放 AI 接管用, 可空):', '') || '';
-    const deviceId = peerName ? (prompt('设备 ID (释放 AI 接管用, 可空):', '') || '') : '';
-    try {
-      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/outcome', {
-        username: username, outcome: outcome, notes: notes,
-        peer_name: peerName, device_id: deviceId,
-      });
-      showToast('🏁 已标记 ' + outcome + (outcome === 'converted' || outcome === 'lost' ? ' (AI 接管已释放)' : ''), 'success');
+    await _lmModal('🏁 标记客户结果', [
+      { type: 'info', html: '<b>成交 / 流失</b>: 终态, 自动释放 AI 接管 (worker 重新接手 AI 自动回).<br><b>待跟进</b>: 保留接管态, 后续继续跟.' },
+      { name: 'username', label: '你的客服 ID', value: _lmCsCurrentUser() || 'agent_001', required: true },
+      { name: 'outcome', label: '结果', type: 'select', required: true, value: 'converted',
+        options: [
+          { value: 'converted', label: '✅ 成交 (converted)' },
+          { value: 'lost', label: '❌ 流失 (lost)' },
+          { value: 'pending_followup', label: '⏳ 待跟进 (pending_followup)' },
+        ] },
+      { name: 'notes', label: '备注 / 原因', type: 'textarea',
+        placeholder: '例: 客户加 LINE 后真买了; 或: 客户失联' },
+      { name: 'peer_name', label: '客户姓名 (释放 AI 用)', hint: '终态时填了会自动释放 ai_takeover_state' },
+      { name: 'device_id', label: '设备 ID (释放 AI 用)' },
+    ], async function (data) {
+      try { localStorage.setItem('oc_cs_id', data.username); } catch (e) {}
+      await Shell.api.post('/lead-mesh/handoffs/' + handoffId + '/outcome', data);
+      const final = data.outcome === 'converted' || data.outcome === 'lost';
+      showToast('🏁 已标 ' + data.outcome + (final ? ' (AI 接管已释放)' : ''), 'success');
       _lmRenderInbox();
-    } catch (e) {
-      showToast('标记失败: ' + (e.message || e), 'error');
-    }
+    });
   };
 
   window.lmSwitchInboxTab = function (tab) {

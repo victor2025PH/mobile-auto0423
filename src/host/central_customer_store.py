@@ -294,10 +294,23 @@ class CentralCustomerStore:
                 SET accepted_by_human = %s, accepted_at = NOW(),
                     outcome = 'accepted'
                 WHERE handoff_id = %s AND accepted_by_human IS NULL
+                RETURNING customer_id::text
                 """,
                 (accepted_by_human, handoff_id),
             )
-            return cur.rowcount > 0
+            row = cur.fetchone()
+            if not row:
+                return False
+            # 同步 customers.status='accepted_by_human' 让 L3 看板可见
+            cur.execute(
+                """
+                UPDATE customers SET status = 'accepted_by_human'
+                WHERE customer_id = %s
+                  AND status NOT IN ('converted', 'lost', 'accepted_by_human')
+                """,
+                (row["customer_id"],),
+            )
+            return True
 
     def complete_handoff(
         self,
@@ -312,10 +325,25 @@ class CentralCustomerStore:
                 UPDATE customer_handoffs
                 SET completed_at = NOW(), outcome = %s
                 WHERE handoff_id = %s AND completed_at IS NULL
+                RETURNING customer_id::text
                 """,
                 (outcome, handoff_id),
             )
-            return cur.rowcount > 0
+            row = cur.fetchone()
+            if not row:
+                return False
+            customer_id = row["customer_id"]
+            # 同步 customers.status 让 L3 看板一目了然.
+            # 状态机守卫: 已 converted/lost 终态保持; in_line/accepted 升级到结果.
+            cur.execute(
+                """
+                UPDATE customers SET status = %s
+                WHERE customer_id = %s
+                  AND status NOT IN ('converted', 'lost')
+                """,
+                (outcome, customer_id),
+            )
+            return True
 
     # ── 查询 ────────────────────────────────────────────────────────
     def list_customers(

@@ -30,6 +30,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <nav class="sidebar-nav">
     <div class="nav-search"><input id="nav-search" placeholder="搜索功能..." oninput="_filterNav(this.value)"/></div>
 
+    <!-- 客服中心置顶 (PR-6.5+) — 确保用户第一屏就看到, 不被滚动条吞掉 -->
+    <div class="nav-section" onclick="_toggleSection(this)" data-cs-section="1" style="background:linear-gradient(135deg,rgba(168,85,247,.18),rgba(96,165,250,.18));border-left:3px solid #a855f7">
+      &#129309; 客服中心
+      <span id="cs-pending-badge" style="display:none;margin-left:6px;font-size:10px;padding:1px 6px;background:#ef4444;color:#fff;border-radius:8px;font-weight:600">0</span>
+      <span class="sec-arrow">&#9660;</span>
+    </div>
+    <div class="nav-group" data-cs-group="1">
+      <div class="nav-item" onclick="if(window.lmOpenHandoffInbox)lmOpenHandoffInbox('')" style="font-weight:500"><span class="icon">&#128229;</span><span>待接管队列</span></div>
+      <div class="nav-item" onclick="if(window.lmOpenLeadSearch)lmOpenLeadSearch()"><span class="icon">&#128270;</span><span>客户搜索</span></div>
+      <div class="nav-item" onclick="if(window.lmOpenCommandCenter)lmOpenCommandCenter()"><span class="icon">&#128290;</span><span>命令中心</span></div>
+      <div class="nav-item" onclick="window.open('/static/l2-dashboard.html','_blank')"><span class="icon">&#128202;</span><span>L2 客户漏斗看板</span></div>
+    </div>
+
     <div class="nav-section" onclick="_toggleSection(this)">核心 <span class="sec-arrow">&#9660;</span></div>
     <div class="nav-group">
       <div class="nav-item active" data-page="overview"><span class="icon">&#9632;</span><span data-i18n="overview">总览</span></div>
@@ -103,14 +116,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="nav-item" data-page="studio"><span class="icon">&#127775;</span><span>工作台</span></div>
     </div>
 
-    <div class="nav-section" onclick="_toggleSection(this)" data-cs-section="1">&#129309; 客服中心 <span class="sec-arrow">&#9660;</span></div>
-    <div class="nav-group" data-cs-group="1">
-      <div class="nav-item" onclick="if(window.lmOpenHandoffInbox)lmOpenHandoffInbox('')"><span class="icon">&#128229;</span><span>待接管队列</span></div>
-      <div class="nav-item" onclick="if(window.lmOpenLeadSearch)lmOpenLeadSearch()"><span class="icon">&#128270;</span><span>客户搜索</span></div>
-      <div class="nav-item" onclick="if(window.lmOpenCommandCenter)lmOpenCommandCenter()"><span class="icon">&#128290;</span><span>命令中心</span></div>
-      <div class="nav-item" onclick="window.open('/static/l2-dashboard.html','_blank')"><span class="icon">&#128202;</span><span>L2 客户漏斗看板</span></div>
-    </div>
-
     <div class="nav-section collapsed" onclick="_toggleSection(this)" data-admin-only="1">系统 <span class="sec-arrow">&#9660;</span></div>
     <div class="nav-group collapsed" data-admin-only="1">
       <div class="nav-item" data-page="cluster"><span class="icon">&#9741;</span><span>集群管理</span></div>
@@ -126,6 +131,36 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="nav-item" onclick="doLogout()"><span class="icon">&#128682;</span><span>退出登录</span></div>
     </div>
 
+    <script>
+    /* 待接管 badge 自动更新 — 30 秒一次 */
+    async function _updateCsBadge() {
+      try {
+        const r = await fetch('/lead-mesh/handoffs?state=pending&limit=1', {
+          headers: {'Authorization': 'Bearer ' + (localStorage.getItem('oc_token') || '')}
+        });
+        if (!r.ok) return;
+        const d = await r.json();
+        const list = (d && d.handoffs) || [];
+        // 拉准数: 再调一次拿全 count (limit=200 估足够)
+        const r2 = await fetch('/lead-mesh/handoffs?state=pending&limit=200', {
+          headers: {'Authorization': 'Bearer ' + (localStorage.getItem('oc_token') || '')}
+        });
+        const d2 = await r2.json();
+        const total = ((d2 && d2.handoffs) || []).length;
+        const badges = [
+          document.getElementById('cs-pending-badge'),
+          document.getElementById('ov-cs-pending-badge'),
+        ];
+        const display = total > 0 ? '' : 'none';
+        const text = total > 99 ? '99+' : String(total);
+        badges.forEach(function(b) {
+          if (b) { b.style.display = display; b.textContent = text; }
+        });
+      } catch (e) {}
+    }
+    setInterval(_updateCsBadge, 30000);
+    setTimeout(_updateCsBadge, 1500);  // 启动 1.5s 后第一次拉
+    </script>
     <script>
     /* PR-6.5: role-based 菜单显隐. customer_service 只看客服中心 + 总览 */
     (function applyRoleMenu(){
@@ -270,6 +305,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <!-- 一键操作中心 (精简版：仅保留真实有效的批量操作) -->
     <h3 style="font-size:14px;margin-bottom:10px;color:var(--text-dim)">一键操作</h3>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px;margin-bottom:16px">
+      <!-- 客服中心快捷入口 (高优先级 - 紫色边框突出) -->
+      <div class="action-card" onclick="if(window.lmOpenHandoffInbox)lmOpenHandoffInbox('')" style="border:2px solid #a855f7;background:linear-gradient(135deg,rgba(168,85,247,.1),rgba(96,165,250,.05))">
+        <div class="action-icon" style="background:linear-gradient(135deg,#a855f7,#6366f1);position:relative">
+          &#128229;
+          <span id="ov-cs-pending-badge" style="display:none;position:absolute;top:-6px;right:-6px;font-size:10px;padding:2px 6px;background:#ef4444;color:#fff;border-radius:8px;font-weight:600">0</span>
+        </div>
+        <div class="action-label" style="color:#a855f7;font-weight:600">客服接管队列</div>
+        <div class="action-desc">真人接客户 &middot; 标成交</div>
+      </div>
+      <div class="action-card" onclick="window.open('/static/l2-dashboard.html','_blank')" style="border:1px solid rgba(96,165,250,.3)">
+        <div class="action-icon" style="background:linear-gradient(135deg,#3b82f6,#06b6d4)">&#128202;</div>
+        <div class="action-label">L2 客户漏斗</div>
+        <div class="action-desc">运营看板 &middot; 实时刷</div>
+      </div>
       <div class="action-card" onclick="batchTask('tiktok_check_inbox',{auto_reply:true,max_conversations:20})">
         <div class="action-icon" style="background:linear-gradient(135deg,#06b6d4,#3b82f6)">&#128172;</div>
         <div class="action-label">立即收件箱</div>
@@ -2816,7 +2865,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script src="/static/js/platform-shell.js?v=20260420c"></script>
 <script src="/static/js/tiktok-ops.js?v=20260417i"></script>
 <script src="/static/js/facebook-ops.js?v=20260420d"></script>
-<script src="/static/js/lead-mesh-ui.js?v=20260426pr66"></script>
+<script src="/static/js/lead-mesh-ui.js?v=20260426pr66c"></script>
 <script src="/static/js/platform-grid.js?v=20260417a"></script>
 <script src="/static/js/studio.js?v=20260411f"></script>
 <script>
