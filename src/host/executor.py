@@ -846,6 +846,9 @@ def _execute_facebook(manager, resolved, task_type, params):
                 assume_on_profile=bool(params.get("assume_on_profile", False)),
                 preset_key=_preset_key,
                 ai_decision=params.get("ai_decision") or "greeting",
+                # 2026-04-26 fix: 透传 force_send_greeting 让 prob gate / phase
+                # 都能被 caller (B2B 客户测试 / E2E) 一键绕过
+                force=bool(params.get("force_send_greeting")),
             )
             return ok, ("" if ok else "打招呼发送失败"), None
 

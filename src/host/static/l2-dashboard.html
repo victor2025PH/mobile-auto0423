@@ -320,6 +320,12 @@
     </table>
   </div>
 
+  <!-- 任务失败原因分析 (B2B 客户调试核心面板) -->
+  <div class="panel" style="background:linear-gradient(135deg,rgba(239,68,68,.04),rgba(245,158,11,.04));border-color:rgba(239,68,68,.2)">
+    <h2>🔴 任务失败分析 <span class="panel-hint" id="ea-meta">近 24h · admin 看出现在卡哪个失败模式</span></h2>
+    <div id="ea-content"><div class="empty">加载中…</div></div>
+  </div>
+
   <!-- Events stats -->
   <div class="panel">
     <h2>📈 7 天事件统计</h2>
@@ -1629,10 +1635,117 @@ async function loadTopFrustrated() {
   }
 }
 
+// ─── 任务失败原因分析 (B2B 调试) ────────────────────────────────
+async function loadErrorAnalysis() {
+  try {
+    const data = await fetchJson('/tasks/error-analysis?hours=24');
+    const target = document.getElementById('ea-content');
+    document.getElementById('ea-meta').innerText =
+      '近 24h · 总 ' + (data.total_tasks || 0) + ' 任务 · 失败 ' +
+      (data.total_failed || 0) + ' 个 · 失败率 ' + (data.failure_rate || 0) + '%';
+
+    if (!data.total_failed) {
+      target.innerHTML = '<div class="empty">✅ 24h 内无失败任务</div>';
+      return;
+    }
+
+    const CAT_LABELS = {
+      vpn_failure: '🌐 VPN 故障',
+      network_timeout: '⏱️ 网络超时',
+      ui_not_found: '🎯 UI 元素未找到',
+      account_limited: '🚫 账号限流/封禁',
+      device_offline: '📵 设备离线',
+      geo_mismatch: '🗺️ IP 地理不匹配',
+      task_timeout: '⏰ 任务超时',
+      unknown: '❓ 未分类',
+    };
+    const CAT_COLORS = {
+      vpn_failure: '#a855f7',
+      network_timeout: '#f59e0b',
+      ui_not_found: '#3b82f6',
+      account_limited: '#ef4444',
+      device_offline: '#06b6d4',
+      geo_mismatch: '#fb923c',
+      task_timeout: '#ec4899',
+      unknown: '#94a3b8',
+    };
+
+    const cats = data.categories || {};
+    const sorted = Object.entries(cats)
+      .filter(([k, v]) => v > 0)
+      .sort((a, b) => b[1] - a[1]);
+    const maxV = Math.max(1, ...sorted.map(x => x[1]));
+
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px">';
+
+    // 左: 错误分类柱条
+    html += '<div><div style="font-size:11px;color:#94a3b8;margin-bottom:6px">📊 失败类型分布</div>';
+    sorted.forEach(([k, v]) => {
+      const pct = (v / maxV) * 100;
+      const label = CAT_LABELS[k] || k;
+      const color = CAT_COLORS[k] || '#94a3b8';
+      html += '<div style="margin:5px 0;font-size:11px">'
+        + '<div style="display:flex;justify-content:space-between;color:#cbd5e1">'
+        + '<span>' + safeText(label) + '</span><b>' + v + '</b></div>'
+        + '<div style="background:#0f172a;border-radius:4px;height:6px;overflow:hidden;margin-top:2px">'
+        + '<div style="background:' + color + ';height:100%;width:' + pct.toFixed(1) + '%"></div>'
+        + '</div></div>';
+    });
+    html += '</div>';
+
+    // 中: 修复建议
+    const TOP_FIX = {
+      vpn_failure: '检查 V2RayNG 是否前台运行, 节点是否过期; 跑 scripts/sim_captive_diagnose.py',
+      network_timeout: 'SIM 卡可能用尽流量或被运营商门户拦截; 跑 scripts/sim_captive_diagnose.py',
+      ui_not_found: 'FB UI 版本变化导致 selector miss; 启用 VLM fallback 或更新 selector',
+      account_limited: '账号被风控, 立即停手 24h 让账号冷却; 检查是否触发 anti-spam',
+      device_offline: 'USB 接触不良 / adb 断开; adb kill-server && adb start-server',
+      geo_mismatch: 'VPN 节点国家不匹配 persona; 切对应国家的 VPN',
+      task_timeout: '设备性能瓶颈或 LLM 调用慢; 看 /cluster/customers/push/metrics',
+      unknown: '看具体 task.result.error 字段定位',
+    };
+    const topCat = sorted[0] ? sorted[0][0] : null;
+    html += '<div><div style="font-size:11px;color:#94a3b8;margin-bottom:6px">💡 修复建议 (针对 Top 失败类型)</div>';
+    if (topCat) {
+      html += '<div style="background:rgba(96,165,250,.1);border-left:3px solid #60a5fa;padding:10px 12px;border-radius:6px;font-size:12px;line-height:1.6;margin-bottom:8px">'
+        + '<b style="color:#60a5fa">' + safeText(CAT_LABELS[topCat] || topCat) + ' ('
+        + sorted[0][1] + ' 个)</b><br><span style="color:#cbd5e1">'
+        + safeText(TOP_FIX[topCat] || '查看 logs/openclaw.log') + '</span></div>';
+    }
+    html += '</div>';
+
+    // 右: 设备失败排行 (Top 5)
+    const byDev = data.by_device || {};
+    const devSorted = Object.entries(byDev).sort((a, b) =>
+      (b[1].total_failed || 0) - (a[1].total_failed || 0)).slice(0, 5);
+    if (devSorted.length > 0) {
+      html += '<div><div style="font-size:11px;color:#94a3b8;margin-bottom:6px">📉 失败 Top 5 设备</div>';
+      devSorted.forEach(([dev, info]) => {
+        const total = info.total_failed || 0;
+        const top = info.top_category || '?';
+        const color = CAT_COLORS[top] || '#94a3b8';
+        html += '<div style="margin:4px 0;font-size:11px;display:flex;justify-content:space-between;align-items:center">'
+          + '<span class="mono" style="color:#cbd5e1">' + safeText(dev.substring(0, 14)) + '…</span>'
+          + '<div><span style="color:' + color + ';font-size:10px;margin-right:6px">'
+          + safeText(CAT_LABELS[top] || top) + '</span>'
+          + '<b style="color:#ef4444">' + total + '</b></div>'
+          + '</div>';
+      });
+      html += '</div>';
+    }
+
+    html += '</div>';
+    target.innerHTML = html;
+  } catch (e) {
+    document.getElementById('ea-content').innerHTML =
+      '<div class="empty">加载失败: ' + safeText(e.message) + '</div>';
+  }
+}
+
 // ─── refresh all ────────────────────────────────────────────────
 async function refresh() {
   document.getElementById('last-update').innerText = '刷新中…';
-  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics(), loadAbExperiment(), loadViews(), loadTopHighPriority(), loadTopFrustrated(), loadReferralDecisionsAggregate()]);
+  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics(), loadAbExperiment(), loadViews(), loadTopHighPriority(), loadTopFrustrated(), loadReferralDecisionsAggregate(), loadErrorAnalysis()]);
   document.getElementById('last-update').innerText = '更新于 ' + new Date().toLocaleTimeString();
 }
 
