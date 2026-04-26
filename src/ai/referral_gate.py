@@ -76,28 +76,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PERSONA_CFG_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_PERSONA_CFG_CACHE_MTIME: float = 0.0
 _PERSONA_CFG_LOCK_PATH = "config/referral_strategies.yaml"
 
 
 def _load_persona_strategies_yaml() -> Dict[str, Dict[str, Any]]:
-    """读 config/referral_strategies.yaml, 失败返 {}. 模块级 cache."""
-    global _PERSONA_CFG_CACHE
-    if _PERSONA_CFG_CACHE is not None:
-        return _PERSONA_CFG_CACHE
+    """读 config/referral_strategies.yaml, 失败返 {}.
+
+    Phase-11 hot reload: 按文件 mtime 检查, 变了就重读.
+    运营改 yaml 后无需重启 30 worker.
+    """
+    global _PERSONA_CFG_CACHE, _PERSONA_CFG_CACHE_MTIME
     try:
         import yaml
         from pathlib import Path
-        # 相对项目根 (cwd) 找
         path = Path(_PERSONA_CFG_LOCK_PATH)
         if not path.exists():
             _PERSONA_CFG_CACHE = {}
+            _PERSONA_CFG_CACHE_MTIME = 0.0
+            return _PERSONA_CFG_CACHE
+        mtime = path.stat().st_mtime
+        # cache 命中且 mtime 没变 → 直接返
+        if _PERSONA_CFG_CACHE is not None and mtime == _PERSONA_CFG_CACHE_MTIME:
             return _PERSONA_CFG_CACHE
         with path.open(encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         _PERSONA_CFG_CACHE = data if isinstance(data, dict) else {}
+        _PERSONA_CFG_CACHE_MTIME = mtime
+        if mtime > 0:
+            logger.info("[referral_gate] persona strategies yaml reloaded (mtime=%.0f)",
+                        mtime)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[referral_gate] load persona strategies failed: %s", exc)
-        _PERSONA_CFG_CACHE = {}
+        if _PERSONA_CFG_CACHE is None:
+            _PERSONA_CFG_CACHE = {}
     return _PERSONA_CFG_CACHE
 
 
@@ -130,26 +142,37 @@ def load_persona_config(persona_key: Optional[str]) -> Dict[str, Any]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _TRIGGER_KW_CACHE: Optional[Dict[str, List[str]]] = None
+_TRIGGER_KW_CACHE_MTIME: float = 0.0
 _TRIGGER_KW_PATH = "config/referral_trigger_keywords.yaml"
 
 
 def _load_trigger_keywords() -> Dict[str, List[str]]:
-    """读 config/referral_trigger_keywords.yaml. 失败返 {}."""
-    global _TRIGGER_KW_CACHE
-    if _TRIGGER_KW_CACHE is not None:
-        return _TRIGGER_KW_CACHE
+    """读 config/referral_trigger_keywords.yaml. 失败返 {}.
+
+    Phase-11 hot reload 同 _load_persona_strategies_yaml.
+    """
+    global _TRIGGER_KW_CACHE, _TRIGGER_KW_CACHE_MTIME
     try:
         import yaml
         from pathlib import Path
         path = Path(_TRIGGER_KW_PATH)
         if not path.exists():
             _TRIGGER_KW_CACHE = {}
+            _TRIGGER_KW_CACHE_MTIME = 0.0
+            return _TRIGGER_KW_CACHE
+        mtime = path.stat().st_mtime
+        if _TRIGGER_KW_CACHE is not None and mtime == _TRIGGER_KW_CACHE_MTIME:
             return _TRIGGER_KW_CACHE
         with path.open(encoding="utf-8") as f:
             _TRIGGER_KW_CACHE = yaml.safe_load(f) or {}
+        _TRIGGER_KW_CACHE_MTIME = mtime
+        if mtime > 0:
+            logger.info("[referral_gate] trigger keywords yaml reloaded (mtime=%.0f)",
+                        mtime)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[referral_gate] load trigger keywords failed: %s", exc)
-        _TRIGGER_KW_CACHE = {}
+        if _TRIGGER_KW_CACHE is None:
+            _TRIGGER_KW_CACHE = {}
     return _TRIGGER_KW_CACHE
 
 

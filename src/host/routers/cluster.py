@@ -1547,6 +1547,66 @@ def _ab_auto_tick() -> None:
         })
     except Exception:
         pass
+    # Phase-11: webhook 推钉钉/feishu/Slack
+    try:
+        _send_webhook_notification(
+            title="🎓 A/B 实验自动 graduate",
+            markdown=(
+                f"前实验: **{cur.get('name')}**\n"
+                f"赢家: **{winner}** (graduated)\n"
+                f"新实验: **{new_name}** ({new_id[:8]}…)\n"
+                f"对手: **{challenger}** vs winner"
+            ),
+        )
+    except Exception:
+        pass
+
+
+def _send_webhook_notification(title: str, markdown: str) -> None:
+    """Phase-11: 通用 webhook 通知 (admin 不盯盘也能看到 graduate / SLA 报警).
+
+    env:
+      OPENCLAW_NOTIFY_WEBHOOK = URL
+      OPENCLAW_NOTIFY_TYPE    = generic | slack | dingtalk | feishu (default generic)
+    无 URL 不发. 失败 catch 不抛.
+    """
+    import os as _os
+    url = (_os.environ.get("OPENCLAW_NOTIFY_WEBHOOK") or "").strip()
+    if not url:
+        return
+    notify_type = (_os.environ.get("OPENCLAW_NOTIFY_TYPE") or "generic").strip().lower()
+    body: dict
+    if notify_type == "dingtalk":
+        body = {
+            "msgtype": "markdown",
+            "markdown": {"title": title, "text": f"### {title}\n\n{markdown}"},
+        }
+    elif notify_type == "feishu":
+        body = {
+            "msg_type": "interactive",
+            "card": {
+                "header": {"title": {"tag": "plain_text", "content": title}},
+                "elements": [{"tag": "markdown", "content": markdown}],
+            },
+        }
+    elif notify_type == "slack":
+        body = {"text": f"*{title}*\n{markdown}"}
+    else:  # generic
+        body = {"title": title, "markdown": markdown,
+                "text": f"{title}\n\n{markdown}"}
+    import json as _j
+    import urllib.request as _ureq
+    data = _j.dumps(body).encode()
+    req = _ureq.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with _ureq.urlopen(req, timeout=8.0):
+            pass
+        logger.info("[notify_webhook] sent (%s) title=%s", notify_type, title)
+    except Exception as exc:
+        logger.warning("[notify_webhook] failed: %s", exc)
 
 
 @router.post("/cluster/customers/upsert", dependencies=[Depends(verify_api_key)])
@@ -1884,6 +1944,16 @@ def cluster_customers_llm_insight(customer_id: str, force: int = 0):
     out = dict(data)
     out["cached"] = False
     return out
+
+
+@router.get("/cluster/referral-decisions/aggregate",
+            dependencies=[Depends(verify_api_key)])
+def cluster_referral_decisions_aggregate(days: int = 30):
+    """Phase-11: referral_decision 事件聚合 (admin 调 gate 阈值看板)."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return store.referral_decisions_aggregate(days=days)
 
 
 @router.get("/cluster/customers/top/high-priority",
