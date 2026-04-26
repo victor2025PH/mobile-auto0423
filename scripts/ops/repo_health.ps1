@@ -13,8 +13,113 @@
 
 param(
     [switch]$Verbose,
-    [switch]$Fetch
+    [switch]$Fetch,
+    [switch]$Json
 )
+
+# JSON-only mode: machine-readable output for CI / Prometheus / cron consumption.
+if ($Json) {
+    $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    Set-Location $ProjectRoot
+
+    if ($Fetch) {
+        & git fetch origin main 2>&1 | Out-Null
+    }
+
+    $r = [ordered]@{
+        timestamp = (Get-Date).ToString('o')
+        verdict = 0
+        verdict_label = $null
+        branch = $null
+        ahead_local_main = 0
+        behind_local_main = 0
+        local_main_behind_origin = $null
+        on_main_with_changes = $false
+        modified = 0
+        untracked = 0
+        staged = 0
+        runtime_configs = @{}
+        launch_env_exists = $false
+        launch_env_size = 0
+        disk_hotspots_mb = @{}
+        vendor_dll_count = 0
+        vendor_has_scrcpy_server = $false
+    }
+    function _bump { param([int]$lvl) if ($lvl -gt $r.verdict) { $r.verdict = $lvl } }
+
+    # Branch
+    $r.branch = (& git branch --show-current 2>$null).Trim()
+    if (-not $r.branch) { _bump 1 }
+
+    if ($r.branch -and $r.branch -ne 'main') {
+        $r.ahead_local_main  = [int](& git rev-list --count "main..HEAD" 2>$null)
+        $r.behind_local_main = [int](& git rev-list --count "HEAD..main" 2>$null)
+        if ($r.behind_local_main -gt 0) { _bump 1 }
+    }
+    $hasOriginMain = (& git rev-parse --verify --quiet "refs/remotes/origin/main") 2>$null
+    if ($hasOriginMain) {
+        $r.local_main_behind_origin = [int](& git rev-list --count "main..origin/main" 2>$null)
+        if ($r.local_main_behind_origin -gt 0) { _bump 1 }
+    }
+
+    # Status
+    $dirty = & git status --porcelain 2>$null
+    $r.modified = ($dirty | Where-Object { $_ -match '^\s*M' }).Count
+    $r.untracked = ($dirty | Where-Object { $_ -match '^\?\?' }).Count
+    $r.staged = ($dirty | Where-Object { $_ -match '^[AMRD]' -and $_ -notmatch '^\?\?' }).Count
+
+    if ($r.branch -eq 'main' -and ($r.modified -gt 0 -or $r.staged -gt 0)) {
+        $r.on_main_with_changes = $true
+        _bump 1
+    }
+
+    # Runtime configs
+    $runtimeConfigs = @(
+        'config/cluster_state.json',
+        'config/device_aliases.json',
+        'config/device_registry.json',
+        'config/notify_config.json'
+    )
+    foreach ($cfg in $runtimeConfigs) {
+        $isDirty = [bool]($dirty | Where-Object { $_ -match [regex]::Escape($cfg) })
+        $r.runtime_configs[$cfg] = if ($isDirty) { 'dirty' } else { 'clean' }
+    }
+
+    # launch.env
+    $envFile = Join-Path $ProjectRoot "config\launch.env"
+    if (Test-Path $envFile) {
+        $r.launch_env_exists = $true
+        $r.launch_env_size = (Get-Item $envFile).Length
+    } else {
+        _bump 1
+    }
+
+    # Disk hotspots
+    $hotspots = @('logs', 'logs\_archive', 'data', 'data\_archive', 'debug', 'temp', 'apk_repo')
+    foreach ($h in $hotspots) {
+        $p = Join-Path $ProjectRoot $h
+        if (Test-Path $p) {
+            $size = (Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue |
+                     Measure-Object -Property Length -Sum).Sum
+            $r.disk_hotspots_mb[$h] = [Math]::Round(($size / 1MB), 1)
+            if ($r.disk_hotspots_mb[$h] -gt 500) { _bump 1 }
+        }
+    }
+
+    # Vendor
+    $vendor = Join-Path $ProjectRoot "vendor"
+    if (Test-Path $vendor) {
+        $r.vendor_dll_count = (Get-ChildItem $vendor -Filter "*.dll").Count
+        $r.vendor_has_scrcpy_server = Test-Path (Join-Path $vendor "scrcpy-server")
+        if (-not $r.vendor_has_scrcpy_server) { _bump 1 }
+    } else {
+        _bump 1
+    }
+
+    $r.verdict_label = switch ($r.verdict) { 0 {'HEALTHY'} 1 {'NEEDS ATTENTION'} default {'UNKNOWN'} }
+    $r | ConvertTo-Json -Depth 4
+    exit $r.verdict
+}
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
