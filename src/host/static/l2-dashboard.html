@@ -194,18 +194,42 @@
     </table>
   </div>
 
-  <!-- Recent customers -->
+  <!-- Recent customers + 搜索过滤 -->
   <div class="panel">
-    <h2>👥 最近 50 个客户 <span class="panel-hint">点行看完整聊天 / 事件 / handoff 历史</span></h2>
+    <h2>👥 客户列表 <span class="panel-hint">点行看完整档案 · 含最近聊天预览</span></h2>
+    <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
+      <input id="search-q" placeholder="搜索姓名 / customer_id..." oninput="debounceSearch()" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 10px;border-radius:6px;font-size:12px;flex:1;min-width:140px"/>
+      <select id="search-priority" onchange="doSearch()" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:12px">
+        <option value="">所有 priority</option>
+        <option value="high">🔥 high</option>
+        <option value="medium">⚡ medium</option>
+        <option value="low">💤 low</option>
+      </select>
+      <select id="search-status" onchange="doSearch()" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:12px">
+        <option value="">所有 status</option>
+        <option value="in_funnel">in_funnel</option>
+        <option value="in_messenger">in_messenger</option>
+        <option value="in_line">in_line</option>
+        <option value="accepted_by_human">accepted_by_human</option>
+        <option value="converted">converted</option>
+        <option value="lost">lost</option>
+      </select>
+      <select id="search-ab" onchange="doSearch()" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:6px 8px;border-radius:6px;font-size:12px">
+        <option value="">所有 variant</option>
+        <option value="v1">v1</option>
+        <option value="v2">v2</option>
+      </select>
+      <button onclick="resetSearch()" style="background:none;border:1px solid #475569;color:#cbd5e1;padding:6px 12px;border-radius:6px;font-size:11px;cursor:pointer">清空</button>
+    </div>
     <table>
       <thead>
         <tr>
-          <th style="width:110px">customer</th>
-          <th>姓名</th>
+          <th style="width:100px">customer</th>
+          <th>姓名 / 最近聊天</th>
           <th style="width:140px">状态</th>
-          <th style="width:140px">worker</th>
-          <th style="width:130px">device</th>
-          <th style="width:110px">更新</th>
+          <th style="width:130px">worker</th>
+          <th style="width:120px">device</th>
+          <th style="width:90px">更新</th>
         </tr>
       </thead>
       <tbody id="customers-tbody">
@@ -396,20 +420,33 @@ async function loadHandoffPending() {
 }
 
 async function loadCustomers() {
+  await _renderCustomers('/cluster/customers?limit=50');
+}
+
+async function _renderCustomers(url) {
   try {
-    const data = await fetchJson('/cluster/customers?limit=50');
+    const data = await fetchJson(url);
     const customers = data.customers || data || [];
     if (customers.length === 0) {
-      document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">还没有客户记录</td></tr>';
+      document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">没有匹配的客户</td></tr>';
       return;
     }
     const priorityEmoji = { 'high': '🔥', 'medium': '⚡', 'low': '💤' };
     document.getElementById('customers-tbody').innerHTML = customers.map(c => {
       const tag = c.priority_tag || 'medium';
       const emoji = priorityEmoji[tag] || '';
+      const last = c.last_chat || null;
+      const preview = last
+        ? '<div style="font-size:11px;color:#64748b;font-style:italic;margin-top:3px">'
+          + (last.direction === 'incoming' ? '📩 ' : '📤 ')
+          + safeText((last.content || '').substring(0, 60))
+          + ((last.content || '').length > 60 ? '…' : '')
+          + '</div>'
+        : '';
       return '<tr onclick="openCustomer(\'' + safeText(c.customer_id) + '\')">'
         + '<td class="mono">' + safeText((c.customer_id || '').substring(0, 12)) + '…</td>'
-        + '<td>' + emoji + ' <span class="name">' + safeText(c.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span></td>'
+        + '<td>' + emoji + ' <span class="name">' + safeText(c.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span>'
+        + preview + '</td>'
         + '<td><span class="pill ' + safeText(c.status) + '">' + safeText(c.status || 'in_funnel') + '</span></td>'
         + '<td class="mono">' + safeText(c.last_worker_id || '—') + '</td>'
         + '<td class="mono">' + safeText((c.last_device_id || '—').substring(0, 14)) + '</td>'
@@ -419,6 +456,37 @@ async function loadCustomers() {
   } catch (e) {
     document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">加载失败: ' + safeText(e.message) + '</td></tr>';
   }
+}
+
+let _searchTimer = null;
+function debounceSearch() {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(doSearch, 300);
+}
+
+function doSearch() {
+  const q = document.getElementById('search-q').value;
+  const priority = document.getElementById('search-priority').value;
+  const status = document.getElementById('search-status').value;
+  const ab = document.getElementById('search-ab').value;
+  if (!q && !priority && !status && !ab) {
+    return loadCustomers();
+  }
+  const qs = new URLSearchParams();
+  if (q) qs.set('q', q);
+  if (priority) qs.set('priority', priority);
+  if (status) qs.set('status', status);
+  if (ab) qs.set('ab_variant', ab);
+  qs.set('limit', '100');
+  return _renderCustomers('/cluster/customers-search?' + qs.toString());
+}
+
+function resetSearch() {
+  document.getElementById('search-q').value = '';
+  document.getElementById('search-priority').value = '';
+  document.getElementById('search-status').value = '';
+  document.getElementById('search-ab').value = '';
+  loadCustomers();
 }
 
 async function loadTimeseries() {

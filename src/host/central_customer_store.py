@@ -357,13 +357,13 @@ class CentralCustomerStore:
         where = []
         params = []
         if status:
-            where.append("status = %s")
+            where.append("c.status = %s")
             params.append(status)
         if country:
-            where.append("country = %s")
+            where.append("c.country = %s")
             params.append(country)
         if worker_id:
-            where.append("last_worker_id = %s")
+            where.append("c.last_worker_id = %s")
             params.append(worker_id)
         where_sql = " WHERE " + " AND ".join(where) if where else ""
         params.extend([limit, offset])
@@ -371,14 +371,71 @@ class CentralCustomerStore:
         with self._cursor() as cur:
             cur.execute(
                 f"""
-                SELECT customer_id::text, canonical_id, canonical_source,
-                       primary_name, age_band, gender, country, interests,
-                       ai_profile, status, priority_tag, last_worker_id, last_device_id,
-                       created_at, updated_at
+                SELECT
+                    c.customer_id::text, c.canonical_id, c.canonical_source,
+                    c.primary_name, c.age_band, c.gender, c.country, c.interests,
+                    c.ai_profile, c.status, c.priority_tag,
+                    c.last_worker_id, c.last_device_id,
+                    c.created_at, c.updated_at,
+                    -- Phase-5: 最近一条聊天预览 (任何 channel / direction)
+                    (SELECT json_build_object('content', ch.content,
+                                              'direction', ch.direction,
+                                              'ts', ch.ts)
+                       FROM customer_chats ch
+                       WHERE ch.customer_id = c.customer_id
+                       ORDER BY ch.ts DESC LIMIT 1) AS last_chat
+                FROM customers c
+                {where_sql}
+                ORDER BY c.updated_at DESC
+                LIMIT %s OFFSET %s
+                """,
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def search_customers(
+        self,
+        q: str = "",
+        priority: str = "",
+        status: str = "",
+        ab_variant: str = "",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Phase-5: 多维过滤 + 模糊搜索客户.
+
+        q: 模糊匹配 primary_name / canonical_id (case-insensitive)
+        priority: high|medium|low
+        status: in_funnel|in_messenger|in_line|...
+        ab_variant: v1|v2
+        """
+        where = []
+        params: List[Any] = []
+        if q:
+            where.append("(primary_name ILIKE %s OR canonical_id ILIKE %s)")
+            qpat = f"%{q}%"
+            params.extend([qpat, qpat])
+        if priority and priority in ("high", "medium", "low"):
+            where.append("priority_tag = %s")
+            params.append(priority)
+        if status:
+            where.append("status = %s")
+            params.append(status)
+        if ab_variant:
+            where.append("ai_profile->>'ab_variant' = %s")
+            params.append(ab_variant)
+        where_sql = " WHERE " + " AND ".join(where) if where else ""
+        params.append(min(max(1, int(limit)), 200))
+
+        with self._cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT customer_id::text, primary_name, status, priority_tag,
+                       ai_profile, country, last_worker_id, last_device_id,
+                       updated_at
                 FROM customers
                 {where_sql}
                 ORDER BY updated_at DESC
-                LIMIT %s OFFSET %s
+                LIMIT %s
                 """,
                 params,
             )
@@ -432,6 +489,64 @@ class CentralCustomerStore:
             cust["handoffs"] = [dict(r) for r in cur.fetchall()]
 
             return cust
+
+    def compute_ab_winner(
+        self,
+        days: int = 30,
+        min_samples_per_variant: int = 10,
+        min_rate_diff: float = 0.15,
+    ) -> Dict[str, Any]:
+        """Phase-5: 启发式判断 A/B winner. 不引 scipy.
+
+        判定: 每个 variant 至少 min_samples_per_variant 个 outcome (converted+lost),
+        且 conversion_rate 差 ≥ min_rate_diff (绝对值) → 标 winner.
+
+        返回 {winner: 'v1'|'v2'|None, confidence: float, samples: dict, rates: dict}.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(c.ai_profile->>'ab_variant', '') AS variant,
+                    SUM(CASE WHEN h.outcome='converted' THEN 1 ELSE 0 END) AS converted_n,
+                    SUM(CASE WHEN h.outcome IN ('converted', 'lost') THEN 1 ELSE 0 END) AS finished_n
+                FROM customer_handoffs h
+                JOIN customers c ON c.customer_id = h.customer_id
+                WHERE h.completed_at IS NOT NULL
+                  AND h.completed_at > NOW() - (INTERVAL '1 day' * %s)
+                  AND COALESCE(c.ai_profile->>'ab_variant', '') IN ('v1', 'v2')
+                GROUP BY variant
+                """,
+                (max(1, min(int(days), 365)),),
+            )
+            rows = {r["variant"]: dict(r) for r in cur.fetchall()}
+
+        v1 = rows.get("v1") or {"converted_n": 0, "finished_n": 0}
+        v2 = rows.get("v2") or {"converted_n": 0, "finished_n": 0}
+        f1 = int(v1.get("finished_n") or 0)
+        f2 = int(v2.get("finished_n") or 0)
+        c1 = int(v1.get("converted_n") or 0)
+        c2 = int(v2.get("converted_n") or 0)
+        rate1 = (c1 / f1) if f1 else 0.0
+        rate2 = (c2 / f2) if f2 else 0.0
+
+        winner = None
+        confidence = 0.0
+        if f1 >= min_samples_per_variant and f2 >= min_samples_per_variant:
+            diff = abs(rate1 - rate2)
+            if diff >= min_rate_diff:
+                winner = "v1" if rate1 > rate2 else "v2"
+                # 简单置信度: diff / (max possible) — 信号强度
+                confidence = min(1.0, diff / 0.5)
+
+        return {
+            "winner": winner,
+            "confidence": round(confidence, 2),
+            "samples": {"v1": f1, "v2": f2},
+            "rates": {"v1": round(rate1, 3), "v2": round(rate2, 3)},
+            "min_samples_required": min_samples_per_variant,
+            "min_rate_diff_required": min_rate_diff,
+        }
 
     def variant_sla_stats(self, days: int = 30) -> List[Dict[str, Any]]:
         """Phase-4: 按 ab_variant (v1/v2) 切片转化率, 给主管做 A/B 决策.

@@ -1765,6 +1765,30 @@ def cluster_customers_sla_agents(days: int = 30):
     return {"days": days, "agents": store.agent_sla_stats(days=min(max(1, days), 365))}
 
 
+@router.get("/cluster/customers-search",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_search(q: str = "", priority: str = "", status: str = "",
+                              ab_variant: str = "", limit: int = 50):
+    """Phase-5: 客户搜索 / 多维过滤."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"customers": store.search_customers(
+        q=q, priority=priority, status=status, ab_variant=ab_variant,
+        limit=limit,
+    )}
+
+
+@router.get("/cluster/customers/ab/winner",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_ab_winner(days: int = 30):
+    """Phase-5: A/B 实验 winner 自动判定."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return store.compute_ab_winner(days=min(max(1, days), 365))
+
+
 @router.get("/cluster/customers/sla/variants",
             dependencies=[Depends(verify_api_key)])
 def cluster_customers_sla_variants(days: int = 30):
