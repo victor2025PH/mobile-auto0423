@@ -79,6 +79,10 @@ config/routers.json
 # 模板见 config/referral_receivers.yaml.example
 config/referral_receivers.yaml
 
+# 启动配置 (端口 / API key 等本地化, 不入库)
+# 模板见 config/launch.env.example
+config/launch.env
+
 # 本地真机调试产物 (截图 + hierarchy dump)
 debug/
 
