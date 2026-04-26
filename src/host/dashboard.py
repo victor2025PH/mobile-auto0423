@@ -235,6 +235,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
       } catch (e) {}
     }
+
+    /* Phase-5: 注册 service worker (PWA offline 缓存) */
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('/sw.js', {scope: '/'})
+          .then(function (reg) { console.log('[PWA] sw registered, scope:', reg.scope); })
+          .catch(function (err) { console.warn('[PWA] sw register failed:', err); });
+      });
+    }
     </script>
     <script>
     /* PR-6.5: role-based 菜单显隐. customer_service 只看客服中心 + 总览 */

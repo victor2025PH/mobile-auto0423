@@ -46,13 +46,67 @@ CHANNEL_MESSENGER = "messenger"
 # Phase-3 A/B: 客户分流到 v1/v2. hash(canonical_id) % N 一致性映射,
 # 同一客户永远落同一 variant. 后续 chat_brain 按 variant 用不同话术.
 AB_VARIANTS = ("v1", "v2")
+AB_WINNER_CACHE_TTL_SEC = 300.0  # 5 min
+AB_WINNER_TRAFFIC_PCT = 80       # 有 winner 时 80% 流量给赢家
+
+
+_ab_winner_cache: Dict[str, Any] = {"winner": None, "fetched_at": 0.0}
+_ab_winner_lock = __import__("threading").Lock()
+
+
+def _fetch_ab_winner() -> Optional[str]:
+    """Phase-5: 从主控拿 winner (5 min cache). 失败返 None.
+
+    每次调 _ab_variant_for 不阻塞: 用 cache, 后台异步刷新.
+    """
+    import time as _t
+    with _ab_winner_lock:
+        rec = _ab_winner_cache
+        if _t.time() - rec.get("fetched_at", 0) < AB_WINNER_CACHE_TTL_SEC:
+            return rec.get("winner")
+
+    # cache 过期, 同步去拉 (一般 < 50ms 因为主控本机)
+    try:
+        from src.host.central_push_client import _http_post_json
+        # 改用 GET. _http_post_json 是 POST, 用 urllib 直接 GET
+        from urllib.request import Request, urlopen
+        from src.host.cluster_lock_client import get_coordinator_url
+        url = get_coordinator_url().rstrip("/") + "/cluster/customers/ab/winner"
+        with urlopen(url, timeout=3.0) as r:
+            import json as _j
+            data = _j.loads(r.read().decode("utf-8", errors="replace"))
+        winner = (data.get("winner") or "").lower()
+        if winner not in AB_VARIANTS:
+            winner = None
+        with _ab_winner_lock:
+            _ab_winner_cache["winner"] = winner
+            _ab_winner_cache["fetched_at"] = _t.time()
+        return winner
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] ab winner fetch failed: %s", exc)
+        with _ab_winner_lock:
+            _ab_winner_cache["fetched_at"] = _t.time()  # 防雪崩
+        return None
 
 
 def _ab_variant_for(canonical_id: str) -> str:
-    """一致性 hash 分流, 50/50."""
+    """一致性 hash 分流, 默认 50/50.
+
+    Phase-5: 如果主控有 winner, 80% 流量给 winner, 20% 给对照组
+    (保留对照组探测 winner 是否仍然好).
+    """
     if not canonical_id:
         return AB_VARIANTS[0]
     h = sum(ord(c) for c in canonical_id)
+
+    winner = _fetch_ab_winner()
+    if winner in AB_VARIANTS:
+        # 80% 给 winner, 20% 给对照
+        if (h % 100) < AB_WINNER_TRAFFIC_PCT:
+            return winner
+        else:
+            return AB_VARIANTS[1] if winner == AB_VARIANTS[0] else AB_VARIANTS[0]
+    # 没 winner: 50/50
     return AB_VARIANTS[h % len(AB_VARIANTS)]
 
 # status 状态机 (与 store SQL 守卫一致):
@@ -230,6 +284,34 @@ def _detect_lang_safe(text: str) -> Optional[str]:
         return None
 
 
+def _maybe_update_priority_from_emotion(
+    customer_id: str,
+    persona_key: str,
+    recent_messages: List[Dict[str, str]],
+) -> None:
+    """Phase-5: 根据 emotion 评分实时更新 priority_tag.
+
+    < 0.3 → low (不耐烦/敷衍, 不浪费真人产能)
+    > 0.7 → high (高意向, 优先接管)
+    中间 → 不动
+    LLM 失败 fallback 不动.
+    """
+    if not customer_id or not recent_messages:
+        return
+    try:
+        from src.ai.chat_emotion_scorer import score_emotion
+        result = score_emotion(recent_messages, persona_key=persona_key)
+        if result.get("fallback"):
+            return  # LLM 失败不操作
+        overall = float(result.get("overall") or 0.5)
+        if overall < 0.3:
+            _push_priority(customer_id, "low")
+        elif overall > 0.7:
+            _push_priority(customer_id, "high")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] emotion priority failed: %s", exc)
+
+
 def sync_messenger_incoming(
     device_id: str,
     peer_name: str,
@@ -276,7 +358,28 @@ def sync_messenger_incoming(
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[customer_sync] messenger_incoming push failed: %s", exc)
+
+    # Phase-5: 根据当前消息 + 历史几条算 emotion, 更新 priority
+    # 异步 fire-and-forget 不阻塞主流程
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        global _emotion_executor
+        try:
+            _emotion_executor
+        except NameError:
+            _emotion_executor = ThreadPoolExecutor(max_workers=2,
+                                                    thread_name_prefix="emo")
+        # 简化: 只用当前 incoming 一条 + last outgoing 1 条 (从 fb_store 拉太重)
+        msgs = [{"role": "user", "content": content}]
+        _emotion_executor.submit(_maybe_update_priority_from_emotion,
+                                  cid, "jp_female_midlife", msgs)
+    except Exception:
+        pass
+
     return cid
+
+
+_emotion_executor = None
 
 
 def sync_messenger_outgoing(
