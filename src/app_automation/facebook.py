@@ -2314,10 +2314,15 @@ class FacebookAutomation(BaseAutomation):
                                                    device_id=did,
                                                    phase_override=phase)
         # cold_start 直接拒绝（playbook 把 max_friends_per_run 设为 0）
+        # 2026-04-26 fix: force=True 时 (router 层 force_add_friend 透传过来)
+        # 跳过 phase gate, 由 caller 完全负责风险评估 (B2B 客户测试 / E2E smoke)
         if int(ab_cfg.get("max_friends_per_run", 5)) <= 0:
-            log.info("[add_friend_with_note] phase=%s 禁止加好友, skip: %s",
-                     eff_phase, profile_name)
-            return False
+            if not force:
+                log.info("[add_friend_with_note] phase=%s 禁止加好友, skip: %s "
+                         "(传 force=True 可绕过)", eff_phase, profile_name)
+                return False
+            log.warning("[add_friend_with_note] phase=%s force=True 绕过 gate: %s",
+                        eff_phase, profile_name)
 
         # P3-1 2026-04-23: 整段"cap 检查 → 发起请求 → 写库"用 device+section 锁串行化,
         # 消除多 worker 同时过 gate 造成的竞态超 cap。锁粒度 = 单 device 单 section,
@@ -3327,7 +3332,8 @@ class FacebookAutomation(BaseAutomation):
                                        phase: Optional[str] = None,
                                        assume_on_profile: bool = True,
                                        preset_key: str = "",
-                                       ai_decision: str = "greeting") -> bool:
+                                       ai_decision: str = "greeting",
+                                       force: bool = False) -> bool:
         """加好友之后在 profile 页点 "Message" 发一条打招呼消息(方案 A2)。
 
         本方法**假设调用之前已成功 add_friend_with_note** —— 实际流程:
@@ -3421,7 +3427,8 @@ class FacebookAutomation(BaseAutomation):
                 return self._send_greeting_after_add_friend_locked(
                     profile_name, greeting, did, d,
                     sg_cfg, eff_phase, persona_key,
-                    assume_on_profile, preset_key, ai_decision, _r)
+                    assume_on_profile, preset_key, ai_decision, _r,
+                    force=force)
         finally:
             # 清空 instance 变量, 避免下次调用串线
             self._current_lead_cid = ""
@@ -3431,16 +3438,25 @@ class FacebookAutomation(BaseAutomation):
     def _send_greeting_after_add_friend_locked(
             self, profile_name, greeting, did, d,
             sg_cfg, eff_phase, persona_key,
-            assume_on_profile, preset_key, ai_decision, _r):
-        """锁内主体 — 保证 cap 检查 + UI 发送 + 入库原子化。"""
+            assume_on_profile, preset_key, ai_decision, _r,
+            force: bool = False):
+        """锁内主体 — 保证 cap 检查 + UI 发送 + 入库原子化。
+
+        2026-04-26: force=True 时跳过概率闸 (B2B 客户测试 / E2E 需要确定执行).
+        """
 
         # 概率闸：支持 A/B 抽样（默认 1.0 必发）
+        # 2026-04-26 fix: force=True 时跳过 (传 force_send_greeting=True 透传过来)
         enabled_p = float(sg_cfg.get("enabled_probability", 1.0) or 0.0)
-        if enabled_p <= 0.0 or (enabled_p < 1.0 and _r.random() > enabled_p):
-            log.info("[send_greeting] 概率门未命中(p=%.2f), skip: %s",
+        if not force and (enabled_p <= 0.0 or (enabled_p < 1.0 and _r.random() > enabled_p)):
+            log.info("[send_greeting] 概率门未命中(p=%.2f), skip: %s "
+                     "(传 force_send_greeting=True 可绕过)",
                      enabled_p, profile_name)
             self._set_greet_reason("prob_gate")
             return False
+        if force and enabled_p < 1.0:
+            log.warning("[send_greeting] force=True 绕过概率门 (p=%.2f): %s",
+                        enabled_p, profile_name)
 
         # 24h rolling 日上限（与 add_friend.daily_cap 独立计）
         daily_cap = int(sg_cfg.get("daily_cap_per_account") or 0)
