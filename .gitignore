@@ -33,6 +33,8 @@ data/
 logs/
 *.log
 *.db
+*.db-shm
+*.db-wal
 
 # TLS 证书私钥
 config/certs/*.key

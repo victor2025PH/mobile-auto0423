@@ -13,13 +13,16 @@
 #   -Watch [-Interval N]  Refresh every N seconds (default 5). Ctrl+C to exit.
 #   -Open            After check, open dashboard in default browser (if up).
 #   -Beep            Audible beep when DEGRADED/DOWN or any AUTH device.
+#   -Json            Output structured JSON (no colored console). Useful for
+#                    cron / monitor / Prometheus exporter consumption.
 
 param(
     [switch]$NoExit,
     [switch]$Watch,
     [int]$Interval = 5,
     [switch]$Open,
-    [switch]$Beep
+    [switch]$Beep,
+    [switch]$Json
 )
 
 $ErrorActionPreference = 'Continue'
@@ -43,18 +46,151 @@ if ($Watch) {
     }
 }
 
+# ---- JSON mode: structured output for cron / monitor consumption ----
+if ($Json) {
+    $r = [ordered]@{
+        timestamp        = (Get-Date).ToString('o')
+        verdict          = 0
+        verdict_label    = $null
+        process          = @()
+        ports            = @()
+        health           = @()
+        devices          = @{ connected = 0; total = 0; unauthorized = 0; list = @() }
+        recent_errors    = @()
+        pg_central_store = @{ status = 'unknown'; note = $null }
+    }
+    function _bump { param([int]$lvl) if ($lvl -gt $r.verdict) { $r.verdict = $lvl } }
+
+    # [1] process
+    $procs = Get-OpenClawProcesses
+    foreach ($p in $procs) {
+        $tag = (Get-OpenClawLaunchTag $p.CommandLine).Trim()
+        $r.process += @{ kind = $tag; pid = $p.ProcessId }
+    }
+    if (-not $procs) { _bump 2 }
+    if ($procs -and -not ($procs | Where-Object { $_.CommandLine -match 'service_wrapper\.py' })) {
+        _bump 1
+    }
+
+    # [2] ports
+    $foundPort = $null
+    foreach ($port in @(8000, 18080)) {
+        $listening = netstat -ano | Select-String "LISTENING" | Select-String ":$port "
+        if ($listening) {
+            foreach ($line in $listening) {
+                $parts = $line.Line -split '\s+' | Where-Object { $_ }
+                $localAddr = $parts[1]
+                $pidVal = [int]$parts[-1]
+                $bind = if ($localAddr -match '^([\d.]+):') { $matches[1] } else { 'unknown' }
+                $lanReachable = ($bind -eq '0.0.0.0')
+                $r.ports += @{ port = $port; pid = $pidVal; bind = $bind; lan_reachable = $lanReachable }
+                if (-not $foundPort) { $foundPort = $port }
+                if ($bind -eq '127.0.0.1') { _bump 1 }
+            }
+        }
+    }
+    if (-not $foundPort) { _bump 2 }
+
+    # [3] health
+    foreach ($port in @(8000, 18080)) {
+        try {
+            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 `
+                    -UseBasicParsing -ErrorAction Stop
+            $r.health += @{ port = $port; code = [int]$resp.StatusCode }
+        } catch {
+            $code = $_.Exception.Response.StatusCode.value__
+            if ($code) {
+                $r.health += @{ port = $port; code = [int]$code }
+                _bump 1
+            }
+        }
+    }
+
+    # [4] devices
+    if ($foundPort) {
+        try {
+            $devicesJson = Invoke-WebRequest -Uri "http://127.0.0.1:$foundPort/devices" `
+                           -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+            $devices = $devicesJson.Content | ConvertFrom-Json
+            $connected = @($devices | Where-Object { $_.status -eq 'connected' }).Count
+            $unauth = @($devices | Where-Object { $_.usb_issue -eq 'unauthorized' }).Count
+            $r.devices.connected = $connected
+            $r.devices.total = $devices.Count
+            $r.devices.unauthorized = $unauth
+            foreach ($d in $devices) {
+                $r.devices.list += @{
+                    device_id = $d.device_id
+                    display_name = $d.display_name
+                    status = $d.status
+                    usb_issue = $d.usb_issue
+                }
+            }
+            if ($connected -lt $devices.Count -and $connected -gt 0) { _bump 1 }
+            elseif ($connected -eq 0 -and $devices.Count -gt 0)      { _bump 2 }
+        } catch { }
+    }
+
+    # [5+6] log tail
+    $logFile = Join-Path $ProjectRoot "logs\openclaw.log"
+    $tail = @()
+    if (Test-Path $logFile) {
+        try {
+            $fs = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Open,
+                                          [System.IO.FileAccess]::Read,
+                                          [System.IO.FileShare]::ReadWrite)
+            try {
+                $tailBytes = [Math]::Min(65536, $fs.Length)
+                $fs.Seek(-$tailBytes, [System.IO.SeekOrigin]::End) | Out-Null
+                $buf = New-Object byte[] $tailBytes
+                [void]$fs.Read($buf, 0, $tailBytes)
+                $text = [System.Text.Encoding]::UTF8.GetString($buf)
+            } finally { $fs.Close() }
+            $tail = @(($text -split "`r?`n") | Where-Object { $_ } | Select-Object -Last 200)
+        } catch { }
+    }
+    # [5] recent errors
+    $errs = $tail | Select-String -Pattern '"level":\s*"ERROR"' | Select-Object -Last 3
+    foreach ($e in $errs) {
+        $line = $e.Line
+        if ($line.Length -gt 300) { $line = $line.Substring(0, 300) + '...' }
+        $r.recent_errors += $line
+    }
+    if ($errs) { _bump 1 }
+    # [6] PG central_store
+    $readyIdx = -1; $failedIdx = -1
+    for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+        if ($readyIdx -lt 0 -and $tail[$i] -match 'PG pool ready')        { $readyIdx = $i }
+        if ($failedIdx -lt 0 -and $tail[$i] -match 'PG pool init failed') { $failedIdx = $i }
+        if ($readyIdx -ge 0 -and $failedIdx -ge 0) { break }
+    }
+    if ($readyIdx -lt 0 -and $failedIdx -lt 0) {
+        $r.pg_central_store.status = 'unknown'
+    } elseif ($readyIdx -gt $failedIdx) {
+        $r.pg_central_store.status = 'ready'
+    } else {
+        $r.pg_central_store.status = 'failed'
+        $r.pg_central_store.note = 'See RUNBOOK F9'
+        _bump 1
+    }
+
+    $r.verdict_label = switch ($r.verdict) { 0 {'GO'} 1 {'DEGRADED'} 2 {'DOWN'} default {'UNKNOWN'} }
+    $r | ConvertTo-Json -Depth 6
+    if ($NoExit) { return $r.verdict }
+    exit $r.verdict
+}
+
 # Track worst severity. Helper: bump exit code if worse.
 $script:exitCode = 0
 $script:hasAuthDevice = $false
 function Bump-Exit { param([int]$lvl) if ($lvl -gt $script:exitCode) { $script:exitCode = $lvl } }
 
 Write-Host "==========================================="
-Write-Host "  OpenClaw Status Check (5 items)"
+Write-Host "  OpenClaw Status Check (6 items)"
 Write-Host "==========================================="
 
 # ---- [1/5] Process ----
 Write-Host ""
-Write-Host "[1/5] Process"
+Write-Host "[1/6] Process"
 $procs = Get-OpenClawProcesses
 
 if ($procs) {
@@ -76,7 +212,7 @@ if ($procs) {
 
 # ---- [2/5] Port listening ----
 Write-Host ""
-Write-Host "[2/5] Port listening"
+Write-Host "[2/6] Port listening"
 $foundPort = $null
 foreach ($port in @(8000, 18080)) {
     $listening = netstat -ano | Select-String "LISTENING" | Select-String ":$port "
@@ -102,7 +238,7 @@ if (-not $foundPort) {
 
 # ---- [3/5] /health endpoint ----
 Write-Host ""
-Write-Host "[3/5] /health endpoint"
+Write-Host "[3/6] /health endpoint"
 foreach ($port in @(8000, 18080)) {
     try {
         $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/health" -TimeoutSec 3 `
@@ -119,7 +255,7 @@ foreach ($port in @(8000, 18080)) {
 
 # ---- [4/5] Devices ----
 Write-Host ""
-Write-Host "[4/5] Devices"
+Write-Host "[4/6] Devices"
 if ($foundPort) {
     try {
         $devicesJson = Invoke-WebRequest -Uri "http://127.0.0.1:$foundPort/devices" `
@@ -156,10 +292,12 @@ if ($foundPort) {
     Write-Host "   [SKIP] no listening port, skipped" -ForegroundColor DarkGray
 }
 
-# ---- [5/5] Recent errors ----
+# ---- [5/6] Recent errors ----
+# Read last 200 lines of logs/openclaw.log once, share with [6/6] below.
 Write-Host ""
-Write-Host "[5/5] Recent errors (last 200 lines of logs/openclaw.log)"
+Write-Host "[5/6] Recent errors (last 200 lines of logs/openclaw.log)"
 $logFile = Join-Path $ProjectRoot "logs\openclaw.log"
+$tail = @()
 if (Test-Path $logFile) {
     try {
         # Open with FileShare.ReadWrite so uvicorn/server can keep writing while we read.
@@ -177,7 +315,7 @@ if (Test-Path $logFile) {
             $fs.Close()
         }
         $allLines = $text -split "`r?`n" | Where-Object { $_ }
-        $tail = $allLines | Select-Object -Last 200
+        $tail = @($allLines | Select-Object -Last 200)
         $errs = $tail | Select-String -Pattern '"level":\s*"ERROR"' | Select-Object -Last 3
         if ($errs) {
             Write-Host "   [WARN] last 3 ERROR lines:" -ForegroundColor Yellow
@@ -195,6 +333,35 @@ if (Test-Path $logFile) {
     }
 } else {
     Write-Host "   [SKIP] $logFile not found" -ForegroundColor DarkGray
+}
+
+# ---- [6/6] L2 central_store PG status (RUNBOOK F9) ----
+Write-Host ""
+Write-Host "[6/6] L2 central_store PG status"
+if ($tail.Count -eq 0) {
+    Write-Host "   [SKIP] no log tail to inspect" -ForegroundColor DarkGray
+} else {
+    # Find latest occurrence of either 'PG pool ready' or 'PG pool init failed'
+    $readyIdx = -1
+    $failedIdx = -1
+    for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+        if ($readyIdx -lt 0 -and $tail[$i] -match 'PG pool ready')        { $readyIdx = $i }
+        if ($failedIdx -lt 0 -and $tail[$i] -match 'PG pool init failed') { $failedIdx = $i }
+        if ($readyIdx -ge 0 -and $failedIdx -ge 0) { break }
+    }
+
+    if ($readyIdx -lt 0 -and $failedIdx -lt 0) {
+        Write-Host "   [SKIP] no PG status in last 200 lines (central_store maybe disabled)" -ForegroundColor DarkGray
+    } elseif ($readyIdx -gt $failedIdx) {
+        Write-Host "   [OK]   PG pool ready (most recent)" -ForegroundColor Green
+    } elseif ($failedIdx -gt $readyIdx -and $readyIdx -ge 0) {
+        Write-Host "   [DEGRADED] PG init failed AFTER ready (RUNBOOK F9 — connection poisoned)" -ForegroundColor Yellow
+        Bump-Exit 1
+    } else {
+        Write-Host "   [DEGRADED] PG init failed, no recovery (RUNBOOK F9)" -ForegroundColor Yellow
+        Write-Host "             root fix: PG superuser run 'ALTER ROLE openclaw_app SET lc_messages=''C'';'" -ForegroundColor DarkYellow
+        Bump-Exit 1
+    }
 }
 
 # ---- Summary ----
