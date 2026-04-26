@@ -37,6 +37,41 @@ _ORPHAN_RUNNING_AGE_SEC = 7800
 # 每轮最多补派的任务数，避免洪水
 _RESCUE_BATCH_LIMIT = 100
 
+# 业务进展 SLA 阈值 (秒) — 按 task_type 区分.
+# 触发条件: status=running + type LIKE 'facebook_%' + 在 pool 里 +
+# elapsed >= 阈值 + 该 device 上从 task started 至今**0** 业务事件入库.
+# 业务事件信号源: fb_contact_events.at / facebook_groups.last_visited_at
+# (同一 device 同时只跑一个 task by device_section_lock, 关联可靠).
+#
+# 2026-04-27 加 (Phase 2 P0 #1): 兜底 R0/R3 漏掉的死循环场景:
+# 即使 decorator 正确 + 入口硬编码, 仍可能在 FB 内 dump_hierarchy 卡顿
+# / VPN 中途掉线断网无 UI / 群已被删 / 风控弹窗未识别等情况下死循环.
+# 阈值参考 _TASK_TYPE_TIMEOUTS (executor.py:159) + 业务最低产出周期.
+# 必然写业务事件的 task type — SLA 兜底.
+# 必须满足: 正常完成会写至少 1 条 fb_contact_events / facebook_groups /
+# fb_risk_events. 否则会被 SLA 误杀.
+_TASK_PROGRESS_TIMEOUT_SEC: dict[str, int] = {
+    "facebook_extract_members":          1800,  # 30 min — writes mark_group_visit
+    "facebook_add_friend":               1200,  # 20 min — writes add_friend_sent/risk
+    "facebook_send_greeting":             900,  # 15 min — writes greeting_sent
+    "facebook_send_message":              600,  # 10 min — writes contact_event
+    "facebook_check_inbox":              1200,  # 20 min — writes message_received if any
+    "facebook_check_message_requests":    600,  # 10 min — 同 check_inbox
+    "facebook_join_group":                600,  # 10 min — writes mark_group_visit
+    "facebook_profile_hunt":             1800,  # 30 min — writes contact_event on match
+}
+_DEFAULT_PROGRESS_TIMEOUT_SEC = 1800
+
+# SLA 跳过的 task type — 养号性任务, 正常跑也不产出 contact_event/group_visit/
+# risk_event, 由内层 _TASK_TYPE_TIMEOUTS (executor.py:159) 兜底, 不做业务进展 SLA.
+_SKIP_SLA_TASK_TYPES: frozenset = frozenset({
+    "facebook_group_engage",            # 浏览 + 点赞为主, 仅评论才写 event
+    "facebook_browse_feed",             # 纯浏览
+    "facebook_browse_feed_by_interest",
+    "facebook_browse_groups",           # 浏览 joined groups list
+    "facebook_warmup",                  # 养号开屏
+})
+
 _rescue_thread: Optional[threading.Thread] = None
 _rescue_stop = threading.Event()
 
@@ -240,26 +275,15 @@ def _load_orphan_pending(limit: int) -> list[dict]:
     return out
 
 
-def _load_orphan_running(limit: int) -> list[dict]:
-    """扫"status=running 但 pool 里没在跑"的孤儿 task (跨 server 重启场景).
-
-    判定:
-      - status='running' 且未删除
-      - updated_at 距今 >= _ORPHAN_RUNNING_AGE_SEC (避开正常长任务)
-      - 不在 WorkerPool._futures 里 → 上次进程的 thread 已死
-
-    2026-04-27 加: 用户报"task 跑 5h 还 running" 的真因是 server 在 19:18+01:45
-    重启过两次, in-flight task 的 thread 被杀但 DB status 没更新, 之前
-    pending_rescue_loop 只扫 pending 不扫 running → 孤儿任务永生.
-    """
+def _load_orphan_running(limit):
+    """[#119] 扫 status=running 但 pool 里没在跑的孤儿 task."""
     try:
         from .database import get_conn
         from .task_store import _alive_sql
         from .worker_pool import get_worker_pool
     except Exception as err:
-        logger.debug("[rescue] running orphan 依赖加载失败: %s", err)
+        logger.debug("[rescue] running orphan dep failed: %s", err)
         return []
-
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=_ORPHAN_RUNNING_AGE_SEC)
     cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
     with get_conn() as conn:
@@ -270,7 +294,6 @@ def _load_orphan_running(limit: int) -> list[dict]:
             f"ORDER BY updated_at ASC LIMIT ?",
             (cutoff_iso, limit),
         ).fetchall()
-
     pool = get_worker_pool()
     inflight = set(getattr(pool, "_futures", {}).keys()) | set(
         getattr(pool, "_cancel_flags", {}).keys()
@@ -289,18 +312,14 @@ def _load_orphan_running(limit: int) -> list[dict]:
     return out
 
 
-def _reap_orphan_running(orphans: list[dict]) -> int:
-    """把孤儿 running 任务标 fail (不重派 — 业务可能已部分执行,
-    重派会导致重复加好友/重复发消息等副作用).
-
-    跳过派发到 cluster worker 的 task (走 cluster_sync_thread 路径,
-    避免主控/worker 状态分裂)."""
+def _reap_orphan_running(orphans):
+    """[#119] mark orphan running tasks as failed (no resubmit)."""
     if not orphans:
         return 0
     try:
         from .task_store import set_task_result
     except Exception as err:
-        logger.debug("[rescue] set_task_result 加载失败: %s", err)
+        logger.debug("[rescue] set_task_result load failed: %s", err)
         return 0
     reaped = 0
     skipped_cluster = 0
@@ -312,22 +331,137 @@ def _reap_orphan_running(orphans: list[dict]) -> int:
         try:
             set_task_result(
                 tid, False,
-                error=("任务孤儿: server 重启或 thread 异常退出 "
-                       f"(last_update={t.get('updated_at')}); "
-                       "业务可能已部分执行, 不自动重派"),
+                error=("orphan task: server restart or thread died "
+                       f"(last_update={t.get('updated_at')})"),
             )
             logger.warning("[rescue] reap orphan running task=%s type=%s device=%s",
                            tid, t.get("type"), t.get("device_id"))
             reaped += 1
         except Exception as err:
-            logger.exception("[rescue] reap %s 失败: %s", tid, err)
+            logger.exception("[rescue] reap %s failed: %s", tid, err)
     if skipped_cluster:
         logger.info("[rescue] reap skipped %d cluster-dispatched tasks", skipped_cluster)
     return reaped
 
 
+def _load_no_progress_running(limit):
+    """[#121] scan facebook_* tasks with 0 business events in SLA window."""
+    try:
+        from .database import get_conn
+        from .task_store import _alive_sql
+        from .worker_pool import get_worker_pool
+    except Exception as err:
+        logger.debug("[sla] dep load failed: %s", err)
+        return []
+    pool = get_worker_pool()
+    inflight = set(getattr(pool, "_futures", {}).keys()) | set(
+        getattr(pool, "_cancel_flags", {}).keys()
+    )
+    out = []
+    now = datetime.now(timezone.utc)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT task_id, type, device_id, created_at "
+            f"FROM tasks WHERE status='running' AND {_alive_sql()} "
+            f"AND type LIKE 'facebook_%' "
+            f"ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    for row in rows:
+        tid = row["task_id"]
+        if tid not in inflight:
+            continue
+        if _is_dispatched_to_cluster_worker(tid):
+            continue
+        ttype = row["type"]
+        device = row["device_id"]
+        if not device:
+            continue
+        if ttype in _SKIP_SLA_TASK_TYPES:
+            continue
+        timeout = _TASK_PROGRESS_TIMEOUT_SEC.get(ttype, _DEFAULT_PROGRESS_TIMEOUT_SEC)
+        started_at = _iso_to_dt(row["created_at"])
+        if not started_at:
+            continue
+        elapsed = (now - started_at).total_seconds()
+        if elapsed < timeout:
+            continue
+        cutoff_sqlite = started_at.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with get_conn() as conn:
+                ev = conn.execute(
+                    "SELECT COUNT(*) AS n FROM fb_contact_events "
+                    "WHERE device_id = ? AND at >= ?",
+                    (device, cutoff_sqlite),
+                ).fetchone()
+                n_events = (ev["n"] if ev else 0) or 0
+                gv = conn.execute(
+                    "SELECT COUNT(*) AS n FROM facebook_groups "
+                    "WHERE device_id = ? AND last_visited_at >= ?",
+                    (device, cutoff_sqlite),
+                ).fetchone()
+                n_visits = (gv["n"] if gv else 0) or 0
+                rk = conn.execute(
+                    "SELECT COUNT(*) AS n FROM fb_risk_events "
+                    "WHERE device_id = ? AND detected_at >= ?",
+                    (device, cutoff_sqlite),
+                ).fetchone()
+                n_risks = (rk["n"] if rk else 0) or 0
+        except Exception as err:
+            logger.debug("[sla] query progress tables failed task=%s: %s", tid, err)
+            continue
+        if n_events == 0 and n_visits == 0 and n_risks == 0:
+            out.append({
+                "task_id": tid,
+                "type": ttype,
+                "device_id": device,
+                "elapsed_sec": int(elapsed),
+                "timeout_sec": timeout,
+            })
+    return out
+
+
+def _abort_no_progress_tasks(stuck):
+    """[#121] abort SLA-timed-out tasks via cooperative cancel + force fail."""
+    if not stuck:
+        return 0
+    try:
+        from .task_store import set_task_result
+        from .worker_pool import get_worker_pool
+    except Exception as err:
+        logger.debug("[sla] dep load failed: %s", err)
+        return 0
+    aborted = 0
+    pool = get_worker_pool()
+    for t in stuck:
+        tid = t["task_id"]
+        try:
+            pool.cancel_task(tid)
+        except Exception:
+            pass
+        try:
+            set_task_result(
+                tid, False,
+                error=(f"SLA timeout: {t['type']} on device "
+                       f"{t['device_id'][:12]} {t['elapsed_sec']}s elapsed "
+                       f"(SLA {t['timeout_sec']}s) with 0 events"),
+            )
+            logger.warning("[sla] abort no-progress task=%s type=%s device=%s",
+                           tid, t["type"], t["device_id"][:12])
+            aborted += 1
+        except Exception as err:
+            logger.exception("[sla] abort %s failed: %s", tid, err)
+    return aborted
+
+
 def _rescue_once() -> tuple[int, int]:
-    """跑一轮救援。返回 (scanned, resubmit)."""
+    """跑一轮救援。返回 (scanned, resubmit).
+
+    职责 (按时间顺序):
+      1. retry_ready: 历史失败的 task 到了重试时间 → 重派
+      2. orphan pending: 写进 DB 但没 submit 的 → 重派
+      3. (Phase 2 P0 #1) no-progress facebook task: SLA 超时无业务事件 → abort
+    """
     scanned = 0
     resubmit = 0
 
@@ -340,11 +474,17 @@ def _rescue_once() -> tuple[int, int]:
 
     orphans = _load_orphan_pending(limit=_RESCUE_BATCH_LIMIT)
 
-    # 2026-04-27 加: 回收 running 孤儿 (status=running 但 thread 已死)
+    # [#119] reap running orphans (status=running but thread died)
     running_orphans = _load_orphan_running(limit=_RESCUE_BATCH_LIMIT)
     reaped = _reap_orphan_running(running_orphans)
     if reaped:
         logger.info("[rescue] reaped %d orphan running tasks", reaped)
+
+    # [#121] SLA check: facebook_* task no business event -> abort (no resubmit)
+    stuck = _load_no_progress_running(limit=_RESCUE_BATCH_LIMIT)
+    aborted = _abort_no_progress_tasks(stuck)
+    if aborted:
+        logger.info("[sla] aborted %d no-progress facebook tasks", aborted)
 
     all_candidates: dict[str, dict] = {}
     for t in retry_ready:
