@@ -300,6 +300,103 @@
       + '</div>';
   }
 
+  // ── Phase-2: 客服个人工作台 lmOpenMyDesk ────────────────────────
+  window.lmOpenMyDesk = async function () {
+    const Shell = _shell();
+    if (!Shell) return;
+    let username = localStorage.getItem('oc_user') || localStorage.getItem('oc_cs_id') || '';
+    if (!username) {
+      username = prompt('请输入你的客服 ID:', 'agent_001');
+      if (!username) return;
+      localStorage.setItem('oc_cs_id', username);
+    }
+    Shell.modal.open('lm-mydesk-modal',
+      '<div id="lm-mydesk-body" style="padding:18px">加载中…</div>',
+      { maxWidth: '900px' });
+    await _lmRenderMyDesk(username);
+
+    // 自动刷新 30s
+    if (window._lmMyDeskTimer) clearInterval(window._lmMyDeskTimer);
+    window._lmMyDeskTimer = setInterval(function () {
+      if (!document.getElementById('lm-mydesk-modal')) {
+        clearInterval(window._lmMyDeskTimer);
+        return;
+      }
+      _lmRenderMyDesk(username);
+    }, 30000);
+  };
+
+  async function _lmRenderMyDesk(username) {
+    const body = document.getElementById('lm-mydesk-body');
+    if (!body) return;
+    try {
+      const resp = await _shell().api.get('/lead-mesh/handoffs/assigned/' +
+        encodeURIComponent(username));
+      const handoffs = (resp && resp.handoffs) || [];
+      const cnt = handoffs.length;
+
+      const header = ''
+        + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
+        + '<div>'
+        + '<div style="font-size:18px;font-weight:700">👤 我的工作台 — ' + _safe(username) + '</div>'
+        + '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">'
+        + '我正在跟进的客户 (' + cnt + ' 个) · 红色 = 超过 5 分钟未操作</div>'
+        + '</div>'
+        + '<button onclick="PlatShell.modal.close(\'lm-mydesk-modal\')" style="background:none;border:1px solid var(--border);color:var(--text);padding:4px 12px;border-radius:6px;cursor:pointer">关闭 ✕</button>'
+        + '</div>';
+
+      if (cnt === 0) {
+        body.innerHTML = header + '<div style="text-align:center;padding:50px;color:var(--text-dim)">'
+          + '✅ 当前没有正在跟进的客户<br>'
+          + '<span style="font-size:12px">去 <a href="javascript:void(0)" onclick="PlatShell.modal.close(\'lm-mydesk-modal\');lmOpenHandoffInbox(\'\')" style="color:#a855f7">📥 待接管队列</a> 接新客户</span>'
+          + '</div>';
+        return;
+      }
+
+      const cards = handoffs.map(function (h) {
+        const assignedAt = h.assigned_at ? new Date(h.assigned_at) : null;
+        const ageMin = assignedAt ? Math.floor((Date.now() - assignedAt.getTime()) / 60000) : 0;
+        const isOverdue = ageMin >= 5;
+        let replies = [];
+        let notes = [];
+        try { replies = JSON.parse(h.customer_service_replies_json || '[]'); } catch (e) {}
+        try { notes = JSON.parse(h.internal_notes_json || '[]'); } catch (e) {}
+        const lastReply = replies.length > 0 ? replies[replies.length - 1] : null;
+
+        const ageColor = isOverdue ? '#ef4444' : '#94a3b8';
+        const cardBorder = isOverdue ? '#ef4444' : 'var(--border)';
+
+        return ''
+          + '<div style="background:var(--bg-main);border:1px solid ' + cardBorder + ';border-radius:10px;padding:14px;margin-bottom:10px">'
+          + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">'
+          + '<div style="font-weight:600;font-size:14px">'
+          + '📌 ' + _safe(h.handoff_id.substring(0, 12)) + '… · '
+          + '<span style="font-size:11px;color:var(--text-muted)">渠道 ' + _safe(h.channel) + '</span>'
+          + '</div>'
+          + '<div style="font-size:11px;color:' + ageColor + ';font-weight:' + (isOverdue ? '700' : '400') + '">'
+          + (isOverdue ? '🔥 ' : '🕒 ') + ageMin + ' 分钟前接的'
+          + '</div>'
+          + '</div>'
+          + '<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">'
+          + 'lead <code>' + _safe((h.canonical_id || '').substring(0, 8)) + '</code>'
+          + ' · ' + replies.length + ' 条回复 · ' + notes.length + ' 条备注'
+          + (lastReply ? ' · <i>last: "' + _safe((lastReply.text || '').substring(0, 40)) + '..."</i>' : '')
+          + '</div>'
+          + '<div style="display:flex;gap:6px;flex-wrap:wrap">'
+          + '<button onclick="lmCsReply(\'' + h.handoff_id + '\')" style="padding:5px 12px;background:rgba(96,165,250,.15);color:#60a5fa;border:1px solid rgba(96,165,250,.4);border-radius:6px;font-size:11px;cursor:pointer">💬 回复</button>'
+          + '<button onclick="lmCsNote(\'' + h.handoff_id + '\')" style="padding:5px 12px;background:rgba(251,191,36,.15);color:#fbbf24;border:1px solid rgba(251,191,36,.4);border-radius:6px;font-size:11px;cursor:pointer">📝 备注</button>'
+          + '<button onclick="lmCsOutcome(\'' + h.handoff_id + '\')" style="padding:5px 12px;background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.4);border-radius:6px;font-size:11px;cursor:pointer;font-weight:600">🏁 标记结果</button>'
+          + '<button onclick="lmOpenLeadDossier(\'' + _safe(h.canonical_id) + '\')" style="margin-left:auto;padding:5px 10px;background:none;border:1px solid var(--border);color:var(--text-muted);border-radius:6px;font-size:11px;cursor:pointer">🔍 档案</button>'
+          + '</div>'
+          + '</div>';
+      }).join('');
+
+      body.innerHTML = header + cards;
+    } catch (e) {
+      body.innerHTML = '<div style="color:#ef4444;padding:14px">加载失败: ' + _safe(e.message || e) + '</div>';
+    }
+  }
+
   // ── PR-6.5+: 真 modal 替代 prompt() (轻量内联实现) ──────────────
   function _lmCsCurrentUser() {
     // 优先 dashboard 登录的 username, 然后 localStorage, 最后弹 modal 让用户输

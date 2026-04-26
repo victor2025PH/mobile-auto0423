@@ -56,6 +56,62 @@ def _cleanup_expired_sessions():
         _active_sessions.pop(k, None)
 
 
+# ── Phase-2: Role ACL ────────────────────────────────────────────────
+def _get_session_user(request: Request) -> Optional[dict]:
+    """从 cookie / Authorization 拿当前 session, 返 user dict 或 None."""
+    token = (request.headers.get("Authorization") or "").replace("Bearer ", "").strip()
+    if not token:
+        token = (request.cookies.get("oc_token") or "").strip()
+    if not token:
+        return None
+    sess = _active_sessions.get(token)
+    if not sess or sess.get("expires", 0) <= time.time():
+        return None
+    return sess
+
+
+def get_current_user_role(request: Request) -> str:
+    """返当前用户的 role, 未登录或 internal-mode (api key 空) 返 ''."""
+    sess = _get_session_user(request)
+    return (sess or {}).get("role", "")
+
+
+def get_current_username(request: Request) -> str:
+    sess = _get_session_user(request)
+    return (sess or {}).get("user", "")
+
+
+def requires_role(*allowed_roles: str):
+    """FastAPI dependency factory: 限制 endpoint 仅给指定 role 用户.
+
+    使用:
+        @router.post("/admin/something",
+                     dependencies=[Depends(requires_role("admin"))])
+
+    内网兼容模式 (_API_KEY 空) 时仍要 role 检查 (因为我们不希望客服能调).
+    用 X-API-Key 调时算 admin (机器对机器场景).
+    """
+    allowed = {r.lower() for r in allowed_roles}
+
+    async def _check(request: Request,
+                      key: Optional[str] = Security(_api_key_header)):
+        # 1) X-API-Key 通行 (机器调用)
+        if _API_KEY and key == _API_KEY:
+            return
+        # 2) session: 看 role 在白名单内
+        sess = _get_session_user(request)
+        if not sess:
+            raise HTTPException(status_code=401, detail="未登录")
+        role = (sess.get("role") or "").lower()
+        if role not in allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=f"权限不足: 需要 {', '.join(allowed)}, 当前 role={role}",
+            )
+
+    return _check
+
+
 # ── 密码哈希（PBKDF2 升级） ──
 
 def _hash_password(password: str, salt: str = None) -> str:
@@ -192,7 +248,7 @@ def list_users():
     return [{"username": u["username"], "role": u["role"], "display": u.get("display", "")} for u in users]
 
 
-@router.post("/auth/users", dependencies=[Depends(verify_api_key)])
+@router.post("/auth/users", dependencies=[Depends(requires_role("admin"))])
 def create_user(body: dict):
     users = _load_users()
     if any(u["username"] == body.get("username") for u in users):

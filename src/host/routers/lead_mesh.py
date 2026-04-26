@@ -723,6 +723,26 @@ def api_handoff_full(handoff_id: str):
     return rec
 
 
+@router.get("/events/stream")
+def api_events_stream():
+    """Phase-2: SSE 实时事件流. 浏览器 EventSource 订阅.
+
+    事件类型: handoff_pending_changed / handoff_assigned / handoff_outcome /
+    handoff_replied / handoff_note. 详见 events_stream.py.
+    """
+    from fastapi.responses import StreamingResponse
+    from src.host.lead_mesh.events_stream import event_stream
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @router.get("/handoffs/assigned/{username}")
 def api_handoffs_assigned_to(username: str, limit: int = Query(50, ge=1, le=500)):
     """列出某 username 当前接管中的 handoff (outcome 还没标的)."""

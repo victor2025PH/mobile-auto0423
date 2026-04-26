@@ -131,6 +131,17 @@ def assign_to_human(
             "ai_paused": bool(peer_name_hint and device_id_hint),
         },
     )
+    # Phase-2: SSE 广播
+    try:
+        from src.host.lead_mesh.events_stream import emit_event
+        emit_event("handoff_assigned", {
+            "handoff_id": handoff_id,
+            "by": username,
+            "peer_name": peer_name_hint,
+            "channel": rec.get("channel", ""),
+        })
+    except Exception:
+        pass
     return {"handoff_id": handoff_id, "assigned_to_username": username,
             "assigned_at": now}
 
@@ -327,6 +338,17 @@ def record_outcome(
             "is_terminal": outcome in TERMINAL_OUTCOMES,
         },
     )
+    # Phase-2: SSE 广播
+    try:
+        from src.host.lead_mesh.events_stream import emit_event
+        emit_event("handoff_outcome", {
+            "handoff_id": handoff_id,
+            "by": username,
+            "outcome": outcome,
+            "peer_name": peer_name_hint,
+        })
+    except Exception:
+        pass
     return {"handoff_id": handoff_id, "outcome": outcome, "at": now}
 
 

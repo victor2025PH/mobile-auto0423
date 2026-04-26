@@ -37,6 +37,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span class="sec-arrow">&#9660;</span>
     </div>
     <div class="nav-group" data-cs-group="1">
+      <div class="nav-item" onclick="if(window.lmOpenMyDesk)lmOpenMyDesk()" style="font-weight:600;background:rgba(168,85,247,.08)"><span class="icon">&#128100;</span><span>我的工作台</span></div>
       <div class="nav-item" onclick="if(window.lmOpenHandoffInbox)lmOpenHandoffInbox('')" style="font-weight:500"><span class="icon">&#128229;</span><span>待接管队列</span></div>
       <div class="nav-item" onclick="if(window.lmOpenLeadSearch)lmOpenLeadSearch()"><span class="icon">&#128270;</span><span>客户搜索</span></div>
       <div class="nav-item" onclick="if(window.lmOpenCommandCenter)lmOpenCommandCenter()"><span class="icon">&#128290;</span><span>命令中心</span></div>
@@ -160,6 +161,61 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }
     setInterval(_updateCsBadge, 30000);
     setTimeout(_updateCsBadge, 1500);  // 启动 1.5s 后第一次拉
+
+    /* Phase-2: SSE 实时事件订阅 + 桌面通知 */
+    (function _subscribeEvents() {
+      try {
+        if (typeof EventSource === 'undefined') return;
+        const es = new EventSource('/lead-mesh/events/stream');
+        es.addEventListener('hello', function (e) {
+          console.log('[SSE] connected', e.data);
+        });
+        es.addEventListener('handoff_assigned', function (e) {
+          try {
+            const d = JSON.parse(e.data);
+            const p = d.payload || {};
+            _toast('🙋 ' + (p.by || '?') + ' 接走客户 ' + (p.peer_name || p.handoff_id.substring(0,8)), '#a855f7');
+            _updateCsBadge();
+            _maybeDesktopNotify('客户被接管', (p.by || '') + ' → ' + (p.peer_name || ''));
+          } catch (err) {}
+        });
+        es.addEventListener('handoff_outcome', function (e) {
+          try {
+            const d = JSON.parse(e.data);
+            const p = d.payload || {};
+            const emoji = p.outcome === 'converted' ? '✅' : p.outcome === 'lost' ? '❌' : '⏳';
+            _toast(emoji + ' ' + (p.by || '?') + ' 标 ' + (p.peer_name || '?') + ' 为 ' + (p.outcome || '?'), '#22c55e');
+            _updateCsBadge();
+          } catch (err) {}
+        });
+        es.onerror = function () {
+          // EventSource 自动重连, 不需要手动处理
+        };
+      } catch (e) { console.warn('[SSE] init failed:', e); }
+    })();
+
+    function _toast(msg, color) {
+      const t = document.createElement('div');
+      t.style.cssText = 'position:fixed;bottom:20px;right:20px;'
+        + 'background:rgba(15,23,42,.95);border:1px solid ' + (color || '#475569')
+        + ';color:' + (color || '#e2e8f0') + ';padding:12px 20px;border-radius:10px;'
+        + 'font-size:13px;z-index:99999;box-shadow:0 8px 30px rgba(0,0,0,.5);'
+        + 'animation:slideInRight .3s ease-out';
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(function () { t.remove(); }, 4000);
+    }
+
+    function _maybeDesktopNotify(title, body) {
+      try {
+        if (typeof Notification === 'undefined') return;
+        if (Notification.permission === 'granted') {
+          new Notification(title, { body: body, icon: '/icon-192.svg' });
+        } else if (Notification.permission === 'default') {
+          Notification.requestPermission();
+        }
+      } catch (e) {}
+    }
     </script>
     <script>
     /* PR-6.5: role-based 菜单显隐. customer_service 只看客服中心 + 总览 */

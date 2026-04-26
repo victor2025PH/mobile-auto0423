@@ -372,6 +372,11 @@ def sync_handoff_to_line(
     from_stage: str = "messenger",
     to_stage: str = "line",
     meta: Optional[Dict[str, Any]] = None,
+    receiver_account_key: str = "",
+    persona_key: str = "",
+    snippet_sent: str = "",
+    conversation_snapshot: Optional[List[Dict[str, Any]]] = None,
+    write_lead_handoff: bool = True,
 ) -> Optional[str]:
     """messenger → line (或类似) 真正发起人机交接 handoff.
 
@@ -382,7 +387,11 @@ def sync_handoff_to_line(
     PR-2 的 worker 端 ai_summary 是简化拼接 (persona + last_in/out),
     L3 dashboard 实时拉时再补 LLM 总结.
 
-    返回 handoff_id (sync 调用; None 表示 push 失败 / 早退).
+    Phase-2: 双写 lead_handoffs SQLite (本机) — 让 SPA 引流后台 inbox
+    也能看到 L2 数据. write_lead_handoff=False 时只写 PG 不写 SQLite
+    (单独测试场景用).
+
+    返回 PG 端 handoff_id (sync 调用; None 表示 push 失败 / 早退).
     """
     if not device_id or not peer_name or not ai_summary:
         return None
@@ -391,9 +400,11 @@ def sync_handoff_to_line(
     )
     if not cid:
         return None
+
+    pg_handoff_id: Optional[str] = None
     try:
         from src.host.central_push_client import initiate_handoff
-        return initiate_handoff(
+        pg_handoff_id = initiate_handoff(
             customer_id=cid,
             from_stage=from_stage,
             to_stage=to_stage,
@@ -403,8 +414,26 @@ def sync_handoff_to_line(
             meta=meta,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[customer_sync] handoff initiate failed: %s", exc)
-        return None
+        logger.debug("[customer_sync] PG handoff initiate failed: %s", exc)
+
+    # Phase-2: 双写 lead_handoffs (SQLite). 失败不影响 PG 那边.
+    if write_lead_handoff:
+        try:
+            from src.host.lead_mesh.handoff import create_handoff
+            create_handoff(
+                canonical_id=cid or _build_canonical_id(device_id, peer_name),
+                source_agent=_safe_worker_id() or "customer_sync_bridge",
+                source_device=device_id,
+                channel=to_stage,
+                receiver_account_key=receiver_account_key,
+                persona_key=persona_key,
+                conversation_snapshot=conversation_snapshot or [],
+                snippet_sent=snippet_sent or ai_summary[:200],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[customer_sync] SQLite handoff create failed: %s", exc)
+
+    return pg_handoff_id
 
 
 def build_simple_summary(

@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket
-from .auth import verify_api_key
+from .auth import verify_api_key, requires_role
 from src.openclaw_env import DEFAULT_OPENCLAW_PORT
 from src.host.device_registry import DEFAULT_DEVICES_YAML, PROJECT_ROOT, config_file, scripts_dir
 
@@ -832,7 +832,8 @@ def cluster_set_config(body: dict):
     return {"status": "updated", "config": cfg}
 
 
-@router.post("/cluster/execute-script")
+@router.post("/cluster/execute-script",
+             dependencies=[Depends(requires_role("admin"))])
 def cluster_execute_script(body: dict):
     """Execute a script across all cluster hosts.
     body: {filename, type, target: 'all'|'host:name', variables?}"""
@@ -1127,7 +1128,8 @@ def cluster_pull_update(body: dict = None):
     }
 
 
-@router.post("/cluster/push-update-all")
+@router.post("/cluster/push-update-all",
+             dependencies=[Depends(requires_role("admin"))])
 def push_update_to_all_workers():
     """主控端：向所有在线 Worker 推送更新（服务端中转，避免浏览器 CORS）。"""
     from src.host.multi_host import get_cluster_coordinator
@@ -1191,7 +1193,8 @@ def push_update_to_all_workers():
     }
 
 
-@router.post("/cluster/restart")
+@router.post("/cluster/restart",
+             dependencies=[Depends(requires_role("admin"))])
 def cluster_restart():
     """本机重启：先尝试直接重启进程，fallback 写哨兵文件。"""
     import threading
@@ -1224,7 +1227,8 @@ def cluster_restart():
     return {"ok": True, "message": "重启中，3秒后生效"}
 
 
-@router.post("/cluster/restart-worker/{host_id}")
+@router.post("/cluster/restart-worker/{host_id}",
+             dependencies=[Depends(requires_role("admin"))])
 def restart_remote_worker(host_id: str):
     """主控端：远程触发指定 Worker 重启。"""
     from src.host.multi_host import get_cluster_coordinator
@@ -1642,6 +1646,16 @@ def cluster_customers_funnel(days: int = 7):
         raise HTTPException(400, "central store 仅在 coordinator 节点可用")
     store = _safe_get_store()
     return store.funnel_stats(days=min(max(1, days), 90))
+
+
+@router.get("/cluster/customers/sla/agents",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_sla_agents(days: int = 30):
+    """Phase-2: 主管 SLA 看板 — 按客服 username 统计接管 / 转化 / 平均处理时长."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"days": days, "agents": store.agent_sla_stats(days=min(max(1, days), 365))}
 
 
 @router.get("/cluster/customers/push/metrics",
