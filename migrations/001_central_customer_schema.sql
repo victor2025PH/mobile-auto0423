@@ -45,8 +45,10 @@ CREATE TABLE IF NOT EXISTS customers (
     UNIQUE (canonical_source, canonical_id)
 );
 
--- Phase-3: 兼容老 db 升级 (CREATE TABLE IF NOT EXISTS 不会加新列)
+-- Phase-3/6: 兼容老 db 升级 (CREATE TABLE IF NOT EXISTS 不会加新列)
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS priority_tag TEXT NOT NULL DEFAULT 'medium';
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS custom_tags TEXT[] DEFAULT '{}';
+CREATE INDEX IF NOT EXISTS idx_customers_custom_tags ON customers USING GIN (custom_tags);
 
 CREATE INDEX IF NOT EXISTS idx_customers_status_updated
     ON customers (status, updated_at DESC);

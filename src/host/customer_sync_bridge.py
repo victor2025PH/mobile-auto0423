@@ -50,26 +50,24 @@ AB_WINNER_CACHE_TTL_SEC = 300.0  # 5 min
 AB_WINNER_TRAFFIC_PCT = 80       # 有 winner 时 80% 流量给赢家
 
 
-_ab_winner_cache: Dict[str, Any] = {"winner": None, "fetched_at": 0.0}
+_ab_winner_cache: Dict[str, Any] = {"winner": None, "graduated": False, "fetched_at": 0.0}
 _ab_winner_lock = __import__("threading").Lock()
 
 
-def _fetch_ab_winner() -> Optional[str]:
-    """Phase-5: 从主控拿 winner (5 min cache). 失败返 None.
+def _fetch_ab_winner_state() -> Dict[str, Any]:
+    """Phase-6: 拿 winner + graduated 状态 (5 min cache).
 
-    每次调 _ab_variant_for 不阻塞: 用 cache, 后台异步刷新.
+    返回 {"winner": str|None, "graduated": bool}.
     """
     import time as _t
     with _ab_winner_lock:
         rec = _ab_winner_cache
         if _t.time() - rec.get("fetched_at", 0) < AB_WINNER_CACHE_TTL_SEC:
-            return rec.get("winner")
+            return {"winner": rec.get("winner"), "graduated": rec.get("graduated", False)}
 
     # cache 过期, 同步去拉 (一般 < 50ms 因为主控本机)
     try:
-        from src.host.central_push_client import _http_post_json
-        # 改用 GET. _http_post_json 是 POST, 用 urllib 直接 GET
-        from urllib.request import Request, urlopen
+        from urllib.request import urlopen
         from src.host.cluster_lock_client import get_coordinator_url
         url = get_coordinator_url().rstrip("/") + "/cluster/customers/ab/winner"
         with urlopen(url, timeout=3.0) as r:
@@ -78,35 +76,48 @@ def _fetch_ab_winner() -> Optional[str]:
         winner = (data.get("winner") or "").lower()
         if winner not in AB_VARIANTS:
             winner = None
+        graduated = bool(data.get("graduated"))
         with _ab_winner_lock:
             _ab_winner_cache["winner"] = winner
+            _ab_winner_cache["graduated"] = graduated
             _ab_winner_cache["fetched_at"] = _t.time()
-        return winner
+        return {"winner": winner, "graduated": graduated}
     except Exception as exc:  # noqa: BLE001
         logger.debug("[customer_sync] ab winner fetch failed: %s", exc)
         with _ab_winner_lock:
             _ab_winner_cache["fetched_at"] = _t.time()  # 防雪崩
-        return None
+        return {"winner": None, "graduated": False}
+
+
+def _fetch_ab_winner() -> Optional[str]:
+    """Backward-compat helper: 只返 winner."""
+    return _fetch_ab_winner_state().get("winner")
 
 
 def _ab_variant_for(canonical_id: str) -> str:
-    """一致性 hash 分流, 默认 50/50.
+    """一致性 hash 分流.
 
-    Phase-5: 如果主控有 winner, 80% 流量给 winner, 20% 给对照组
-    (保留对照组探测 winner 是否仍然好).
+    Phase-5: winner 不 graduated 时 80% 流量给赢家, 20% 对照组.
+    Phase-6: winner graduated 时 100% 流量给赢家, 退实验.
+    没 winner: 50/50.
     """
     if not canonical_id:
         return AB_VARIANTS[0]
     h = sum(ord(c) for c in canonical_id)
 
-    winner = _fetch_ab_winner()
+    state = _fetch_ab_winner_state()
+    winner = state.get("winner")
+    graduated = state.get("graduated", False)
+
     if winner in AB_VARIANTS:
-        # 80% 给 winner, 20% 给对照
+        if graduated:
+            # Phase-6: graduated 100% 给 winner
+            return winner
+        # Phase-5: 80% winner, 20% 对照
         if (h % 100) < AB_WINNER_TRAFFIC_PCT:
             return winner
         else:
             return AB_VARIANTS[1] if winner == AB_VARIANTS[0] else AB_VARIANTS[0]
-    # 没 winner: 50/50
     return AB_VARIANTS[h % len(AB_VARIANTS)]
 
 # status 状态机 (与 store SQL 守卫一致):
