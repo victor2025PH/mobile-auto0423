@@ -188,6 +188,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             _updateCsBadge();
           } catch (err) {}
         });
+        /* Phase-3: 客户回了消息 → 检查是否我接管中, 是则桌面通知 */
+        es.addEventListener('chat_inbound', async function (e) {
+          try {
+            const d = JSON.parse(e.data);
+            const p = d.payload || {};
+            const me = localStorage.getItem('oc_user') || localStorage.getItem('oc_cs_id') || '';
+            if (!me) return;
+            // 异步查我是不是接管中此客户
+            const r = await fetch('/lead-mesh/handoffs/assigned/' + encodeURIComponent(me),
+              { headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('oc_token') || '') } });
+            if (!r.ok) return;
+            const data = await r.json();
+            const isMine = (data.handoffs || []).some(h => h.canonical_id === p.customer_id);
+            if (isMine) {
+              _toast('💬 客户 ' + (p.peer_name || '?') + ' 回了一条 ' + p.content_lang + ' 消息 (' + p.content_len + '字)', '#06b6d4');
+              _maybeDesktopNotify('客户回消息了', (p.peer_name || '客户') + ' · ' + p.channel);
+            }
+          } catch (err) { console.warn('chat_inbound:', err); }
+        });
         es.onerror = function () {
           // EventSource 自动重连, 不需要手动处理
         };

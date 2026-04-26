@@ -1518,6 +1518,32 @@ def cluster_customers_chat_push(customer_id: str, body: dict):
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    # Phase-3: incoming 消息 → SSE 广播 (不含 content, 只 customer_id + len)
+    if direction == "incoming":
+        try:
+            from src.host.lead_mesh.events_stream import emit_event
+            # 顺手查 primary_name (用于通知显示) — 失败不阻塞
+            peer_name = ""
+            try:
+                with store._cursor() as cur:
+                    cur.execute("SELECT primary_name FROM customers WHERE customer_id = %s",
+                                (customer_id,))
+                    row = cur.fetchone()
+                    if row:
+                        peer_name = row.get("primary_name") or ""
+            except Exception:
+                pass
+            emit_event("chat_inbound", {
+                "customer_id": customer_id,
+                "peer_name": peer_name,
+                "channel": channel,
+                "content_len": len(content),
+                "content_lang": body.get("content_lang") or "",
+            })
+        except Exception:
+            pass
+
     return {"chat_id": cid}
 
 
@@ -1646,6 +1672,26 @@ def cluster_customers_funnel(days: int = 7):
         raise HTTPException(400, "central store 仅在 coordinator 节点可用")
     store = _safe_get_store()
     return store.funnel_stats(days=min(max(1, days), 90))
+
+
+@router.get("/cluster/customers/funnel/timeseries",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_funnel_timeseries(days: int = 30):
+    """Phase-3: 历史漏斗时序图 — 按天统计 events / outcomes."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"days": days, "series": store.funnel_timeseries(days=min(max(1, days), 365))}
+
+
+@router.post("/cluster/customers/priority/recompute",
+             dependencies=[Depends(verify_api_key)])
+def cluster_customers_priority_recompute():
+    """Phase-3: 重算所有客户 priority_tag (启发式: status 映射)."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return store.recompute_priority_tags()
 
 
 @router.get("/cluster/customers/sla/agents",

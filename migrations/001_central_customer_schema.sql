@@ -17,6 +17,9 @@ VALUES (1, 'L2 central customer store: customers + events + chats + handoffs')
 ON CONFLICT (version) DO NOTHING;
 
 -- ── customers (master 表) ────────────────────────────────────────────
+-- Phase-3: priority_tag 客户分群 (high/medium/low) - 由 customer_sync_bridge 启发式更新
+-- 直接 SQL: ALTER TABLE customers ADD COLUMN IF NOT EXISTS priority_tag TEXT DEFAULT 'medium';
+-- 已有 customers 表的环境用上面 ALTER, 新建走下面 CREATE
 CREATE TABLE IF NOT EXISTS customers (
     customer_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     canonical_id TEXT NOT NULL,            -- 业务侧 ID, 例: fb_uid / messenger_thread_id / line_user_id
@@ -34,12 +37,16 @@ CREATE TABLE IF NOT EXISTS customers (
         -- accepted_by_human: 人工已接管
         -- converted: 真转化 (打款 / 实际成交)
         -- lost: 流失
+    priority_tag TEXT NOT NULL DEFAULT 'medium',  -- Phase-3: high/medium/low 客户分群
     last_worker_id TEXT,                    -- 最后写入的 worker (e.g. "worker-175")
     last_device_id TEXT,                    -- 最后操作的设备 serial
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (canonical_source, canonical_id)
 );
+
+-- Phase-3: 兼容老 db 升级 (CREATE TABLE IF NOT EXISTS 不会加新列)
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS priority_tag TEXT NOT NULL DEFAULT 'medium';
 
 CREATE INDEX IF NOT EXISTS idx_customers_status_updated
     ON customers (status, updated_at DESC);

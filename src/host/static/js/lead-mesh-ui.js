@@ -416,10 +416,15 @@
     return new Promise(function (resolve) {
       const overlay = document.createElement('div');
       overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.7);'
-        + 'z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px';
+        + 'z-index:99999;display:flex;align-items:center;justify-content:center;padding:10px;'
+        + 'overflow-y:auto';
+      const isMobile = window.innerWidth < 600;
       const card = document.createElement('div');
-      card.style.cssText = 'background:#1e293b;border:1px solid #475569;border-radius:14px;'
-        + 'width:100%;max-width:520px;box-shadow:0 24px 60px rgba(0,0,0,.6);overflow:hidden';
+      card.style.cssText = 'background:#1e293b;border:1px solid #475569;border-radius:'
+        + (isMobile ? '10px' : '14px') + ';'
+        + 'width:100%;max-width:' + (isMobile ? '100%' : '520px')
+        + ';box-shadow:0 24px 60px rgba(0,0,0,.6);overflow:hidden;'
+        + 'max-height:' + (isMobile ? '95vh' : 'auto') + ';overflow-y:auto';
       let bodyHtml = '<div style="padding:18px 22px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;align-items:center">'
         + '<h3 style="margin:0;font-size:16px;font-weight:600;color:#e2e8f0">' + _safe(title) + '</h3>'
         + '<button data-act="close" style="background:none;border:1px solid #475569;color:#cbd5e1;padding:4px 12px;border-radius:6px;cursor:pointer">关闭 ✕</button>'

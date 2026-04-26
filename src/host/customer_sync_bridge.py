@@ -43,6 +43,18 @@ CANONICAL_SOURCE = "facebook_name"
 CHANNEL_FACEBOOK = "facebook"
 CHANNEL_MESSENGER = "messenger"
 
+# Phase-3 A/B: 客户分流到 v1/v2. hash(canonical_id) % N 一致性映射,
+# 同一客户永远落同一 variant. 后续 chat_brain 按 variant 用不同话术.
+AB_VARIANTS = ("v1", "v2")
+
+
+def _ab_variant_for(canonical_id: str) -> str:
+    """一致性 hash 分流, 50/50."""
+    if not canonical_id:
+        return AB_VARIANTS[0]
+    h = sum(ord(c) for c in canonical_id)
+    return AB_VARIANTS[h % len(AB_VARIANTS)]
+
 # status 状态机 (与 store SQL 守卫一致):
 # in_funnel < in_messenger < in_line < accepted_by_human < converted/lost
 STATUS_IN_FUNNEL = "in_funnel"
@@ -72,16 +84,21 @@ def _ensure_customer(
     """upsert_customer + 返回 customer_id (deterministic UUIDv5).
 
     status 传了主控会按状态机守卫单调升级 (终态 + 人工接管态不可降级).
+    Phase-3: 自动分流 ab_variant 到 ai_profile (v1/v2).
     """
+    canonical_id = _build_canonical_id(device_id, peer_name)
+    # 自动注入 ab_variant (一致性 hash, 同 customer 总同 variant)
+    profile = dict(ai_profile or {})
+    profile.setdefault("ab_variant", _ab_variant_for(canonical_id))
     try:
         from src.host.central_push_client import upsert_customer
         return upsert_customer(
             canonical_source=CANONICAL_SOURCE,
-            canonical_id=_build_canonical_id(device_id, peer_name),
+            canonical_id=canonical_id,
             primary_name=peer_name,
             worker_id=_safe_worker_id() or None,
             device_id=device_id,
-            ai_profile=ai_profile,
+            ai_profile=profile,
             status=status,
             fire_and_forget=True,
         )

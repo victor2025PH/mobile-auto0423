@@ -213,6 +213,13 @@
     </table>
   </div>
 
+  <!-- Phase-3: 历史漏斗时序图 -->
+  <div class="panel">
+    <h2>📈 30 天漏斗趋势 <span class="panel-hint">每天事件量 + 转化数</span></h2>
+    <div id="ts-chart" style="height:240px"></div>
+    <div id="ts-legend" style="margin-top:10px;display:flex;gap:14px;flex-wrap:wrap;font-size:11px"></div>
+  </div>
+
   <!-- Agent SLA 主管视角 -->
   <div class="panel">
     <h2>🏆 客服 SLA <span class="panel-hint">近 30 天 · 按接管量倒序</span></h2>
@@ -390,18 +397,79 @@ async function loadCustomers() {
       document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">还没有客户记录</td></tr>';
       return;
     }
-    document.getElementById('customers-tbody').innerHTML = customers.map(c =>
-      '<tr onclick="openCustomer(\'' + safeText(c.customer_id) + '\')">'
-      + '<td class="mono">' + safeText((c.customer_id || '').substring(0, 12)) + '…</td>'
-      + '<td><span class="name">' + safeText(c.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span></td>'
-      + '<td><span class="pill ' + safeText(c.status) + '">' + safeText(c.status || 'in_funnel') + '</span></td>'
-      + '<td class="mono">' + safeText(c.last_worker_id || '—') + '</td>'
-      + '<td class="mono">' + safeText((c.last_device_id || '—').substring(0, 14)) + '</td>'
-      + '<td>' + fmtTime(c.updated_at) + '</td>'
-      + '</tr>'
-    ).join('');
+    const priorityEmoji = { 'high': '🔥', 'medium': '⚡', 'low': '💤' };
+    document.getElementById('customers-tbody').innerHTML = customers.map(c => {
+      const tag = c.priority_tag || 'medium';
+      const emoji = priorityEmoji[tag] || '';
+      return '<tr onclick="openCustomer(\'' + safeText(c.customer_id) + '\')">'
+        + '<td class="mono">' + safeText((c.customer_id || '').substring(0, 12)) + '…</td>'
+        + '<td>' + emoji + ' <span class="name">' + safeText(c.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span></td>'
+        + '<td><span class="pill ' + safeText(c.status) + '">' + safeText(c.status || 'in_funnel') + '</span></td>'
+        + '<td class="mono">' + safeText(c.last_worker_id || '—') + '</td>'
+        + '<td class="mono">' + safeText((c.last_device_id || '—').substring(0, 14)) + '</td>'
+        + '<td>' + fmtTime(c.updated_at) + '</td>'
+        + '</tr>';
+    }).join('');
   } catch (e) {
     document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">加载失败: ' + safeText(e.message) + '</td></tr>';
+  }
+}
+
+async function loadTimeseries() {
+  try {
+    const data = await fetchJson('/cluster/customers/funnel/timeseries?days=30');
+    const series = data.series || [];
+    if (series.length === 0) {
+      document.getElementById('ts-chart').innerHTML = '<div class="empty">无数据</div>';
+      return;
+    }
+    // 4 条线: friend_request_sent (cyan) / greeting_sent (purple) /
+    //   message_received (blue) / converted (green)
+    const lines = [
+      { key: 'friend_request_sent', color: '#06b6d4', label: '加好友' },
+      { key: 'greeting_sent', color: '#a855f7', label: '打招呼' },
+      { key: 'message_received', color: '#60a5fa', label: '客户回复' },
+      { key: 'customer_converted', color: '#22c55e', label: '成交' },
+    ];
+    const W = 1200, H = 240, P = 30;
+    let maxY = 1;
+    series.forEach(s => lines.forEach(l => { if (s[l.key] > maxY) maxY = s[l.key]; }));
+    const xStep = (W - 2 * P) / Math.max(1, series.length - 1);
+    const yScale = (H - 2 * P) / maxY;
+
+    const paths = lines.map(l => {
+      const pts = series.map((s, i) => {
+        const x = P + i * xStep;
+        const y = H - P - (s[l.key] || 0) * yScale;
+        return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
+      return '<path d="' + pts + '" stroke="' + l.color + '" stroke-width="2" fill="none"/>';
+    }).join('');
+
+    // x 轴标签 (每 5 天一个)
+    const xLabels = series.map((s, i) => {
+      if (i % 5 !== 0 && i !== series.length - 1) return '';
+      const x = P + i * xStep;
+      const dt = new Date(s.date);
+      return '<text x="' + x.toFixed(1) + '" y="' + (H - 8) + '" fill="#64748b" font-size="9" text-anchor="middle">'
+        + (dt.getMonth()+1) + '/' + dt.getDate() + '</text>';
+    }).join('');
+    // y 轴 max
+    const yMax = '<text x="' + (P - 4) + '" y="' + (P + 4) + '" fill="#64748b" font-size="9" text-anchor="end">' + maxY + '</text>';
+    const yMin = '<text x="' + (P - 4) + '" y="' + (H - P + 4) + '" fill="#64748b" font-size="9" text-anchor="end">0</text>';
+    const grid = '<line x1="' + P + '" y1="' + (H - P) + '" x2="' + (W - P) + '" y2="' + (H - P) + '" stroke="#334155" stroke-width="1"/>'
+      + '<line x1="' + P + '" y1="' + P + '" x2="' + P + '" y2="' + (H - P) + '" stroke="#334155" stroke-width="1"/>';
+
+    document.getElementById('ts-chart').innerHTML =
+      '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:100%;display:block">'
+      + grid + paths + xLabels + yMax + yMin + '</svg>';
+
+    document.getElementById('ts-legend').innerHTML = lines.map(l =>
+      '<div style="display:flex;align-items:center;gap:5px"><span style="width:10px;height:10px;background:' + l.color + ';border-radius:50%"></span>'
+      + '<span style="color:#cbd5e1">' + l.label + '</span></div>'
+    ).join('');
+  } catch (e) {
+    document.getElementById('ts-chart').innerHTML = '<div class="empty">加载失败: ' + safeText(e.message) + '</div>';
   }
 }
 
@@ -607,7 +675,7 @@ function showToast(msg, color) {
 // ─── refresh all ────────────────────────────────────────────────
 async function refresh() {
   document.getElementById('last-update').innerText = '刷新中…';
-  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadAgentSla(), loadPushMetrics()]);
+  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics()]);
   document.getElementById('last-update').innerText = '更新于 ' + new Date().toLocaleTimeString();
 }
 
