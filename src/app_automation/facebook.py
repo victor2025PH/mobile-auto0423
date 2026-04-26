@@ -4521,26 +4521,150 @@ class FacebookAutomation(BaseAutomation):
 
         return stats
 
+    # 搜索结果页的 "Groups" filter chip text (多语种 FB)
+    _FB_SEARCH_GROUPS_FILTER_TEXTS = (
+        "Groups", "GROUPS",
+        "群组", "群組",
+        "グループ",
+        "Gruppi",
+    )
+
+    def _tap_search_results_groups_filter(self, d, did: str) -> bool:
+        """硬编码点搜索结果页的 Groups filter chip.
+
+        FB 搜索结果页顶部布局: [All] [Posts] [People] [Groups] [Pages] ...
+        AutoSelector 学错时会把 "Groups, tab 4 of 6" (底部 tab) 当成
+        filter chip → 把搜索页切回 Groups 主 tab → 任务卡住.
+        """
+        for txt in self._FB_SEARCH_GROUPS_FILTER_TEXTS:
+            try:
+                el = d(text=txt, clickable=True)
+                if el.exists(timeout=0.6):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[enter_group] tap search Groups filter by text=%r", txt)
+                    return True
+                el = d(description=txt, clickable=True)
+                if el.exists(timeout=0.4):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.4)
+                    log.info("[enter_group] tap search Groups filter by desc=%r", txt)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _tap_first_search_result_group(self, d, did: str,
+                                       group_name: str) -> bool:
+        """硬编码点搜索结果列表里 group_name 对应的群入口.
+
+        2 层 fallback 优先精确匹配 group_name (避免误点其他 group),
+        最后才信任 TextView center 坐标 (即使父 ViewGroup 不可点).
+        """
+        # 1) 精确 text + clickable (列表项整行)
+        try:
+            el = d(text=group_name, clickable=True)
+            if el.exists(timeout=0.8):
+                self.hb.tap(d, *self._el_center(el))
+                time.sleep(0.5)
+                log.info("[enter_group] tap first result by exact text=%r", group_name)
+                return True
+        except Exception:
+            pass
+        # 2) textContains (容忍 emoji / decorations)
+        try:
+            el = d(textContains=group_name, clickable=True)
+            if el.exists(timeout=0.6):
+                self.hb.tap(d, *self._el_center(el))
+                time.sleep(0.5)
+                log.info("[enter_group] tap first result by textContains=%r", group_name)
+                return True
+        except Exception:
+            pass
+        # 3) TextView center (父 ViewGroup 不可点时兜底)
+        try:
+            el = d(text=group_name)
+            if el.exists(timeout=0.4):
+                self.hb.tap(d, *self._el_center(el))
+                time.sleep(0.5)
+                log.info("[enter_group] tap first result via TextView center=%r", group_name)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _assert_on_specific_group_page(self, d, group_name: str) -> bool:
+        """进群后自检: 当前页面顶部包含 group_name (区别于推荐群卡片
+        / 误入 Messenger / 误入 profile 页等)."""
+        try:
+            if d(textContains=group_name).exists(timeout=1.5):
+                return True
+            try:
+                xml = d.dump_hierarchy() or ""
+                # 只看前 3000 字符 (顶部 toolbar / header 区域)
+                if group_name in xml[:3000]:
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return False
+
     def enter_group(self, group_name: str,
                     device_id: Optional[str] = None) -> bool:
-        """通过搜索进入指定群组(假设已加入)。"""
+        """通过搜索进入指定群组(假设已加入).
+
+        2026-04-27 改造 (PR #119 R3 治本): 3 个裸 smart_tap → 硬编码
+        helper + 自检, 修 5h 死循环事故的真根因. 见 memory:
+        autoselector_pitfall.md / session_handoff_2026-04-27_pr119.
+
+        步骤:
+          1. _tap_search_bar_preferred (既有 helper, 自带 FB Home + Messenger
+             误入检测 + force-restart 兜底)
+          2. type_text + press enter 提交搜索
+          3. _tap_search_results_groups_filter (新硬编码, 防误点底部 tab)
+          4. _tap_first_search_result_group (新硬编码, 精确 group_name 匹配)
+          5. _assert_on_specific_group_page (新自检, 防进错群/误入推荐卡片)
+        每步硬编码失败降级 smart_tap (但有自检兜底, 不会污染 selector 持续作恶).
+        """
         did = self._did(device_id)
         d = self._u2(did)
 
         with self.guarded("enter_group", device_id=did, weight=0.2):
-            if not self.smart_tap("Search bar or search icon", device_id=did):
-                self._fallback_search_tap(d)
+            # Step 1: 进搜索页 (既有 _tap_search_bar_preferred 已包含完整自检)
+            if not self._tap_search_bar_preferred(d, did):
+                log.info("[enter_group] _tap_search_bar_preferred miss, 降级")
+                if not self.smart_tap("Search bar or search icon", device_id=did):
+                    self._fallback_search_tap(d)
             time.sleep(0.6)
+
+            # Step 2: 输入群名 + 提交
             self.hb.type_text(d, group_name)
             time.sleep(1.0)
             d.press("enter")
             time.sleep(1.5)
-            self.smart_tap("Groups tab or filter", device_id=did)
+
+            # Step 3: 切到 Groups filter
+            if not self._tap_search_results_groups_filter(d, did):
+                log.info("[enter_group] hardcoded Groups filter miss, 降级 smart_tap")
+                self.smart_tap("Groups tab or filter", device_id=did)
             time.sleep(1.0)
-            ok = self.smart_tap("First matching group", device_id=did)
-            if ok:
-                time.sleep(random.uniform(2.0, 3.5))
-            return ok
+
+            # Step 4: 点对应群
+            if not self._tap_first_search_result_group(d, did, group_name):
+                log.info("[enter_group] hardcoded first result miss, 降级 smart_tap")
+                if not self.smart_tap("First matching group", device_id=did):
+                    log.warning("[enter_group] 全路径找不到 group=%r", group_name)
+                    return False
+            time.sleep(random.uniform(2.0, 3.5))
+
+            # Step 5: 自检确实进了对的群 (防误入推荐群 / Messenger / profile)
+            if not self._assert_on_specific_group_page(d, group_name):
+                log.warning("[enter_group] 自检失败: 当前页未包含 group_name=%r "
+                             "(可能误入推荐群/Messenger/profile)", group_name)
+                return False
+            log.info("[enter_group] 进入群组成功: %r", group_name)
+            return True
 
     def comment_on_post(self, comment_text: str,
                         device_id: Optional[str] = None) -> bool:

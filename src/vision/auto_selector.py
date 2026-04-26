@@ -343,6 +343,36 @@ class SelectorStore:
 # AutoSelector — the main API
 # ---------------------------------------------------------------------------
 
+# 受保护的 target 列表 — smart_tap 仍可即时找元素并 click,
+# 但 **不允许写学习 cache**, 防止污染重灾区. 适用于 "已经有硬编码
+# helper 替代主路径, smart_tap 只是 fallback" 的场景.
+#
+# 2026-04-27 加 (圈层拓客 5h 死循环事故 R3 治本):
+# 这些 target 历史上反复被 AutoSelector 学错 (4-23 第一次, 4-26 又来
+# 一次), 见 memory/autoselector_pitfall.md. 现已有硬编码 helper:
+#
+# 圈层拓客 / Groups 相关流程:
+#   "Search bar or search icon"        → _tap_search_bar_preferred
+#   "Groups tab"                       → _tap_groups_bottom_tab
+#   "Groups tab or filter"             → _tap_search_results_groups_filter
+#   "Members tab in the group header"  → _tap_group_members_tab
+#   "First matching group"             → _tap_first_search_result_group
+#   "Your groups"                      → _tap_your_groups_entry
+#   "Group name or icon at top to open info"  → enter_group + 自检兜底
+#
+# 加新 helper 后请同步加入这个集合; 撤销 helper 时也要从集合移除
+# (否则没主路径 + 不学 cache, smart_tap 会永远依赖 Vision 路径, 浪费 API).
+_PROTECTED_TARGETS: frozenset = frozenset({
+    "Search bar or search icon",
+    "Groups tab",
+    "Groups tab or filter",
+    "Members tab in the group header",
+    "First matching group",
+    "Your groups",
+    "Group name or icon at top to open info",
+})
+
+
 class AutoSelector:
     """
     Intelligent element finder: cached selectors → Vision learning → save.
@@ -352,6 +382,8 @@ class AutoSelector:
         - Vision fallback when cache misses
         - Auto-relearn: when a selector's confidence drops below threshold,
           automatically invalidate and re-learn via Vision
+        - Protected targets: smart_tap can still resolve via Vision, but
+          will NOT write learned selectors back (防污染). See _PROTECTED_TARGETS.
 
     Usage:
         auto = AutoSelector(vision_backend)
@@ -392,8 +424,14 @@ class AutoSelector:
 
         Returns ParsedElement on success, None if not found.
         """
-        # 1. try cached selectors
-        entry = self._store.get(package, target)
+        # 0. protected target: 跳过 cache 读取 (防历史污染 cache 持续作恶) +
+        # 跳过学习写入 (本次 Vision 找到的也不写). smart_tap 仍可用 Vision
+        # 路径正常 click. 适用于"已有硬编码 helper 主路径, smart_tap 仅
+        # fallback" 的关键入口, 见 _PROTECTED_TARGETS.
+        is_protected = target in _PROTECTED_TARGETS
+
+        # 1. try cached selectors (skip for protected)
+        entry = None if is_protected else self._store.get(package, target)
         if entry:
             result = self._try_selectors(device, entry)
             if result:
@@ -419,6 +457,15 @@ class AutoSelector:
         parsed = self._parser.find(device, target, context)
         if not parsed:
             return None
+
+        # 2.5 protected target: 跳过学习写入 (Step 0 已跳过 cache 读取).
+        # smart_tap 仍可正常 click (用 parsed.center), 但 cache 保持空白 →
+        # 下次 smart_tap 还会走 Vision (不会因学错 cache 持续点错位置).
+        if learn and is_protected:
+            log.info("AutoSelector PROTECTED: %s/%s 关键入口受保护, 跳过学习写入 "
+                     "(由硬编码 helper 处理主路径, smart_tap 仅 Vision fallback)",
+                     package, target)
+            return parsed
 
         # 3. learn the selector for next time
         if learn and parsed.selectors:
