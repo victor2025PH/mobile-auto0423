@@ -376,11 +376,70 @@ def _rescue_loop():
     logger.info("[rescue] pending_rescue_loop 已退出")
 
 
+def _startup_reap_running_orphans() -> int:
+    """server 启动时立即回收一次 running 孤儿.
+
+    新进程的 pool._futures 必然为空, 所以**所有 status=running 的 task
+    都是上一进程的孤儿** (无论 updated_at 多久前). 用一个临时小阈值
+    (60s, 避开新进程刚启动后 set_task_running 写入的微小窗口) 兜底回收,
+    不必等 15s 轮询周期或 _ORPHAN_RUNNING_AGE_SEC=7800s 长阈值.
+    """
+    try:
+        from .database import get_conn
+        from .task_store import _alive_sql, set_task_result
+        from .worker_pool import get_worker_pool
+    except Exception as err:
+        logger.debug("[rescue] startup reap 依赖加载失败: %s", err)
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    pool = get_worker_pool()
+    inflight = set(getattr(pool, "_futures", {}).keys()) | set(
+        getattr(pool, "_cancel_flags", {}).keys()
+    )
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT task_id, type, device_id, updated_at "
+            f"FROM tasks WHERE status='running' AND {_alive_sql()} "
+            f"AND (updated_at IS NULL OR updated_at <= ?)",
+            (cutoff_iso,),
+        ).fetchall()
+
+    reaped = 0
+    for row in rows:
+        tid = row["task_id"]
+        if tid in inflight:
+            continue
+        try:
+            set_task_result(
+                tid, False,
+                error=("任务孤儿: server 启动时检测到上一进程未完成的 "
+                       f"running 任务 (last_update={row['updated_at']})"),
+            )
+            logger.warning("[rescue] startup-reap task=%s type=%s device=%s",
+                           tid, row["type"], row["device_id"])
+            reaped += 1
+        except Exception as err:
+            logger.exception("[rescue] startup-reap %s 失败: %s", tid, err)
+    return reaped
+
+
 def start_pending_rescue_loop() -> bool:
     """幂等启动后台救援线程。已启动返回 False。"""
     global _rescue_thread
     if _rescue_thread and _rescue_thread.is_alive():
         return False
+
+    # 2026-04-27 加: server 启动时立即回收 running 孤儿, 不等 15s 轮询.
+    # 新进程的 pool 必为空, 所有 status=running 都必然是上进程孤儿.
+    try:
+        n = _startup_reap_running_orphans()
+        if n:
+            logger.info("[rescue] startup reaped %d running orphans", n)
+    except Exception as err:
+        logger.exception("[rescue] startup reap 异常: %s", err)
+
     _rescue_stop.clear()
     _rescue_thread = threading.Thread(
         target=_rescue_loop, daemon=True, name="pending-rescue-loop"
