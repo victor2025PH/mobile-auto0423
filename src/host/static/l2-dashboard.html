@@ -43,6 +43,7 @@
   .stat-card.red .value { color:#ef4444; }
   .stat-card.cyan .value { color:#06b6d4; }
   .stat-card.purple .value { color:#a855f7; }
+  .spark { display:block; width:100%; height:30px; margin-top:6px; opacity:.85; }
 
   /* ── panel ─────────────────────────────────────────────────── */
   .panel { background:#1e293b; border:1px solid #334155; border-radius:12px;
@@ -171,14 +172,22 @@
 
 <div class="container">
 
-  <!-- 6 stat cards -->
+  <!-- Phase-7: A/B current experiment 面板 -->
+  <div class="panel" id="ab-experiment-panel" style="display:none;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(96,165,250,.08))">
+    <h2>🧪 当前 A/B 实验
+      <span class="panel-hint" id="ab-experiment-meta">—</span>
+    </h2>
+    <div id="ab-experiment-body" style="font-size:13px"></div>
+  </div>
+
+  <!-- 6 stat cards (Phase-7: 含 sparkline) -->
   <div class="stats-grid">
-    <div class="stat-card cyan"><div class="label">客户总数</div><div class="value" id="stat-customers">—</div></div>
-    <div class="stat-card amber"><div class="label">in_messenger 中</div><div class="value" id="stat-messenger">—</div></div>
-    <div class="stat-card amber"><div class="label">in_line (已引)</div><div class="value" id="stat-line">—</div></div>
-    <div class="stat-card purple"><div class="label">accepted_by_human</div><div class="value" id="stat-accepted">—</div></div>
-    <div class="stat-card green"><div class="label">已转化</div><div class="value" id="stat-converted">—</div></div>
-    <div class="stat-card red"><div class="label">流失</div><div class="value" id="stat-lost">—</div></div>
+    <div class="stat-card cyan"><div class="label">客户总数</div><div class="value" id="stat-customers">—</div><svg id="spark-customers" class="spark"></svg></div>
+    <div class="stat-card amber"><div class="label">in_messenger 中</div><div class="value" id="stat-messenger">—</div><svg id="spark-messenger" class="spark"></svg></div>
+    <div class="stat-card amber"><div class="label">in_line (已引)</div><div class="value" id="stat-line">—</div><svg id="spark-line" class="spark"></svg></div>
+    <div class="stat-card purple"><div class="label">accepted_by_human</div><div class="value" id="stat-accepted">—</div><svg id="spark-accepted" class="spark"></svg></div>
+    <div class="stat-card green"><div class="label">已转化</div><div class="value" id="stat-converted">—</div><svg id="spark-converted" class="spark"></svg></div>
+    <div class="stat-card red"><div class="label">流失</div><div class="value" id="stat-lost">—</div><svg id="spark-lost" class="spark"></svg></div>
   </div>
 
   <!-- Pending handoff queue -->
@@ -228,6 +237,15 @@
         <option value="v2">v2</option>
       </select>
       <button onclick="resetSearch()" style="background:none;border:1px solid #475569;color:#cbd5e1;padding:6px 12px;border-radius:6px;font-size:11px;cursor:pointer">清空</button>
+    </div>
+    <!-- Phase-7: 保存的视图 -->
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;font-size:11px;color:#94a3b8">
+      <span style="color:#64748b">📌 视图:</span>
+      <select id="view-select" onchange="loadView()" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:5px 8px;border-radius:6px;font-size:11px;flex:1;min-width:180px">
+        <option value="">— 选已保存的视图 —</option>
+      </select>
+      <button onclick="saveCurrentView()" title="把当前过滤条件存为视图" style="background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.4);color:#22c55e;padding:5px 10px;border-radius:6px;font-size:11px;cursor:pointer">💾 保存当前</button>
+      <button onclick="deleteSelectedView()" title="删当前选中的视图" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#f87171;padding:5px 10px;border-radius:6px;font-size:11px;cursor:pointer">🗑️ 删</button>
     </div>
     <table>
       <thead>
@@ -373,6 +391,8 @@ async function loadFunnel() {
     document.getElementById('stat-accepted').innerText = cs.accepted_by_human || 0;
     document.getElementById('stat-converted').innerText = cs.converted || 0;
     document.getElementById('stat-lost').innerText = cs.lost || 0;
+    // Phase-7: 同时拉 7 天 sparkline 数据
+    loadSparklines();
 
     const ev = data.events_by_type || {};
     const evSorted = Object.entries(ev).sort((a, b) => b[1] - a[1]);
@@ -881,10 +901,186 @@ function showToast(msg, color) {
   setTimeout(() => t.remove(), 3500);
 }
 
+// ─── Phase-7: sparkline (7 天迷你趋势) ──────────────────────────
+function _renderSpark(svgId, values, color) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  const w = 120, h = 30, p = 2;
+  const maxV = Math.max(1, ...values);
+  if (values.length < 2) { svg.innerHTML = ''; return; }
+  const pts = values.map((v, i) => {
+    const x = p + (i * (w - 2 * p) / (values.length - 1));
+    const y = h - p - ((v / maxV) * (h - 2 * p));
+    return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  // 末点 dot 突出今日
+  const lastX = p + ((values.length - 1) * (w - 2 * p) / (values.length - 1));
+  const lastY = h - p - ((values[values.length - 1] / maxV) * (h - 2 * p));
+  svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+  svg.innerHTML = '<path d="' + pts + '" stroke="' + color + '" stroke-width="1.5" fill="none" opacity="0.85"/>'
+    + '<circle cx="' + lastX.toFixed(1) + '" cy="' + lastY.toFixed(1) + '" r="2.2" fill="' + color + '"/>';
+}
+
+async function loadSparklines() {
+  try {
+    const data = await fetchJson('/cluster/customers/funnel/timeseries?days=7');
+    const series = (data.series || []).slice(-7);
+    if (series.length < 2) return;
+    // 客户总数 = 加好友累计 (用 friend_request_sent 当增量代理)
+    _renderSpark('spark-customers', series.map(s => s.friend_request_sent || 0), '#06b6d4');
+    // in_messenger 进入 = message_received 入站量趋势
+    _renderSpark('spark-messenger', series.map(s => s.message_received || 0), '#f59e0b');
+    // in_line = wa_referral_sent 引流量趋势
+    _renderSpark('spark-line', series.map(s => s.wa_referral_sent || 0), '#f59e0b');
+    // 接管 ≈ greeting_sent 当代理 (没有现成 daily 接管数, 与"打招呼"等比)
+    _renderSpark('spark-accepted', series.map(s => s.greeting_sent || 0), '#a855f7');
+    _renderSpark('spark-converted', series.map(s => s.customer_converted || 0), '#22c55e');
+    _renderSpark('spark-lost', series.map(s => s.customer_lost || 0), '#ef4444');
+  } catch (e) {
+    console.debug('spark:', e);
+  }
+}
+
+// ─── Phase-7: A/B current experiment 面板 ────────────────────────
+async function loadAbExperiment() {
+  try {
+    const exp = await fetchJson('/cluster/ab/experiment/running');
+    const panel = document.getElementById('ab-experiment-panel');
+    if (!exp || !exp.experiment_id) {
+      panel.style.display = 'none';
+      return;
+    }
+    panel.style.display = '';
+    document.getElementById('ab-experiment-meta').innerText =
+      '实验 ID ' + (exp.experiment_id || '').substring(0, 8) + '… · 自 ' + fmtDateTime(exp.started_at);
+    // 同时拉 winner 状态
+    let winnerInfo = null;
+    try { winnerInfo = await fetchJson('/cluster/customers/ab/winner?days=30'); } catch (e) {}
+    const variants = exp.variants || ['v1','v2'];
+    const winner = winnerInfo && winnerInfo.winner;
+    const samples = (winnerInfo && winnerInfo.samples) || {};
+    const graduated = winnerInfo && winnerInfo.graduated;
+    const role = (localStorage.getItem('oc_role') || '').toLowerCase();
+    let html = '<div style="display:flex;flex-wrap:wrap;gap:14px;align-items:center">'
+      + '<div><b>名称:</b> ' + safeText(exp.name || '—') + '</div>'
+      + '<div><b>variants:</b> ' + variants.map(v => '<span style="display:inline-block;padding:2px 8px;margin:0 3px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.4);border-radius:8px;color:#c084fc">' + safeText(v) + '</span>').join('') + '</div>';
+    if (winner) {
+      html += '<div><b>当前赢家:</b> <span style="color:#22c55e;font-weight:700">' + safeText(winner) + '</span>'
+        + (graduated ? ' <span style="background:rgba(34,197,94,.2);color:#22c55e;padding:2px 8px;border-radius:8px;font-size:10px;margin-left:4px">graduated 100%</span>' : ' <span style="color:#94a3b8;font-size:11px">(80/20 流量)</span>')
+        + '</div>';
+    } else {
+      html += '<div style="color:#94a3b8">尚未判出 winner (50/50 流量)</div>';
+    }
+    if (Object.keys(samples).length > 0) {
+      html += '<div style="font-size:11px;color:#94a3b8;width:100%">'
+        + Object.entries(samples).map(([v, s]) =>
+            '<span style="margin-right:14px"><b style="color:#cbd5e1">' + safeText(v) + ':</b> '
+            + (s.handled || 0) + ' 接管 · ' + (s.converted_n || 0) + ' 成交 · '
+            + ((s.conversion_rate || 0) * 100).toFixed(1) + '%</span>'
+          ).join('') + '</div>';
+    }
+    if (exp.note) html += '<div style="width:100%;font-size:11px;color:#64748b">📝 ' + safeText(exp.note) + '</div>';
+    if (role === 'admin') {
+      html += '<div style="width:100%;margin-top:8px"><button onclick="graduateAndRestart()" style="background:rgba(168,85,247,.18);color:#c084fc;border:1px solid rgba(168,85,247,.4);padding:6px 14px;border-radius:6px;font-size:11px;cursor:pointer">🎓 graduate 当前 · 启新实验</button></div>';
+    }
+    html += '</div>';
+    document.getElementById('ab-experiment-body').innerHTML = html;
+  } catch (e) {
+    console.debug('ab exp:', e);
+  }
+}
+
+async function graduateAndRestart() {
+  const newName = prompt('新实验名 (e.g. v3_vs_v4):', '');
+  if (!newName) return;
+  const variantsStr = prompt('新 variants (逗号分隔):', 'v3,v4');
+  if (!variantsStr) return;
+  const variants = variantsStr.split(',').map(s => s.trim()).filter(Boolean);
+  if (variants.length < 2) { showToast('至少 2 个 variant', '#ef4444'); return; }
+  const note = prompt('备注 (可选):', '') || '';
+  try {
+    const r = await fetchJson('/cluster/ab/graduate-and-restart', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({new_name: newName, new_variants: variants, note: note}),
+    });
+    showToast('✅ 新实验已启动: ' + (r.new_experiment_id || '').substring(0, 8) + '… (前任赢家: ' + (r.previous_winner || '—') + ')', '#22c55e');
+    loadAbExperiment();
+  } catch (e) {
+    showToast('❌ 启新实验失败: ' + e.message, '#ef4444');
+  }
+}
+
+// ─── Phase-7: 客户视图 ──────────────────────────────────────────
+async function loadViews() {
+  try {
+    const data = await fetchJson('/cluster/customer-views');
+    const views = data.views || [];
+    const sel = document.getElementById('view-select');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— 选已保存的视图 —</option>'
+      + views.map(v => '<option value="' + safeText(v.view_id) + '">' + safeText(v.name) + '</option>').join('');
+    if (cur) sel.value = cur;
+    window._views = views;
+  } catch (e) {
+    console.debug('views:', e);
+  }
+}
+
+function loadView() {
+  const id = document.getElementById('view-select').value;
+  if (!id || !window._views) return;
+  const v = window._views.find(x => x.view_id === id);
+  if (!v) return;
+  const p = v.params_json || v.params || {};
+  document.getElementById('search-q').value = p.q || '';
+  document.getElementById('search-priority').value = p.priority || '';
+  document.getElementById('search-status').value = p.status || '';
+  document.getElementById('search-ab').value = p.ab_variant || '';
+  doSearch();
+}
+
+async function saveCurrentView() {
+  const name = prompt('视图名 (例: 高优先级 in_messenger):', '');
+  if (!name) return;
+  const params = {
+    q: document.getElementById('search-q').value || '',
+    priority: document.getElementById('search-priority').value || '',
+    status: document.getElementById('search-status').value || '',
+    ab_variant: document.getElementById('search-ab').value || '',
+  };
+  try {
+    await fetchJson('/cluster/customer-views', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name, params: params, owner: localStorage.getItem('oc_user') || 'admin'}),
+    });
+    showToast('✅ 视图已保存', '#22c55e');
+    loadViews();
+  } catch (e) {
+    showToast('❌ 保存失败: ' + e.message, '#ef4444');
+  }
+}
+
+async function deleteSelectedView() {
+  const sel = document.getElementById('view-select');
+  const id = sel.value;
+  if (!id) { showToast('请先选一个视图', '#f59e0b'); return; }
+  if (!confirm('确认删除视图 "' + sel.options[sel.selectedIndex].text + '" ?')) return;
+  try {
+    await fetchJson('/cluster/customer-views/' + encodeURIComponent(id), {method: 'DELETE'});
+    showToast('🗑️ 已删除', '#94a3b8');
+    sel.value = '';
+    loadViews();
+  } catch (e) {
+    showToast('❌ 删除失败: ' + e.message, '#ef4444');
+  }
+}
+
 // ─── refresh all ────────────────────────────────────────────────
 async function refresh() {
   document.getElementById('last-update').innerText = '刷新中…';
-  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics()]);
+  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics(), loadAbExperiment(), loadViews()]);
   document.getElementById('last-update').innerText = '更新于 ' + new Date().toLocaleTimeString();
 }
 

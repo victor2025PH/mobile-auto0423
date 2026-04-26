@@ -300,11 +300,16 @@ def _maybe_update_priority_from_emotion(
     persona_key: str,
     recent_messages: List[Dict[str, str]],
 ) -> None:
-    """Phase-5: 根据 emotion 评分实时更新 priority_tag.
+    """Phase-5/7: 根据 emotion 评分实时更新 priority_tag.
 
-    < 0.3 → low (不耐烦/敷衍, 不浪费真人产能)
-    > 0.7 → high (高意向, 优先接管)
-    中间 → 不动
+    Phase-5 (overall):
+        overall < 0.3 → low
+        overall > 0.7 → high
+
+    Phase-7 (多维独立 trigger, 优先级高于 overall, 因为更敏感):
+        frustration > 0.7 → low (强烈不耐烦, 一维就够判)
+        trust > 0.6 AND interest > 0.6 → high (双高 = 真有戏)
+
     LLM 失败 fallback 不动.
     """
     if not customer_id or not recent_messages:
@@ -314,13 +319,58 @@ def _maybe_update_priority_from_emotion(
         result = score_emotion(recent_messages, persona_key=persona_key)
         if result.get("fallback"):
             return  # LLM 失败不操作
+        trust = float(result.get("trust") or 0.5)
+        interest = float(result.get("interest") or 0.5)
+        frustration = float(result.get("frustration") or 0.5)
         overall = float(result.get("overall") or 0.5)
+
+        # Phase-7: 多维独立判定 (覆盖 Phase-5 overall 判定)
+        if frustration > 0.7:
+            _push_priority(customer_id, "low")
+            _emit_priority_event(customer_id, "low",
+                                  reason="frustration_high",
+                                  scores={"frustration": frustration})
+            return
+        if trust > 0.6 and interest > 0.6:
+            _push_priority(customer_id, "high")
+            _emit_priority_event(customer_id, "high",
+                                  reason="trust_interest_dual_high",
+                                  scores={"trust": trust, "interest": interest})
+            return
+
+        # Phase-5 overall 兜底
         if overall < 0.3:
             _push_priority(customer_id, "low")
         elif overall > 0.7:
             _push_priority(customer_id, "high")
     except Exception as exc:  # noqa: BLE001
         logger.debug("[customer_sync] emotion priority failed: %s", exc)
+
+
+def _emit_priority_event(
+    customer_id: str,
+    priority_tag: str,
+    *,
+    reason: str,
+    scores: Dict[str, float],
+) -> None:
+    """Phase-7: 推 priority_changed 事件给主控 → SSE 广播给 L3 看板."""
+    try:
+        from src.host.central_push_client import record_event
+        record_event(
+            customer_id=customer_id,
+            event_type="priority_changed",
+            worker_id=_safe_worker_id(),
+            device_id="",
+            meta={
+                "priority_tag": priority_tag,
+                "reason": reason,
+                "scores": scores,
+            },
+            fire_and_forget=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] priority event push failed: %s", exc)
 
 
 def sync_messenger_incoming(

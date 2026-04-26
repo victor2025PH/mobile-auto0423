@@ -394,34 +394,177 @@ class CentralCustomerStore:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    # ── Phase-7: A/B 实验生命周期 ─────────────────────────────────────
+    def get_running_experiment(self) -> Optional[Dict[str, Any]]:
+        """返当前 running 的 A/B 实验, 没有返 None."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT experiment_id::text, name, status, variants,
+                       started_at, ended_at, winner, samples, note
+                FROM ab_experiments
+                WHERE status = 'running'
+                ORDER BY started_at DESC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def archive_experiment_with_winner(
+        self,
+        experiment_id: str,
+        winner: str,
+        samples: Dict[str, int],
+    ) -> bool:
+        """winner graduate 后归档实验. 自动启新实验."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ab_experiments
+                SET status = 'completed',
+                    ended_at = NOW(),
+                    winner = %s,
+                    samples = %s::jsonb
+                WHERE experiment_id = %s AND status = 'running'
+                """,
+                (winner, json.dumps(samples), experiment_id),
+            )
+            return cur.rowcount > 0
+
+    def start_new_experiment(
+        self,
+        name: str,
+        variants: List[str],
+        note: str = "",
+    ) -> str:
+        """启新 A/B 实验. variants 是 list, 例 ['v1', 'v3']."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO ab_experiments (name, status, variants, note)
+                VALUES (%s, 'running', %s, %s)
+                RETURNING experiment_id::text
+                """,
+                (name, variants, note),
+            )
+            return cur.fetchone()["experiment_id"]
+
+    def list_experiments(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT experiment_id::text, name, status, variants,
+                       started_at, ended_at, winner, samples, note
+                FROM ab_experiments
+                ORDER BY started_at DESC LIMIT %s
+                """,
+                (limit,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    # ── Phase-7: 客户视图保存 ─────────────────────────────────────────
+    def save_view(self, name: str, owner: str, params: Dict[str, Any]) -> str:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO customer_views (name, owner_username, params_json)
+                VALUES (%s, %s, %s::jsonb)
+                RETURNING view_id::text
+                """,
+                (name, owner, json.dumps(params)),
+            )
+            return cur.fetchone()["view_id"]
+
+    def list_views(self, owner: Optional[str] = None,
+                    limit: int = 50) -> List[Dict[str, Any]]:
+        with self._cursor() as cur:
+            if owner:
+                cur.execute(
+                    """
+                    SELECT view_id::text, name, owner_username,
+                           params_json, created_at
+                    FROM customer_views
+                    WHERE owner_username = %s OR owner_username = 'admin'
+                    ORDER BY created_at DESC LIMIT %s
+                    """,
+                    (owner, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT view_id::text, name, owner_username,
+                           params_json, created_at
+                    FROM customer_views
+                    ORDER BY created_at DESC LIMIT %s
+                    """,
+                    (limit,),
+                )
+            return [dict(r) for r in cur.fetchall()]
+
+    def delete_view(self, view_id: str, owner: Optional[str] = None) -> bool:
+        with self._cursor() as cur:
+            if owner:
+                cur.execute(
+                    "DELETE FROM customer_views WHERE view_id = %s AND owner_username = %s",
+                    (view_id, owner),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM customer_views WHERE view_id = %s",
+                    (view_id,),
+                )
+            return cur.rowcount > 0
+
     def search_chats(
         self,
         q: str = "",
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
-        """Phase-6: 全文搜聊天内容. 用 ILIKE 起步 (32 客户级别 OK).
+        """Phase-6/7: 全文搜聊天内容.
 
-        返回 list of {chat_id, customer_id, primary_name, channel, direction,
-                      content, content_lang, ts}.
+        Phase-6 用 ILIKE 起步.
+        Phase-7 加 pg_trgm GIN: 优先用 %% 操作符 + similarity() 排序
+        (走 idx_chats_content_trgm); pg_trgm 没装时静默回退 ILIKE.
         """
         if not q or len(q) < 2:
             return []
+        lim = min(max(1, int(limit)), 200)
         with self._cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    ch.chat_id::text, ch.customer_id::text, ch.channel, ch.direction,
-                    ch.content, ch.content_lang, ch.ts,
-                    c.primary_name, c.status, c.priority_tag
-                FROM customer_chats ch
-                JOIN customers c ON c.customer_id = ch.customer_id
-                WHERE ch.content ILIKE %s
-                ORDER BY ch.ts DESC
-                LIMIT %s
-                """,
-                (f"%{q}%", min(max(1, int(limit)), 200)),
-            )
-            return [dict(r) for r in cur.fetchall()]
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        ch.chat_id::text, ch.customer_id::text, ch.channel, ch.direction,
+                        ch.content, ch.content_lang, ch.ts,
+                        c.primary_name, c.status, c.priority_tag,
+                        similarity(ch.content, %s) AS sim
+                    FROM customer_chats ch
+                    JOIN customers c ON c.customer_id = ch.customer_id
+                    WHERE ch.content %% %s OR ch.content ILIKE %s
+                    ORDER BY sim DESC NULLS LAST, ch.ts DESC
+                    LIMIT %s
+                    """,
+                    (q, q, f"%{q}%", lim),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            except Exception:
+                # pg_trgm 没装 / similarity() 不可用 — fallback 纯 ILIKE
+                cur.execute(
+                    """
+                    SELECT
+                        ch.chat_id::text, ch.customer_id::text, ch.channel, ch.direction,
+                        ch.content, ch.content_lang, ch.ts,
+                        c.primary_name, c.status, c.priority_tag
+                    FROM customer_chats ch
+                    JOIN customers c ON c.customer_id = ch.customer_id
+                    WHERE ch.content ILIKE %s
+                    ORDER BY ch.ts DESC
+                    LIMIT %s
+                    """,
+                    (f"%{q}%", lim),
+                )
+                return [dict(r) for r in cur.fetchall()]
 
     def search_customers(
         self,
