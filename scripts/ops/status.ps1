@@ -7,18 +7,45 @@
 #   1 = DEGRADED  service up but with warnings (loopback bind / partial devices / errors in log)
 #   2 = DOWN      no process / no port / /health not 200 / 0 devices
 #
-# When invoked from another .ps1 (start.ps1 / migrate.ps1), pass -NoExit so the
-# verdict-based 'exit' does not propagate up and kill the caller.
+# Args:
+#   -NoExit          When invoked from start.ps1 / migrate.ps1, prevent 'exit'
+#                    from propagating to the caller (returns code instead).
+#   -Watch [-Interval N]  Refresh every N seconds (default 5). Ctrl+C to exit.
+#   -Open            After check, open dashboard in default browser (if up).
+#   -Beep            Audible beep when DEGRADED/DOWN or any AUTH device.
 
-param([switch]$NoExit)
+param(
+    [switch]$NoExit,
+    [switch]$Watch,
+    [int]$Interval = 5,
+    [switch]$Open,
+    [switch]$Beep
+)
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $ProjectRoot
 . "$PSScriptRoot\_lib.ps1"
 
+# In watch mode, NoExit is implied (we own the loop) and we recurse into
+# the same script with a fresh state per iteration.
+if ($Watch) {
+    Write-Host "Watch mode: refresh every $Interval seconds. Ctrl+C to exit." -ForegroundColor DarkCyan
+    while ($true) {
+        Clear-Host
+        $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Write-Host "[$stamp]  status --watch (interval=${Interval}s)" -ForegroundColor DarkGray
+        & $PSCommandPath -NoExit @(
+            if ($Open) { '-Open' }
+            if ($Beep) { '-Beep' }
+        )
+        Start-Sleep -Seconds $Interval
+    }
+}
+
 # Track worst severity. Helper: bump exit code if worse.
 $script:exitCode = 0
+$script:hasAuthDevice = $false
 function Bump-Exit { param([int]$lvl) if ($lvl -gt $script:exitCode) { $script:exitCode = $lvl } }
 
 Write-Host "==========================================="
@@ -117,7 +144,7 @@ if ($foundPort) {
 
         foreach ($d in $devices) {
             $icon = if ($d.status -eq 'connected') { '[OK  ]' }
-                    elseif ($d.usb_issue -eq 'unauthorized') { '[AUTH]' }
+                    elseif ($d.usb_issue -eq 'unauthorized') { '[AUTH]'; $script:hasAuthDevice = $true }
                     else { '[DOWN]' }
             $color = if ($d.status -eq 'connected') { 'Green' } else { 'Yellow' }
             Write-Host ("       {0}  {1}  ({2})" -f $icon, $d.display_name, $d.device_id) -ForegroundColor $color
@@ -187,6 +214,27 @@ $verdict = switch ($script:exitCode) {
 $verdictColor = switch ($script:exitCode) { 0 { 'Green' } 1 { 'Yellow' } 2 { 'Red' } }
 Write-Host ("  >> Verdict: [{0}] {1}" -f $script:exitCode, $verdict) -ForegroundColor $verdictColor
 Write-Host "==========================================="
+
+# -Open: open dashboard in default browser (only if service is up)
+if ($Open -and $foundPort -and $script:exitCode -lt 2) {
+    $url = "http://localhost:$foundPort/dashboard"
+    Write-Host "Opening browser: $url" -ForegroundColor Cyan
+    Start-Process $url -ErrorAction SilentlyContinue
+}
+
+# -Beep: audible alert if degraded/down or any AUTH device
+if ($Beep -and ($script:exitCode -gt 0 -or $script:hasAuthDevice)) {
+    try {
+        # 800Hz / 200ms; repeat 2x for AUTH/DEGRADED, 3x for DOWN
+        $reps = if ($script:exitCode -ge 2) { 3 } else { 2 }
+        for ($i = 0; $i -lt $reps; $i++) {
+            [Console]::Beep(800, 200)
+            Start-Sleep -Milliseconds 100
+        }
+    } catch {
+        # Beep not available (e.g. no console) — silently ignore
+    }
+}
 
 if ($NoExit) { return $script:exitCode }
 exit $script:exitCode
