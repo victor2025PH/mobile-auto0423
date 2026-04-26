@@ -980,6 +980,56 @@ class CentralCustomerStore:
                 rows.append(d)
             return rows
 
+    def list_top_high_priority(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Phase-10: 高 priority 客户 Top N (运营主动出击).
+
+        优先 status 还在 funnel/messenger/line (未接管未转化 = 真正可操作),
+        最近活跃排前.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    customer_id::text, primary_name, status, priority_tag,
+                    last_worker_id, last_device_id, updated_at,
+                    ai_profile, country, custom_tags
+                FROM customers
+                WHERE priority_tag = 'high'
+                  AND status IN ('in_funnel', 'in_messenger', 'in_line')
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (min(max(1, int(limit)), 50),),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def list_top_frustrated(self, days: int = 7,
+                             limit: int = 10) -> List[Dict[str, Any]]:
+        """Phase-10: 高 frustration 客户 Top N (运营主动安抚).
+
+        从 customer_events.priority_changed 拉 reason='frustration_high',
+        近 N 天 distinct customer 按最近一次事件时间排.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (e.customer_id)
+                    e.customer_id::text, e.ts AS event_ts, e.meta,
+                    c.primary_name, c.status, c.priority_tag,
+                    c.last_worker_id, c.country
+                FROM customer_events e
+                JOIN customers c ON c.customer_id = e.customer_id
+                WHERE e.event_type = 'priority_changed'
+                  AND e.meta->>'reason' = 'frustration_high'
+                  AND e.ts > NOW() - (INTERVAL '1 day' * %s)
+                ORDER BY e.customer_id, e.ts DESC
+                """,
+                (max(1, min(int(days), 90)),),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            rows.sort(key=lambda r: r["event_ts"], reverse=True)
+            return rows[: min(max(1, int(limit)), 50)]
+
     def list_pending_handoffs(self, limit: int = 100) -> List[Dict[str, Any]]:
         """L3 人工接管面板: 列出待接管 (accepted_by_human IS NULL)."""
         with self._cursor() as cur:
