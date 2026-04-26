@@ -44,6 +44,12 @@
   .stat-card.cyan .value { color:#06b6d4; }
   .stat-card.purple .value { color:#a855f7; }
   .spark { display:block; width:100%; height:30px; margin-top:6px; opacity:.85; }
+  /* Phase-8: handoff SLA 超时行高亮 */
+  tbody tr.sla-breach { background:rgba(239,68,68,.08); border-left:3px solid #ef4444; }
+  tbody tr.sla-breach:hover { background:rgba(239,68,68,.14); }
+  tbody tr.sla-breach td:first-child::before { content:"⏰ "; }
+  @keyframes sla-pulse { 0%,100% { opacity:.6 } 50% { opacity:1 } }
+  #sla-breach-badge { animation: sla-pulse 1.6s ease-in-out infinite; }
 
   /* ── panel ─────────────────────────────────────────────────── */
   .panel { background:#1e293b; border:1px solid #334155; border-radius:12px;
@@ -164,6 +170,7 @@
       <option value="365">365 天</option>
     </select>
     <input id="cs-id" class="cs-id" placeholder="客服 ID (e.g. agent_001)" title="接管客户时记录是谁接的"/>
+    <span id="sla-breach-badge" style="display:none;background:rgba(239,68,68,.18);color:#f87171;border:1px solid rgba(239,68,68,.5);padding:5px 10px;border-radius:14px;font-size:12px;font-weight:600;cursor:pointer" onclick="document.getElementById('handoff-tbody').scrollIntoView({behavior:'smooth'})" title="点跳到待接管面板">⏰ <span id="sla-breach-count">0</span> 超时</span>
     <button onclick="openChatSearch()" title="全文搜聊天内容">🔎 搜聊天</button>
     <button onclick="exportCsv()" title="导出客户列表 CSV">📥 导出</button>
     <button onclick="refresh()">🔄 刷新</button>
@@ -427,23 +434,66 @@ function renderAiSummary(s) {
   }).join('');
 }
 
+const SLA_BREACH_MIN = 30; // Phase-8: handoff > 30 min 未接管 → 报警
+let _slaPrevBreachCount = 0;
+
+function _isSlaBreach(initiatedAt) {
+  if (!initiatedAt) return false;
+  try {
+    const ageMin = (Date.now() - new Date(initiatedAt).getTime()) / 60000;
+    return ageMin >= SLA_BREACH_MIN;
+  } catch (e) { return false; }
+}
+
+function _slaBeep() {
+  // 单声轻提示, AudioContext 在用户首次点击页面后才被允许 → 跳过初次 0→N 也 OK
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = 880; g.gain.value = 0.04;
+    o.connect(g); g.connect(ctx.destination);
+    o.start();
+    setTimeout(() => { o.stop(); ctx.close(); }, 220);
+  } catch (e) {}
+}
+
 async function loadHandoffPending() {
   try {
     const data = await fetchJson('/cluster/customers/handoff/pending?limit=50');
     const handoffs = data.handoffs || [];
+    // Phase-8: 客户端算 SLA breach
+    let breachCount = 0;
+    handoffs.forEach(h => { if (_isSlaBreach(h.initiated_at)) breachCount++; });
+    const badge = document.getElementById('sla-breach-badge');
+    document.getElementById('sla-breach-count').innerText = breachCount;
+    badge.style.display = breachCount > 0 ? '' : 'none';
+    if (breachCount > _slaPrevBreachCount && _slaPrevBreachCount === 0) {
+      _slaBeep(); // 0 → N 时响一下
+    }
+    _slaPrevBreachCount = breachCount;
+
     if (handoffs.length === 0) {
       document.getElementById('handoff-tbody').innerHTML = '<tr><td colspan="7" class="empty">没有待接管的 handoff</td></tr>';
       return;
     }
+    // 超时排前面
+    handoffs.sort((a, b) => {
+      const ba = _isSlaBreach(a.initiated_at) ? 1 : 0;
+      const bb = _isSlaBreach(b.initiated_at) ? 1 : 0;
+      if (ba !== bb) return bb - ba;
+      return new Date(a.initiated_at || 0) - new Date(b.initiated_at || 0);
+    });
     document.getElementById('handoff-tbody').innerHTML = handoffs.map(h => {
       const aiSum = h.ai_summary || '';
-      return '<tr onclick="openCustomer(\'' + safeText(h.customer_id) + '\')">'
+      const breach = _isSlaBreach(h.initiated_at);
+      const cls = breach ? 'sla-breach' : '';
+      return '<tr class="' + cls + '" onclick="openCustomer(\'' + safeText(h.customer_id) + '\')">'
         + '<td class="mono">' + safeText((h.handoff_id || '').substring(0, 12)) + '…</td>'
         + '<td><span class="name">' + safeText(h.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span></td>'
         + '<td>' + safeText((h.ai_profile && h.ai_profile.persona_key) || '—') + ' / ' + safeText(h.country || '—') + '</td>'
         + '<td class="mono" style="color:#cbd5e1">' + safeText(h.from_stage || '—') + ' → ' + safeText(h.to_stage || '—') + '</td>'
         + '<td><div class="ai-summary">' + renderAiSummary(aiSum) + '</div></td>'
-        + '<td>' + fmtTime(h.initiated_at) + '</td>'
+        + '<td' + (breach ? ' style="color:#ef4444;font-weight:600"' : '') + '>' + fmtTime(h.initiated_at) + '</td>'
         + '<td><button class="btn-accept" onclick="event.stopPropagation();acceptHandoff(\'' + safeText(h.handoff_id) + '\',\'' + safeText(h.primary_name || '') + '\')">🙋 我接手</button></td>'
         + '</tr>';
     }).join('');
@@ -751,8 +801,10 @@ async function loadPushMetrics() {
 }
 
 // ─── modal: 客户详情 ─────────────────────────────────────────────
+let _currentCustomerId = '';
 async function openCustomer(customerId) {
   if (!customerId) return;
+  _currentCustomerId = customerId;
   document.getElementById('modal-title').innerText = '客户详情 · ' + customerId.substring(0, 12);
   document.getElementById('modal-body').innerHTML = '加载中…';
   document.getElementById('modal-overlay').classList.add('active');
@@ -761,6 +813,38 @@ async function openCustomer(customerId) {
     renderCustomerDetail(c);
   } catch (e) {
     document.getElementById('modal-body').innerHTML = '<div class="empty">加载失败: ' + safeText(e.message) + '</div>';
+  }
+}
+
+// Phase-8: LLM 客户洞察 (lazy: 用户点开 modal 才异步请求)
+async function loadLlmInsight(customerId, force) {
+  const target = document.getElementById('llm-insight-body');
+  if (!target) return;
+  target.innerHTML = '<div style="color:#94a3b8;font-size:11px">🧠 LLM 思考中… (首次约 3-5 秒, 命中缓存即时)</div>';
+  try {
+    const url = '/cluster/customers/' + encodeURIComponent(customerId) + '/llm-insight' + (force ? '?force=1' : '');
+    const r = await fetchJson(url);
+    const cached = r.cached ? '<span style="font-size:10px;color:#64748b;margin-left:8px">(缓存)</span>' : '';
+    const refreshBtn = '<button onclick="loadLlmInsight(\'' + safeText(customerId) + '\', 1)" style="background:none;border:1px solid #475569;color:#cbd5e1;padding:3px 8px;border-radius:5px;font-size:10px;cursor:pointer;margin-left:8px">🔄 强制重算</button>';
+    if (!r.ok) {
+      target.innerHTML = '<div style="color:#f59e0b">⚠️ ' + safeText(r.summary || r.error) + '</div>' + refreshBtn;
+      return;
+    }
+    const ready = (r.conversion_readiness || 0);
+    const readyColor = ready > 0.7 ? '#22c55e' : ready > 0.4 ? '#f59e0b' : '#94a3b8';
+    const concerns = (r.key_concerns || []).map(c =>
+      '<li style="margin:3px 0;color:#cbd5e1">' + safeText(c) + '</li>').join('');
+    target.innerHTML = ''
+      + '<div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:10px">'
+      +   (r.urgent_signal ? '<span style="background:rgba(239,68,68,.15);color:#f87171;padding:3px 10px;border-radius:8px;font-size:11px;font-weight:600">🚨 急需接管</span>' : '')
+      +   '<span style="background:rgba(' + (ready > 0.7 ? '34,197,94' : ready > 0.4 ? '245,158,11' : '148,163,184') + ',.15);color:' + readyColor + ';padding:3px 10px;border-radius:8px;font-size:11px;font-weight:600">引流成熟度: ' + (ready * 100).toFixed(0) + '%</span>'
+      +   cached + refreshBtn
+      + '</div>'
+      + '<div style="color:#e2e8f0;font-size:13px;line-height:1.6;margin-bottom:10px">' + safeText(r.summary) + '</div>'
+      + (concerns ? '<div style="margin-bottom:10px"><b style="color:#94a3b8;font-size:11px">关键诉求:</b><ul style="margin:4px 0 0 20px;padding:0;font-size:12px">' + concerns + '</ul></div>' : '')
+      + '<div style="background:rgba(96,165,250,.08);border-left:3px solid #60a5fa;padding:8px 12px;border-radius:4px;font-size:12px"><b style="color:#60a5fa">建议: </b>' + safeText(r.recommended_action) + '</div>';
+  } catch (e) {
+    target.innerHTML = '<div style="color:#ef4444">❌ ' + safeText(e.message) + '</div>';
   }
 }
 
@@ -792,6 +876,12 @@ function renderCustomerDetail(c) {
     + '<div class="k">创建</div><div class="v">' + fmtDateTime(c.created_at) + '</div>'
     + '<div class="k">更新</div><div class="v">' + fmtDateTime(c.updated_at) + '</div>'
     + '</div></div>';
+
+  // Phase-8: LLM 客户洞察 (lazy load)
+  html += '<div class="modal-section" style="background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.2);border-radius:8px;padding:14px 16px">'
+    + '<h4 style="color:#c084fc">🧠 AI 客户洞察 <span style="font-size:10px;color:#64748b;font-weight:400;margin-left:6px">基于最近 50 条聊天</span></h4>'
+    + '<div id="llm-insight-body"></div>'
+    + '</div>';
 
   // ai_profile
   if (aiProfile && Object.keys(aiProfile).length > 0) {
@@ -857,6 +947,10 @@ function renderCustomerDetail(c) {
   }
 
   document.getElementById('modal-body').innerHTML = html;
+  // Phase-8: 异步拉 LLM 洞察, 不阻塞 modal 渲染
+  if (c.customer_id) {
+    setTimeout(() => loadLlmInsight(c.customer_id, 0), 50);
+  }
 }
 
 // ─── 接管 handoff ───────────────────────────────────────────────
