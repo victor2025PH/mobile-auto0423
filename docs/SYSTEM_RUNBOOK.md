@@ -225,8 +225,10 @@ curl http://127.0.0.1:8000/health
 | **真因（已诊断）** | PG server locale = `zh_CN.GBK` → server 用 GBK 编码错误消息（如认证失败 / 拒绝连接的握手期错误）→ psycopg2 默认用 utf-8 解码 → 撞 GBK 字节（如 0xd6 = "误"的首字节）→ UnicodeDecodeError |
 | **影响范围** | 仅影响 L2 中央客户画像（central_customer_store）；**不影响**主功能（FB 加好友 / Messenger 收件箱 / 设备控制） |
 | **检测命令** | `grep -E "central_store.*PG.*failed\|UnicodeDecodeError" logs/openclaw.log` |
-| **2026-04-26 已应用 fix（src/host/central_customer_store.py:81+）** | DSN 增加：<br>1) `client_encoding=utf8` — 让查询/数据用 utf-8<br>2) `options='-c lc_messages=C'` — 让本 session 错误消息用 C locale（英文 ASCII）|
-| **如果 fix 后仍失败** | 1) PG server 配置 `lc_messages='C'` 全局生效（postgresql.conf）；2) PG server locale 改 utf-8（initdb 时 `-E UTF8 --locale=C`）；3) 临时绕过：注释 `src/host/api.py` 里 central_store 的 init 调用 |
+| **2026-04-26 已应用 fix（src/host/central_customer_store.py）** | 1) DSN `client_encoding=utf8` — 查询/数据传输用 utf-8（L88-92）<br>2) `_conn()` catch `UnicodeDecodeError` 标记 `discard=True` 让 pool 丢弃中毒连接（Phase-13 已有兜底，L124-134） |
+| **⚠️ 试过的错路（不要再走）** | 在 DSN 加 `options='-c lc_messages=C'` — **PG 会拒绝**：`lc_messages` 是 PG SUSET（superuser-set），普通用户在 DSN options 里设不被允许 |
+| **真正根治（需 PG superuser 一次性执行）** | 在 PG 上以 superuser 跑：<br>`ALTER ROLE openclaw_app SET lc_messages='C';`<br>之后该用户所有 session 错误消息都是英文 ASCII，不再撞 GBK 0xd6。**这是推荐的最终修复**。 |
+| **其它方案** | 1) PG server 全局 `postgresql.conf` 改 `lc_messages='C'` + 重启；2) PG server locale utf-8（`initdb -E UTF8 --locale=C`，需重做 cluster）；3) 临时绕过：注释 `src/host/api.py` 里 central_store init 调用 |
 | **TODO** | 完整诊断 → `docs/runbook/L2_OPS_HANDBOOK.md` |
 
 ### 故障码字典（MessengerError）
@@ -284,7 +286,8 @@ curl http://127.0.0.1:8000/health
 | 2026-04-26 | 新增 `weekly_report.bat`（包装 phase8_funnel_report.py，输出 markdown 到 logs/reports/） | Claude |
 | 2026-04-26 | scrcpy_manager.py 候选路径加 `vendor/scrcpy-server`；`scrcpy-server` 文件 git mv 到 `vendor/` | Claude |
 | 2026-04-26 | `mobile-auto-project/` 历史子目录归档到 `docs/_archive_old_subproject/` | Claude |
-| 2026-04-26 | F9 实质修复 — central_customer_store.py DSN 加 `client_encoding=utf8 options='-c lc_messages=C'` | Claude |
+| 2026-04-26 | F9 修复尝试 #1 — DSN 加 `options='-c lc_messages=C'`（**后被 linter/用户修正**: lc_messages 是 SUSET，普通用户改会被 PG 拒） | Claude |
+| 2026-04-26 | F9 修复尝试 #2（最终）— DSN 只保留 `client_encoding=utf8`；中毒连接由 `_conn()` 的 UnicodeDecodeError catch + discard 兜底（Phase-13 已有）；真正根治需 PG superuser 跑 `ALTER ROLE openclaw_app SET lc_messages='C';` | victor + Claude |
 
 > 之后每次改 `cluster.yaml` / `devices.yaml` / `task_execution_policy.yaml` / `facebook_playbook.yaml` / `launch.env` 留一行：日期 + 改了啥 + 谁。
 

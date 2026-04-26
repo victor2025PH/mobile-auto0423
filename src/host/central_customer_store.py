@@ -80,17 +80,15 @@ class CentralCustomerStore:
     ):
         # F9 fix (RUNBOOK):
         #   client_encoding=utf8     — force query/data wire to UTF-8
-        #   options='-c lc_messages=C' — force this session to emit error
-        #                                messages in C (English) locale.
-        # On a zh-CN locale PG server, the default lc_messages is zh_CN.GBK
-        # so error messages come back as GBK bytes (e.g. 0xd6) and psycopg2's
-        # UTF-8 decode chokes with "'utf-8' codec can't decode byte 0xd6 in
-        # position 55". client_encoding alone fixes data; lc_messages fixes
-        # errors (incl. connection-rejected handshake errors).
+        # 真正根治 zh_CN.GBK 错误消息 (byte 0xd6) 需要 PG superuser 运行:
+        #   ALTER ROLE openclaw_app SET lc_messages='C';
+        # 见 docs/SYSTEM_RUNBOOK.md 安装步骤. PGOPTIONS '-c lc_messages=C'
+        # 不能在 DSN 设, 因 lc_messages 是 SUSET, 普通 user 改会被 PG 拒.
+        # 没 SUSET 时由 _conn 的 UnicodeDecodeError catch 兜底丢弃中毒连接.
         self._dsn = (
             f"host={host} port={port} dbname={dbname} user={user} "
             f"password={password} application_name=openclaw_central "
-            f"client_encoding=utf8 options='-c lc_messages=C'"
+            f"client_encoding=utf8"
         )
         self._pool: Optional[ThreadedConnectionPool] = None
         self._pool_lock = threading.Lock()
