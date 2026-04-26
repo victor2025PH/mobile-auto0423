@@ -803,6 +803,25 @@ def _to_response(t: dict) -> TaskResponse:
     result = result_dict_with_gate_hints(raw) if raw is not None else None
     ui = build_task_ui_enrichment(t)
     task_type = t.get("type", "")
+
+    # 2026-04-27 Phase 2 P0 #2: 从 checkpoint 提取 current_step (业务方法
+    # 调 task_store.set_task_step 写入). 容错: checkpoint 可能是 dict / JSON
+    # str / None / 不含 current_step 字段, 任一情况都返 None.
+    current_step = current_sub_step = current_step_at = None
+    cp_raw = t.get("checkpoint")
+    if cp_raw:
+        cp_dict = cp_raw
+        if isinstance(cp_raw, str):
+            try:
+                import json as _j
+                cp_dict = _j.loads(cp_raw)
+            except Exception:
+                cp_dict = None
+        if isinstance(cp_dict, dict):
+            current_step = cp_dict.get("current_step") or None
+            current_sub_step = cp_dict.get("current_sub_step") or None
+            current_step_at = cp_dict.get("current_step_at") or None
+
     return TaskResponse(
         task_id=t["task_id"],
         type=task_type,
@@ -820,5 +839,8 @@ def _to_response(t: dict) -> TaskResponse:
         phase_caption=ui.get("phase_caption"),
         execution_policy_hint=ui.get("execution_policy_hint"),
         stuck_reason_zh=ui.get("stuck_reason_zh"),
+        current_step=current_step,
+        current_sub_step=current_sub_step,
+        current_step_at=current_step_at,
         deleted_at=t.get("deleted_at") or None,
     )

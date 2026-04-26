@@ -43,6 +43,21 @@ log = logging.getLogger(__name__)
 PACKAGE = "com.facebook.katana"
 MESSENGER_PACKAGE = "com.facebook.orca"
 
+
+def _set_step(step: str, sub_step: str = "") -> None:
+    """轻量 wrapper for task_store.set_task_step — Phase 2 P0 #2 dashboard 步骤可视化.
+
+    业务方法在关键步骤前调用 _set_step("xxx", "yyy"), 写到 task.checkpoint.
+    current_step → dashboard 任务详情 modal 实时显示. lazy import 防循环.
+    异常静默 (进度可视化不该影响业务跑).
+    task_id 由 task_store.set_task_step 从 thread-local task_context 隐式获取.
+    """
+    try:
+        from src.host.task_store import set_task_step
+        set_task_step(step, sub_step)
+    except Exception:
+        pass
+
 _FB_DISMISS_TEXTS = [
     # English
     "Not Now", "NOT NOW", "Not now",
@@ -4632,6 +4647,7 @@ class FacebookAutomation(BaseAutomation):
 
         with self.guarded("enter_group", device_id=did, weight=0.2):
             # Step 1: 进搜索页 (既有 _tap_search_bar_preferred 已包含完整自检)
+            _set_step("搜索群组", group_name)
             if not self._tap_search_bar_preferred(d, did):
                 log.info("[enter_group] _tap_search_bar_preferred miss, 降级")
                 if not self.smart_tap("Search bar or search icon", device_id=did):
@@ -4645,12 +4661,14 @@ class FacebookAutomation(BaseAutomation):
             time.sleep(1.5)
 
             # Step 3: 切到 Groups filter
+            _set_step("筛选 Groups 结果", group_name)
             if not self._tap_search_results_groups_filter(d, did):
                 log.info("[enter_group] hardcoded Groups filter miss, 降级 smart_tap")
                 self.smart_tap("Groups tab or filter", device_id=did)
             time.sleep(1.0)
 
             # Step 4: 点对应群
+            _set_step("点击群组进入", group_name)
             if not self._tap_first_search_result_group(d, did, group_name):
                 log.info("[enter_group] hardcoded first result miss, 降级 smart_tap")
                 if not self.smart_tap("First matching group", device_id=did):
@@ -4827,6 +4845,7 @@ class FacebookAutomation(BaseAutomation):
             return members
 
         with self.guarded("extract_members", device_id=did, weight=0.6):
+            _set_step("打开 Members tab", group_name)
             # 2026-04-23 bug fix: "Members tab in the group header" 的 AutoSelector
             # 学习被污染为 "Suggested group: 50代以上..." 的 bounds(推荐群卡片),
             # 会误点进推荐群。改用硬定位:text/desc 精确匹配 "Members"/"メンバー"。
@@ -4864,6 +4883,9 @@ class FacebookAutomation(BaseAutomation):
                             continue
                         members.append({"name": name})
                         seen_names.add(name)
+                        # 业务进展可见: 每提取 1 人刷新 dashboard step
+                        _set_step("提取群成员",
+                                  f"第 {len(members)}/{max_members} 人 — {name}")
                         if len(members) >= max_members:
                             break
                 except Exception as e:
