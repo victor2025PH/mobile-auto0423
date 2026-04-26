@@ -1423,10 +1423,130 @@ def _safe_get_store():
     """延迟加载 store (PG 不可达时不阻塞 import)."""
     try:
         from src.host.central_customer_store import get_store
-        return get_store()
+        store = get_store()
+        # Phase-8: 第一次在 coordinator 拿到 store 时, 顺手起 A/B graduate 守护线程
+        _ensure_ab_auto_graduate_thread()
+        return store
     except Exception as exc:
         logger.exception("[central_store] init failed: %s", exc)
         raise HTTPException(503, f"central store unavailable: {exc}")
+
+
+# ── Phase-8: A/B 自动 graduate 守护线程 (coordinator 进程内单例) ──────────
+import threading as _phase8_th
+_ab_auto_thread_started = False
+_ab_auto_thread_lock = _phase8_th.Lock()
+_AB_AUTO_CHECK_INTERVAL_SEC = 6 * 3600.0      # 每 6h 检一次
+_AB_AUTO_MIN_EXPERIMENT_AGE_SEC = 7 * 86400.0 # 实验跑足 7 天才考虑 graduate
+_AB_AUTO_COOLDOWN_SEC = 7 * 86400.0           # graduate 之间至少 7 天
+
+
+def _ensure_ab_auto_graduate_thread() -> None:
+    global _ab_auto_thread_started
+    if _ab_auto_thread_started:
+        return
+    if not _is_coordinator_role():
+        return
+    with _ab_auto_thread_lock:
+        if _ab_auto_thread_started:
+            return
+        t = _phase8_th.Thread(target=_ab_auto_loop, daemon=True,
+                               name="ab-auto-graduate")
+        t.start()
+        _ab_auto_thread_started = True
+        logger.info("[ab_auto_graduate] thread started")
+
+
+def _ab_auto_loop() -> None:
+    """每 6h 检查一次. 启动 5min 后第一次跑, 避免开机风暴."""
+    import time as _t
+    _t.sleep(300)
+    while True:
+        try:
+            _ab_auto_tick()
+        except Exception:
+            logger.exception("[ab_auto_graduate] tick failed")
+        _t.sleep(_AB_AUTO_CHECK_INTERVAL_SEC)
+
+
+def _ab_auto_tick() -> None:
+    """单次决策: 实验 7 天 + winner graduated + 距上次 graduate ≥ 7 天 → 自动启新."""
+    import time as _t
+    from src.host.central_customer_store import get_store
+    store = get_store()
+    cur = store.get_running_experiment()
+    if not cur:
+        logger.debug("[ab_auto_graduate] no running experiment")
+        return
+
+    started_at = cur.get("started_at")
+    if started_at:
+        try:
+            from datetime import datetime as _dt
+            if hasattr(started_at, "timestamp"):
+                age_sec = _t.time() - started_at.timestamp()
+            else:
+                age_sec = _t.time() - _dt.fromisoformat(str(started_at).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            age_sec = _AB_AUTO_MIN_EXPERIMENT_AGE_SEC + 1  # 解析失败按"够老"处理
+    else:
+        age_sec = _AB_AUTO_MIN_EXPERIMENT_AGE_SEC + 1
+    if age_sec < _AB_AUTO_MIN_EXPERIMENT_AGE_SEC:
+        logger.info("[ab_auto_graduate] skip: experiment age %.1fh < 7 days", age_sec / 3600)
+        return
+
+    history = store.list_experiments(limit=5)
+    archived = [e for e in history if e.get("status") == "archived" and e.get("ended_at")]
+    if archived:
+        last = archived[0]
+        try:
+            from datetime import datetime as _dt
+            ended = last.get("ended_at")
+            if hasattr(ended, "timestamp"):
+                cooldown = _t.time() - ended.timestamp()
+            else:
+                cooldown = _t.time() - _dt.fromisoformat(str(ended).replace("Z", "+00:00")).timestamp()
+            if cooldown < _AB_AUTO_COOLDOWN_SEC:
+                logger.info("[ab_auto_graduate] skip: last graduate %.1fh ago < cooldown",
+                            cooldown / 3600)
+                return
+        except Exception:
+            pass
+
+    winner_state = store.compute_ab_winner(days=30)
+    winner = winner_state.get("winner")
+    graduated = winner_state.get("graduated")
+    if not winner or not graduated:
+        logger.info("[ab_auto_graduate] skip: winner=%s graduated=%s", winner, graduated)
+        return
+
+    variants = cur.get("variants") or [winner]
+    losers = [v for v in variants if v != winner]
+    challenger = losers[0] if losers else (winner + "_v2")
+    new_name = f"auto_{challenger}_vs_{winner}_{int(_t.time())}"
+
+    store.archive_experiment_with_winner(
+        experiment_id=cur["experiment_id"],
+        winner=winner,
+        samples=winner_state.get("samples", {}),
+    )
+    new_id = store.start_new_experiment(
+        name=new_name, variants=[challenger, winner],
+        note=f"auto-graduated from {cur.get('name', '')}, prev winner={winner}",
+    )
+    logger.warning("[ab_auto_graduate] graduated %s (winner=%s) → new experiment %s (%s)",
+                   cur.get("name"), winner, new_id, new_name)
+    # SSE 广播 (best-effort)
+    try:
+        from src.host.lead_mesh.events_stream import emit_event
+        emit_event("ab_auto_graduated", {
+            "previous_experiment": cur.get("name"),
+            "previous_winner": winner,
+            "new_experiment_id": new_id,
+            "new_experiment_name": new_name,
+        })
+    except Exception:
+        pass
 
 
 @router.post("/cluster/customers/upsert", dependencies=[Depends(verify_api_key)])
@@ -1650,6 +1770,120 @@ def cluster_customers_detail(customer_id: str,
     if not cust:
         raise HTTPException(404, "customer not found")
     return cust
+
+
+# Phase-8: LLM 客户洞察 — 内存缓存 (customer_id, last_chat_id) → result, 1h TTL
+_llm_insight_cache: dict = {}
+_llm_insight_lock = __import__("threading").Lock()
+_LLM_INSIGHT_TTL_SEC = 3600.0
+
+
+def _build_llm_insight(customer: dict) -> dict:
+    """Phase-8: 调 LLM 出客户洞察 (urgent / concerns / action / readiness / summary)."""
+    chats = customer.get("chats") or []
+    if not chats:
+        return {"ok": False, "error": "no_chat_history",
+                "summary": "尚无聊天记录, 不能给洞察",
+                "urgent_signal": False, "key_concerns": [],
+                "recommended_action": "等客户先回复一两轮", "conversion_readiness": 0.0}
+
+    # 取最近 50 条 (chats 已按 ts ASC, 取 tail)
+    recent = chats[-50:]
+    persona = (customer.get("ai_profile") or {}).get("persona_key", "")
+    primary_name = customer.get("primary_name") or "客户"
+    chat_lines = []
+    for ch in recent:
+        who = "客户" if ch.get("direction") == "incoming" else "Bot"
+        content = (ch.get("content") or "").replace("\n", " ").strip()
+        if not content:
+            continue
+        chat_lines.append(f"{who}: {content[:200]}")
+    history = "\n".join(chat_lines[-30:])  # LLM 上下文限制, 取最近 30 条
+
+    system = (
+        "你是日本中年女性情感陪伴 bot 的运营顾问. "
+        "请基于聊天记录给出 JSON 格式的客户洞察, 不要任何 markdown / 解释, "
+        "只输出 JSON 对象."
+    )
+    user = f"""客户名: {primary_name}
+预设 persona: {persona}
+
+聊天记录 (按时间从早到晚):
+{history}
+
+请按以下格式返回 JSON (全部字段必填):
+{{
+  "urgent_signal": <true|false>,
+  "key_concerns": ["客户主要诉求 1", "诉求 2", "..."],
+  "recommended_action": "<给客服一句话建议>",
+  "conversion_readiness": <0.0-1.0 的小数, 引流到 LINE 的成熟度>,
+  "summary": "<两到三句话总结这个客户>"
+}}"""
+
+    try:
+        from src.ai.llm_client import get_llm_client
+        client = get_llm_client()
+        text = client.chat_with_system(system, user, temperature=0.4, max_tokens=600)
+        # 容错解析: LLM 可能裹 ```json ``` 或前后带空白
+        import json as _j
+        import re as _re
+        cleaned = (text or "").strip()
+        m = _re.search(r"\{.*\}", cleaned, _re.DOTALL)
+        if not m:
+            return {"ok": False, "error": "llm_no_json",
+                    "raw": cleaned[:300], "summary": "LLM 未返回 JSON",
+                    "urgent_signal": False, "key_concerns": [],
+                    "recommended_action": "需要人工查看", "conversion_readiness": 0.5}
+        data = _j.loads(m.group(0))
+        return {
+            "ok": True,
+            "urgent_signal": bool(data.get("urgent_signal")),
+            "key_concerns": list(data.get("key_concerns") or []),
+            "recommended_action": str(data.get("recommended_action") or ""),
+            "conversion_readiness": float(data.get("conversion_readiness") or 0.5),
+            "summary": str(data.get("summary") or ""),
+        }
+    except Exception as exc:
+        logger.warning("[llm_insight] failed: %s", exc)
+        return {"ok": False, "error": str(exc)[:200],
+                "summary": f"LLM 调用失败: {exc}",
+                "urgent_signal": False, "key_concerns": [],
+                "recommended_action": "LLM 离线, 请人工查看", "conversion_readiness": 0.5}
+
+
+@router.get("/cluster/customers/{customer_id}/llm-insight",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_llm_insight(customer_id: str, force: int = 0):
+    """Phase-8: LLM 客户洞察 (urgent_signal / key_concerns / recommended_action /
+    conversion_readiness / summary). 缓存 1h, force=1 强制重算."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    cust = store.get_customer(customer_id=customer_id, include_events=0, include_chats=50)
+    if not cust:
+        raise HTTPException(404, "customer not found")
+    chats = cust.get("chats") or []
+    last_chat_id = chats[-1].get("chat_id") if chats else "no_chat"
+    cache_key = f"{customer_id}:{last_chat_id}"
+    import time as _t
+    now = _t.time()
+    if not force:
+        with _llm_insight_lock:
+            rec = _llm_insight_cache.get(cache_key)
+            if rec and (now - rec["fetched_at"]) < _LLM_INSIGHT_TTL_SEC:
+                out = dict(rec["data"])
+                out["cached"] = True
+                return out
+    data = _build_llm_insight(cust)
+    with _llm_insight_lock:
+        _llm_insight_cache[cache_key] = {"data": data, "fetched_at": now}
+        # 简单 LRU: 超过 500 条删最旧的 100 条
+        if len(_llm_insight_cache) > 500:
+            for k in sorted(_llm_insight_cache.items(), key=lambda kv: kv[1]["fetched_at"])[:100]:
+                _llm_insight_cache.pop(k[0], None)
+    out = dict(data)
+    out["cached"] = False
+    return out
 
 
 @router.get("/cluster/customers/handoff/pending",
