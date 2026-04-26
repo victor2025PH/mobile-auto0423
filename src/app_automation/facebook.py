@@ -44,6 +44,7 @@ PACKAGE = "com.facebook.katana"
 MESSENGER_PACKAGE = "com.facebook.orca"
 
 _FB_DISMISS_TEXTS = [
+    # English
     "Not Now", "NOT NOW", "Not now",
     "Skip", "SKIP",
     "Maybe Later", "Later",
@@ -54,6 +55,20 @@ _FB_DISMISS_TEXTS = [
     "Allow", "ALLOW",
     "Allow all the time",
     "While using the app",
+    "Cancel",
+    "DENY", "Deny",
+    # 2026-04-27 A3 fix: 中文常见弹窗 (MIUI / 中文 FB)
+    "稍后", "暂不", "拒绝", "取消",
+    "知道了", "我知道了", "好", "好的", "确定",
+    "继续", "允许", "始终允许", "仅在使用此应用时",
+    "不允许", "禁止",
+    # 录音/语音相关弹窗
+    "回拨", "重拨",
+    # 日文 (jp_caring_male persona 主市场)
+    "後で", "あとで", "今はしない", "スキップ",
+    "閉じる", "キャンセル",
+    "OK", "わかりました", "了解",
+    "続ける", "許可",
 ]
 
 _FB_RISK_KEYWORDS = [
@@ -939,6 +954,32 @@ class FacebookAutomation(BaseAutomation):
             if not dismissed:
                 break
 
+    def _detect_no_network_banner(self, d) -> bool:
+        """2026-04-27 A1: 检测 Messenger 顶部"无网络连接"红色 banner.
+
+        VPN 切换后 Messenger 不会自动识别新路由, 显示该 banner 时所有发消息
+        / 收消息都失败. 调用方应 force-stop+restart Messenger.
+        """
+        no_net_keywords = [
+            # 中文 (zh-CN, MIUI default)
+            "无网络连接", "无网络", "暂无网络", "网络连接失败",
+            # 中文繁体 (zh-TW)
+            "無網路連線", "無網路", "網路連線失敗",
+            # English
+            "No internet connection", "No Internet Connection",
+            "Connecting...", "No connection",
+            # 日文 (Japan customers)
+            "ネットワークに接続できません", "インターネット接続なし",
+            "接続なし", "オフライン",
+        ]
+        for kw in no_net_keywords:
+            try:
+                if d(textContains=kw).exists(timeout=0.3):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _detect_risk_dialog(self, d) -> Tuple[bool, str]:
         """检测当前界面是否有真实的风控/验证对话框 (Sprint 3 P2 真机加固版)。
 
@@ -1530,12 +1571,26 @@ class FacebookAutomation(BaseAutomation):
     )
 
     _MESSENGER_SEND_SELECTORS = (
+        # 2026-04-27 A3 fix: 多语言 + multi-attribute (description, text, resourceId)
+        # 按命中频率排序: en/jp/zh 主市场, ko/es/pt B 跨境
         {"description": "Send"},           # en
-        {"description": "发送"},           # zh
         {"description": "送信"},           # ja
+        {"description": "发送"},           # zh-CN
+        {"description": "發送"},           # zh-TW
+        {"description": "보내기"},         # ko
+        {"description": "Enviar"},         # es / pt
+        {"description": "Senden"},         # de
+        {"description": "Envoyer"},        # fr
         {"descriptionContains": "Send"},
-        {"descriptionContains": "发送"},
         {"descriptionContains": "送信"},
+        {"descriptionContains": "发送"},
+        # text-based fallback (有些 FB 版本 Send 在 text 而非 desc)
+        {"text": "Send"},
+        {"text": "送信"},
+        {"text": "发送"},
+        # resourceId 兜底
+        {"resourceIdMatches": ".*send.*button.*", "clickable": True},
+        {"resourceIdMatches": ".*composer.*send.*", "clickable": True},
     )
 
     def _find_messenger_ui_fallback(self, d, selectors, timeout_total: float = 3.0):
@@ -5387,6 +5442,21 @@ class FacebookAutomation(BaseAutomation):
                 d.app_start(MESSENGER_PACKAGE)
                 time.sleep(3)
                 self._dismiss_dialogs(d)
+                # 2026-04-27 A1 fix: VPN 切换后 Messenger 网络感知滞后, 显示
+                # 红色"无网络连接"banner; 检测到立即 force-stop+restart 让
+                # Messenger 重建 socket 走新路由
+                if self._detect_no_network_banner(d):
+                    log.warning("[messenger] 检测到'无网络'banner, force_restart "
+                                "Messenger 等 VPN 路由稳定")
+                    d.app_stop(MESSENGER_PACKAGE)
+                    time.sleep(2)  # 让 socket 完全释放
+                    d.app_start(MESSENGER_PACKAGE)
+                    time.sleep(5)  # 等新连接建立
+                    self._dismiss_dialogs(d)
+                    if self._detect_no_network_banner(d):
+                        log.warning("[messenger] 第二次启动仍无网络, abort task")
+                        stats["error"] = "messenger_no_network_after_restart"
+                        return stats
                 stats["opened"] = True
 
                 is_risk, msg = self._detect_risk_dialog(d)
@@ -6017,42 +6087,39 @@ class FacebookAutomation(BaseAutomation):
         """从 Messenger 主列表 dump 当前可见对话。返回 [{name, unread, bounds}].
 
         Phase 17 (2026-04-25): 结构敏感 ListView 行级匹配.
-        旧实现 flat scan 所有 clickable element + sanitize 兜底;
-        现实现优先用 parent_class 过滤 — peer 行的父容器必含 RecyclerView/
-        ListView/ScrollView/LinearLayout. 不匹配父容器的 element (顶部工具栏
-        按钮 / 底部 navigation tab) 直接跳过.
-
-        旧 sanitize 仍作为内层兜底 (双层防御).
+        2026-04-27 A2 fix: parent_class 过滤太严导致 B 设备 0 对话, 改成软约束 +
+        多 fallback (clickable text + content-desc + RelativeLayout).
         """
         try:
             xml = d.dump_hierarchy()
-        except Exception:
+        except Exception as e:
+            log.debug("[list_messenger] dump_hierarchy 失败: %s", e)
             return []
         try:
             from ..vision.screen_parser import XMLParser
-        except Exception:
+        except Exception as e:
+            log.debug("[list_messenger] XMLParser import 失败: %s", e)
             return []
         try:
             elements = XMLParser.parse(xml)
-        except Exception:
+        except Exception as e:
+            log.debug("[list_messenger] parse 失败: %s", e)
             return []
+
         items: List[Dict] = []
         seen = set()
+        # Phase 1: 严格匹配 (parent_class in _MESSENGER_LIST_CONTAINERS)
         for el in elements:
             text = (el.text or "").strip()
             if not el.clickable:
                 continue
-            # Phase 17: 父容器结构过滤 (老 XMLParser 没 parent_class 则
-            # parent_class="" 跳过此 check 退化为旧行为, 不破兼容).
             parent_cls = getattr(el, "parent_class", "") or ""
             if parent_cls:
-                # 新 parser 提供了 parent_class — 必须父容器含 list 关键字
                 in_list = any(kw in parent_cls
                                for kw in
                                FacebookAutomation._MESSENGER_LIST_CONTAINERS)
                 if not in_list:
                     continue
-            # Phase 15-16 字符串 sanitize 兜底
             if not FacebookAutomation._is_valid_peer_name(text):
                 continue
             if text in seen:
@@ -6065,6 +6132,39 @@ class FacebookAutomation(BaseAutomation):
             })
             if len(items) >= max_n:
                 break
+
+        # 2026-04-27 A2 fix: Phase 1 没找到任何对话时, 走宽松 fallback —
+        # 不限父容器 class, 只看 content-desc / desc / text 含日文/中文/英文姓名
+        if len(items) == 0:
+            log.warning("[list_messenger] Phase 1 (parent_class 严格) 0 hit, "
+                         "降级到宽松 fallback")
+            for el in elements:
+                text = (el.text or "").strip()
+                desc = getattr(el, "content_desc", "") or getattr(el, "desc", "") or ""
+                # 用 text 或 content_desc 作为名字源
+                candidate = text or desc
+                if not candidate:
+                    continue
+                if not FacebookAutomation._is_valid_peer_name(candidate):
+                    continue
+                if candidate in seen:
+                    continue
+                # 只要 clickable 或 content_desc 非空都收
+                if not el.clickable and not desc:
+                    continue
+                seen.add(candidate)
+                items.append({
+                    "name": candidate,
+                    "unread": bool(getattr(el, "selected", False)
+                                    or "未读" in desc or "Unread" in desc
+                                    or "•" in candidate),
+                    "bounds": getattr(el, "bounds", None),
+                    "_fallback": True,
+                })
+                if len(items) >= max_n:
+                    break
+            log.info("[list_messenger] fallback 找到 %d 个对话", len(items))
+
         return items
 
     def _open_and_read_conversation(self, d, conv: Dict, did: str,
