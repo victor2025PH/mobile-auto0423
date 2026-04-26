@@ -62,6 +62,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_emotion_score": 0.0,      # soft: L3 情感综合分门槛 (0 = 禁用)
                                    # jp_female_midlife yaml 里设 0.5
                                    # (聊得有温度才允许引)
+    # Phase-9: LLM 洞察驱动的智能引流
+    "max_frustration": 0.0,        # hard_block: frustration > 此值时不引流 (referral_ask 除外). 0 = 禁用
+    "early_refer_readiness": 0.0,  # hard_allow: readiness ≥ 此值且 turns ≥ early_refer_min_turns → 早引流. 0 = 禁用
+    "early_refer_min_turns": 5,
+    "delay_refer_readiness": 0.0,  # hard_block: readiness ≤ 此值且 turns ≤ delay_refer_max_turns → 延后. 0 = 禁用
+    "delay_refer_max_turns": 10,
 }
 
 
@@ -214,7 +220,9 @@ def should_refer(*,
                  now: Optional[_dt.datetime] = None,
                  incoming_text: str = "",
                  persona_key: Optional[str] = None,
-                 emotion_overall: Optional[float] = None) -> GateDecision:
+                 emotion_overall: Optional[float] = None,
+                 emotion_frustration: Optional[float] = None,
+                 conversion_readiness: Optional[float] = None) -> GateDecision:
     """返回引流闸决策 — graceful, 永不抛。
 
     Args:
@@ -320,6 +328,52 @@ def should_refer(*,
         reasons.append("intent=buying (强购买信号)")
         return GateDecision(refer=True, level="hard_allow",
                             reasons=reasons)
+
+    # ── 层 2.5: Phase-9 LLM 洞察智能层 ────────────────────────────────────
+    # 顺序: frustration 优先 (拒绝信号) > 早引流 (高 readiness) > 延后引流 (低 readiness)
+    _max_frust = float(cfg.get("max_frustration", 0.0) or 0.0)
+    if _max_frust > 0 and emotion_frustration is not None:
+        try:
+            f = float(emotion_frustration)
+            if f > _max_frust:
+                reasons.append(
+                    f"frustration={f:.2f} > {_max_frust:.2f} (客户烦躁, 暂不引流)"
+                )
+                return GateDecision(refer=False, level="hard_block",
+                                    reasons=reasons)
+        except (TypeError, ValueError):
+            pass
+
+    _total_turns_seen = int(profile.get("total_turns", 0) or 0)
+    _early = float(cfg.get("early_refer_readiness", 0.0) or 0.0)
+    _early_min_turns = int(cfg.get("early_refer_min_turns", 5))
+    if _early > 0 and conversion_readiness is not None:
+        try:
+            r = float(conversion_readiness)
+            if r >= _early and _total_turns_seen >= _early_min_turns:
+                reasons.append(
+                    f"readiness={r:.2f} ≥ {_early:.2f} & turns={_total_turns_seen} ≥ "
+                    f"{_early_min_turns} (高意向早引流)"
+                )
+                return GateDecision(refer=True, level="hard_allow",
+                                    reasons=reasons)
+        except (TypeError, ValueError):
+            pass
+
+    _delay = float(cfg.get("delay_refer_readiness", 0.0) or 0.0)
+    _delay_max_turns = int(cfg.get("delay_refer_max_turns", 10))
+    if _delay > 0 and conversion_readiness is not None:
+        try:
+            r = float(conversion_readiness)
+            if r <= _delay and _total_turns_seen <= _delay_max_turns:
+                reasons.append(
+                    f"readiness={r:.2f} ≤ {_delay:.2f} & turns={_total_turns_seen} ≤ "
+                    f"{_delay_max_turns} (低意向延后引流)"
+                )
+                return GateDecision(refer=False, level="hard_block",
+                                    reasons=reasons)
+        except (TypeError, ValueError):
+            pass
 
     # ── 层 3: soft score ────────────────────────────────────────────────
     score = 0

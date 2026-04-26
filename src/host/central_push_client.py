@@ -185,6 +185,59 @@ def _http_post_json(
     raise RuntimeError(f"central push failed after {retries + 1}: {last_exc}")
 
 
+# ── Phase-9: HTTP GET (用于读 LLM 洞察 readiness) ─────────────────────
+def _http_get_json(path: str, timeout: float = 8.0) -> Dict[str, Any]:
+    """同步 GET. 失败抛."""
+    url = _coord_url().rstrip("/") + path
+    headers = _api_key_header()
+    req = _ureq.Request(url, method="GET", headers=headers)
+    with _ureq.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return json.loads(raw)
+
+
+# ── Phase-9: 客户端 readiness 缓存 (worker 端 5 min, 命中率高时省 LLM 钱) ──
+_READINESS_CACHE: Dict[str, Dict[str, Any]] = {}
+_READINESS_LOCK = __import__("threading").Lock()
+_READINESS_TTL_SEC = 300.0
+
+
+def fetch_llm_readiness(customer_id: str) -> Optional[Dict[str, float]]:
+    """Phase-9: worker 端拉 LLM 洞察的 readiness/frustration. 失败返 None.
+
+    返 {"conversion_readiness": 0-1, "frustration": 0-1} 或 None.
+    缓存 5 min: 同 customer_id 短窗口内不重复 HTTP.
+    """
+    if not customer_id:
+        return None
+    now = time.time()
+    with _READINESS_LOCK:
+        rec = _READINESS_CACHE.get(customer_id)
+        if rec and (now - rec["fetched_at"]) < _READINESS_TTL_SEC:
+            return rec["data"]
+    try:
+        data = _http_get_json(
+            f"/cluster/customers/{customer_id}/llm-insight",
+            timeout=8.0,
+        )
+        if not data.get("ok"):
+            return None
+        out = {
+            "conversion_readiness": float(data.get("conversion_readiness") or 0.5),
+            "frustration": 0.0,  # frustration 来自 emotion_scorer, 这里不出
+        }
+        with _READINESS_LOCK:
+            _READINESS_CACHE[customer_id] = {"data": out, "fetched_at": now}
+            if len(_READINESS_CACHE) > 1000:
+                # 简单 LRU: 超 1000 条删最旧 200
+                old = sorted(_READINESS_CACHE.items(), key=lambda kv: kv[1]["fetched_at"])[:200]
+                for k, _ in old:
+                    _READINESS_CACHE.pop(k, None)
+        return out
+    except Exception:
+        return None
+
+
 # ── 本地 SQLite retry queue ──────────────────────────────────────────
 class EnqueueRetryStore:
     """worker 离线时把 push 写本地 SQLite, 后台 drain 线程扫表回补.

@@ -6377,12 +6377,28 @@ class FacebookAutomation(BaseAutomation):
                         }
                     # Phase-6: emotion 评分接进 should_refer (异步, 缓存 10 min)
                     _emotion_overall = None
+                    _emotion_frustration = None
                     try:
                         from src.ai.chat_emotion_scorer import score_emotion
                         _msgs = [{"role": "user", "content": incoming_text or ""}]
                         _emo_result = score_emotion(_msgs, persona_key=persona_key or "")
                         if not _emo_result.get("fallback"):
                             _emotion_overall = float(_emo_result.get("overall") or 0.5)
+                            _emotion_frustration = float(_emo_result.get("frustration") or 0.5)
+                    except Exception:
+                        pass
+                    # Phase-9: turns ≥ 4 时才查 LLM readiness (省 HTTP)
+                    _readiness = None
+                    try:
+                        _turns_seen = int((memory_ctx or {}).get("profile", {}).get("total_turns", 0) or 0)
+                        if _turns_seen >= 4:
+                            from src.host.central_push_client import (
+                                fetch_llm_readiness, compute_customer_id,
+                            )
+                            _cid = compute_customer_id("facebook_name", f"{did}::{peer_name}")
+                            _r = fetch_llm_readiness(_cid)
+                            if _r:
+                                _readiness = float(_r.get("conversion_readiness") or 0.5)
                     except Exception:
                         pass
                     gate = should_refer(
@@ -6397,6 +6413,9 @@ class FacebookAutomation(BaseAutomation):
                         persona_key=persona_key,
                         # Phase-6: emotion 接 gate, jp_female_midlife.min_emotion_score=0.5
                         emotion_overall=_emotion_overall,
+                        # Phase-9: 多维独立信号
+                        emotion_frustration=_emotion_frustration,
+                        conversion_readiness=_readiness,
                     )
                     decision = "wa_referral" if gate.refer else "reply"
                     # PR-7: 拒绝词命中 → 写 referral_rejected_at 触发 7 天冷却

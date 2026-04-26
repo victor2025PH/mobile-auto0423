@@ -990,7 +990,7 @@ class CentralCustomerStore:
                     h.to_stage, h.initiated_at, h.ai_summary,
                     h.initiating_worker_id, h.initiating_device_id,
                     c.canonical_source, c.primary_name, c.age_band, c.gender,
-                    c.country, c.interests, c.ai_profile
+                    c.country, c.interests, c.ai_profile, c.priority_tag
                 FROM customer_handoffs h
                 JOIN customers c ON c.customer_id = h.customer_id
                 WHERE h.accepted_by_human IS NULL
