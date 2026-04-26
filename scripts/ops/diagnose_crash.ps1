@@ -6,18 +6,30 @@
 # Args:
 #   -Last N      Look at last N crash events. Default 5.
 #   -Days N      Only look at events in the last N days. Default 1.
+#   -Hours N     Only look at events in the last N hours (overrides -Days).
 #   -Json        Structured output.
 #
 # Usage:
-#   diagnose_crash.bat
-#   diagnose_crash.bat -Last 10 -Days 7
+#   diagnose_crash.bat                  # last 5 crashes in 1 day
+#   diagnose_crash.bat -Hours 1         # last hour only
+#   diagnose_crash.bat -Last 10 -Days 7 # last 10 in 7 days
 #   diagnose_crash.bat -Json
 
 param(
     [int]$Last = 5,
     [int]$Days = 1,
+    [int]$Hours = 0,
     [switch]$Json
 )
+
+# -Hours overrides -Days (more granular). -Days 1 default.
+if ($Hours -gt 0) {
+    $cutoff = (Get-Date).AddHours(-$Hours)
+    $windowDesc = "$Hours hour(s)"
+} else {
+    $cutoff = (Get-Date).AddDays(-$Days)
+    $windowDesc = "$Days day(s)"
+}
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -31,7 +43,6 @@ if (-not (Test-Path $wrapperLog)) {
     exit 1
 }
 
-$cutoff = (Get-Date).AddDays(-$Days)
 $cutoffStr = $cutoff.ToString('yyyy-MM-dd HH:mm:ss')
 
 # Read wrapper.log (UTF-8, share-read)
@@ -93,13 +104,13 @@ $crashes = @($crashes | Select-Object -Last $Last)
 
 if (-not $crashes -or $crashes.Count -eq 0) {
     if ($Json) {
-        @{ crashes = @(); summary = "No server.py crashes in last $Days day(s)" } | ConvertTo-Json -Depth 4
+        @{ crashes = @(); summary = "No server.py crashes in last $windowDesc" } | ConvertTo-Json -Depth 4
     } else {
         Write-Host "==========================================="
         Write-Host "  OpenClaw Crash Diagnosis"
         Write-Host "==========================================="
         Write-Host ""
-        Write-Host "[OK] No server.py crashes in last $Days day(s)" -ForegroundColor Green
+        Write-Host "[OK] No server.py crashes in last $windowDesc" -ForegroundColor Green
     }
     exit 0
 }
@@ -137,7 +148,7 @@ foreach ($c in $crashes) {
 if ($Json) {
     @{
         crashes = $crashes
-        summary = "Found $($crashes.Count) crash(es) in last $Days day(s)"
+        summary = "Found $($crashes.Count) crash(es) in last $windowDesc"
         cutoff = $cutoffStr
     } | ConvertTo-Json -Depth 4
 } else {
@@ -145,7 +156,7 @@ if ($Json) {
     Write-Host "  OpenClaw Crash Diagnosis"
     Write-Host "==========================================="
     Write-Host ""
-    Write-Host ("Found {0} crash(es) in last {1} day(s) (since {2})" -f $crashes.Count, $Days, $cutoffStr) -ForegroundColor Cyan
+    Write-Host ("Found {0} crash(es) in last {1} (since {2})" -f $crashes.Count, $windowDesc, $cutoffStr) -ForegroundColor Cyan
     Write-Host ""
 
     foreach ($c in $crashes) {

@@ -8,7 +8,13 @@
 #   4. Start standard wrapper using launch.env
 #   5. Verify (status check)
 #
+# Args:
+#   -Force   Even if already running as wrapper, stop+start anyway (useful
+#            when wrapper exists but server is unhealthy / port wrong / etc).
+#
 # Reference: docs/SYSTEM_RUNBOOK.md F8
+
+param([switch]$Force)
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -24,13 +30,16 @@ Write-Host ""
 $kind = Get-OpenClawProcessKind
 if (-not $kind) {
     Write-Host "[INFO] No OpenClaw process running. Will just start fresh." -ForegroundColor Cyan
-} elseif ($kind -eq 'wrapper') {
+} elseif ($kind -eq 'wrapper' -and -not $Force) {
     Write-Host "[INFO] Already using service_wrapper. Nothing to migrate." -ForegroundColor Green
     Write-Host "       (run stop.bat then start.bat for a clean restart)"
+    Write-Host "       (or migrate.bat -Force to forcibly stop+start)"
     Write-Host ""
     Write-Host "Running status check..."
     & (Join-Path $PSScriptRoot "status.ps1")
     exit 0
+} elseif ($kind -eq 'wrapper' -and $Force) {
+    Write-Host "[INFO] Already wrapper, but -Force given. Will stop+start anyway." -ForegroundColor Yellow
 } else {
     Write-Host ("[INFO] Current launch shape: {0}" -f $kind) -ForegroundColor Yellow
     Write-Host "       Will migrate to service_wrapper (auto-restart + OTA)"

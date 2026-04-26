@@ -25,6 +25,15 @@ param(
     [switch]$Json
 )
 
+# Mutex check: -Watch and -Json are exclusive (Watch is interactive console,
+# Json is one-shot machine-readable output). Combining them makes no sense.
+if ($Watch -and $Json) {
+    Write-Host "[ERROR] -Watch and -Json are mutually exclusive." -ForegroundColor Red
+    Write-Host "        -Watch is for interactive console refresh." -ForegroundColor DarkGray
+    Write-Host "        -Json is for one-shot structured output." -ForegroundColor DarkGray
+    exit 2
+}
+
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $ProjectRoot

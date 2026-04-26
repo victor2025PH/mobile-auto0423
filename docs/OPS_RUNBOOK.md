@@ -155,10 +155,51 @@ schtasks /Create /SC DAILY /ST 03:00 /TN OpenClawSnapshot \
 ## 5. e2e smoke test (每次重启后跑一次)
 
 ```bash
-python scripts/e2e_smoke.py
+python scripts/e2e_smoke.py --base http://127.0.0.1:18080
 ```
 
-**预期**: 14+ stages 全过, 0 failed. 失败任何一项不要继续跑真实流量, 先修。
+**预期**: 12 stages × 29 assertions 全过, 0 failed. 失败任何一项不要继续跑真实流量, 先修。
+
+## 5.1 SLO 红线检查 (cron 每 5 min)
+
+```bash
+python scripts/slo_check.py --webhook  # 红线 + 黄线时推 webhook
+python scripts/slo_check.py --json     # 机器可读
+```
+
+7 个红线检查: health / central_store / handoff_breach / push_fail_rate /
+refer_rate / daily_friend_request / sla_response
+
+cron 配置 (Linux):
+```bash
+*/5 * * * * cd /path && python scripts/slo_check.py --webhook >> logs/slo.log
+```
+
+Windows Task Scheduler:
+```powershell
+schtasks /Create /SC MINUTE /MO 5 /TN OpenClawSLO ^
+  /TR "python D:\workspace\mobile-auto0423\scripts\slo_check.py --webhook"
+```
+
+## 5.2 Chat review (每天 5 min)
+
+```bash
+python scripts/chat_review.py --base http://127.0.0.1:18080 --limit 20
+```
+
+交互快捷键 `g`/`b`/`s`/`n`/`p`/`q`. 输出 `reports/chat_review_YYYYMMDD.csv`.
+
+每天目标 review **20 条**, 标 bad 的客户 1 周后聚类找规律 → 优化 chat_brain
+prompt / 调阈值。
+
+## 5.3 周报 (每周日)
+
+```bash
+python scripts/weekly_report.py             # 自动出 reports/weekly_YYYYMMDD.md
+python scripts/weekly_report.py --print     # 终端预览
+```
+
+含 7 天漏斗趋势 (ASCII sparkline) + 客户分桶 + 决策 SLA + **启发式调参建议**。
 
 ---
 
