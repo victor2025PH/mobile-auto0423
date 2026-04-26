@@ -3,6 +3,20 @@
 > 本仓库 = **Facebook / Messenger 移动端自动化 bot**，双 worker 同 repo 协作。
 > 本文件是 Claude Code 在本 cwd 下自动读取的项目级 memory，所有 Claude session（A/B）都会加载。
 
+## 🆘 出问题 / 新 session 进入时
+
+**先读 [`docs/SYSTEM_RUNBOOK.md`](docs/SYSTEM_RUNBOOK.md)** — 系统运维 SSOT，包含：
+- §0 30 秒速查（端口/启停/日志路径）
+- §1 进程拓扑 + A/B 业务链分流
+- §3 应急恢复 SOP（后台打不开 / 设备失控 / 故障字典）
+- §4 Claude 新窗口 onboarding
+
+**配套文档**：[`docs/SYSTEM_ARCHITECTURE.md`](docs/SYSTEM_ARCHITECTURE.md)（架构图谱）、[`docs/CAPABILITIES.md`](docs/CAPABILITIES.md)（业务能力）。
+
+**日常启停**：根目录 `start.bat` / `stop.bat` / `status.bat` 三件套。
+
+⚠️ **不要重新做"进程结构分析"** —— RUNBOOK §1 已有权威拓扑。
+
 ## 仓库定位
 
 - **A worker**（greeting bot）：`add_friend` / `send_greeting` / `extract_members` / `browse_feed`
@@ -34,10 +48,11 @@
 
 Claude 崩溃后重入本 repo：
 
-1. `git fetch origin && git checkout main && git pull`
-2. `gh pr list --author victor2025PH --state open` 看自己还有哪些 PR 在开
-3. 读 `docs/B_RESUME_2026-04-23-EVENING.md` 的 Step 1-9（手动恢复脚本）
+1. **先读 [`docs/SYSTEM_RUNBOOK.md`](docs/SYSTEM_RUNBOOK.md)**（运维 SSOT，§0 §1 §3 §4）
+2. `git fetch origin && git checkout main && git pull`
+3. `gh pr list --author victor2025PH --state open` 看自己还有哪些 PR 在开
 4. 读 `~/.claude/projects/C--telegram-mtproto-ai/memory/MEMORY.md` 的 "Project: mobile-auto0423" 段，重建上下文
+5. （历史参考）`docs/runbook/B_RESUME_2026-04-23-EVENING.md` 是 B Claude 当时的恢复脚本
 
 ## 日常测试
 

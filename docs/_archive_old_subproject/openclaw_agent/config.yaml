@@ -1,0 +1,6 @@
+host_url: "http://127.0.0.1:8000"
+device_id: "89NZVGKFD6BYUO5P"
+use_host_adb: true
+adb_host: "127.0.0.1"
+adb_port: 37123
+poll_interval: 5

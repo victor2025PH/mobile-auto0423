@@ -78,10 +78,13 @@ class CentralCustomerStore:
         pool_min: int = DEFAULT_POOL_MIN,
         pool_max: int = DEFAULT_POOL_MAX,
     ):
-        # client_encoding=utf8: force PG to send error messages in UTF-8.
-        # On a zh-CN locale PG server, error messages otherwise come back as
-        # GBK (e.g. byte 0xd6) and psycopg2's UTF-8 decode chokes with
-        # "'utf-8' codec can't decode byte 0xd6 in position 55" (RUNBOOK F9).
+        # F9 fix (RUNBOOK):
+        #   client_encoding=utf8     — force query/data wire to UTF-8
+        # 真正根治 zh_CN.GBK 错误消息 (byte 0xd6) 需要 PG superuser 运行:
+        #   ALTER ROLE openclaw_app SET lc_messages='C';
+        # 见 docs/SYSTEM_RUNBOOK.md 安装步骤. PGOPTIONS '-c lc_messages=C'
+        # 不能在 DSN 设, 因 lc_messages 是 SUSET, 普通 user 改会被 PG 拒.
+        # 没 SUSET 时由 _conn 的 UnicodeDecodeError catch 兜底丢弃中毒连接.
         self._dsn = (
             f"host={host} port={port} dbname={dbname} user={user} "
             f"password={password} application_name=openclaw_central "

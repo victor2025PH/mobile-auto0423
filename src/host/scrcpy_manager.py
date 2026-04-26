@@ -71,7 +71,9 @@ def _find_scrcpy_server() -> str:
 
     # 项目根目录和 cwd
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidates.append(os.path.join(project_root, "vendor", "scrcpy-server"))
     candidates.append(os.path.join(project_root, "scrcpy-server"))
+    candidates.append(os.path.join(os.getcwd(), "vendor", "scrcpy-server"))
     candidates.append(os.path.join(os.getcwd(), "scrcpy-server"))
 
     import shutil
