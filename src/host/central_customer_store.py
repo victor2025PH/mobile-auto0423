@@ -433,6 +433,42 @@ class CentralCustomerStore:
 
             return cust
 
+    def variant_sla_stats(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Phase-4: 按 ab_variant (v1/v2) 切片转化率, 给主管做 A/B 决策.
+
+        返回 list of {variant, handled, converted, lost, pending,
+                      conversion_rate, avg_minutes}.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(c.ai_profile->>'ab_variant', '(none)') AS variant,
+                    COUNT(h.handoff_id) AS handled,
+                    SUM(CASE WHEN h.outcome='converted' THEN 1 ELSE 0 END) AS converted_n,
+                    SUM(CASE WHEN h.outcome='lost' THEN 1 ELSE 0 END) AS lost_n,
+                    SUM(CASE WHEN h.completed_at IS NULL THEN 1 ELSE 0 END) AS pending_n,
+                    AVG(EXTRACT(EPOCH FROM (h.completed_at - h.accepted_at))/60.0)
+                        FILTER (WHERE h.completed_at IS NOT NULL AND h.accepted_at IS NOT NULL)
+                        AS avg_minutes
+                FROM customer_handoffs h
+                JOIN customers c ON c.customer_id = h.customer_id
+                WHERE h.initiated_at > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY variant
+                ORDER BY variant
+                """,
+                (max(1, min(int(days), 365)),),
+            )
+            rows = []
+            for r in cur.fetchall():
+                d = dict(r)
+                handled = int(d.get("handled") or 0)
+                conv = int(d.get("converted_n") or 0)
+                d["conversion_rate"] = (conv / handled) if handled else 0.0
+                d["avg_minutes"] = float(d["avg_minutes"]) if d.get("avg_minutes") is not None else None
+                rows.append(d)
+            return rows
+
     def funnel_timeseries(self, days: int = 30) -> List[Dict[str, Any]]:
         """Phase-3: 历史漏斗时序 — 按天统计关键事件.
 
@@ -487,6 +523,20 @@ class CentralCustomerStore:
                     "customer_lost": int(oc.get("customer_lost") or 0),
                 })
             return all_days
+
+    def update_priority(self, customer_id: str, priority_tag: str) -> bool:
+        """Phase-4: 实时更新单个客户的 priority_tag.
+
+        priority_tag in {high, medium, low}. 立即生效, 不等 recompute.
+        """
+        if priority_tag not in ("high", "medium", "low"):
+            return False
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE customers SET priority_tag = %s WHERE customer_id = %s",
+                (priority_tag, customer_id),
+            )
+            return cur.rowcount > 0
 
     def recompute_priority_tags(self) -> Dict[str, int]:
         """Phase-3: 客户分群 — 启发式 SQL 一次性重算所有 customers.priority_tag.

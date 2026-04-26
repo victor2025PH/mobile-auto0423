@@ -40,6 +40,30 @@ BOT_PERSONA_IDENTITIES: Dict[str, str] = {
 - 绝不暴露你是 AI 或自动化程序""",
 }
 
+# Phase-4: A/B 实验 — 不同 variant 在 stage='referral' 引流时用不同话术风格
+# v1 (温柔陪护型, default 风格) vs v2 (轻松风趣型)
+AB_VARIANT_REFERRAL_STYLES: Dict[str, str] = {
+    "v1": """\
+## A/B variant=v1 引流话术风格 — 温柔陪护型
+- 句式: "もしよければ / よかったら / 無理しないでね"
+- 每条引流话术结尾留温柔余地, 不催不赶
+- 例: "もっとゆっくりお話したくて、よかったらLINEを交換できたら嬉しいです"
+""",
+    "v2": """\
+## A/B variant=v2 引流话术风格 — 轻松风趣型
+- 句式: "よかったら / 笑 / 実は / そういえば"
+- 偶尔加一句轻松俏皮收尾, 拉近距离
+- 例: "実はここよりLINEのほうが返信早いんだよね 笑 IDだけ送るね"
+""",
+}
+
+
+def _bot_referral_ab_segment(ab_variant: Optional[str]) -> str:
+    """Phase-4: stage='referral' 时按 ab_variant 注入不同风格."""
+    if not ab_variant:
+        return ""
+    return AB_VARIANT_REFERRAL_STYLES.get(ab_variant.lower(), "")
+
 
 def _bot_persona_identity(bot_persona: Optional[str]) -> str:
     """根据 bot_persona key 返回身份块. 未配置返回通用调性."""
@@ -152,6 +176,7 @@ class ChatBrain:
         ab_variant: str = "",
         persist: bool = True,
         bot_persona: Optional[str] = None,
+        cs_ab_variant: Optional[str] = None,
     ) -> ChatResult:
         """
         AI 生成个性化回复。
@@ -190,6 +215,7 @@ class ChatBrain:
         system_prompt = self._build_system_prompt(
             stage, prof, platform, target_language, contact_info, source,
             bot_persona=bot_persona,
+            cs_ab_variant=cs_ab_variant,
         )
         if ab_style_hint.strip():
             system_prompt += (
@@ -338,6 +364,7 @@ class ChatBrain:
         platform: str, target_language: str,
         contact_info: str, source: str,
         bot_persona: Optional[str] = None,
+        cs_ab_variant: Optional[str] = None,
     ) -> str:
         stage_info = STAGES.get(stage, STAGES["icebreak"])
         lang_map = {
@@ -407,6 +434,10 @@ class ChatBrain:
 - 引流话术每次重写, 不要复用同一句
 - 末尾加"無理しないでね / よかったら"等关心语
 """
+            # Phase-4: A/B variant 风格分流
+            ab_seg = _bot_referral_ab_segment(cs_ab_variant)
+            if ab_seg:
+                prompt += "\n" + ab_seg
 
         prompt += "\n直接输出回复消息，不要加引号、前缀或任何解释。"
         return prompt

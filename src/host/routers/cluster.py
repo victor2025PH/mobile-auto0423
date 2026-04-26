@@ -1674,6 +1674,50 @@ def cluster_customers_funnel(days: int = 7):
     return store.funnel_stats(days=min(max(1, days), 90))
 
 
+@router.get("/cluster/customers-export.csv",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_export_csv(limit: int = 1000):
+    """Phase-4: 导出客户 CSV 给运营 / 财务做报表."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+    store = _safe_get_store()
+    customers = store.list_customers(limit=min(max(1, limit), 5000))
+    buf = io.StringIO()
+    # Excel BOM, 让中文正确
+    buf.write("﻿")
+    writer = csv.writer(buf)
+    writer.writerow([
+        "customer_id", "primary_name", "status", "priority_tag",
+        "ab_variant", "country", "last_worker_id", "last_device_id",
+        "created_at", "updated_at", "interests",
+    ])
+    for c in customers:
+        ai_profile = c.get("ai_profile") or {}
+        writer.writerow([
+            c.get("customer_id", ""),
+            c.get("primary_name", ""),
+            c.get("status", ""),
+            c.get("priority_tag", ""),
+            ai_profile.get("ab_variant", ""),
+            c.get("country", ""),
+            c.get("last_worker_id", ""),
+            c.get("last_device_id", ""),
+            str(c.get("created_at", "")),
+            str(c.get("updated_at", "")),
+            ", ".join(c.get("interests") or []),
+        ])
+    csv_str = buf.getvalue()
+    filename = f"customers_{int(_time_c.time())}.csv"
+    return StreamingResponse(
+        iter([csv_str.encode("utf-8")]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/cluster/customers/funnel/timeseries",
             dependencies=[Depends(verify_api_key)])
 def cluster_customers_funnel_timeseries(days: int = 30):
@@ -1694,6 +1738,23 @@ def cluster_customers_priority_recompute():
     return store.recompute_priority_tags()
 
 
+@router.post("/cluster/customers/{customer_id}/priority",
+             dependencies=[Depends(verify_api_key)])
+def cluster_customers_update_priority(customer_id: str, body: dict):
+    """Phase-4: 实时更新单个客户 priority_tag.
+
+    Body: {priority_tag: high|medium|low}
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    tag = (body.get("priority_tag") or "").strip().lower()
+    if tag not in ("high", "medium", "low"):
+        raise HTTPException(400, "priority_tag 必须是 high|medium|low")
+    store = _safe_get_store()
+    ok = store.update_priority(customer_id, tag)
+    return {"customer_id": customer_id, "priority_tag": tag, "updated": ok}
+
+
 @router.get("/cluster/customers/sla/agents",
             dependencies=[Depends(verify_api_key)])
 def cluster_customers_sla_agents(days: int = 30):
@@ -1702,6 +1763,16 @@ def cluster_customers_sla_agents(days: int = 30):
         raise HTTPException(400, "central store 仅在 coordinator 节点可用")
     store = _safe_get_store()
     return {"days": days, "agents": store.agent_sla_stats(days=min(max(1, days), 365))}
+
+
+@router.get("/cluster/customers/sla/variants",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_sla_variants(days: int = 30):
+    """Phase-4: 按 ab_variant 切片转化率, 给主管做 A/B 决策."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"days": days, "variants": store.variant_sla_stats(days=min(max(1, days), 365))}
 
 
 @router.get("/cluster/customers/push/metrics",

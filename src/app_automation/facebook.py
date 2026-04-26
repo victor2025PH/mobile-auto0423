@@ -6323,6 +6323,16 @@ class FacebookAutomation(BaseAutomation):
                                 .get("bot_persona") or "")
             except Exception:
                 pass
+            # Phase-4: 算 ab_variant — deterministic hash 同步 customer_sync_bridge
+            _cs_ab_variant = ""
+            try:
+                from src.host.customer_sync_bridge import (_ab_variant_for,
+                                                           _build_canonical_id)
+                _cs_ab_variant = _ab_variant_for(
+                    _build_canonical_id(did, peer_name)
+                )
+            except Exception:
+                pass
             result = brain.generate_reply(
                 lead_id=peer_name,
                 incoming_message=incoming_text,
@@ -6333,6 +6343,7 @@ class FacebookAutomation(BaseAutomation):
                 source="inbox",
                 ab_style_hint=ab_style_hint.strip(),
                 bot_persona=_bot_persona or None,
+                cs_ab_variant=_cs_ab_variant or None,
             )
             if result and result.message:
                 reply = result.message
