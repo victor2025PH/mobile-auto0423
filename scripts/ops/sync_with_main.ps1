@@ -22,15 +22,20 @@
 param(
     [switch]$Rebase,
     [switch]$Pull,
-    [switch]$AutoStash    # BBB: pass --autostash to git rebase (auto stash+pop dirty)
+    [switch]$AutoStash,   # BBB: pass --autostash to git rebase (auto stash+pop dirty)
+    [switch]$CherryPick,  # FFF: cherry-pick fresh commits to new branch off origin/main
+                          #      (use when main has squash-merged this branch's commits)
+    [string]$BranchName = ""   # FFF: name for new cherry-pick branch (default: auto)
 )
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $ProjectRoot
 
-if ($Rebase -and $Pull) {
-    Write-Host "[ERROR] -Rebase and -Pull are mutually exclusive." -ForegroundColor Red
+# Mutex: -Rebase / -Pull / -CherryPick are exclusive (pick one apply mode)
+$_modes = @($Rebase, $Pull, $CherryPick) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
+if ($_modes -gt 1) {
+    Write-Host "[ERROR] -Rebase / -Pull / -CherryPick are mutually exclusive (pick one)." -ForegroundColor Red
     exit 2
 }
 
@@ -124,18 +129,104 @@ if ($Pull) {
     & git @rebaseArgs 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
-        Write-Host "   [CONFLICT] rebase has conflicts. Resolve and continue:" -ForegroundColor Yellow
-        Write-Host "      1) edit conflicted files" -ForegroundColor DarkYellow
-        Write-Host "      2) git add <files>" -ForegroundColor DarkYellow
-        Write-Host "      3) git rebase --continue" -ForegroundColor DarkYellow
-        Write-Host "      or abort: git rebase --abort" -ForegroundColor DarkYellow
+        Write-Host "   [CONFLICT] rebase has conflicts." -ForegroundColor Yellow
+        # GGG: This commonly happens when main has squash-merged this branch's
+        # earlier commits. Replaying the originals hits the squash content.
+        Write-Host "   This often happens when main squash-merged your previous commits." -ForegroundColor DarkYellow
+        Write-Host "   Recommended fix (squash-merge case):" -ForegroundColor DarkYellow
+        Write-Host "      git rebase --abort" -ForegroundColor DarkYellow
+        Write-Host "      sync_with_main.bat -CherryPick    (smart: detects squash via patch-id)" -ForegroundColor DarkYellow
+        Write-Host "   Or resolve manually:" -ForegroundColor DarkGray
+        Write-Host "      edit conflicted files / git add / git rebase --continue / --abort" -ForegroundColor DarkGray
         exit 1
     }
     Write-Host "   [OK]   rebased onto origin/main" -ForegroundColor Green
     $newAhead = [int](& git rev-list --count "origin/main..HEAD" 2>$null)
     Write-Host ("          now {0} commit(s) ahead of origin/main, ready to push" -f $newAhead) -ForegroundColor Cyan
+} elseif ($CherryPick) {
+    # FFF: smart cherry-pick using `git cherry` to detect squash-merged commits
+    # by patch-id. Creates new branch off origin/main and applies only fresh ones.
+    if ($currentBranch -eq 'main') {
+        Write-Host "   [ERROR] -CherryPick is for feat-* branches, not main." -ForegroundColor Red
+        exit 1
+    }
+
+    # git cherry origin/main HEAD format: "+ <sha>" = fresh, "- <sha>" = already in main (by patch-id)
+    $cherryOutput = & git cherry origin/main HEAD 2>$null
+    $freshCommits = @()
+    $squashedCommits = @()
+    foreach ($line in $cherryOutput) {
+        if ($line -match '^\+\s+([a-f0-9]+)$')      { $freshCommits += $matches[1] }
+        elseif ($line -match '^\-\s+([a-f0-9]+)$')  { $squashedCommits += $matches[1] }
+    }
+
+    Write-Host ""
+    Write-Host ("   Found: {0} fresh commit(s), {1} already-in-main (by patch-id)" -f $freshCommits.Count, $squashedCommits.Count)
+    if ($squashedCommits.Count -gt 0) {
+        Write-Host "          (squashed-to-main commits will be skipped automatically)" -ForegroundColor DarkGray
+    }
+
+    if ($freshCommits.Count -eq 0) {
+        Write-Host "   [OK]   nothing fresh to cherry-pick. Branch is fully merged." -ForegroundColor Green
+        Write-Host ("          Safe to delete: git branch -D {0}" -f $currentBranch) -ForegroundColor DarkGray
+        exit 0
+    }
+
+    # Pick destination branch name
+    if ($BranchName) {
+        $cleanName = $BranchName -replace '[^a-zA-Z0-9-]', '-'
+        $newBranch = "feat-ops-$cleanName-$(Get-Date -Format 'yyyy-MM-dd')"
+    } else {
+        $newBranch = "feat-ops-resync-$(Get-Date -Format 'yyyy-MM-dd-HHmm')"
+    }
+    $exists = & git rev-parse --verify --quiet "refs/heads/$newBranch" 2>$null
+    if ($exists) {
+        Write-Host ("   [ERROR] new branch '{0}' already exists. Pass -BranchName <unique>." -f $newBranch) -ForegroundColor Red
+        exit 1
+    }
+
+    # Refuse if working tree dirty
+    $dirty = & git status --porcelain 2>$null | Where-Object { $_ -notmatch '^\?\?' }
+    if ($dirty) {
+        Write-Host "   [ERROR] working tree has uncommitted changes; commit or stash first." -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host ("   Creating '{0}' off origin/main..." -f $newBranch)
+    & git checkout -b $newBranch origin/main 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "   [ERROR] checkout failed (see above)" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host ("   Cherry-picking {0} fresh commit(s) (oldest first)..." -f $freshCommits.Count)
+    foreach ($sha in $freshCommits) {
+        $shortSha = $sha.Substring(0, 7)
+        $subject = (& git log -1 --pretty=%s $sha 2>$null).Trim()
+        Write-Host ("      pick {0}: {1}" -f $shortSha, $subject) -ForegroundColor DarkCyan
+        & git cherry-pick $sha 2>&1 | ForEach-Object { Write-Host "         $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host ""
+            Write-Host ("   [CONFLICT] cherry-pick {0} failed. Resolve:" -f $shortSha) -ForegroundColor Yellow
+            Write-Host "      1) edit conflicted files / git add <files>" -ForegroundColor DarkGray
+            Write-Host "      2) git cherry-pick --continue" -ForegroundColor DarkGray
+            Write-Host "      or abort: git cherry-pick --abort && git checkout - && git branch -D $newBranch" -ForegroundColor DarkGray
+            exit 1
+        }
+    }
+
+    Write-Host ""
+    Write-Host ("   [OK]   cherry-picked {0} commit(s) onto {1}" -f $freshCommits.Count, $newBranch) -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Next steps:" -ForegroundColor DarkCyan
+    Write-Host ("  - git push -u origin {0} && gh pr create" -f $newBranch)
+    if ($squashedCommits.Count -gt 0) {
+        Write-Host ("  - obsolete: git branch -D {0}" -f $currentBranch) -ForegroundColor DarkGray
+    }
 } else {
-    Write-Host "   [SKIP] no -Rebase / -Pull flag (read-only mode)" -ForegroundColor DarkGray
+    Write-Host "   [SKIP] no -Rebase / -Pull / -CherryPick flag (read-only mode)" -ForegroundColor DarkGray
 }
 
 exit 0

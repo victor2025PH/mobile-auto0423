@@ -167,6 +167,24 @@ if (-not $branch) {
             Write-Host "                 (sibling Claude / collaborator merged a PR — see RUNBOOK 4fbee97 incident)" -ForegroundColor DarkYellow
             Bump-Exit 1
         }
+
+        # HHH: Detect commits on this branch whose patch-id is already in origin/main
+        # (squash-merged). If all squashed -> branch is obsolete.
+        if ($branch -ne 'main') {
+            $cherryLines = & git cherry origin/main HEAD 2>$null
+            $freshCnt = @($cherryLines | Where-Object { $_ -match '^\+\s+' }).Count
+            $squashCnt = @($cherryLines | Where-Object { $_ -match '^\-\s+' }).Count
+            if ($squashCnt -gt 0) {
+                if ($freshCnt -eq 0) {
+                    Write-Host ("          [INFO] all {0} commit(s) of this branch are already in origin/main (squash-merged)" -f $squashCnt) -ForegroundColor Cyan
+                    Write-Host ("                 branch obsolete — safe to delete: git branch -D {0}" -f $branch) -ForegroundColor DarkCyan
+                    Write-Host "                 or batch: cleanup_branches.bat -Apply" -ForegroundColor DarkCyan
+                } else {
+                    Write-Host ("          [INFO] {0} commit(s) on this branch already in origin/main (squashed); {1} fresh" -f $squashCnt, $freshCnt) -ForegroundColor Cyan
+                    Write-Host "                 to resync onto origin/main: sync_with_main.bat -CherryPick" -ForegroundColor DarkCyan
+                }
+            }
+        }
     }
 }
 
