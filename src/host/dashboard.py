@@ -103,8 +103,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="nav-item" data-page="studio"><span class="icon">&#127775;</span><span>工作台</span></div>
     </div>
 
-    <div class="nav-section collapsed" onclick="_toggleSection(this)">系统 <span class="sec-arrow">&#9660;</span></div>
-    <div class="nav-group collapsed">
+    <div class="nav-section" onclick="_toggleSection(this)" data-cs-section="1">&#129309; 客服中心 <span class="sec-arrow">&#9660;</span></div>
+    <div class="nav-group" data-cs-group="1">
+      <div class="nav-item" onclick="if(window.lmOpenHandoffInbox)lmOpenHandoffInbox('')"><span class="icon">&#128229;</span><span>待接管队列</span></div>
+      <div class="nav-item" onclick="if(window.lmOpenLeadSearch)lmOpenLeadSearch()"><span class="icon">&#128270;</span><span>客户搜索</span></div>
+      <div class="nav-item" onclick="if(window.lmOpenCommandCenter)lmOpenCommandCenter()"><span class="icon">&#128290;</span><span>命令中心</span></div>
+      <div class="nav-item" onclick="window.open('/static/l2-dashboard.html','_blank')"><span class="icon">&#128202;</span><span>L2 客户漏斗看板</span></div>
+    </div>
+
+    <div class="nav-section collapsed" onclick="_toggleSection(this)" data-admin-only="1">系统 <span class="sec-arrow">&#9660;</span></div>
+    <div class="nav-group collapsed" data-admin-only="1">
       <div class="nav-item" data-page="cluster"><span class="icon">&#9741;</span><span>集群管理</span></div>
       <div class="nav-item" data-page="notify-center"><span class="icon">&#128276;</span><span>通知中心</span></div>
       <div class="nav-item" data-page="backup"><span class="icon">&#128190;</span><span>备份恢复</span></div>
@@ -112,8 +120,47 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="nav-item" data-page="tpl-market"><span class="icon">&#127970;</span><span>模板市场</span></div>
       <div class="nav-item" data-page="user-mgmt"><span class="icon">&#128101;</span><span>用户管理</span></div>
       <div class="nav-item" onclick="window.open('/docs','_blank')"><span class="icon">&#128196;</span><span>API 文档</span></div>
+    </div>
+
+    <div class="nav-group">
       <div class="nav-item" onclick="doLogout()"><span class="icon">&#128682;</span><span>退出登录</span></div>
     </div>
+
+    <script>
+    /* PR-6.5: role-based 菜单显隐. customer_service 只看客服中心 + 总览 */
+    (function applyRoleMenu(){
+      try {
+        const role = (localStorage.getItem('oc_role') || '').toLowerCase();
+        if (role === 'customer_service') {
+          // 隐藏所有 admin-only sections (核心/平台/自动化/数据/监控/系统 等)
+          // 但保留 客服中心 (data-cs-section/data-cs-group) + 总览
+          document.querySelectorAll('.nav-section').forEach(function(s) {
+            const isCs = s.hasAttribute('data-cs-section');
+            if (!isCs) s.style.display = 'none';
+          });
+          document.querySelectorAll('.nav-group').forEach(function(g) {
+            const isCs = g.hasAttribute('data-cs-group');
+            // 保留客服中心 + 退出登录所在的 group
+            const hasLogout = g.querySelector('[onclick*="doLogout"]');
+            if (!isCs && !hasLogout) g.style.display = 'none';
+          });
+          // 保留 总览 nav item (单独, 不隐藏其所在 group 时已隐藏, 单独 reveal 它)
+          const ov = document.querySelector('[data-page="overview"]');
+          if (ov) {
+            ov.style.display = '';
+            const ovGroup = ov.closest('.nav-group');
+            if (ovGroup) {
+              ovGroup.style.display = '';
+              // 隐藏同 group 的其它 item
+              ovGroup.querySelectorAll('.nav-item').forEach(function(it) {
+                if (it !== ov) it.style.display = 'none';
+              });
+            }
+          }
+        }
+      } catch (e) { console.warn('[role menu] apply failed:', e); }
+    })();
+    </script>
   </nav>
   <div class="sidebar-footer"><span>OpenClaw v1.2.0</span></div>
 </aside>
@@ -2769,7 +2816,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script src="/static/js/platform-shell.js?v=20260420c"></script>
 <script src="/static/js/tiktok-ops.js?v=20260417i"></script>
 <script src="/static/js/facebook-ops.js?v=20260420d"></script>
-<script src="/static/js/lead-mesh-ui.js?v=20260423a"></script>
+<script src="/static/js/lead-mesh-ui.js?v=20260426pr66"></script>
 <script src="/static/js/platform-grid.js?v=20260417a"></script>
 <script src="/static/js/studio.js?v=20260411f"></script>
 <script>
