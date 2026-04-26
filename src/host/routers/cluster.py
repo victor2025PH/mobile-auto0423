@@ -1886,6 +1886,26 @@ def cluster_customers_llm_insight(customer_id: str, force: int = 0):
     return out
 
 
+@router.get("/cluster/customers/top/high-priority",
+            dependencies=[Depends(verify_api_key)])
+def cluster_top_high_priority(limit: int = 10):
+    """Phase-10: 高 priority 客户 Top N (运营主动出击)."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"customers": store.list_top_high_priority(limit=limit)}
+
+
+@router.get("/cluster/customers/top/frustrated",
+            dependencies=[Depends(verify_api_key)])
+def cluster_top_frustrated(days: int = 7, limit: int = 10):
+    """Phase-10: 高 frustration 客户 Top N (运营主动安抚)."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"customers": store.list_top_frustrated(days=days, limit=limit)}
+
+
 @router.get("/cluster/customers/handoff/pending",
             dependencies=[Depends(verify_api_key)])
 def cluster_handoff_pending(limit: int = 100):

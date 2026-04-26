@@ -218,6 +218,18 @@
     </table>
   </div>
 
+  <!-- Phase-10: 主动出击面板 (高优先级 + 高 frustration Top 10) -->
+  <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(380px, 1fr));gap:14px;margin-bottom:18px">
+    <div class="panel" style="background:linear-gradient(135deg,rgba(34,197,94,.04),rgba(34,197,94,.02));border-color:rgba(34,197,94,.2);margin-bottom:0">
+      <h2>🔥 高优先级 Top 10 <span class="panel-hint">未接管未转化, 主动跟进</span></h2>
+      <div id="top-high-priority" style="font-size:12px"><div class="empty">加载中…</div></div>
+    </div>
+    <div class="panel" style="background:linear-gradient(135deg,rgba(239,68,68,.04),rgba(239,68,68,.02));border-color:rgba(239,68,68,.2);margin-bottom:0">
+      <h2>😣 高 frustration Top 10 <span class="panel-hint">近 7 天 frustration > 0.7, 主动安抚</span></h2>
+      <div id="top-frustrated" style="font-size:12px"><div class="empty">加载中…</div></div>
+    </div>
+  </div>
+
   <!-- Recent customers + 搜索过滤 -->
   <div class="panel">
     <h2>👥 客户列表 <span class="panel-hint">点行看完整档案 · 含最近聊天预览</span></h2>
@@ -862,6 +874,13 @@ function _matchTemplatesForConcerns(concerns, templates) {
   return matched;
 }
 
+// Phase-10: 模板里的 〇〇さん 替换成客户名
+let _currentCustomerName = '';
+function _renderTemplateText(text) {
+  const name = (_currentCustomerName || '').trim() || 'あなた';
+  return (text || '').replace(/〇〇さん/g, name);
+}
+
 function _copyReply(text) {
   try {
     navigator.clipboard.writeText(text);
@@ -886,11 +905,12 @@ async function _renderReplyTemplates(concerns) {
   if (matched.length === 0) { target.innerHTML = ''; return; }
   target.innerHTML = matched.map(tpl => {
     const replies = (tpl.replies || []).map((rep, i) => {
-      const escaped = rep.replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+      const filled = _renderTemplateText(rep);
+      const escaped = filled.replace(/'/g, '&#39;').replace(/"/g, '&quot;');
       return '<div style="background:#0f172a;border:1px solid #334155;border-radius:6px;padding:8px 10px;margin:4px 0;font-size:12px;line-height:1.5;color:#e2e8f0;cursor:pointer" '
         + 'onclick="_copyReply(\'' + escaped + '\')" title="点击复制">'
         + '<span style="font-size:10px;color:#64748b;margin-right:6px">候选 ' + (i + 1) + '</span>'
-        + safeText(rep)
+        + safeText(filled)
         + '</div>';
     }).join('');
     return '<div style="margin-bottom:10px">'
@@ -943,6 +963,8 @@ function renderCustomerDetail(c) {
   const events = c.events || [];
   const chats = c.chats || [];
   const handoffs = c.handoffs || [];
+  // Phase-10: 模板渲染时用得到
+  _currentCustomerName = c.primary_name || '';
 
   let html = '';
 
@@ -1008,6 +1030,35 @@ function renderCustomerDetail(c) {
         + (ch.content_lang ? '<span class="lang">[' + safeText(ch.content_lang) + ']</span>' : '')
         + (ch.ai_generated ? '<span class="ai-tag">AI</span>' : '')
         + (ch.template_id ? '<span class="ai-tag" style="background:rgba(96,165,250,.15);color:#60a5fa">tpl:' + safeText(ch.template_id) + '</span>' : '')
+        + '</div></div>';
+    });
+    html += '</div></div>';
+  }
+
+  // Phase-10: 引流决策历史 (referral_decision 类事件高亮独立 section)
+  const refDecs = events.filter(ev => ev.event_type === 'referral_decision');
+  if (refDecs.length > 0) {
+    html += '<div class="modal-section"><h4>📊 引流决策历史 (' + refDecs.length + ')</h4>'
+      + '<div class="timeline">';
+    refDecs.slice().reverse().slice(0, 20).forEach(ev => {
+      const m = ev.meta || {};
+      const refColor = m.refer ? '#22c55e' : '#94a3b8';
+      const levelColor = m.level === 'hard_allow' ? '#22c55e'
+        : m.level === 'hard_block' ? '#ef4444'
+        : m.level === 'soft_pass' ? '#3b82f6' : '#64748b';
+      const scores = [];
+      if (m.readiness != null) scores.push('readiness=' + Number(m.readiness).toFixed(2));
+      if (m.frustration != null) scores.push('frust=' + Number(m.frustration).toFixed(2));
+      if (m.emotion_overall != null) scores.push('emo=' + Number(m.emotion_overall).toFixed(2));
+      const reasons = (m.reasons || []).slice(0, 3).join(' · ');
+      html += '<div class="timeline-item" style="border-left-color:' + refColor + '">'
+        + '<div class="ts">' + fmtDateTime(ev.ts) + '</div>'
+        + '<div class="body">'
+        + '<b style="color:' + refColor + '">' + (m.refer ? '✅ 引流' : '⛔ 不引') + '</b>'
+        + ' <span style="background:rgba(' + (m.level === 'hard_allow' || m.level === 'soft_pass' ? '34,197,94' : '239,68,68') + ',.12);color:' + levelColor + ';padding:1px 8px;border-radius:8px;font-size:10px;font-weight:600">' + safeText(m.level || '—') + '</span>'
+        + (m.score != null ? ' <span style="font-size:10px;color:#64748b">score=' + m.score + '/' + (m.threshold || 0) + '</span>' : '')
+        + (scores.length ? '<br><span style="font-size:10px;color:#94a3b8">' + scores.join(' · ') + '</span>' : '')
+        + (reasons ? '<br><span style="font-size:11px;color:#cbd5e1">' + safeText(reasons) + '</span>' : '')
         + '</div></div>';
     });
     html += '</div></div>';
@@ -1257,10 +1308,62 @@ async function deleteSelectedView() {
   }
 }
 
+// ─── Phase-10: Top 客户主动出击面板 ─────────────────────────────
+function _renderCustomerCard(c, color) {
+  const status = c.status || '—';
+  const updated = c.event_ts || c.updated_at;
+  return '<div onclick="openCustomer(\'' + safeText(c.customer_id) + '\')" '
+    + 'style="display:flex;justify-content:space-between;align-items:center;'
+    + 'padding:8px 10px;margin:4px 0;background:rgba(15,23,42,.5);'
+    + 'border-radius:6px;border-left:3px solid ' + color + ';cursor:pointer">'
+    + '<div><b style="color:#e2e8f0">' + safeText(c.primary_name || '—') + '</b>'
+    + ' <span class="name-flag">🇯🇵</span>'
+    + '<div style="font-size:10px;color:#64748b;margin-top:2px">'
+    + '<span class="pill ' + safeText(status) + '" style="font-size:9px;padding:1px 6px">' + safeText(status) + '</span>'
+    + ' · ' + (c.last_worker_id ? safeText(c.last_worker_id) : '—')
+    + ' · ' + fmtTime(updated) + '</div></div>'
+    + '<span style="color:' + color + ';font-size:11px">→</span>'
+    + '</div>';
+}
+
+async function loadTopHighPriority() {
+  try {
+    const data = await fetchJson('/cluster/customers/top/high-priority?limit=10');
+    const items = data.customers || [];
+    if (items.length === 0) {
+      document.getElementById('top-high-priority').innerHTML =
+        '<div class="empty">暂无高优先级未接管客户 ✅</div>';
+      return;
+    }
+    document.getElementById('top-high-priority').innerHTML =
+      items.map(c => _renderCustomerCard(c, '#22c55e')).join('');
+  } catch (e) {
+    document.getElementById('top-high-priority').innerHTML =
+      '<div class="empty">加载失败: ' + safeText(e.message) + '</div>';
+  }
+}
+
+async function loadTopFrustrated() {
+  try {
+    const data = await fetchJson('/cluster/customers/top/frustrated?days=7&limit=10');
+    const items = data.customers || [];
+    if (items.length === 0) {
+      document.getElementById('top-frustrated').innerHTML =
+        '<div class="empty">近 7 天无 frustration > 0.7 客户 ✅</div>';
+      return;
+    }
+    document.getElementById('top-frustrated').innerHTML =
+      items.map(c => _renderCustomerCard(c, '#ef4444')).join('');
+  } catch (e) {
+    document.getElementById('top-frustrated').innerHTML =
+      '<div class="empty">加载失败: ' + safeText(e.message) + '</div>';
+  }
+}
+
 // ─── refresh all ────────────────────────────────────────────────
 async function refresh() {
   document.getElementById('last-update').innerText = '刷新中…';
-  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics(), loadAbExperiment(), loadViews()]);
+  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadTimeseries(), loadAgentSla(), loadPushMetrics(), loadAbExperiment(), loadViews(), loadTopHighPriority(), loadTopFrustrated()]);
   document.getElementById('last-update').innerText = '更新于 ' + new Date().toLocaleTimeString();
 }
 

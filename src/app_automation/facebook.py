@@ -6418,6 +6418,36 @@ class FacebookAutomation(BaseAutomation):
                         conversion_readiness=_readiness,
                     )
                     decision = "wa_referral" if gate.refer else "reply"
+                    # Phase-10: referral_decision 落 customer_events (复盘 + 调参基础)
+                    try:
+                        from src.host.central_push_client import (
+                            record_event, compute_customer_id,
+                        )
+                        _cid_for_dec = compute_customer_id(
+                            "facebook_name", f"{did}::{peer_name}",
+                        )
+                        record_event(
+                            customer_id=_cid_for_dec,
+                            event_type="referral_decision",
+                            worker_id="",
+                            device_id=did,
+                            meta={
+                                "refer": bool(gate.refer),
+                                "level": gate.level,
+                                "score": int(gate.score or 0),
+                                "threshold": int(gate.threshold or 0),
+                                "reasons": list(gate.reasons or [])[:10],
+                                "intent": intent_tag,
+                                "ref_score": float(ref_score or 0.0),
+                                "emotion_overall": _emotion_overall,
+                                "frustration": _emotion_frustration,
+                                "readiness": _readiness,
+                                "persona_key": persona_key or "",
+                            },
+                            fire_and_forget=True,
+                        )
+                    except Exception as exc:
+                        log.debug("[ai_reply] referral_decision push 失败: %s", exc)
                     # PR-7: 拒绝词命中 → 写 referral_rejected_at 触发 7 天冷却
                     # gate.reasons 含 "拒绝引流关键词命中" 时即拒绝路径
                     if any("拒绝引流关键词命中" in r for r in gate.reasons):

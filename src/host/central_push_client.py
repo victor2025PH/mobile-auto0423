@@ -196,17 +196,25 @@ def _http_get_json(path: str, timeout: float = 8.0) -> Dict[str, Any]:
     return json.loads(raw)
 
 
-# ── Phase-9: 客户端 readiness 缓存 (worker 端 5 min, 命中率高时省 LLM 钱) ──
+# ── Phase-9/10: 客户端 readiness 缓存 + 连续 2 次共识 ─────────────────
+# Phase-9: 单值 5min 缓存
+# Phase-10: 历史 2 个不同 chat_id 的 readiness 都 ≥ early 才返高值, 否则 cap 0.6
+#         (防 LLM 单次误判触发早引流)
 _READINESS_CACHE: Dict[str, Dict[str, Any]] = {}
+_READINESS_HISTORY: Dict[str, list] = {}  # customer_id → [(chat_id, readiness, ts), ...]
 _READINESS_LOCK = __import__("threading").Lock()
 _READINESS_TTL_SEC = 300.0
+_READINESS_CONSENSUS_CAP = 0.6  # 单次误判时返的中性值
+_READINESS_CONSENSUS_HIGH = 0.8  # 共识门槛 (与 early_refer_readiness 一致)
 
 
 def fetch_llm_readiness(customer_id: str) -> Optional[Dict[str, float]]:
-    """Phase-9: worker 端拉 LLM 洞察的 readiness/frustration. 失败返 None.
+    """Phase-9/10: worker 端拉 LLM 洞察的 readiness/frustration. 失败返 None.
 
     返 {"conversion_readiness": 0-1, "frustration": 0-1} 或 None.
-    缓存 5 min: 同 customer_id 短窗口内不重复 HTTP.
+    Phase-9 缓存 5 min.
+    Phase-10 共识防呆: 历史最近 2 个不同 chat_id 的 readiness 都 ≥ 0.8 才返实测;
+    任一次不够即使本次实测高, 也 cap 到 0.6 (避免单次误判触发早引流).
     """
     if not customer_id:
         return None
@@ -222,14 +230,34 @@ def fetch_llm_readiness(customer_id: str) -> Optional[Dict[str, float]]:
         )
         if not data.get("ok"):
             return None
+        raw_readiness = float(data.get("conversion_readiness") or 0.5)
+        last_chat_id = "no_chat"  # llm-insight endpoint 缓存 key 已含 chat_id, 但响应没回出
+        # 用 cached 字段当变化指示: cached=False 意味着 chat_id 变了 (LLM 重新算了)
+        is_new_chat = not bool(data.get("cached"))
+
+        # Phase-10: 共识检查
+        consensus_readiness = raw_readiness
+        with _READINESS_LOCK:
+            hist = _READINESS_HISTORY.setdefault(customer_id, [])
+            if is_new_chat:
+                hist.append((now, raw_readiness))
+                # 只保留最近 5 个
+                if len(hist) > 5:
+                    del hist[:-5]
+            # 共识规则: 历史中最近 2 条 (含本次) 都 ≥ HIGH 才允许高 readiness
+            recent = hist[-2:] if len(hist) >= 2 else hist
+            if raw_readiness >= _READINESS_CONSENSUS_HIGH:
+                if len(recent) < 2 or any(r < _READINESS_CONSENSUS_HIGH for _, r in recent):
+                    consensus_readiness = min(raw_readiness, _READINESS_CONSENSUS_CAP)
+
         out = {
-            "conversion_readiness": float(data.get("conversion_readiness") or 0.5),
+            "conversion_readiness": consensus_readiness,
+            "raw_readiness": raw_readiness,  # 留底, 调试可看
             "frustration": 0.0,  # frustration 来自 emotion_scorer, 这里不出
         }
         with _READINESS_LOCK:
             _READINESS_CACHE[customer_id] = {"data": out, "fetched_at": now}
             if len(_READINESS_CACHE) > 1000:
-                # 简单 LRU: 超 1000 条删最旧 200
                 old = sorted(_READINESS_CACHE.items(), key=lambda kv: kv[1]["fetched_at"])[:200]
                 for k, _ in old:
                     _READINESS_CACHE.pop(k, None)
