@@ -133,6 +133,12 @@ if ($Json) {
         $r.last_fetch_age_min = $null
     }
 
+    # BBC: feat-* branches count (cheap). For obsolete count run cleanup_branches.bat -Json.
+    # Why not compute obsolete here: git cherry on 50+ branches is slow (~1-2s each).
+    $featBranches = & git for-each-ref --format='%(refname:short)' "refs/heads/feat-*" 2>$null
+    $r.feat_branches_count = @($featBranches).Count
+    $r.feat_branches_hint = "run 'cleanup_branches.bat -Json' for obsolete count + per-branch detail"
+
     $r.verdict_label = switch ($r.verdict) { 0 {'HEALTHY'} 1 {'NEEDS ATTENTION'} default {'UNKNOWN'} }
     $r | ConvertTo-Json -Depth 4
     exit $r.verdict

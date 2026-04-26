@@ -1,6 +1,12 @@
 # OpenClaw start script
 # Usage: start.bat  (or directly: powershell -File start.ps1)
 # Detailed runbook: docs/SYSTEM_RUNBOOK.md
+#
+# Args:
+#   -NoBranchCheck   Skip the branch sanity / dirty-config / fetch-age info
+#                    (useful for CI / scripted starts where they're noise)
+
+param([switch]$NoBranchCheck)
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -40,6 +46,8 @@ if (Test-Path $envFile) {
 
 # ---- 0b. Branch sanity + dirty config notice + last-fetch age ----
 # XXX: warn if last 'git fetch' is stale (sibling Claude likely merged PRs).
+# DDE: -NoBranchCheck skips this entire block (CI / scripted use)
+if (-not $NoBranchCheck) {
 try {
     $fetchHead = Join-Path $ProjectRoot ".git\FETCH_HEAD"
     if (Test-Path $fetchHead) {
@@ -87,6 +95,7 @@ try {
 } catch {
     # git not available or not a repo - ignore
 }
+}  # end -NoBranchCheck guard
 
 # ---- 1. Check existing processes ----
 $existing = Get-OpenClawProcesses

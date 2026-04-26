@@ -28,7 +28,8 @@ param(
     [string]$BranchName = "",  # FFF: name for new cherry-pick branch (default: auto)
     [switch]$Auto,       # SSS: try -Rebase --AutoStash, on failure fallback to
                          #      -CherryPick --AutoStash. One-flag-fits-all.
-    [switch]$DryRun      # ZZZ: print what would happen, do not execute
+    [switch]$DryRun,     # ZZZ: print what would happen, do not execute
+    [switch]$Stats       # CCD: print sibling PR frequency on origin/main and exit
 )
 
 $ErrorActionPreference = 'Continue'
@@ -44,6 +45,46 @@ if ($_modes -gt 1) {
 
 # -Auto implies AutoStash (we want hands-off mode)
 if ($Auto) { $AutoStash = $true }
+
+# CCD: -Stats — print sibling PR frequency from origin/main commit log and exit.
+# This is read-only, useful for sensing collaboration intensity before deciding
+# whether to start a long task (high freq -> shorter commit cycles).
+if ($Stats) {
+    Write-Host "==========================================="
+    Write-Host "  Sibling PR frequency on origin/main"
+    Write-Host "==========================================="
+    Write-Host ""
+
+    # Need a recent fetch to get accurate origin/main; warn if stale
+    $fetchHead = Join-Path $ProjectRoot ".git\FETCH_HEAD"
+    if (Test-Path $fetchHead) {
+        $ageMin = [int]([Math]::Round(((Get-Date) - (Get-Item $fetchHead).LastWriteTime).TotalMinutes, 0))
+        if ($ageMin -gt 30) {
+            Write-Host ("[WARN] last fetch was {0} min ago. Run sync_with_main.bat (no flag) first." -f $ageMin) -ForegroundColor Yellow
+            Write-Host ""
+        }
+    }
+
+    $windows = @(
+        @{ label = 'last  1h '; since = '1 hour ago'  },
+        @{ label = 'last  6h '; since = '6 hours ago' },
+        @{ label = 'last 24h '; since = '24 hours ago'},
+        @{ label = 'last 48h '; since = '48 hours ago'},
+        @{ label = 'last  7d '; since = '7 days ago'  },
+        @{ label = 'last 30d '; since = '30 days ago' }
+    )
+    foreach ($w in $windows) {
+        # PS 5.1 native-exe arg quirk: --since=$x with hashtable expansion can split
+        # on spaces. Build args array + splat so each element is one git argument.
+        $gitArgs = @('log', 'origin/main', '--pretty=%s', "--since=$($w.since)")
+        $log = & git @gitArgs 2>$null
+        $count = @($log | Where-Object { $_ -match '\(#\d+\)' }).Count
+        Write-Host ("   {0}  : {1,4} squash-merged PR(s)" -f $w.label, $count)
+    }
+    Write-Host ""
+    Write-Host "Read: high freq (>=10/24h) -> sibling协同压力大, 长任务前必跑 sync_with_main.bat" -ForegroundColor DarkGray
+    exit 0
+}
 
 Write-Host "==========================================="
 Write-Host "  OpenClaw sync-with-main"

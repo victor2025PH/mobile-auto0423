@@ -49,6 +49,23 @@ try {
     $output = & python $pyScript @args 2>&1
     $output | Out-File -FilePath $reportFile -Append -Encoding UTF8
 
+    # EEF: append sibling PR frequency from origin/main commit log
+    # (useful context: how busy was the sibling Claude / collaborator week?)
+    $siblingSection = "`n`n## Sibling协同节奏 (origin/main squash-merged PRs)`n`n"
+    foreach ($w in @(
+        @{ label = '近 24 小时'; since = '24 hours ago' },
+        @{ label = '近 7 天   '; since = '7 days ago'   },
+        @{ label = '近 30 天  '; since = '30 days ago'  }
+    )) {
+        # PS native-exe arg splatting (avoid --since=$expansion space bug)
+        $gitArgs = @('log', 'origin/main', '--pretty=%s', "--since=$($w.since)")
+        $log = & git @gitArgs 2>$null
+        $count = @($log | Where-Object { $_ -match '\(#\d+\)' }).Count
+        $siblingSection += "- $($w.label) : $count PR`n"
+    }
+    $siblingSection += "`n> 数据来源: ``git log origin/main --since=...`` 匹配 ``(#NNN)`` PR 编号`n"
+    Add-Content -Path $reportFile -Value $siblingSection -Encoding UTF8
+
     Write-Host "Report written to: $reportFile" -ForegroundColor Green
     Write-Host ""
     Write-Host "--- Preview (first 30 lines) ---" -ForegroundColor DarkCyan
