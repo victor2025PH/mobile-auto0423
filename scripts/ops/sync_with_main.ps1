@@ -25,19 +25,24 @@ param(
     [switch]$AutoStash,   # BBB: pass --autostash to git rebase (auto stash+pop dirty)
     [switch]$CherryPick,  # FFF: cherry-pick fresh commits to new branch off origin/main
                           #      (use when main has squash-merged this branch's commits)
-    [string]$BranchName = ""   # FFF: name for new cherry-pick branch (default: auto)
+    [string]$BranchName = "",  # FFF: name for new cherry-pick branch (default: auto)
+    [switch]$Auto        # SSS: try -Rebase --AutoStash, on failure fallback to
+                         #      -CherryPick --AutoStash. One-flag-fits-all.
 )
 
 $ErrorActionPreference = 'Continue'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $ProjectRoot
 
-# Mutex: -Rebase / -Pull / -CherryPick are exclusive (pick one apply mode)
-$_modes = @($Rebase, $Pull, $CherryPick) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
+# Mutex: -Rebase / -Pull / -CherryPick / -Auto are exclusive (pick one apply mode)
+$_modes = @($Rebase, $Pull, $CherryPick, $Auto) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
 if ($_modes -gt 1) {
-    Write-Host "[ERROR] -Rebase / -Pull / -CherryPick are mutually exclusive (pick one)." -ForegroundColor Red
+    Write-Host "[ERROR] -Rebase / -Pull / -CherryPick / -Auto are mutually exclusive (pick one)." -ForegroundColor Red
     exit 2
 }
+
+# -Auto implies AutoStash (we want hands-off mode)
+if ($Auto) { $AutoStash = $true }
 
 Write-Host "==========================================="
 Write-Host "  OpenClaw sync-with-main"
@@ -97,11 +102,17 @@ if ($needPull) {
     Write-Host ("   [SUGGEST] local main is behind origin/main by {0}; run sync_with_main.bat -Pull" -f $mainBehind) -ForegroundColor Cyan
 }
 if ($needSync) {
+    # RRR: New canonical advice — git rebase has built-in patch-content
+    # detection that auto-drops "patch contents already upstream" commits.
+    # In practice this works for most squash-merge cases. Only fallback to
+    # -CherryPick when -Rebase actually fails on a real conflict.
+    Write-Host ("   [SUGGEST] {0} is behind origin/main." -f $currentBranch) -ForegroundColor Cyan
+    Write-Host "             Recommended: sync_with_main.bat -Rebase -AutoStash" -ForegroundColor Cyan
+    Write-Host "             One-flag mode: sync_with_main.bat -Auto  (rebase, fallback to cherry-pick)" -ForegroundColor Cyan
     if ($squashSuspected) {
-        Write-Host ("   [SUGGEST] {0}: {1} commit(s) squash-merged to main detected." -f $currentBranch, $hintSquash) -ForegroundColor Cyan
-        Write-Host "             Run: sync_with_main.bat -CherryPick    (smart, skips squashed)" -ForegroundColor Cyan
-    } else {
-        Write-Host ("   [SUGGEST] {0} is behind origin/main; run sync_with_main.bat -Rebase" -f $currentBranch) -ForegroundColor Cyan
+        Write-Host ("   [INFO]    {0} commit(s) detected as already-in-main by patch-id." -f $hintSquash) -ForegroundColor DarkCyan
+        Write-Host "             git rebase will auto-drop them via patch-content detection." -ForegroundColor DarkCyan
+        Write-Host "             If rebase conflicts: fallback to sync_with_main.bat -CherryPick -AutoStash" -ForegroundColor DarkCyan
     }
 }
 
@@ -144,15 +155,18 @@ if ($Pull) {
     & git @rebaseArgs 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
-        Write-Host "   [CONFLICT] rebase has conflicts." -ForegroundColor Yellow
-        # GGG: This commonly happens when main has squash-merged this branch's
-        # earlier commits. Replaying the originals hits the squash content.
-        Write-Host "   This often happens when main squash-merged your previous commits." -ForegroundColor DarkYellow
-        Write-Host "   Recommended fix (squash-merge case):" -ForegroundColor DarkYellow
-        Write-Host "      git rebase --abort" -ForegroundColor DarkYellow
-        Write-Host "      sync_with_main.bat -CherryPick    (smart: detects squash via patch-id)" -ForegroundColor DarkYellow
-        Write-Host "   Or resolve manually:" -ForegroundColor DarkGray
-        Write-Host "      edit conflicted files / git add / git rebase --continue / --abort" -ForegroundColor DarkGray
+        Write-Host "   [CONFLICT] rebase has conflicts on a real file change." -ForegroundColor Yellow
+        # UUU: Updated guidance (2026-04-26) — git rebase has patch-content
+        # detection that auto-drops "patch contents already upstream" commits,
+        # so most squash-merge cases pass cleanly. A real conflict means
+        # main and this branch both modified the same lines.
+        Write-Host "   Primary fix (resolve the actual conflict):" -ForegroundColor DarkYellow
+        Write-Host "      1) edit conflicted files" -ForegroundColor DarkYellow
+        Write-Host "      2) git add <files>" -ForegroundColor DarkYellow
+        Write-Host "      3) git rebase --continue" -ForegroundColor DarkYellow
+        Write-Host "   Or abort and try a different strategy:" -ForegroundColor DarkGray
+        Write-Host "      git rebase --abort" -ForegroundColor DarkGray
+        Write-Host "      sync_with_main.bat -CherryPick -AutoStash    (skip squashed by patch-id)" -ForegroundColor DarkGray
         exit 1
     }
     Write-Host "   [OK]   rebased onto origin/main" -ForegroundColor Green
@@ -267,8 +281,41 @@ if ($Pull) {
     if ($squashedCommits.Count -gt 0) {
         Write-Host ("  - obsolete: git branch -D {0}" -f $currentBranch) -ForegroundColor DarkGray
     }
+} elseif ($Auto) {
+    # SSS: Auto mode = try -Rebase --AutoStash first (works for most squash
+    # cases via git's patch-content detection). If rebase fails with a real
+    # conflict, abort and fallback to -CherryPick --AutoStash.
+    if ($currentBranch -eq 'main') {
+        Write-Host "   [ERROR] -Auto is for feat-* branches, not main. Use -Pull instead." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "   [Auto/1] Attempting -Rebase --AutoStash first..." -ForegroundColor Cyan
+
+    & git rebase --autostash origin/main 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "   [OK]   -Rebase succeeded (likely git auto-dropped already-upstream patches)" -ForegroundColor Green
+        $newAhead = [int](& git rev-list --count "origin/main..HEAD" 2>$null)
+        Write-Host ("          now {0} commit(s) ahead of origin/main, ready to push" -f $newAhead) -ForegroundColor Cyan
+        exit 0
+    }
+
+    # Rebase failed - abort and fallback
+    Write-Host ""
+    Write-Host "   [Auto/1] -Rebase failed (conflict). Aborting and trying -CherryPick fallback..." -ForegroundColor Yellow
+    & git rebase --abort 2>&1 | Out-Null
+
+    # Re-invoke ourselves with -CherryPick -AutoStash
+    Write-Host ""
+    Write-Host "   [Auto/2] sync_with_main.bat -CherryPick -AutoStash"
+    & $PSCommandPath -CherryPick -AutoStash
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "   [ERROR] both -Rebase and -CherryPick failed. Manual resolution needed." -ForegroundColor Red
+        Write-Host "           Inspect: git status / git log --oneline HEAD..origin/main" -ForegroundColor DarkRed
+        exit 1
+    }
 } else {
-    Write-Host "   [SKIP] no -Rebase / -Pull / -CherryPick flag (read-only mode)" -ForegroundColor DarkGray
+    Write-Host "   [SKIP] no -Rebase / -Pull / -CherryPick / -Auto flag (read-only mode)" -ForegroundColor DarkGray
 }
 
 exit 0

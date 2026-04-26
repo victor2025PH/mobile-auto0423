@@ -322,11 +322,37 @@ curl http://127.0.0.1:8000/health
 - 多个原始 commit squash 成 1 个 PR commit 时，patch-id 不匹配 → 工具不识别
 - 用户手动判断时可用 `gh pr list --state merged --search "<branch>"` 看 PR 历史
 
+### 🎯 突破性认知：git rebase 自带 patch-content detection（2026-04-26 实测发现）
+
+**之前的错误认知**（第 1-4 次事故时）：
+- "squash merge 让 rebase 重放原始 commits → 必撞 conflict → 必须用 -CherryPick"
+
+**实测真相**（第 5 次事故 PR #115 期间发现）：
+```
+git rebase --autostash origin/main
+  Rebasing (1/2)
+  dropping c7a5f1f02b9082fa9fa9c794b4474f10665c1666 ... -- patch contents already upstream
+  Rebasing (2/2)
+  Applied autostash.
+  Successfully rebased and updated refs/heads/feat-ops-stage-e-2026-04-26.
+```
+
+**原理**：
+- `git cherry` 用 **patch-id**（hash of patch text）→ 1:1 匹配，multi-commit squash 不识别
+- `git rebase` 用 **patch-content detection** → 检查 patch 应用后的 tree 是否已等于 upstream tree → **能识别 squash N→1 后的 already-upstream commits 自动 drop**
+- 真正撞 conflict 的情况：main 和 branch 都修改了同一行，**不是因为 squash**
+
+**新认知下的工具推荐顺序**：
+1. **首选**：`sync_with_main.bat -Rebase -AutoStash`（git 自带智能，多数 squash 自动平稳处理）
+2. **一键**：`sync_with_main.bat -Auto`（自动 fallback：rebase 失败 → cherry-pick）
+3. **手动 fallback**：`sync_with_main.bat -CherryPick -AutoStash`（rebase 真撞 conflict 时用）
+
 **从此事故学到的工程原则**：
 1. **squash merge workflow + Claude long task = 反复事故**（结构性问题，不是 bug）
-2. **防呆工具不能 100% 完美** — 但可以**降低事故修复成本**（4 次平均 1.6 min）
+2. **防呆工具不能 100% 完美** — 但可以**降低事故修复成本**（5 次：3min → 30s → **0s 全自动**）
 3. **每个 commit 前必跑 repo_health** — 工具链已让这成为反射动作
 4. **加注 RUNBOOK** 比工具增强更重要 — 让人知道局限
+5. **质疑权威认知，实测 > 推断** — git rebase 比想象的智能
 
 > 之后每次改 `cluster.yaml` / `devices.yaml` / `task_execution_policy.yaml` / `facebook_playbook.yaml` / `launch.env` 留一行：日期 + 改了啥 + 谁。
 
