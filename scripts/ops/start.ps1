@@ -38,7 +38,21 @@ if (Test-Path $envFile) {
     }
 }
 
-# ---- 0b. Branch sanity + dirty config notice ----
+# ---- 0b. Branch sanity + dirty config notice + last-fetch age ----
+# XXX: warn if last 'git fetch' is stale (sibling Claude likely merged PRs).
+try {
+    $fetchHead = Join-Path $ProjectRoot ".git\FETCH_HEAD"
+    if (Test-Path $fetchHead) {
+        $lastFetch = (Get-Item $fetchHead).LastWriteTime
+        $ageMin = [Math]::Round(((Get-Date) - $lastFetch).TotalMinutes, 0)
+        if ($ageMin -gt 10) {
+            Write-Host ""
+            Write-Host ("[INFO] last 'git fetch' was {0} min ago." -f $ageMin) -ForegroundColor Cyan
+            Write-Host "       sibling Claude may have merged PRs since. Run: sync_with_main.bat" -ForegroundColor DarkCyan
+        }
+    }
+} catch { }
+
 # Branch sanity (防 4fbee97-style 事故): warn if on main with dirty/staged.
 try {
     $branch = (& git branch --show-current 2>$null).Trim()

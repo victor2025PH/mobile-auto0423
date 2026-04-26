@@ -26,8 +26,9 @@ param(
     [switch]$CherryPick,  # FFF: cherry-pick fresh commits to new branch off origin/main
                           #      (use when main has squash-merged this branch's commits)
     [string]$BranchName = "",  # FFF: name for new cherry-pick branch (default: auto)
-    [switch]$Auto        # SSS: try -Rebase --AutoStash, on failure fallback to
+    [switch]$Auto,       # SSS: try -Rebase --AutoStash, on failure fallback to
                          #      -CherryPick --AutoStash. One-flag-fits-all.
+    [switch]$DryRun      # ZZZ: print what would happen, do not execute
 )
 
 $ErrorActionPreference = 'Continue'
@@ -289,6 +290,20 @@ if ($Pull) {
         Write-Host "   [ERROR] -Auto is for feat-* branches, not main. Use -Pull instead." -ForegroundColor Red
         exit 1
     }
+
+    # ZZZ: dry-run support - show plan without executing
+    if ($DryRun) {
+        Write-Host "   [DRY RUN] -Auto would do:" -ForegroundColor Yellow
+        Write-Host "      [1/2] git rebase --autostash origin/main" -ForegroundColor DarkYellow
+        Write-Host "             (git auto-drops 'patch contents already upstream' commits)" -ForegroundColor DarkGray
+        Write-Host "      [2/2] on rebase failure: git rebase --abort" -ForegroundColor DarkYellow
+        Write-Host "             then: sync_with_main.bat -CherryPick -AutoStash" -ForegroundColor DarkYellow
+        Write-Host "             (creates new branch off origin/main, cherry-picks fresh commits)" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "      Re-run without -DryRun to execute." -ForegroundColor Cyan
+        exit 0
+    }
+
     Write-Host "   [Auto/1] Attempting -Rebase --AutoStash first..." -ForegroundColor Cyan
 
     & git rebase --autostash origin/main 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }

@@ -116,6 +116,23 @@ if ($Json) {
         _bump 1
     }
 
+    # YYY: sibling协同压力指标 - count merged-PR commits on origin/main in last 24h
+    # (subject contains "(#NNN)"). Doesn't need network if origin/main was fetched.
+    $recentSquash = 0
+    try {
+        $recentLog = & git log origin/main --pretty=%s --since='24 hours ago' 2>$null
+        $recentSquash = @($recentLog | Where-Object { $_ -match '\(#\d+\)' }).Count
+    } catch { }
+    $r.sibling_prs_24h = $recentSquash
+
+    # YYY: also expose last fetch age in minutes (helps consumers know data freshness)
+    $fetchHead = Join-Path $ProjectRoot ".git\FETCH_HEAD"
+    if (Test-Path $fetchHead) {
+        $r.last_fetch_age_min = [int]([Math]::Round(((Get-Date) - (Get-Item $fetchHead).LastWriteTime).TotalMinutes, 0))
+    } else {
+        $r.last_fetch_age_min = $null
+    }
+
     $r.verdict_label = switch ($r.verdict) { 0 {'HEALTHY'} 1 {'NEEDS ATTENTION'} default {'UNKNOWN'} }
     $r | ConvertTo-Json -Depth 4
     exit $r.verdict
