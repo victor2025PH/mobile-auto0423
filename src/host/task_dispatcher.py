@@ -93,14 +93,33 @@ def dispatch_after_create(
                 from . import task_store
                 # Phase-13 fix: 用 set_task_running (task_store 没 update_task)
                 task_store.set_task_running(task_id)
+                # 真实运维 fix: 存 checkpoint 让 sync 线程能 poll worker 状态回报
+                _remote_id = remote.get("task_id", "")
+                if _remote_id:
+                    try:
+                        task_store.save_checkpoint(task_id, {
+                            "_cluster_dispatch": {
+                                "worker_ip": worker["ip"],
+                                "worker_port": worker.get("port", 8000),
+                                "remote_task_id": _remote_id,
+                                "dispatched_at": datetime.now(
+                                    timezone.utc).isoformat(),
+                            },
+                        })
+                    except Exception as exc:
+                        logger.debug(
+                            "[dispatch] save_checkpoint 失败 task=%s: %s",
+                            task_id[:8], exc)
+                # 启 sync 线程 (一次性, 模块单例)
+                _ensure_cluster_sync_thread()
                 logger.info(
                     "[dispatch] task=%s → worker %s (remote_id=%s)",
                     task_id[:8], worker["ip"],
-                    str(remote.get("task_id", ""))[:8],
+                    str(_remote_id)[:8],
                 )
                 result.update(dispatched=True, mode="worker",
                               worker_ip=worker["ip"],
-                              remote_task_id=remote.get("task_id", ""))
+                              remote_task_id=_remote_id)
                 return result
             except Exception as err:
                 logger.info("[dispatch] 集群派发失败 task=%s，回落本机: %s",
@@ -283,3 +302,112 @@ def start_pending_rescue_loop() -> bool:
 
 def stop_pending_rescue_loop() -> None:
     _rescue_stop.set()
+
+
+# ---------------------------------------------------------------------------
+# 真实运维 fix: cluster dispatch 状态同步线程
+# ---------------------------------------------------------------------------
+# 派发到 worker 的任务, worker 完成后状态不会自动回报主控.
+# 主控的 task_store 永远停在 status=running. 此线程定期扫并 poll worker.
+
+_CLUSTER_SYNC_INTERVAL_SEC = 5.0
+_cluster_sync_thread: Optional[threading.Thread] = None
+_cluster_sync_started = threading.Event()
+
+
+def _ensure_cluster_sync_thread() -> None:
+    """模块单例: 第一次有 cluster dispatch 时启."""
+    global _cluster_sync_thread
+    if _cluster_sync_started.is_set():
+        return
+    if _cluster_sync_started.is_set():  # double-check pattern
+        return
+    _cluster_sync_started.set()
+    _cluster_sync_thread = threading.Thread(
+        target=_cluster_sync_loop, daemon=True,
+        name="cluster-dispatch-sync")
+    _cluster_sync_thread.start()
+    logger.info("[cluster_sync] thread started, interval=%.0fs",
+                _CLUSTER_SYNC_INTERVAL_SEC)
+
+
+def _cluster_sync_loop() -> None:
+    while not _rescue_stop.is_set():
+        try:
+            _cluster_sync_tick()
+        except Exception:
+            logger.exception("[cluster_sync] tick failed")
+        _rescue_stop.wait(_CLUSTER_SYNC_INTERVAL_SEC)
+
+
+def _cluster_sync_tick() -> None:
+    """扫主控 status=running 且有 cluster checkpoint 的任务,
+    poll worker 状态, 完成的同步回主控 task_store."""
+    from . import task_store
+    from .database import get_conn
+    from .task_store import _alive_sql
+
+    # 拿所有 status=running 任务 (限 50)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT task_id, device_id, created_at FROM tasks "
+            f"WHERE status='running' AND {_alive_sql()} "
+            f"ORDER BY updated_at ASC LIMIT 50",
+        ).fetchall()
+
+    if not rows:
+        return
+
+    import urllib.request as _ur
+    import json as _json
+    synced = 0
+    for row in rows:
+        task_id = row["task_id"]
+        # 看 checkpoint 找 cluster 派发信息
+        try:
+            cp = task_store.get_checkpoint(task_id) or {}
+        except Exception:
+            cp = {}
+        cluster_info = cp.get("_cluster_dispatch")
+        if not cluster_info:
+            continue
+        worker_ip = cluster_info.get("worker_ip")
+        worker_port = cluster_info.get("worker_port", 8000)
+        remote_id = cluster_info.get("remote_task_id")
+        if not (worker_ip and remote_id):
+            continue
+        # 拉 worker 那边状态
+        url = f"http://{worker_ip}:{worker_port}/tasks/{remote_id}"
+        try:
+            req = _ur.Request(url, method="GET")
+            with _ur.urlopen(req, timeout=5) as resp:
+                remote = _json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as exc:
+            logger.debug("[cluster_sync] poll %s 失败: %s", remote_id[:8], exc)
+            continue
+        rstatus = remote.get("status")
+        if rstatus not in ("completed", "failed", "cancelled", "timeout"):
+            continue
+        # remote 完成 → 同步到 coord task_store
+        rresult = remote.get("result") or {}
+        success = bool(rresult.get("success"))
+        error = str(rresult.get("error") or "")
+        screenshot = str(rresult.get("screenshot_path") or "")
+        try:
+            task_store.set_task_result(
+                task_id, success=success, error=error,
+                screenshot_path=screenshot,
+                extra={
+                    "device_id": row["device_id"] or "",
+                    "_dispatched_to": worker_ip,
+                    "_remote_task_id": remote_id,
+                    **{k: v for k, v in rresult.items()
+                        if k not in ("success", "error", "screenshot_path")},
+                },
+            )
+            synced += 1
+        except Exception as exc:
+            logger.warning("[cluster_sync] set_task_result 失败 task=%s: %s",
+                           task_id[:8], exc)
+    if synced > 0:
+        logger.info("[cluster_sync] synced %d remote completions", synced)
