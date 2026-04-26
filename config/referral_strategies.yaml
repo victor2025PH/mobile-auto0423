@@ -31,5 +31,11 @@ jp_female_midlife:
   trigger_keywords_lang: ja
   bot_persona: jp_caring_male   # AI 调性: 日本男性关爱型 (chat_brain 注入)
   referral_tone: companion      # 温柔陪护, 非商业
+  # Phase-9: LLM 洞察驱动智能引流 (覆盖 7 轮硬阈值)
+  max_frustration: 0.5          # frustration > 0.5 暂不引 (referral_ask 除外)
+  early_refer_readiness: 0.8    # readiness ≥ 0.8 + turns ≥ 5 → 早引流 (跳过 7 轮)
+  early_refer_min_turns: 5
+  delay_refer_readiness: 0.3    # readiness ≤ 0.3 + turns ≤ 10 → 延后 (即使到 7 轮也别引)
+  delay_refer_max_turns: 10
 
 # 备用 persona 走 default (italy_lifestyle / brazil_beauty / arabic_business 等)

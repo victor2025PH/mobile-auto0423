@@ -434,14 +434,19 @@ function renderAiSummary(s) {
   }).join('');
 }
 
-const SLA_BREACH_MIN = 30; // Phase-8: handoff > 30 min 未接管 → 报警
+// Phase-8/9: handoff SLA 阈值. Phase-9 按 priority 分层
+const SLA_BREACH_MIN = {high: 15, medium: 30, low: 60}; // 分钟
 let _slaPrevBreachCount = 0;
 
-function _isSlaBreach(initiatedAt) {
+function _slaThresholdMin(priority) {
+  return SLA_BREACH_MIN[priority] || SLA_BREACH_MIN.medium;
+}
+
+function _isSlaBreach(initiatedAt, priority) {
   if (!initiatedAt) return false;
   try {
     const ageMin = (Date.now() - new Date(initiatedAt).getTime()) / 60000;
-    return ageMin >= SLA_BREACH_MIN;
+    return ageMin >= _slaThresholdMin(priority);
   } catch (e) { return false; }
 }
 
@@ -463,7 +468,7 @@ async function loadHandoffPending() {
     const handoffs = data.handoffs || [];
     // Phase-8: 客户端算 SLA breach
     let breachCount = 0;
-    handoffs.forEach(h => { if (_isSlaBreach(h.initiated_at)) breachCount++; });
+    handoffs.forEach(h => { if (_isSlaBreach(h.initiated_at, h.priority_tag)) breachCount++; });
     const badge = document.getElementById('sla-breach-badge');
     document.getElementById('sla-breach-count').innerText = breachCount;
     badge.style.display = breachCount > 0 ? '' : 'none';
@@ -478,22 +483,30 @@ async function loadHandoffPending() {
     }
     // 超时排前面
     handoffs.sort((a, b) => {
-      const ba = _isSlaBreach(a.initiated_at) ? 1 : 0;
-      const bb = _isSlaBreach(b.initiated_at) ? 1 : 0;
+      const ba = _isSlaBreach(a.initiated_at, a.priority_tag) ? 1 : 0;
+      const bb = _isSlaBreach(b.initiated_at, b.priority_tag) ? 1 : 0;
       if (ba !== bb) return bb - ba;
+      // 同样未超时, 按 priority 排序: high 在前
+      const pr = {high: 0, medium: 1, low: 2};
+      const pa = pr[a.priority_tag || 'medium'], pb = pr[b.priority_tag || 'medium'];
+      if (pa !== pb) return pa - pb;
       return new Date(a.initiated_at || 0) - new Date(b.initiated_at || 0);
     });
+    const _prEmoji = {high: '🔥', medium: '⚡', low: '💤'};
     document.getElementById('handoff-tbody').innerHTML = handoffs.map(h => {
       const aiSum = h.ai_summary || '';
-      const breach = _isSlaBreach(h.initiated_at);
+      const breach = _isSlaBreach(h.initiated_at, h.priority_tag);
       const cls = breach ? 'sla-breach' : '';
+      const prTag = h.priority_tag || 'medium';
+      const prEmoji = _prEmoji[prTag] || '';
+      const prHint = '阈值 ' + _slaThresholdMin(prTag) + ' min';
       return '<tr class="' + cls + '" onclick="openCustomer(\'' + safeText(h.customer_id) + '\')">'
         + '<td class="mono">' + safeText((h.handoff_id || '').substring(0, 12)) + '…</td>'
-        + '<td><span class="name">' + safeText(h.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span></td>'
+        + '<td>' + prEmoji + ' <span class="name">' + safeText(h.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span></td>'
         + '<td>' + safeText((h.ai_profile && h.ai_profile.persona_key) || '—') + ' / ' + safeText(h.country || '—') + '</td>'
         + '<td class="mono" style="color:#cbd5e1">' + safeText(h.from_stage || '—') + ' → ' + safeText(h.to_stage || '—') + '</td>'
         + '<td><div class="ai-summary">' + renderAiSummary(aiSum) + '</div></td>'
-        + '<td' + (breach ? ' style="color:#ef4444;font-weight:600"' : '') + '>' + fmtTime(h.initiated_at) + '</td>'
+        + '<td' + (breach ? ' style="color:#ef4444;font-weight:600"' : '') + ' title="' + prHint + '">' + fmtTime(h.initiated_at) + '</td>'
         + '<td><button class="btn-accept" onclick="event.stopPropagation();acceptHandoff(\'' + safeText(h.handoff_id) + '\',\'' + safeText(h.primary_name || '') + '\')">🙋 我接手</button></td>'
         + '</tr>';
     }).join('');
@@ -816,6 +829,76 @@ async function openCustomer(customerId) {
   }
 }
 
+// Phase-9: 客服回复模板 (lazy load 一次, 全局复用)
+let _replyTemplates = null;
+async function _loadReplyTemplates() {
+  if (_replyTemplates) return _replyTemplates;
+  try {
+    const r = await fetch('/static/replies/ja.json');
+    _replyTemplates = (await r.json()).templates || [];
+  } catch (e) {
+    _replyTemplates = [];
+  }
+  return _replyTemplates;
+}
+
+function _matchTemplatesForConcerns(concerns, templates) {
+  // 部分关键词匹配 (lowercase substring), 同模板只返一次
+  const matched = [];
+  const seen = new Set();
+  (concerns || []).forEach(c => {
+    const lc = (c || '').toLowerCase();
+    templates.forEach(tpl => {
+      if (seen.has(tpl.id)) return;
+      const hits = (tpl.keywords || []).some(k => lc.includes(k.toLowerCase()));
+      if (hits) { matched.push(tpl); seen.add(tpl.id); }
+    });
+  });
+  // 兜底: 一个都没命中给 _default
+  if (matched.length === 0) {
+    const def = templates.find(t => t.id === '_default');
+    if (def) matched.push(def);
+  }
+  return matched;
+}
+
+function _copyReply(text) {
+  try {
+    navigator.clipboard.writeText(text);
+    showToast('📋 已复制到剪贴板', '#22c55e');
+  } catch (e) {
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('📋 已复制', '#22c55e');
+  }
+}
+
+async function _renderReplyTemplates(concerns) {
+  const target = document.getElementById('reply-templates-body');
+  if (!target) return;
+  const templates = await _loadReplyTemplates();
+  const matched = _matchTemplatesForConcerns(concerns, templates);
+  if (matched.length === 0) { target.innerHTML = ''; return; }
+  target.innerHTML = matched.map(tpl => {
+    const replies = (tpl.replies || []).map((rep, i) => {
+      const escaped = rep.replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+      return '<div style="background:#0f172a;border:1px solid #334155;border-radius:6px;padding:8px 10px;margin:4px 0;font-size:12px;line-height:1.5;color:#e2e8f0;cursor:pointer" '
+        + 'onclick="_copyReply(\'' + escaped + '\')" title="点击复制">'
+        + '<span style="font-size:10px;color:#64748b;margin-right:6px">候选 ' + (i + 1) + '</span>'
+        + safeText(rep)
+        + '</div>';
+    }).join('');
+    return '<div style="margin-bottom:10px">'
+      + '<div style="font-size:11px;color:#94a3b8;margin-bottom:4px">📂 ' + safeText(tpl.label) + '</div>'
+      + replies + '</div>';
+  }).join('');
+}
+
 // Phase-8: LLM 客户洞察 (lazy: 用户点开 modal 才异步请求)
 async function loadLlmInsight(customerId, force) {
   const target = document.getElementById('llm-insight-body');
@@ -842,7 +925,10 @@ async function loadLlmInsight(customerId, force) {
       + '</div>'
       + '<div style="color:#e2e8f0;font-size:13px;line-height:1.6;margin-bottom:10px">' + safeText(r.summary) + '</div>'
       + (concerns ? '<div style="margin-bottom:10px"><b style="color:#94a3b8;font-size:11px">关键诉求:</b><ul style="margin:4px 0 0 20px;padding:0;font-size:12px">' + concerns + '</ul></div>' : '')
-      + '<div style="background:rgba(96,165,250,.08);border-left:3px solid #60a5fa;padding:8px 12px;border-radius:4px;font-size:12px"><b style="color:#60a5fa">建议: </b>' + safeText(r.recommended_action) + '</div>';
+      + '<div style="background:rgba(96,165,250,.08);border-left:3px solid #60a5fa;padding:8px 12px;border-radius:4px;font-size:12px;margin-bottom:10px"><b style="color:#60a5fa">建议: </b>' + safeText(r.recommended_action) + '</div>'
+      + '<details style="margin-top:10px"><summary style="cursor:pointer;font-size:11px;color:#c084fc;font-weight:600;padding:4px 0">💬 推荐回复 (按客户诉求自动匹配, 点击复制)</summary>'
+      + '<div id="reply-templates-body" style="margin-top:8px"></div></details>';
+    _renderReplyTemplates(r.key_concerns || []);
   } catch (e) {
     target.innerHTML = '<div style="color:#ef4444">❌ ' + safeText(e.message) + '</div>';
   }
