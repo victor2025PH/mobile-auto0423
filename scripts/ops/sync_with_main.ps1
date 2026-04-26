@@ -78,16 +78,31 @@ Write-Host ""
 Write-Host "[3/4] Recommendation"
 
 $needPull = $mainBehind -gt 0
-$needRebase = ($currentBranch -ne 'main') -and (([int](& git rev-list --count "HEAD..origin/main" 2>$null)) -gt 0)
+$needSync = ($currentBranch -ne 'main') -and (([int](& git rev-list --count "HEAD..origin/main" 2>$null)) -gt 0)
 
-if (-not $needPull -and -not $needRebase) {
+# MMM: smart recommendation - if any of branch's commits are squash-merged
+# (detected by patch-id via `git cherry`), suggest -CherryPick over -Rebase.
+$squashSuspected = $false
+if ($needSync -and $currentBranch -ne 'main') {
+    $cherryHint = & git cherry origin/main HEAD 2>$null
+    $hintFresh = @($cherryHint | Where-Object { $_ -match '^\+\s+' }).Count
+    $hintSquash = @($cherryHint | Where-Object { $_ -match '^\-\s+' }).Count
+    if ($hintSquash -gt 0) { $squashSuspected = $true }
+}
+
+if (-not $needPull -and -not $needSync) {
     Write-Host "   [OK]   already up to date with origin/main" -ForegroundColor Green
 }
 if ($needPull) {
     Write-Host ("   [SUGGEST] local main is behind origin/main by {0}; run sync_with_main.bat -Pull" -f $mainBehind) -ForegroundColor Cyan
 }
-if ($needRebase) {
-    Write-Host ("   [SUGGEST] {0} is behind origin/main; run sync_with_main.bat -Rebase" -f $currentBranch) -ForegroundColor Cyan
+if ($needSync) {
+    if ($squashSuspected) {
+        Write-Host ("   [SUGGEST] {0}: {1} commit(s) squash-merged to main detected." -f $currentBranch, $hintSquash) -ForegroundColor Cyan
+        Write-Host "             Run: sync_with_main.bat -CherryPick    (smart, skips squashed)" -ForegroundColor Cyan
+    } else {
+        Write-Host ("   [SUGGEST] {0} is behind origin/main; run sync_with_main.bat -Rebase" -f $currentBranch) -ForegroundColor Cyan
+    }
 }
 
 # ---- 4. apply (if requested) ----
@@ -185,11 +200,27 @@ if ($Pull) {
         exit 1
     }
 
-    # Refuse if working tree dirty
+    # LLL: dirty handling with optional -AutoStash
+    # Two kinds of dirty matter for cherry-pick:
+    #   1) staged/modified that would conflict with checkout (rare)
+    #   2) runtime config files (cluster_state.json etc) — safe to carry across
+    # We use git stash (with -u for untracked) when -AutoStash is given.
     $dirty = & git status --porcelain 2>$null | Where-Object { $_ -notmatch '^\?\?' }
-    if ($dirty) {
+    $stashed = $false
+    if ($dirty -and -not $AutoStash) {
         Write-Host "   [ERROR] working tree has uncommitted changes; commit or stash first." -ForegroundColor Red
+        Write-Host "           Or pass -AutoStash to auto stash+cherry-pick+pop." -ForegroundColor DarkRed
         exit 1
+    }
+    if ($dirty -and $AutoStash) {
+        Write-Host "   [INFO] working tree dirty; stashing before cherry-pick" -ForegroundColor Cyan
+        & git stash push -u -m "sync_with_main_autostash_$(Get-Date -Format yyyyMMdd-HHmmss)" 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -eq 0) {
+            $stashed = $true
+        } else {
+            Write-Host "   [ERROR] stash failed; aborting cherry-pick" -ForegroundColor Red
+            exit 1
+        }
     }
 
     Write-Host ""
@@ -197,6 +228,7 @@ if ($Pull) {
     & git checkout -b $newBranch origin/main 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "   [ERROR] checkout failed (see above)" -ForegroundColor Red
+        if ($stashed) { Write-Host "          recover: git stash pop" -ForegroundColor DarkRed }
         exit 1
     }
 
@@ -219,6 +251,16 @@ if ($Pull) {
 
     Write-Host ""
     Write-Host ("   [OK]   cherry-picked {0} commit(s) onto {1}" -f $freshCommits.Count, $newBranch) -ForegroundColor Green
+
+    # LLL: pop the stash back
+    if ($stashed) {
+        Write-Host "   [INFO] popping autostash..." -ForegroundColor Cyan
+        & git stash pop 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "   [WARN] stash pop had conflicts; resolve manually with 'git stash list' / 'git stash pop'" -ForegroundColor Yellow
+        }
+    }
+
     Write-Host ""
     Write-Host "Next steps:" -ForegroundColor DarkCyan
     Write-Host ("  - git push -u origin {0} && gh pr create" -f $newBranch)

@@ -289,6 +289,45 @@ curl http://127.0.0.1:8000/health
 | 2026-04-26 | F9 修复尝试 #1 — DSN 加 `options='-c lc_messages=C'`（**后被 linter/用户修正**: lc_messages 是 SUSET，普通用户改会被 PG 拒） | Claude |
 | 2026-04-26 | F9 修复尝试 #2（最终）— DSN 只保留 `client_encoding=utf8`；中毒连接由 `_conn()` 的 UnicodeDecodeError catch + discard 兜底（Phase-13 已有）；真正根治需 PG superuser 跑 `ALTER ROLE openclaw_app SET lc_messages='C';` | victor + Claude |
 
+## §7 — sibling Claude 协同事故图谱（2026-04-26）
+
+**事故频率**：单次 Claude 长任务期间 victor 通过 GitHub PR squash merge 到 main，频率 ~7-20 min/次。事故 4 次，自救 4 次成功。
+
+| # | 时间 | 事故 | 根因 | 修复方式 | 用时 |
+|---|------|------|------|---------|------|
+| 1 | 15:19 | 4fbee97 commit 误落 main | git checkout 自动切回 main + 我没察觉 + 没用 `branch_create.bat` | `git branch new + reset --hard HEAD~1` | 1 min |
+| 2 | 15:26 | PR #112 squash 我 4fbee97 | sibling 期间合 PR 我不知情 | `git checkout -b stage-c main + cherry-pick 218f516` | 2 min |
+| 3 | ~16:25 | PR #113 + sync_with_main -Rebase 撞 conflict | squash merge 让 rebase 重放原始 commits 撞 main 上 squash 内容 | `git rebase --abort + cherry-pick 806ada1 → stage-d` | 3 min |
+| 4 | ~16:55 | PR #114 squash 我 581ba2a | 同 #2，工具盲区（git cherry 不识别 multi-commit squash） | `git checkout -b stage-e main + cherry-pick 5262c21` | 30 sec |
+
+**防呆工具链演进**（每次事故学一个教训）：
+
+| 事故 | 工具教训 |
+|------|---------|
+| #1 | `branch_create.bat` — 一键建 feat-* 分支防忘切 |
+| #1 | `repo_health.bat` 加 main+dirty 警告 |
+| #1 | `start.ps1` 启动前加 branch sanity |
+| #2 | `sync_with_main.bat` — fetch + 报告 ahead/behind |
+| #2 | CLAUDE.md 加 "sibling Claude 长任务前置检查" 章节 |
+| #3 | `repo_health.bat -Fetch` — 显式 fetch + origin/main 对比 |
+| #3 | `sync_with_main.bat -Rebase --AutoStash` — 处理 dirty |
+| #4 | `sync_with_main.bat -CherryPick` — 用 git cherry detect squash |
+| #4 | `sync_with_main.bat -CherryPick -AutoStash` — handle dirty |
+| #4 | `cleanup_branches.bat` — 自动 detect obsolete branches |
+| #4 | RUNBOOK §5 加 "F9 已应用 fix" |
+| #4 | smart Recommendation：检测 squash → 推荐 -CherryPick 而非 -Rebase |
+
+**已知工具盲区**：
+- `git cherry origin/main HEAD` 只 detect 1:1 patch-id 等价
+- 多个原始 commit squash 成 1 个 PR commit 时，patch-id 不匹配 → 工具不识别
+- 用户手动判断时可用 `gh pr list --state merged --search "<branch>"` 看 PR 历史
+
+**从此事故学到的工程原则**：
+1. **squash merge workflow + Claude long task = 反复事故**（结构性问题，不是 bug）
+2. **防呆工具不能 100% 完美** — 但可以**降低事故修复成本**（4 次平均 1.6 min）
+3. **每个 commit 前必跑 repo_health** — 工具链已让这成为反射动作
+4. **加注 RUNBOOK** 比工具增强更重要 — 让人知道局限
+
 > 之后每次改 `cluster.yaml` / `devices.yaml` / `task_execution_policy.yaml` / `facebook_playbook.yaml` / `launch.env` 留一行：日期 + 改了啥 + 谁。
 
 ---
