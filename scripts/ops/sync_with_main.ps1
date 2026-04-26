@@ -21,7 +21,8 @@
 
 param(
     [switch]$Rebase,
-    [switch]$Pull
+    [switch]$Pull,
+    [switch]$AutoStash    # BBB: pass --autostash to git rebase (auto stash+pop dirty)
 )
 
 $ErrorActionPreference = 'Continue'
@@ -108,12 +109,19 @@ if ($Pull) {
     }
     # Check for uncommitted changes
     $dirty = & git status --porcelain 2>$null | Where-Object { $_ -notmatch '^\?\?' }
-    if ($dirty) {
+    if ($dirty -and -not $AutoStash) {
         Write-Host "   [ERROR] working tree has uncommitted changes; commit or stash first." -ForegroundColor Red
+        Write-Host "           Or pass -AutoStash to auto stash+rebase+pop." -ForegroundColor DarkRed
         exit 1
     }
-    Write-Host ("   git rebase origin/main  ({0} -> origin/main)" -f $currentBranch)
-    & git rebase origin/main 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
+    if ($dirty -and $AutoStash) {
+        Write-Host "   [INFO] working tree dirty; using --autostash" -ForegroundColor Cyan
+    }
+    $rebaseArgs = @('rebase')
+    if ($AutoStash) { $rebaseArgs += '--autostash' }
+    $rebaseArgs += 'origin/main'
+    Write-Host ("   git {0}  ({1} -> origin/main)" -f ($rebaseArgs -join ' '), $currentBranch)
+    & git @rebaseArgs 2>&1 | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray }
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
         Write-Host "   [CONFLICT] rebase has conflicts. Resolve and continue:" -ForegroundColor Yellow

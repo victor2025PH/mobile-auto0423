@@ -12,12 +12,35 @@
 param(
     [string]$Name = "",
     [switch]$FromMain,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$NoFetch     # by default we fetch origin/main first (prevent stale main)
 )
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $ProjectRoot
+
+# ---- 0. Fast-forward local main from origin (default ON, opt-out via -NoFetch) ----
+# Why: ZZ 优化 - 防止在 stale main 上建分支, sibling 协同期间 main 经常落后
+if (-not $NoFetch) {
+    Write-Host "[INFO] git fetch origin main (use -NoFetch to skip)..." -ForegroundColor DarkGray
+    & git fetch origin main 2>&1 | Out-Null
+    $localBehind = [int](& git rev-list --count "main..origin/main" 2>$null)
+    if ($localBehind -gt 0) {
+        Write-Host ("[WARN] local main is {0} commit(s) behind origin/main." -f $localBehind) -ForegroundColor Yellow
+        Write-Host "       Branch will be created on STALE main. Recommend:" -ForegroundColor DarkYellow
+        Write-Host "          1) git checkout main && git pull --ff-only origin main" -ForegroundColor DarkYellow
+        Write-Host "          2) Then re-run branch_create.bat" -ForegroundColor DarkYellow
+        Write-Host "       Or pass -NoFetch / accept stale base." -ForegroundColor DarkYellow
+        Write-Host ""
+        if (-not $DryRun) {
+            Write-Host "Press Ctrl+C to cancel, Enter to proceed anyway..." -ForegroundColor Yellow
+            [void](Read-Host)
+        }
+    } else {
+        Write-Host "   [OK]   local main is up to date with origin/main" -ForegroundColor DarkGray
+    }
+}
 
 # Build branch name
 $datestamp = Get-Date -Format 'yyyy-MM-dd-HHmm'
