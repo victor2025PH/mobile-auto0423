@@ -1,6 +1,12 @@
 # OpenClaw start script
 # Usage: start.bat  (or directly: powershell -File start.ps1)
 # Detailed runbook: docs/SYSTEM_RUNBOOK.md
+#
+# Args:
+#   -NoBranchCheck   Skip the branch sanity / dirty-config / fetch-age info
+#                    (useful for CI / scripted starts where they're noise)
+
+param([switch]$NoBranchCheck)
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -38,7 +44,23 @@ if (Test-Path $envFile) {
     }
 }
 
-# ---- 0b. Branch sanity + dirty config notice ----
+# ---- 0b. Branch sanity + dirty config notice + last-fetch age ----
+# XXX: warn if last 'git fetch' is stale (sibling Claude likely merged PRs).
+# DDE: -NoBranchCheck skips this entire block (CI / scripted use)
+if (-not $NoBranchCheck) {
+try {
+    $fetchHead = Join-Path $ProjectRoot ".git\FETCH_HEAD"
+    if (Test-Path $fetchHead) {
+        $lastFetch = (Get-Item $fetchHead).LastWriteTime
+        $ageMin = [Math]::Round(((Get-Date) - $lastFetch).TotalMinutes, 0)
+        if ($ageMin -gt 10) {
+            Write-Host ""
+            Write-Host ("[INFO] last 'git fetch' was {0} min ago." -f $ageMin) -ForegroundColor Cyan
+            Write-Host "       sibling Claude may have merged PRs since. Run: sync_with_main.bat" -ForegroundColor DarkCyan
+        }
+    }
+} catch { }
+
 # Branch sanity (防 4fbee97-style 事故): warn if on main with dirty/staged.
 try {
     $branch = (& git branch --show-current 2>$null).Trim()
@@ -73,6 +95,7 @@ try {
 } catch {
     # git not available or not a repo - ignore
 }
+}  # end -NoBranchCheck guard
 
 # ---- 1. Check existing processes ----
 $existing = Get-OpenClawProcesses

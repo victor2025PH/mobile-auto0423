@@ -116,6 +116,45 @@ if ($Json) {
         _bump 1
     }
 
+    # YYY: sibling协同压力指标 - count merged-PR commits on origin/main in last 24h
+    # (subject contains "(#NNN)"). Doesn't need network if origin/main was fetched.
+    $recentSquash = 0
+    try {
+        $recentLog = & git log origin/main --pretty=%s --since='24 hours ago' 2>$null
+        $recentSquash = @($recentLog | Where-Object { $_ -match '\(#\d+\)' }).Count
+    } catch { }
+    $r.sibling_prs_24h = $recentSquash
+
+    # YYY: also expose last fetch age in minutes (helps consumers know data freshness)
+    $fetchHead = Join-Path $ProjectRoot ".git\FETCH_HEAD"
+    if (Test-Path $fetchHead) {
+        $r.last_fetch_age_min = [int]([Math]::Round(((Get-Date) - (Get-Item $fetchHead).LastWriteTime).TotalMinutes, 0))
+    } else {
+        $r.last_fetch_age_min = $null
+    }
+
+    # BBC: feat-* branches count (cheap). For obsolete count run cleanup_branches.bat -Json.
+    # Why not compute obsolete here: git cherry on 50+ branches is slow (~1-2s each).
+    $featBranches = & git for-each-ref --format='%(refname:short)' "refs/heads/feat-*" 2>$null
+    $r.feat_branches_count = @($featBranches).Count
+    $r.feat_branches_hint = "run 'cleanup_branches.bat -Json' for obsolete count + per-branch detail"
+
+    # HHJ: pre-commit hook status (signal CI / monitor whether hook is installed)
+    $hookFile = Join-Path $ProjectRoot ".git\hooks\pre-commit"
+    if (Test-Path $hookFile) {
+        $hookContent = Get-Content $hookFile -Raw -ErrorAction SilentlyContinue
+        if ($hookContent -match 'OpenClaw|pre_commit\.ps1') {
+            $r.pre_commit_hook_installed = $true
+            $r.pre_commit_hook_kind = 'openclaw'
+        } else {
+            $r.pre_commit_hook_installed = $true
+            $r.pre_commit_hook_kind = 'other'
+        }
+    } else {
+        $r.pre_commit_hook_installed = $false
+        $r.pre_commit_hook_kind = $null
+    }
+
     $r.verdict_label = switch ($r.verdict) { 0 {'HEALTHY'} 1 {'NEEDS ATTENTION'} default {'UNKNOWN'} }
     $r | ConvertTo-Json -Depth 4
     exit $r.verdict
