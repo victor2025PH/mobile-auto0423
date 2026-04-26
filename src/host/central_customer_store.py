@@ -375,6 +375,7 @@ class CentralCustomerStore:
                     c.customer_id::text, c.canonical_id, c.canonical_source,
                     c.primary_name, c.age_band, c.gender, c.country, c.interests,
                     c.ai_profile, c.status, c.priority_tag,
+                    c.custom_tags,
                     c.last_worker_id, c.last_device_id,
                     c.created_at, c.updated_at,
                     -- Phase-5: 最近一条聊天预览 (任何 channel / direction)
@@ -390,6 +391,35 @@ class CentralCustomerStore:
                 LIMIT %s OFFSET %s
                 """,
                 params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def search_chats(
+        self,
+        q: str = "",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Phase-6: 全文搜聊天内容. 用 ILIKE 起步 (32 客户级别 OK).
+
+        返回 list of {chat_id, customer_id, primary_name, channel, direction,
+                      content, content_lang, ts}.
+        """
+        if not q or len(q) < 2:
+            return []
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    ch.chat_id::text, ch.customer_id::text, ch.channel, ch.direction,
+                    ch.content, ch.content_lang, ch.ts,
+                    c.primary_name, c.status, c.priority_tag
+                FROM customer_chats ch
+                JOIN customers c ON c.customer_id = ch.customer_id
+                WHERE ch.content ILIKE %s
+                ORDER BY ch.ts DESC
+                LIMIT %s
+                """,
+                (f"%{q}%", min(max(1, int(limit)), 200)),
             )
             return [dict(r) for r in cur.fetchall()]
 
@@ -495,13 +525,20 @@ class CentralCustomerStore:
         days: int = 30,
         min_samples_per_variant: int = 10,
         min_rate_diff: float = 0.15,
+        graduate_min_days: int = 7,
+        graduate_min_samples: int = 30,
     ) -> Dict[str, Any]:
         """Phase-5: 启发式判断 A/B winner. 不引 scipy.
+        Phase-6: 加 graduate 判定 — winner 持续 graduate_min_days 天 +
+        samples ≥ graduate_min_samples/variant 后 graduated=True 100% 流量.
 
-        判定: 每个 variant 至少 min_samples_per_variant 个 outcome (converted+lost),
-        且 conversion_rate 差 ≥ min_rate_diff (绝对值) → 标 winner.
+        判定 winner: 每个 variant 至少 min_samples_per_variant 个 outcome,
+        且 conversion_rate 差 ≥ min_rate_diff → 标 winner.
 
-        返回 {winner: 'v1'|'v2'|None, confidence: float, samples: dict, rates: dict}.
+        判定 graduate: 看最近 graduate_min_days 天每天的 winner 是否一致,
+        且累计 samples ≥ graduate_min_samples/variant.
+
+        返回 {winner, confidence, samples, rates, graduated, graduate_reason}.
         """
         with self._cursor() as cur:
             cur.execute(
@@ -536,8 +573,56 @@ class CentralCustomerStore:
             diff = abs(rate1 - rate2)
             if diff >= min_rate_diff:
                 winner = "v1" if rate1 > rate2 else "v2"
-                # 简单置信度: diff / (max possible) — 信号强度
                 confidence = min(1.0, diff / 0.5)
+
+        # Phase-6: graduate 判定 — winner 稳定 + 样本够多
+        graduated = False
+        graduate_reason = ""
+        if winner and f1 >= graduate_min_samples and f2 >= graduate_min_samples:
+            # 看最近 graduate_min_days 天每天的 winner 是否一致
+            with self._cursor() as cur:
+                cur.execute(
+                    """
+                    WITH daily AS (
+                        SELECT
+                            DATE(h.completed_at) AS day,
+                            COALESCE(c.ai_profile->>'ab_variant', '') AS variant,
+                            SUM(CASE WHEN h.outcome='converted' THEN 1 ELSE 0 END)::float AS conv,
+                            SUM(CASE WHEN h.outcome IN ('converted', 'lost') THEN 1 ELSE 0 END)::float AS fin
+                        FROM customer_handoffs h
+                        JOIN customers c ON c.customer_id = h.customer_id
+                        WHERE h.completed_at IS NOT NULL
+                          AND h.completed_at > NOW() - (INTERVAL '1 day' * %s)
+                          AND COALESCE(c.ai_profile->>'ab_variant', '') IN ('v1', 'v2')
+                        GROUP BY day, variant
+                    )
+                    SELECT day, variant, conv, fin FROM daily
+                    WHERE fin > 0
+                    ORDER BY day DESC, variant
+                    """,
+                    (graduate_min_days,),
+                )
+                daily_rows = list(cur.fetchall())
+            # 每天计算 winner, 看是否一致
+            from collections import defaultdict
+            day_buckets = defaultdict(dict)
+            for r in daily_rows:
+                day_buckets[str(r["day"])][r["variant"]] = (r["conv"], r["fin"])
+            consistent = True
+            for day, vmap in day_buckets.items():
+                v1f = vmap.get("v1", (0, 0))
+                v2f = vmap.get("v2", (0, 0))
+                if v1f[1] == 0 or v2f[1] == 0:
+                    continue  # 某天该 variant 无样本, 跳过
+                r1 = v1f[0] / v1f[1]
+                r2 = v2f[0] / v2f[1]
+                day_winner = "v1" if r1 > r2 else "v2" if r2 > r1 else None
+                if day_winner is not None and day_winner != winner:
+                    consistent = False
+                    break
+            if consistent and len(day_buckets) >= 2:
+                graduated = True
+                graduate_reason = f"winner '{winner}' 稳定超过 {len(day_buckets)} 天"
 
         return {
             "winner": winner,
@@ -546,6 +631,10 @@ class CentralCustomerStore:
             "rates": {"v1": round(rate1, 3), "v2": round(rate2, 3)},
             "min_samples_required": min_samples_per_variant,
             "min_rate_diff_required": min_rate_diff,
+            "graduated": graduated,
+            "graduate_reason": graduate_reason,
+            "graduate_min_days": graduate_min_days,
+            "graduate_min_samples": graduate_min_samples,
         }
 
     def variant_sla_stats(self, days: int = 30) -> List[Dict[str, Any]]:
@@ -638,6 +727,38 @@ class CentralCustomerStore:
                     "customer_lost": int(oc.get("customer_lost") or 0),
                 })
             return all_days
+
+    def add_custom_tag(self, customer_id: str, tag: str) -> bool:
+        """Phase-6: 加自定义标签 (TEXT[] PG 数组)."""
+        tag = (tag or "").strip()
+        if not tag or len(tag) > 50:
+            return False
+        with self._cursor() as cur:
+            # array_append + array_distinct 防重 (PG 没原生 distinct, 用 array_remove + append)
+            cur.execute(
+                """
+                UPDATE customers
+                SET custom_tags = array_append(
+                    array_remove(COALESCE(custom_tags, '{}'), %s),
+                    %s
+                )
+                WHERE customer_id = %s
+                """,
+                (tag, tag, customer_id),
+            )
+            return cur.rowcount > 0
+
+    def remove_custom_tag(self, customer_id: str, tag: str) -> bool:
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE customers
+                SET custom_tags = array_remove(COALESCE(custom_tags, '{}'), %s)
+                WHERE customer_id = %s
+                """,
+                (tag, customer_id),
+            )
+            return cur.rowcount > 0
 
     def update_priority(self, customer_id: str, priority_tag: str) -> bool:
         """Phase-4: 实时更新单个客户的 priority_tag.

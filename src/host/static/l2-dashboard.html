@@ -155,7 +155,15 @@
     主控 192.168.0.118 ·
     <span id="last-update">未刷新</span> ·
     <a href="/dashboard" class="back-link" title="跳到主后台 / 客服中心">↩ 主后台</a>
+    <select id="days-select" onchange="changeDays()" class="cs-id" style="width:120px" title="数据时间窗口">
+      <option value="1">今天</option>
+      <option value="7">7 天</option>
+      <option value="30" selected>30 天</option>
+      <option value="90">90 天</option>
+      <option value="365">365 天</option>
+    </select>
     <input id="cs-id" class="cs-id" placeholder="客服 ID (e.g. agent_001)" title="接管客户时记录是谁接的"/>
+    <button onclick="openChatSearch()" title="全文搜聊天内容">🔎 搜聊天</button>
     <button onclick="exportCsv()" title="导出客户列表 CSV">📥 导出</button>
     <button onclick="refresh()">🔄 刷新</button>
   </div>
@@ -299,6 +307,11 @@
 
 <script>
 const TIMER_MS = 30000;
+let _selectedDays = 30;
+function changeDays() {
+  _selectedDays = parseInt(document.getElementById('days-select').value, 10) || 30;
+  refresh();
+}
 
 // ─── helpers ────────────────────────────────────────────────────
 function fmtTime(s) {
@@ -352,7 +365,7 @@ async function fetchJson(url, options) {
 // ─── 加载主数据 ─────────────────────────────────────────────────
 async function loadFunnel() {
   try {
-    const data = await fetchJson('/cluster/customers/funnel/stats?days=30');
+    const data = await fetchJson('/cluster/customers/funnel/stats?days=' + _selectedDays);
     const cs = data.customers_by_status || {};
     document.getElementById('stat-customers').innerText = Object.values(cs).reduce((a,b)=>a+b, 0);
     document.getElementById('stat-messenger').innerText = cs.in_messenger || 0;
@@ -443,9 +456,13 @@ async function _renderCustomers(url) {
           + ((last.content || '').length > 60 ? '…' : '')
           + '</div>'
         : '';
+      const customTags = (c.custom_tags || []).map(t =>
+        '<span style="display:inline-block;font-size:10px;padding:1px 7px;margin:1px 2px 1px 0;background:rgba(168,85,247,.15);color:#c084fc;border-radius:8px">' + safeText(t) + '</span>'
+      ).join('');
       return '<tr onclick="openCustomer(\'' + safeText(c.customer_id) + '\')">'
         + '<td class="mono">' + safeText((c.customer_id || '').substring(0, 12)) + '…</td>'
         + '<td>' + emoji + ' <span class="name">' + safeText(c.primary_name || '—') + '</span><span class="name-flag">🇯🇵</span>'
+        + (customTags ? '<div style="margin-top:3px">' + customTags + '</div>' : '')
         + preview + '</td>'
         + '<td><span class="pill ' + safeText(c.status) + '">' + safeText(c.status || 'in_funnel') + '</span></td>'
         + '<td class="mono">' + safeText(c.last_worker_id || '—') + '</td>'
@@ -491,7 +508,7 @@ function resetSearch() {
 
 async function loadTimeseries() {
   try {
-    const data = await fetchJson('/cluster/customers/funnel/timeseries?days=30');
+    const data = await fetchJson('/cluster/customers/funnel/timeseries?days=' + _selectedDays);
     const series = data.series || [];
     if (series.length === 0) {
       document.getElementById('ts-chart').innerHTML = '<div class="empty">无数据</div>';
@@ -594,7 +611,7 @@ let _slaMode = 'agents';
 async function loadAgentSla() {
   try {
     if (_slaMode === 'variants') {
-      const data = await fetchJson('/cluster/customers/sla/variants?days=30');
+      const data = await fetchJson('/cluster/customers/sla/variants?days=' + _selectedDays);
       const variants = data.variants || [];
       document.getElementById('sla-thead').innerHTML = '<tr>'
         + '<th>variant</th><th>接管</th><th>成交</th><th>流失</th><th>跟进中</th><th>转化率</th><th>平均处理 (min)</th></tr>';
@@ -620,7 +637,7 @@ async function loadAgentSla() {
       return;
     }
     // agents
-    const data = await fetchJson('/cluster/customers/sla/agents?days=30');
+    const data = await fetchJson('/cluster/customers/sla/agents?days=' + _selectedDays);
     const agents = data.agents || [];
     document.getElementById('sla-thead').innerHTML = '<tr>'
       + '<th>客服</th><th>接管</th><th>成交</th><th>流失</th><th>跟进中</th><th>转化率</th><th>平均处理 (min)</th></tr>';
@@ -663,6 +680,33 @@ function switchSla(mode) {
 
 function exportCsv() {
   window.open('/cluster/customers-export.csv', '_blank');
+}
+
+async function openChatSearch() {
+  const q = prompt('搜索聊天内容 (含日文/英文):', '');
+  if (!q || q.length < 2) return;
+  try {
+    const data = await fetchJson('/cluster/chats-search?q=' + encodeURIComponent(q) + '&limit=30');
+    const chats = data.chats || [];
+    let html = '<div class="modal-section"><h4>搜索 "' + safeText(q) + '" 命中 ' + chats.length + ' 条</h4>';
+    if (chats.length === 0) {
+      html += '<div class="empty">无匹配</div>';
+    } else {
+      html += '<div class="timeline">' + chats.map(ch => {
+        const cls = ch.direction === 'incoming' ? 'incoming' : 'outgoing';
+        const who = ch.direction === 'incoming' ? '客户' : '我';
+        return '<div class="timeline-item ' + cls + '" onclick="closeModal();openCustomer(\'' + safeText(ch.customer_id) + '\')" style="cursor:pointer">'
+          + '<div class="ts">' + fmtDateTime(ch.ts) + '<br><b style="color:#cbd5e1">' + safeText(ch.primary_name || '?') + '</b></div>'
+          + '<div class="body"><b>' + who + ':</b> ' + safeText(ch.content) + '</div></div>';
+      }).join('') + '</div>';
+    }
+    html += '</div>';
+    document.getElementById('modal-title').innerText = '🔎 聊天搜索: ' + q;
+    document.getElementById('modal-body').innerHTML = html;
+    document.getElementById('modal-overlay').classList.add('active');
+  } catch (e) {
+    showToast('搜索失败: ' + e.message, '#ef4444');
+  }
 }
 
 async function loadPushMetrics() {

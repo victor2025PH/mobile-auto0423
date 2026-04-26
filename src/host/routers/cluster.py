@@ -1738,6 +1738,29 @@ def cluster_customers_priority_recompute():
     return store.recompute_priority_tags()
 
 
+@router.put("/cluster/customers/{customer_id}/tags",
+            dependencies=[Depends(verify_api_key)])
+def cluster_customers_add_tag(customer_id: str, body: dict):
+    """Phase-6: 加自定义标签. Body: {tag: str}."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    tag = (body.get("tag") or "").strip()
+    if not tag:
+        raise HTTPException(400, "tag 必填")
+    store = _safe_get_store()
+    return {"ok": store.add_custom_tag(customer_id, tag), "tag": tag}
+
+
+@router.delete("/cluster/customers/{customer_id}/tags/{tag}",
+               dependencies=[Depends(verify_api_key)])
+def cluster_customers_remove_tag(customer_id: str, tag: str):
+    """Phase-6: 删自定义标签."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"ok": store.remove_custom_tag(customer_id, tag), "tag": tag}
+
+
 @router.post("/cluster/customers/{customer_id}/priority",
              dependencies=[Depends(verify_api_key)])
 def cluster_customers_update_priority(customer_id: str, body: dict):
@@ -1763,6 +1786,16 @@ def cluster_customers_sla_agents(days: int = 30):
         raise HTTPException(400, "central store 仅在 coordinator 节点可用")
     store = _safe_get_store()
     return {"days": days, "agents": store.agent_sla_stats(days=min(max(1, days), 365))}
+
+
+@router.get("/cluster/chats-search",
+            dependencies=[Depends(verify_api_key)])
+def cluster_chats_search(q: str = "", limit: int = 50):
+    """Phase-6: 全文搜聊天内容."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"q": q, "chats": store.search_chats(q=q, limit=limit)}
 
 
 @router.get("/cluster/customers-search",
