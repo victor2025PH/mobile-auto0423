@@ -373,7 +373,7 @@ class CentralCustomerStore:
                 f"""
                 SELECT customer_id::text, canonical_id, canonical_source,
                        primary_name, age_band, gender, country, interests,
-                       ai_profile, status, last_worker_id, last_device_id,
+                       ai_profile, status, priority_tag, last_worker_id, last_device_id,
                        created_at, updated_at
                 FROM customers
                 {where_sql}
@@ -432,6 +432,84 @@ class CentralCustomerStore:
             cust["handoffs"] = [dict(r) for r in cur.fetchall()]
 
             return cust
+
+    def funnel_timeseries(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Phase-3: 历史漏斗时序 — 按天统计关键事件.
+
+        返回 list of {date, friend_request_sent, greeting_sent, message_received,
+                      wa_referral_sent, customer_converted, customer_lost}.
+        """
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT
+                    DATE(ts) AS day,
+                    SUM(CASE WHEN event_type='friend_request_sent' THEN 1 ELSE 0 END) AS friend_request_sent,
+                    SUM(CASE WHEN event_type='greeting_sent' THEN 1 ELSE 0 END) AS greeting_sent,
+                    SUM(CASE WHEN event_type='message_received' THEN 1 ELSE 0 END) AS message_received,
+                    SUM(CASE WHEN event_type='wa_referral_sent' THEN 1 ELSE 0 END) AS wa_referral_sent
+                FROM customer_events
+                WHERE ts > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY day
+                ORDER BY day
+            """, (max(1, min(int(days), 365)),))
+            events_by_day = {str(r["day"]): dict(r) for r in cur.fetchall()}
+
+            # converted/lost 来自 customer_handoffs.outcome
+            cur.execute("""
+                SELECT
+                    DATE(completed_at) AS day,
+                    SUM(CASE WHEN outcome='converted' THEN 1 ELSE 0 END) AS customer_converted,
+                    SUM(CASE WHEN outcome='lost' THEN 1 ELSE 0 END) AS customer_lost
+                FROM customer_handoffs
+                WHERE completed_at IS NOT NULL
+                  AND completed_at > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY day
+                ORDER BY day
+            """, (max(1, min(int(days), 365)),))
+            outcomes_by_day = {str(r["day"]): dict(r) for r in cur.fetchall()}
+
+            # 合并 + 填零
+            from datetime import datetime, timedelta
+            all_days: List[Dict[str, Any]] = []
+            today = datetime.utcnow().date()
+            for i in range(int(days), -1, -1):
+                d = today - timedelta(days=i)
+                ds = d.isoformat()
+                ev = events_by_day.get(ds, {})
+                oc = outcomes_by_day.get(ds, {})
+                all_days.append({
+                    "date": ds,
+                    "friend_request_sent": int(ev.get("friend_request_sent") or 0),
+                    "greeting_sent": int(ev.get("greeting_sent") or 0),
+                    "message_received": int(ev.get("message_received") or 0),
+                    "wa_referral_sent": int(ev.get("wa_referral_sent") or 0),
+                    "customer_converted": int(oc.get("customer_converted") or 0),
+                    "customer_lost": int(oc.get("customer_lost") or 0),
+                })
+            return all_days
+
+    def recompute_priority_tags(self) -> Dict[str, int]:
+        """Phase-3: 客户分群 — 启发式 SQL 一次性重算所有 customers.priority_tag.
+
+        规则:
+            high: status in ('in_line', 'accepted_by_human', 'converted')
+                  或 ai_profile->>'has_trigger_keyword' = 'true'
+            low: status = 'lost' 或 status = 'in_funnel' 且 7 天没新事件
+            medium: 默认
+
+        返回 {high, medium, low, lost} 客户数.
+        """
+        with self._cursor() as cur:
+            cur.execute("""
+                UPDATE customers SET priority_tag = CASE
+                    WHEN status IN ('converted', 'accepted_by_human', 'in_line') THEN 'high'
+                    WHEN status = 'lost' THEN 'low'
+                    WHEN status = 'in_funnel' AND updated_at < NOW() - INTERVAL '7 days' THEN 'low'
+                    ELSE 'medium'
+                END
+            """)
+            cur.execute("SELECT priority_tag, COUNT(*) AS n FROM customers GROUP BY priority_tag")
+            return {r["priority_tag"]: int(r["n"]) for r in cur.fetchall()}
 
     def agent_sla_stats(self, days: int = 30) -> List[Dict[str, Any]]:
         """主管 SLA 看板: 按客服 username 统计接管 / 转化 / 平均处理时长.

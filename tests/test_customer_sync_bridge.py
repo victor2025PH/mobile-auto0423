@@ -65,7 +65,9 @@ def test_friend_request_sent_calls_upsert_then_event(mock_pc):
     assert upsert_kwargs["worker_id"] == "w-test"
     assert upsert_kwargs["device_id"] == "d1"
     assert upsert_kwargs["fire_and_forget"] is True
-    assert upsert_kwargs["ai_profile"] == {"persona_key": "hostess_jp"}
+    # Phase-3 加了 ab_variant 自动注入, 验 persona_key 仍存在 + ab_variant 是 v1/v2
+    assert upsert_kwargs["ai_profile"]["persona_key"] == "hostess_jp"
+    assert upsert_kwargs["ai_profile"]["ab_variant"] in ("v1", "v2")
 
     mock_pc.record_event.assert_called_once()
     evt_kwargs = mock_pc.record_event.call_args.kwargs
@@ -86,7 +88,10 @@ def test_friend_request_risk_status_maps_to_risk_event(mock_pc):
 def test_friend_request_no_persona_key_no_ai_profile(mock_pc):
     bridge.sync_friend_request_sent("d1", "Carol", status="sent")
     upsert_kwargs = mock_pc.upsert_customer.call_args.kwargs
-    assert upsert_kwargs["ai_profile"] is None
+    # Phase-3: ai_profile 不再可能为 None (ab_variant 始终注入), 只验没 persona_key
+    profile = upsert_kwargs["ai_profile"] or {}
+    assert "persona_key" not in profile or not profile.get("persona_key")
+    assert profile.get("ab_variant") in ("v1", "v2")
 
 
 # ── greeting_sent ────────────────────────────────────────────────────
