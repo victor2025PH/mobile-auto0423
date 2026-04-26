@@ -346,22 +346,53 @@ def _resolve_phase_and_cfg(section: str,
     return phase, cfg
 
 
+class FbAppNotForegroundError(RuntimeError):
+    """FB App 启动 / 切回前台失败。
+
+    2026-04-27 圈层拓客 5h 死循环事故根因: decorator 静默吞掉了
+    _ensure_foreground 失败状态, 业务方法在错误 App (Messenger/launcher)
+    里继续 smart_tap → AutoSelector 学错入口 → 死循环 + 反复触发风控.
+
+    抛此异常让 executor 把 task 标 fail, watchdog 自愈重派 (会再走一次
+    _ensure_foreground), 而不是任务表面 success 但 0 业务进展.
+    """
+    def __init__(self, method: str, current_pkg: str, expected_pkg: str):
+        self.method = method
+        self.current_pkg = current_pkg
+        self.expected_pkg = expected_pkg
+        super().__init__(
+            f"[{method}] FB 未能切回前台: current={current_pkg or '?'} "
+            f"expected={expected_pkg}. AutoSelector 学习污染防护中止业务."
+        )
+
+
 def _with_fb_foreground(method):
     """装饰器: 业务方法执行前自动 ensure FB 在前台 + dismiss XSpace 双开。
 
     所有面向 task entry 的 facebook 业务方法包一层即可,避免漏改。
+
+    2026-04-27 修复: ensure_foreground 失败时 raise FbAppNotForegroundError
+    (而非静默警告继续), 防止业务方法在错误 App 里跑导致 selector 污染 +
+    死循环. 历史事故见 memory/autoselector_pitfall.md / SYSTEM_RUNBOOK §3.
     """
     import functools as _ft
 
     @_ft.wraps(method)
     def _wrapper(self, *args, **kwargs):
+        did = self._did(kwargs.get("device_id"))
+        d = self._u2(did)
         try:
-            did = self._did(kwargs.get("device_id"))
-            d = self._u2(did)
-            self._ensure_foreground(d, did)
+            ok = self._ensure_foreground(d, did)
         except Exception as e:
-            log.warning("[%s] ensure_foreground 阶段异常(继续执行业务): %s",
-                        method.__name__, e)
+            log.warning("[%s] _ensure_foreground 抛异常: %s", method.__name__, e)
+            ok = False
+        if not ok:
+            current = ""
+            try:
+                current = (d.app_current() or {}).get("package", "")
+            except Exception:
+                pass
+            raise FbAppNotForegroundError(method.__name__, current, PACKAGE)
         return method(self, *args, **kwargs)
     return _wrapper
 

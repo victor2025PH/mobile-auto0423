@@ -28,6 +28,9 @@ Thumbs.db
 test-results/
 playwright-report/
 
+# 根目录散落的 debug/排查截图 (人手抓的, 不入 git; 子目录 PNG 不受影响)
+/*.png
+
 # 数据和日志
 data/
 logs/
