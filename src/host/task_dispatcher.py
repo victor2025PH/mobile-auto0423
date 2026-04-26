@@ -27,6 +27,13 @@ logger = logging.getLogger(__name__)
 _RESCUE_INTERVAL_SEC = 15
 # 多久未更新的 pending 才判定为"僵尸"（避免抢走刚 create 还没 submit 的任务）
 _ORPHAN_AGE_SEC = 120
+# running 任务多久未 update 才判定为孤儿 (跨 server 重启场景):
+# - 一般业务方法每完成一步会 set_task_running / progress_cb 刷 updated_at
+# - 阈值仍未 update + 不在 pool._futures 里 → 进程已死, 标 fail
+# - 阈值 = executor 最长 timeout (tiktok_auto=7200s) + 10min buffer
+#   宁可晚回收 1h, 不可误杀正常 2h 的 tiktok_auto / tiktok_warmup 任务.
+#   用户报的 "5h running" 场景远超本阈值, 仍能被准确回收.
+_ORPHAN_RUNNING_AGE_SEC = 7800
 # 每轮最多补派的任务数，避免洪水
 _RESCUE_BATCH_LIMIT = 100
 
@@ -233,6 +240,92 @@ def _load_orphan_pending(limit: int) -> list[dict]:
     return out
 
 
+def _load_orphan_running(limit: int) -> list[dict]:
+    """扫"status=running 但 pool 里没在跑"的孤儿 task (跨 server 重启场景).
+
+    判定:
+      - status='running' 且未删除
+      - updated_at 距今 >= _ORPHAN_RUNNING_AGE_SEC (避开正常长任务)
+      - 不在 WorkerPool._futures 里 → 上次进程的 thread 已死
+
+    2026-04-27 加: 用户报"task 跑 5h 还 running" 的真因是 server 在 19:18+01:45
+    重启过两次, in-flight task 的 thread 被杀但 DB status 没更新, 之前
+    pending_rescue_loop 只扫 pending 不扫 running → 孤儿任务永生.
+    """
+    try:
+        from .database import get_conn
+        from .task_store import _alive_sql
+        from .worker_pool import get_worker_pool
+    except Exception as err:
+        logger.debug("[rescue] running orphan 依赖加载失败: %s", err)
+        return []
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_ORPHAN_RUNNING_AGE_SEC)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT task_id, type, device_id, updated_at "
+            f"FROM tasks WHERE status='running' AND {_alive_sql()} "
+            f"AND (updated_at IS NULL OR updated_at <= ?) "
+            f"ORDER BY updated_at ASC LIMIT ?",
+            (cutoff_iso, limit),
+        ).fetchall()
+
+    pool = get_worker_pool()
+    inflight = set(getattr(pool, "_futures", {}).keys()) | set(
+        getattr(pool, "_cancel_flags", {}).keys()
+    )
+    out = []
+    for row in rows:
+        tid = row["task_id"]
+        if tid in inflight:
+            continue
+        out.append({
+            "task_id": tid,
+            "type": row["type"],
+            "device_id": row["device_id"],
+            "updated_at": row["updated_at"],
+        })
+    return out
+
+
+def _reap_orphan_running(orphans: list[dict]) -> int:
+    """把孤儿 running 任务标 fail (不重派 — 业务可能已部分执行,
+    重派会导致重复加好友/重复发消息等副作用).
+
+    跳过派发到 cluster worker 的 task (走 cluster_sync_thread 路径,
+    避免主控/worker 状态分裂)."""
+    if not orphans:
+        return 0
+    try:
+        from .task_store import set_task_result
+    except Exception as err:
+        logger.debug("[rescue] set_task_result 加载失败: %s", err)
+        return 0
+    reaped = 0
+    skipped_cluster = 0
+    for t in orphans:
+        tid = t["task_id"]
+        if _is_dispatched_to_cluster_worker(tid):
+            skipped_cluster += 1
+            continue
+        try:
+            set_task_result(
+                tid, False,
+                error=("任务孤儿: server 重启或 thread 异常退出 "
+                       f"(last_update={t.get('updated_at')}); "
+                       "业务可能已部分执行, 不自动重派"),
+            )
+            logger.warning("[rescue] reap orphan running task=%s type=%s device=%s",
+                           tid, t.get("type"), t.get("device_id"))
+            reaped += 1
+        except Exception as err:
+            logger.exception("[rescue] reap %s 失败: %s", tid, err)
+    if skipped_cluster:
+        logger.info("[rescue] reap skipped %d cluster-dispatched tasks", skipped_cluster)
+    return reaped
+
+
 def _rescue_once() -> tuple[int, int]:
     """跑一轮救援。返回 (scanned, resubmit)."""
     scanned = 0
@@ -246,6 +339,12 @@ def _rescue_once() -> tuple[int, int]:
         retry_ready = []
 
     orphans = _load_orphan_pending(limit=_RESCUE_BATCH_LIMIT)
+
+    # 2026-04-27 加: 回收 running 孤儿 (status=running 但 thread 已死)
+    running_orphans = _load_orphan_running(limit=_RESCUE_BATCH_LIMIT)
+    reaped = _reap_orphan_running(running_orphans)
+    if reaped:
+        logger.info("[rescue] reaped %d orphan running tasks", reaped)
 
     all_candidates: dict[str, dict] = {}
     for t in retry_ready:
@@ -287,11 +386,94 @@ def _rescue_loop():
     logger.info("[rescue] pending_rescue_loop 已退出")
 
 
+def _is_dispatched_to_cluster_worker(task_id: str) -> bool:
+    """task 是否派发到 cluster worker 上跑 (而非本机 pool).
+
+    避免 reaper 误杀派发到 worker 还在跑的 task — 那种 task 主控本地
+    pool._futures 必然没有它, 但 worker 上仍在跑, 由 cluster_sync_thread
+    定期 poll worker 状态回写主控. reaper 应跳过, 让 cluster_sync 处理.
+    """
+    try:
+        from .task_store import get_checkpoint
+        cp = get_checkpoint(task_id) or {}
+        return bool(cp.get("_cluster_dispatch"))
+    except Exception:
+        return False
+
+
+def _startup_reap_running_orphans() -> int:
+    """server 启动时立即回收一次 running 孤儿.
+
+    新进程的 pool._futures 必然为空, 所以**所有本机 status=running 的 task
+    都是上一进程的孤儿** (无论 updated_at 多久前). 用一个临时小阈值
+    (60s, 避开新进程刚启动后 set_task_running 写入的微小窗口) 兜底回收,
+    不必等 15s 轮询周期或 _ORPHAN_RUNNING_AGE_SEC=7800s 长阈值.
+
+    跳过派发到 cluster worker 的 task (走 cluster_sync_thread 路径).
+    """
+    try:
+        from .database import get_conn
+        from .task_store import _alive_sql, set_task_result
+        from .worker_pool import get_worker_pool
+    except Exception as err:
+        logger.debug("[rescue] startup reap 依赖加载失败: %s", err)
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=60)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    pool = get_worker_pool()
+    inflight = set(getattr(pool, "_futures", {}).keys()) | set(
+        getattr(pool, "_cancel_flags", {}).keys()
+    )
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT task_id, type, device_id, updated_at "
+            f"FROM tasks WHERE status='running' AND {_alive_sql()} "
+            f"AND (updated_at IS NULL OR updated_at <= ?)",
+            (cutoff_iso,),
+        ).fetchall()
+
+    reaped = 0
+    skipped_cluster = 0
+    for row in rows:
+        tid = row["task_id"]
+        if tid in inflight:
+            continue
+        if _is_dispatched_to_cluster_worker(tid):
+            skipped_cluster += 1
+            continue
+        try:
+            set_task_result(
+                tid, False,
+                error=("任务孤儿: server 启动时检测到上一进程未完成的 "
+                       f"running 任务 (last_update={row['updated_at']})"),
+            )
+            logger.warning("[rescue] startup-reap task=%s type=%s device=%s",
+                           tid, row["type"], row["device_id"])
+            reaped += 1
+        except Exception as err:
+            logger.exception("[rescue] startup-reap %s 失败: %s", tid, err)
+    if skipped_cluster:
+        logger.info("[rescue] startup-reap skipped %d cluster-dispatched tasks "
+                    "(let cluster_sync_thread handle)", skipped_cluster)
+    return reaped
+
+
 def start_pending_rescue_loop() -> bool:
     """幂等启动后台救援线程。已启动返回 False。"""
     global _rescue_thread
     if _rescue_thread and _rescue_thread.is_alive():
         return False
+
+    # 2026-04-27 加: server 启动时立即回收 running 孤儿, 不等 15s 轮询.
+    # 新进程的 pool 必为空, 所有 status=running 都必然是上进程孤儿.
+    try:
+        n = _startup_reap_running_orphans()
+        if n:
+            logger.info("[rescue] startup reaped %d running orphans", n)
+    except Exception as err:
+        logger.exception("[rescue] startup reap 异常: %s", err)
+
     _rescue_stop.clear()
     _rescue_thread = threading.Thread(
         target=_rescue_loop, daemon=True, name="pending-rescue-loop"
