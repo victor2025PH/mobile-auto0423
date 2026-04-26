@@ -78,9 +78,14 @@ class CentralCustomerStore:
         pool_min: int = DEFAULT_POOL_MIN,
         pool_max: int = DEFAULT_POOL_MAX,
     ):
+        # client_encoding=utf8: force PG to send error messages in UTF-8.
+        # On a zh-CN locale PG server, error messages otherwise come back as
+        # GBK (e.g. byte 0xd6) and psycopg2's UTF-8 decode chokes with
+        # "'utf-8' codec can't decode byte 0xd6 in position 55" (RUNBOOK F9).
         self._dsn = (
             f"host={host} port={port} dbname={dbname} user={user} "
-            f"password={password} application_name=openclaw_central"
+            f"password={password} application_name=openclaw_central "
+            f"client_encoding=utf8"
         )
         self._pool: Optional[ThreadedConnectionPool] = None
         self._pool_lock = threading.Lock()
@@ -109,14 +114,32 @@ class CentralCustomerStore:
         if not self._pool:
             raise RuntimeError("central_store pool not initialized")
         c = self._pool.getconn()
+        discard = False
         try:
             yield c
             c.commit()
+        except (UnicodeDecodeError, psycopg2.OperationalError) as exc:
+            # Phase-13: 这两类错误 (Chinese Windows GBK PG 消息 / 连接断开)
+            # 表示 connection 已坏, 从 pool 里丢弃, 让下次拿干净的
+            logger.warning("[central_store] connection poisoned (%s), discarding",
+                           type(exc).__name__)
+            try:
+                c.rollback()
+            except Exception:
+                pass
+            discard = True
+            raise
         except Exception:
-            c.rollback()
+            try:
+                c.rollback()
+            except Exception:
+                pass
             raise
         finally:
-            self._pool.putconn(c)
+            try:
+                self._pool.putconn(c, close=discard)
+            except Exception:
+                pass
 
     @contextmanager
     def _cursor(self) -> Iterator[psycopg2.extras.RealDictCursor]:
@@ -966,10 +989,13 @@ class CentralCustomerStore:
                     AVG(EXTRACT(EPOCH FROM (accepted_at - initiated_at))/60.0)
                         FILTER (WHERE accepted_at IS NOT NULL)
                         AS avg_accept_minutes,
+                    COUNT(*) FILTER (WHERE accepted_at IS NOT NULL) AS accept_n,
                     -- Phase-12: 接管 → 转化时间 (accepted → completed WHERE outcome=converted)
                     AVG(EXTRACT(EPOCH FROM (completed_at - accepted_at))/60.0)
                         FILTER (WHERE outcome='converted' AND accepted_at IS NOT NULL)
-                        AS avg_convert_minutes
+                        AS avg_convert_minutes,
+                    COUNT(*) FILTER (WHERE outcome='converted' AND accepted_at IS NOT NULL)
+                        AS convert_n_with_time
                 FROM customer_handoffs
                 WHERE accepted_by_human IS NOT NULL
                   AND accepted_at > NOW() - (INTERVAL '1 day' * %s)
@@ -987,6 +1013,8 @@ class CentralCustomerStore:
                 d["avg_minutes"] = float(d["avg_minutes"]) if d.get("avg_minutes") is not None else None
                 d["avg_accept_minutes"] = float(d["avg_accept_minutes"]) if d.get("avg_accept_minutes") is not None else None
                 d["avg_convert_minutes"] = float(d["avg_convert_minutes"]) if d.get("avg_convert_minutes") is not None else None
+                d["accept_n"] = int(d.get("accept_n") or 0)
+                d["convert_n_with_time"] = int(d.get("convert_n_with_time") or 0)
                 rows.append(d)
             return rows
 
@@ -1267,3 +1295,20 @@ def reset_for_tests(**kwargs) -> CentralCustomerStore:
             _store_singleton.close()
         _store_singleton = CentralCustomerStore(**kwargs)
         return _store_singleton
+
+
+def reset_store() -> None:
+    """Phase-13: 清掉 broken pool 让下次 get_store 重建.
+
+    用于 _safe_get_store 失败自动恢复 (常见原因: PG 返 GBK 编码错误消息
+    导致 psycopg2 UnicodeDecodeError, pool connection 进入坏状态).
+    """
+    global _store_singleton
+    with _singleton_lock:
+        if _store_singleton is not None:
+            try:
+                _store_singleton.close()
+            except Exception:
+                pass
+            _store_singleton = None
+            logger.warning("[central_store] singleton reset, will reconnect on next call")

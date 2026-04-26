@@ -1420,16 +1420,27 @@ def cluster_lock_list(worker_id: str = "", device_id: str = ""):
 
 
 def _safe_get_store():
-    """延迟加载 store (PG 不可达时不阻塞 import)."""
+    """延迟加载 store (PG 不可达时不阻塞 import).
+
+    Phase-13: pool 进入坏状态时 (常见: Chinese Windows PG 返 GBK 错误消息触发
+    UnicodeDecodeError) 自动 reset_store + 重试一次.
+    """
+    from src.host.central_customer_store import get_store, reset_store
     try:
-        from src.host.central_customer_store import get_store
         store = get_store()
-        # Phase-8: 第一次在 coordinator 拿到 store 时, 顺手起 A/B graduate 守护线程
-        _ensure_ab_auto_graduate_thread()
+        _ensure_ab_auto_graduate_thread()  # Phase-8: 守护线程
         return store
     except Exception as exc:
-        logger.exception("[central_store] init failed: %s", exc)
-        raise HTTPException(503, f"central store unavailable: {exc}")
+        # 第一次失败: reset + retry once
+        logger.warning("[central_store] init/get failed (will reset+retry): %s", exc)
+        try:
+            reset_store()
+            store = get_store()
+            _ensure_ab_auto_graduate_thread()
+            return store
+        except Exception as exc2:
+            logger.exception("[central_store] reset+retry also failed: %s", exc2)
+            raise HTTPException(503, f"central store unavailable: {exc2}")
 
 
 # ── Phase-8: A/B 自动 graduate 守护线程 (coordinator 进程内单例) ──────────
@@ -1458,15 +1469,79 @@ def _ensure_ab_auto_graduate_thread() -> None:
 
 
 def _ab_auto_loop() -> None:
-    """每 6h 检查一次. 启动 5min 后第一次跑, 避免开机风暴."""
+    """每 6h 检查一次 A/B graduate. 启动 5min 后第一次跑, 避免开机风暴.
+    Phase-13: 同时跑 SLA 大批超时 / push 失败率检查 (高频, 5 min 一次).
+    """
     import time as _t
     _t.sleep(300)
+    last_ab_tick = 0.0
     while True:
+        now = _t.time()
+        # A/B graduate 6h 一次
+        if now - last_ab_tick >= _AB_AUTO_CHECK_INTERVAL_SEC:
+            try:
+                _ab_auto_tick()
+            except Exception:
+                logger.exception("[ab_auto_graduate] tick failed")
+            last_ab_tick = now
+        # Phase-13: SLA + push 失败率检查 5min 一次
         try:
-            _ab_auto_tick()
+            _ops_health_check_tick()
         except Exception:
-            logger.exception("[ab_auto_graduate] tick failed")
-        _t.sleep(_AB_AUTO_CHECK_INTERVAL_SEC)
+            logger.exception("[ops_health_check] tick failed")
+        _t.sleep(300)
+
+
+def _ops_health_check_tick() -> None:
+    """Phase-13: 运维健康指标检查, 触发 webhook 通知.
+    - SLA 大批超时 (>=5 个 pending handoff 超 30 min) → webhook
+    - push 失败率 (push_failure / push_total > 30% 5min 内) → webhook
+    """
+    if not _is_coordinator_role():
+        return
+    # SLA 大批超时
+    try:
+        from src.host.central_customer_store import get_store
+        store = get_store()
+        pending = store.list_pending_handoffs(limit=200)
+        import time as _t
+        now_ts = _t.time()
+        breach_count = 0
+        for h in pending:
+            init_at = h.get("initiated_at")
+            if not init_at:
+                continue
+            try:
+                age_sec = now_ts - init_at.timestamp()
+            except Exception:
+                continue
+            if age_sec > 1800:  # 30 min
+                breach_count += 1
+        if breach_count >= 5:
+            _send_webhook_notification(
+                title="⏰ SLA 大批超时报警",
+                markdown=(f"待人工接管 handoff 超 30 min 已达 **{breach_count}** 个\n"
+                          f"建议: 立即上线客服或检查接管池"),
+                dedup_key=f"sla_breach_bulk:{breach_count // 5}",
+            )
+    except Exception as exc:
+        logger.debug("[ops_health_check] SLA breach check failed: %s", exc)
+    # push 失败率
+    try:
+        from src.host.central_push_client import get_push_metrics
+        m = get_push_metrics()
+        total = int(m.get("push_total") or 0)
+        fail = int(m.get("push_failure") or 0)
+        if total >= 50 and (fail / total) > 0.30:
+            _send_webhook_notification(
+                title="⚠️ push 失败率异常",
+                markdown=(f"central push 失败率 **{(fail/total*100):.1f}%** "
+                          f"(fail={fail} / total={total})\n"
+                          f"建议: 检查 coordinator 网络 / PG 连接"),
+                dedup_key="push_fail_rate_high",
+            )
+    except Exception as exc:
+        logger.debug("[ops_health_check] push fail check failed: %s", exc)
 
 
 def _ab_auto_tick() -> None:
@@ -1562,18 +1637,44 @@ def _ab_auto_tick() -> None:
         pass
 
 
-def _send_webhook_notification(title: str, markdown: str) -> None:
-    """Phase-11: 通用 webhook 通知 (admin 不盯盘也能看到 graduate / SLA 报警).
+# Phase-13: webhook 冷却 dict (5min 内同 hash 不重发)
+_WEBHOOK_COOLDOWN: dict = {}
+_WEBHOOK_COOLDOWN_LOCK = _phase8_th.Lock()
+_WEBHOOK_COOLDOWN_SEC = 300.0
+
+
+def _send_webhook_notification(title: str, markdown: str,
+                                 dedup_key: str = "") -> None:
+    """Phase-11/13: 通用 webhook 通知 (admin 不盯盘也能看到 graduate / SLA 报警).
 
     env:
       OPENCLAW_NOTIFY_WEBHOOK = URL
       OPENCLAW_NOTIFY_TYPE    = generic | slack | dingtalk | feishu (default generic)
     无 URL 不发. 失败 catch 不抛.
+
+    Phase-13 dedup_key: 5 分钟内同 key 不重发, 防刷屏 (默认 = title).
     """
     import os as _os
     url = (_os.environ.get("OPENCLAW_NOTIFY_WEBHOOK") or "").strip()
     if not url:
         return
+    # Phase-13: 冷却去重
+    key = (dedup_key or title).strip()
+    if key:
+        import time as _t
+        now = _t.time()
+        with _WEBHOOK_COOLDOWN_LOCK:
+            last = _WEBHOOK_COOLDOWN.get(key, 0.0)
+            if now - last < _WEBHOOK_COOLDOWN_SEC:
+                logger.debug("[notify_webhook] cooldown skip key=%s (last %.0fs ago)",
+                             key, now - last)
+                return
+            _WEBHOOK_COOLDOWN[key] = now
+            # 简单 LRU: > 200 条删最旧 50
+            if len(_WEBHOOK_COOLDOWN) > 200:
+                old = sorted(_WEBHOOK_COOLDOWN.items(), key=lambda kv: kv[1])[:50]
+                for k, _v in old:
+                    _WEBHOOK_COOLDOWN.pop(k, None)
     notify_type = (_os.environ.get("OPENCLAW_NOTIFY_TYPE") or "generic").strip().lower()
     body: dict
     if notify_type == "dingtalk":

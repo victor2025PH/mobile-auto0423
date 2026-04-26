@@ -6388,7 +6388,9 @@ class FacebookAutomation(BaseAutomation):
                     except Exception:
                         pass
                     # Phase-9: turns ≥ 4 时才查 LLM readiness (省 HTTP)
+                    # Phase-13: 同时记录 raw_readiness 用于 explainability
                     _readiness = None
+                    _raw_readiness = None
                     try:
                         _turns_seen = int((memory_ctx or {}).get("profile", {}).get("total_turns", 0) or 0)
                         if _turns_seen >= 4:
@@ -6399,6 +6401,7 @@ class FacebookAutomation(BaseAutomation):
                             _r = fetch_llm_readiness(_cid)
                             if _r:
                                 _readiness = float(_r.get("conversion_readiness") or 0.5)
+                                _raw_readiness = float(_r.get("raw_readiness") or _readiness)
                     except Exception:
                         pass
                     gate = should_refer(
@@ -6442,6 +6445,7 @@ class FacebookAutomation(BaseAutomation):
                                 "emotion_overall": _emotion_overall,
                                 "frustration": _emotion_frustration,
                                 "readiness": _readiness,
+                                "raw_readiness": _raw_readiness,  # Phase-13: explainability
                                 "persona_key": persona_key or "",
                             },
                             fire_and_forget=True,
