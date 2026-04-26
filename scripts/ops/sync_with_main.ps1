@@ -81,8 +81,34 @@ if ($Stats) {
         $count = @($log | Where-Object { $_ -match '\(#\d+\)' }).Count
         Write-Host ("   {0}  : {1,4} squash-merged PR(s)" -f $w.label, $count)
     }
+
+    # GGH: ASCII bar chart of last 7 days, one bar per day (Mon..Sun pattern).
     Write-Host ""
-    Write-Host "Read: high freq (>=10/24h) -> sibling协同压力大, 长任务前必跑 sync_with_main.bat" -ForegroundColor DarkGray
+    Write-Host "   Daily distribution (last 7 days):"
+    $dailyData = @()
+    for ($d = 6; $d -ge 0; $d--) {
+        # day = $d days ago (covers that day 00:00 to next day 00:00)
+        $thatDay = (Get-Date).AddDays(-$d).Date
+        $nextDay = $thatDay.AddDays(1)
+        $dayLabel = $thatDay.ToString('MM-dd ddd')
+        # Use ISO 8601 with T separator to avoid PS native-exe space-quoting bugs
+        $sinceArg = "--since=$($thatDay.ToString('yyyy-MM-ddTHH:mm:ss'))"
+        $untilArg = "--until=$($nextDay.ToString('yyyy-MM-ddTHH:mm:ss'))"
+        $gitArgs = @('log', 'origin/main', '--pretty=%s', $sinceArg, $untilArg)
+        $log = & git @gitArgs 2>$null
+        $count = @($log | Where-Object { $_ -match '\(#\d+\)' }).Count
+        $dailyData += @{ label = $dayLabel; count = $count }
+    }
+    $maxCount = ($dailyData | ForEach-Object { $_.count } | Measure-Object -Maximum).Maximum
+    if ($maxCount -lt 1) { $maxCount = 1 }   # avoid div by zero
+    foreach ($d in $dailyData) {
+        $barLen = [Math]::Min(40, [Math]::Round($d.count * 40 / $maxCount, 0))
+        $bar = '#' * $barLen
+        Write-Host ("      {0}  {1,-40}  {2}" -f $d.label, $bar, $d.count)
+    }
+
+    Write-Host ""
+    Write-Host "Read: high freq (>=10/24h) -> sibling collaborator pressure high, run sync_with_main.bat before long task" -ForegroundColor DarkGray
     exit 0
 }
 

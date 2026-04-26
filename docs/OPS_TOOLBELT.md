@@ -33,26 +33,98 @@
 
 ---
 
-## 🎯 sync_with_main 决策树
+## 🎯 工作流决策树（v7）
+
+### 1️⃣ 开新工作前
 
 ```
-有改动要同步? 运行: sync_with_main.bat
-                              │
-                  origin/main 有新 commit?
-                  ┌───────────┴───────────┐
-                 否                      是
-                  │                      │
-              [OK] up to date    sync_with_main.bat -Auto   ← 推荐
-                                         │
-                          ┌──────────────┴──────────────┐
-                       rebase 成功                     失败
-                          │                            │
-                       全部完成                  自动 fallback
-                                                       │
-                                              -CherryPick -AutoStash
+要开新功能 / 修 bug?
+        │
+        ▼
+检查仓库状态:  repo_health.bat
+        │
+   ┌────┴────┐
+verdict 0   verdict 1
+HEALTHY     NEEDS ATTENTION
+   │            │
+   │      看输出按推荐 fix
+   ▼            │
+建分支:  branch_create.bat my-name
+        (默认 fetch origin 防 stale main)
+        │
+        ▼
+开始改代码
+```
+
+### 2️⃣ commit/push 前
+
+```
+准备 commit?
+        │
+        ▼
+检查健康:  repo_health.bat -Fetch
+        │
+        ▼
+git add ... && git commit
+        │
+        ▼ (pre-commit hook 自动跑)
+hook 通过? ──Yes──> commit 成功
+        │
+        No
+        │
+        ▼
+按 hook 提示修
+(常见: 误在 main / 误 stage runtime config)
+```
+
+### 3️⃣ sibling 协同期间（origin/main 有更新）
+
+```
+长任务前先看节奏:  sync_with_main.bat -Stats
+        │
+        ▼ (high freq >=10/24h?)
+       是 ─────────────> 短任务原则: 频繁 commit + push
+        │
+       否
+        │
+        ▼
+工作期间定期: sync_with_main.bat
+        │
+        ▼ (有 [SUGGEST]?)
+       是
+        │
+        ▼
+        sync_with_main.bat -Auto    ← 推荐 (一键)
+                │
+        ┌───────┴───────┐
+     rebase 成功      失败 (真冲突)
+        │              │
+     全部完成    自动 fallback -CherryPick
+                       │
+                   还失败? 手解 / 联系 sibling
 ```
 
 **核心原则**：`-Auto` 是首选，git rebase 自带 patch-content detection 能处理多数 squash-merge 场景（详见 RUNBOOK §7）。
+
+### 4️⃣ 服务挂了 / 异常
+
+```
+        服务异常
+            │
+            ▼
+        status.bat
+            │
+   ┌────────┼────────┬────────┐
+verdict 0  1        2       AUTH
+HEALTHY  DEGRADED  DOWN    设备
+   │        │       │       │
+   ▼        ▼       ▼       ▼
+正常用   看 [5/6]  start.bat  手机授权
+        ERROR        │       USB 调试
+        ↓            ▼
+    diagnose_crash.bat  status.bat
+       (查 crash 历史)   (验证)
+```
 
 ---
 

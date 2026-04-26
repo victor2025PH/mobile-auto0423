@@ -66,6 +66,39 @@ try {
     $siblingSection += "`n> 数据来源: ``git log origin/main --since=...`` 匹配 ``(#NNN)`` PR 编号`n"
     Add-Content -Path $reportFile -Value $siblingSection -Encoding UTF8
 
+    # IIK: append server crash stats from diagnose_crash (last 7 days)
+    try {
+        $diagPs = Join-Path $ProjectRoot "scripts\ops\diagnose_crash.ps1"
+        if (Test-Path $diagPs) {
+            $crashJsonRaw = & powershell -NoProfile -ExecutionPolicy Bypass -File $diagPs -Days 7 -Last 100 -Json 2>$null
+            if ($crashJsonRaw) {
+                $crashData = $crashJsonRaw | ConvertFrom-Json
+                $crashCount = if ($crashData.crashes) { @($crashData.crashes).Count } else { 0 }
+                $crashSection = "`n## 服务稳定性 (server.py 进程退出事件, 近 7 天)`n`n"
+                $crashSection += "- 总 crash 数: **$crashCount**`n"
+                if ($crashCount -gt 0) {
+                    # Group by date
+                    $byDate = @{}
+                    foreach ($c in $crashData.crashes) {
+                        $date = ($c.ts -split ' ')[0]
+                        if (-not $byDate.ContainsKey($date)) { $byDate[$date] = 0 }
+                        $byDate[$date]++
+                    }
+                    $crashSection += "`n按日期:`n"
+                    foreach ($date in ($byDate.Keys | Sort-Object)) {
+                        $crashSection += "  - $date : $($byDate[$date]) 次`n"
+                    }
+                    $crashSection += "`n> 详情: ``diagnose_crash.bat -Days 7``  根因: 多数为 F9 PG init failed (RUNBOOK §3 F9)`n"
+                } else {
+                    $crashSection += "`n稳定 (无 crash). 跑 ``status.bat`` 看实时状态.`n"
+                }
+                Add-Content -Path $reportFile -Value $crashSection -Encoding UTF8
+            }
+        }
+    } catch {
+        # diagnose_crash optional, ignore failure
+    }
+
     Write-Host "Report written to: $reportFile" -ForegroundColor Green
     Write-Host ""
     Write-Host "--- Preview (first 30 lines) ---" -ForegroundColor DarkCyan

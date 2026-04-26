@@ -139,6 +139,22 @@ if ($Json) {
     $r.feat_branches_count = @($featBranches).Count
     $r.feat_branches_hint = "run 'cleanup_branches.bat -Json' for obsolete count + per-branch detail"
 
+    # HHJ: pre-commit hook status (signal CI / monitor whether hook is installed)
+    $hookFile = Join-Path $ProjectRoot ".git\hooks\pre-commit"
+    if (Test-Path $hookFile) {
+        $hookContent = Get-Content $hookFile -Raw -ErrorAction SilentlyContinue
+        if ($hookContent -match 'OpenClaw|pre_commit\.ps1') {
+            $r.pre_commit_hook_installed = $true
+            $r.pre_commit_hook_kind = 'openclaw'
+        } else {
+            $r.pre_commit_hook_installed = $true
+            $r.pre_commit_hook_kind = 'other'
+        }
+    } else {
+        $r.pre_commit_hook_installed = $false
+        $r.pre_commit_hook_kind = $null
+    }
+
     $r.verdict_label = switch ($r.verdict) { 0 {'HEALTHY'} 1 {'NEEDS ATTENTION'} default {'UNKNOWN'} }
     $r | ConvertTo-Json -Depth 4
     exit $r.verdict
