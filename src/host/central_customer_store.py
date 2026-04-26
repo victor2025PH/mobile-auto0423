@@ -78,14 +78,19 @@ class CentralCustomerStore:
         pool_min: int = DEFAULT_POOL_MIN,
         pool_max: int = DEFAULT_POOL_MAX,
     ):
-        # client_encoding=utf8: force PG to send error messages in UTF-8.
-        # On a zh-CN locale PG server, error messages otherwise come back as
-        # GBK (e.g. byte 0xd6) and psycopg2's UTF-8 decode chokes with
-        # "'utf-8' codec can't decode byte 0xd6 in position 55" (RUNBOOK F9).
+        # F9 fix (RUNBOOK):
+        #   client_encoding=utf8     — force query/data wire to UTF-8
+        #   options='-c lc_messages=C' — force this session to emit error
+        #                                messages in C (English) locale.
+        # On a zh-CN locale PG server, the default lc_messages is zh_CN.GBK
+        # so error messages come back as GBK bytes (e.g. 0xd6) and psycopg2's
+        # UTF-8 decode chokes with "'utf-8' codec can't decode byte 0xd6 in
+        # position 55". client_encoding alone fixes data; lc_messages fixes
+        # errors (incl. connection-rejected handshake errors).
         self._dsn = (
             f"host={host} port={port} dbname={dbname} user={user} "
             f"password={password} application_name=openclaw_central "
-            f"client_encoding=utf8"
+            f"client_encoding=utf8 options='-c lc_messages=C'"
         )
         self._pool: Optional[ThreadedConnectionPool] = None
         self._pool_lock = threading.Lock()
