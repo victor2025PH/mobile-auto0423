@@ -381,6 +381,20 @@ def sync_wa_referral_sent(
     return cid
 
 
+def _push_priority(customer_id: str, priority_tag: str) -> None:
+    """Phase-4: 通过 HTTP 调主控更新 priority_tag (worker 不直连 PG)."""
+    if not customer_id or priority_tag not in ("high", "medium", "low"):
+        return
+    try:
+        from src.host.central_push_client import _http_post_json
+        _http_post_json(
+            f"/cluster/customers/{customer_id}/priority",
+            {"priority_tag": priority_tag},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[customer_sync] priority push failed: %s", exc)
+
+
 def sync_handoff_to_line(
     device_id: str,
     peer_name: str,
@@ -432,6 +446,9 @@ def sync_handoff_to_line(
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[customer_sync] PG handoff initiate failed: %s", exc)
+
+    # Phase-4: handoff = 高意向客户, 立刻标 high priority
+    _push_priority(cid, "high")
 
     # Phase-2: 双写 lead_handoffs (SQLite). 失败不影响 PG 那边.
     if write_lead_handoff:
