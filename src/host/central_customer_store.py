@@ -980,6 +980,115 @@ class CentralCustomerStore:
                 rows.append(d)
             return rows
 
+    def referral_decisions_aggregate(self, days: int = 30) -> Dict[str, Any]:
+        """Phase-11: referral_decision 事件聚合 (admin 调 gate 阈值用).
+
+        - by_level: hard_block / hard_allow / soft_pass / soft_fail 计数
+        - by_refer: refer=true 与 false 计数 + refer_rate
+        - top_reasons: reasons[] flatten 出 top 10 (count desc)
+        - avg_scores_by_refer: refer=true vs false 各自的 readiness/frust/emo 均值
+        - timeseries: 每天 total + refer_n + refer_rate
+        """
+        days = max(1, min(int(days), 365))
+        with self._cursor() as cur:
+            # 总 + by_level + by_refer
+            cur.execute("""
+                SELECT
+                    meta->>'level' AS level,
+                    (meta->>'refer')::boolean AS refer,
+                    COUNT(*) AS cnt
+                FROM customer_events
+                WHERE event_type = 'referral_decision'
+                  AND ts > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY level, refer
+            """, (days,))
+            rows = cur.fetchall()
+            by_level: Dict[str, int] = {}
+            by_refer = {"true": 0, "false": 0}
+            total = 0
+            for r in rows:
+                lv = r["level"] or "unknown"
+                cnt = int(r["cnt"])
+                by_level[lv] = by_level.get(lv, 0) + cnt
+                if r["refer"] is True:
+                    by_refer["true"] += cnt
+                else:
+                    by_refer["false"] += cnt
+                total += cnt
+
+            # 平均分 by refer
+            cur.execute("""
+                SELECT
+                    (meta->>'refer')::boolean AS refer,
+                    AVG(NULLIF((meta->>'readiness')::float, NULL)) AS avg_readiness,
+                    AVG(NULLIF((meta->>'frustration')::float, NULL)) AS avg_frust,
+                    AVG(NULLIF((meta->>'emotion_overall')::float, NULL)) AS avg_emo
+                FROM customer_events
+                WHERE event_type = 'referral_decision'
+                  AND ts > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY refer
+            """, (days,))
+            avg_by_refer: Dict[str, Dict[str, float]] = {}
+            for r in cur.fetchall():
+                k = "true" if r["refer"] else "false"
+                avg_by_refer[k] = {
+                    "readiness": float(r["avg_readiness"]) if r["avg_readiness"] is not None else None,
+                    "frustration": float(r["avg_frust"]) if r["avg_frust"] is not None else None,
+                    "emotion_overall": float(r["avg_emo"]) if r["avg_emo"] is not None else None,
+                }
+
+            # top reasons (jsonb_array_elements_text 把数组 unnest)
+            cur.execute("""
+                SELECT reason, COUNT(*) AS cnt FROM (
+                    SELECT jsonb_array_elements_text(meta->'reasons') AS reason
+                    FROM customer_events
+                    WHERE event_type = 'referral_decision'
+                      AND ts > NOW() - (INTERVAL '1 day' * %s)
+                ) sub
+                GROUP BY reason
+                ORDER BY cnt DESC
+                LIMIT 10
+            """, (days,))
+            top_reasons = [
+                {"reason": r["reason"], "count": int(r["cnt"])}
+                for r in cur.fetchall()
+            ]
+
+            # 时序 daily refer rate
+            cur.execute("""
+                SELECT
+                    DATE(ts) AS day,
+                    COUNT(*) AS total_n,
+                    SUM(CASE WHEN (meta->>'refer')::boolean THEN 1 ELSE 0 END) AS refer_n
+                FROM customer_events
+                WHERE event_type = 'referral_decision'
+                  AND ts > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY day
+                ORDER BY day
+            """, (days,))
+            timeseries: List[Dict[str, Any]] = []
+            for r in cur.fetchall():
+                tot = int(r["total_n"])
+                ref = int(r["refer_n"] or 0)
+                timeseries.append({
+                    "date": str(r["day"]),
+                    "total": tot,
+                    "refer_n": ref,
+                    "refer_rate": (ref / tot) if tot else 0.0,
+                })
+
+            refer_rate = (by_refer["true"] / total) if total else 0.0
+            return {
+                "days": days,
+                "total": total,
+                "by_level": by_level,
+                "by_refer": by_refer,
+                "refer_rate": refer_rate,
+                "top_reasons": top_reasons,
+                "avg_scores_by_refer": avg_by_refer,
+                "timeseries": timeseries,
+            }
+
     def list_top_high_priority(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Phase-10: 高 priority 客户 Top N (运营主动出击).
 
