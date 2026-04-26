@@ -1946,6 +1946,36 @@ def cluster_customers_llm_insight(customer_id: str, force: int = 0):
     return out
 
 
+@router.get("/cluster/referral-decisions",
+            dependencies=[Depends(verify_api_key)])
+def cluster_referral_decisions_list(level: str = "",
+                                     refer: str = "",
+                                     reason: str = "",
+                                     days: int = 30,
+                                     limit: int = 50):
+    """Phase-12: referral_decision 详情列表 (配 aggregate 看板钻取).
+
+    Query: level (hard_block|hard_allow|soft_pass|soft_fail) / refer (true|false) /
+           reason (子串过滤) / days / limit
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    refer_bool = None  # Optional[bool]
+    rstr = (refer or "").strip().lower()
+    if rstr == "true":
+        refer_bool = True
+    elif rstr == "false":
+        refer_bool = False
+    store = _safe_get_store()
+    return {"decisions": store.list_referral_decisions(
+        level=(level or "").strip(),
+        refer=refer_bool,
+        reason=(reason or "").strip(),
+        days=days,
+        limit=limit,
+    )}
+
+
 @router.get("/cluster/referral-decisions/aggregate",
             dependencies=[Depends(verify_api_key)])
 def cluster_referral_decisions_aggregate(days: int = 30):

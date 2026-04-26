@@ -961,7 +961,15 @@ class CentralCustomerStore:
                     SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS pending_n,
                     AVG(EXTRACT(EPOCH FROM (completed_at - accepted_at))/60.0)
                         FILTER (WHERE completed_at IS NOT NULL AND accepted_at IS NOT NULL)
-                        AS avg_minutes
+                        AS avg_minutes,
+                    -- Phase-12: 接管响应时间 (initiated → accepted)
+                    AVG(EXTRACT(EPOCH FROM (accepted_at - initiated_at))/60.0)
+                        FILTER (WHERE accepted_at IS NOT NULL)
+                        AS avg_accept_minutes,
+                    -- Phase-12: 接管 → 转化时间 (accepted → completed WHERE outcome=converted)
+                    AVG(EXTRACT(EPOCH FROM (completed_at - accepted_at))/60.0)
+                        FILTER (WHERE outcome='converted' AND accepted_at IS NOT NULL)
+                        AS avg_convert_minutes
                 FROM customer_handoffs
                 WHERE accepted_by_human IS NOT NULL
                   AND accepted_at > NOW() - (INTERVAL '1 day' * %s)
@@ -977,6 +985,8 @@ class CentralCustomerStore:
                 conv = int(d.get("converted_n") or 0)
                 d["conversion_rate"] = (conv / handled) if handled else 0.0
                 d["avg_minutes"] = float(d["avg_minutes"]) if d.get("avg_minutes") is not None else None
+                d["avg_accept_minutes"] = float(d["avg_accept_minutes"]) if d.get("avg_accept_minutes") is not None else None
+                d["avg_convert_minutes"] = float(d["avg_convert_minutes"]) if d.get("avg_convert_minutes") is not None else None
                 rows.append(d)
             return rows
 
@@ -1088,6 +1098,51 @@ class CentralCustomerStore:
                 "avg_scores_by_refer": avg_by_refer,
                 "timeseries": timeseries,
             }
+
+    def list_referral_decisions(
+        self,
+        level: str = "",
+        refer: Optional[bool] = None,
+        reason: str = "",
+        days: int = 30,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Phase-12: referral_decision 事件详情查询 (admin 钻取调研用).
+
+        过滤维度: level / refer / reason 子串. JOIN customers 出 primary_name.
+        """
+        days = max(1, min(int(days), 365))
+        limit = min(max(1, int(limit)), 500)
+        where = ["e.event_type = 'referral_decision'",
+                 "e.ts > NOW() - (INTERVAL '1 day' * %s)"]
+        params: List[Any] = [days]
+        if level:
+            where.append("e.meta->>'level' = %s")
+            params.append(level)
+        if refer is True:
+            where.append("(e.meta->>'refer')::boolean = TRUE")
+        elif refer is False:
+            where.append("(e.meta->>'refer')::boolean = FALSE")
+        if reason:
+            where.append("EXISTS (SELECT 1 FROM jsonb_array_elements_text(e.meta->'reasons') r WHERE r ILIKE %s)")
+            params.append(f"%{reason}%")
+        where_sql = " AND ".join(where)
+        params.append(limit)
+        with self._cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT
+                    e.customer_id::text, e.ts, e.meta,
+                    c.primary_name, c.status, c.priority_tag
+                FROM customer_events e
+                JOIN customers c ON c.customer_id = e.customer_id
+                WHERE {where_sql}
+                ORDER BY e.ts DESC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            return [dict(r) for r in cur.fetchall()]
 
     def list_top_high_priority(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Phase-10: 高 priority 客户 Top N (运营主动出击).
