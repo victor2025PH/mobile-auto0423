@@ -754,10 +754,19 @@ async function loadAgentSla() {
       const avg = a.avg_minutes != null ? a.avg_minutes.toFixed(1) : '—';
       const accept = a.avg_accept_minutes != null ? a.avg_accept_minutes.toFixed(1) : '—';
       const convert = a.avg_convert_minutes != null ? a.avg_convert_minutes.toFixed(1) : '—';
-      // Phase-12: 接管响应 < 15min 绿, < 30 黄, 否则红
-      const acceptColor = a.avg_accept_minutes == null ? '#94a3b8'
+      // Phase-12/13: 接管响应 < 15min 绿, < 30 黄, 否则红; 样本数 < 3 灰色低置信度
+      const acceptN = a.accept_n || 0;
+      const convertN = a.convert_n_with_time || 0;
+      let acceptColor = a.avg_accept_minutes == null ? '#94a3b8'
         : a.avg_accept_minutes < 15 ? '#22c55e'
         : a.avg_accept_minutes < 30 ? '#f59e0b' : '#ef4444';
+      let convertColor = '#22c55e';
+      if (acceptN > 0 && acceptN < 3) acceptColor = '#94a3b8';  // 低置信度灰
+      if (convertN > 0 && convertN < 3) convertColor = '#94a3b8';
+      const acceptN_str = acceptN > 0
+        ? ' <span style="font-size:10px;color:#64748b">(n=' + acceptN + ')</span>' : '';
+      const convertN_str = convertN > 0
+        ? ' <span style="font-size:10px;color:#64748b">(n=' + convertN + ')</span>' : '';
       return '<tr>'
         + '<td><b>' + safeText(a.accepted_by_human) + '</b></td>'
         + '<td>' + (a.handled || 0) + '</td>'
@@ -766,8 +775,8 @@ async function loadAgentSla() {
         + '<td style="color:#f59e0b">' + (a.pending_n || 0) + '</td>'
         + '<td><b style="color:' + rateColor + '">' + (rate * 100).toFixed(1) + '%</b></td>'
         + '<td class="mono">' + avg + '</td>'
-        + '<td class="mono" style="color:' + acceptColor + '">' + accept + '</td>'
-        + '<td class="mono" style="color:#22c55e">' + convert + '</td>'
+        + '<td class="mono" style="color:' + acceptColor + '">' + accept + acceptN_str + '</td>'
+        + '<td class="mono" style="color:' + convertColor + '">' + convert + convertN_str + '</td>'
         + '</tr>';
     }).join('');
   } catch (e) {
@@ -1148,7 +1157,15 @@ function renderCustomerDetail(c) {
         : m.level === 'hard_block' ? '#ef4444'
         : m.level === 'soft_pass' ? '#3b82f6' : '#64748b';
       const scores = [];
-      if (m.readiness != null) scores.push('readiness=' + Number(m.readiness).toFixed(2));
+      // Phase-13: readiness explainability — raw vs consensus 不一致时高亮
+      if (m.readiness != null) {
+        let rTxt = 'readiness=' + Number(m.readiness).toFixed(2);
+        if (m.raw_readiness != null && Math.abs(Number(m.raw_readiness) - Number(m.readiness)) > 0.05) {
+          rTxt += '<span style="color:#f59e0b" title="LLM 实测 raw 与共识值不一致, 共识降级防误判">'
+            + ' (raw=' + Number(m.raw_readiness).toFixed(2) + ' 共识降级)</span>';
+        }
+        scores.push(rTxt);
+      }
       if (m.frustration != null) scores.push('frust=' + Number(m.frustration).toFixed(2));
       if (m.emotion_overall != null) scores.push('emo=' + Number(m.emotion_overall).toFixed(2));
       const reasons = (m.reasons || []).slice(0, 3).join(' · ');
@@ -1431,7 +1448,14 @@ async function openReferralDecisionDrill(filterQs, label) {
           : m.level === 'hard_block' ? '#ef4444'
           : m.level === 'soft_pass' ? '#3b82f6' : '#64748b';
         const scores = [];
-        if (m.readiness != null) scores.push('readiness=' + Number(m.readiness).toFixed(2));
+        // Phase-13: explainability
+        if (m.readiness != null) {
+          let rTxt = 'readiness=' + Number(m.readiness).toFixed(2);
+          if (m.raw_readiness != null && Math.abs(Number(m.raw_readiness) - Number(m.readiness)) > 0.05) {
+            rTxt += '<span style="color:#f59e0b">(raw=' + Number(m.raw_readiness).toFixed(2) + ' 降级)</span>';
+          }
+          scores.push(rTxt);
+        }
         if (m.frustration != null) scores.push('frust=' + Number(m.frustration).toFixed(2));
         if (m.emotion_overall != null) scores.push('emo=' + Number(m.emotion_overall).toFixed(2));
         const reasons = (m.reasons || []).slice(0, 3).join(' · ');
