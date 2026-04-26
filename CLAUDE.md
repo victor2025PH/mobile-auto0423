@@ -54,6 +54,39 @@ Claude 崩溃后重入本 repo：
 4. 读 `~/.claude/projects/C--telegram-mtproto-ai/memory/MEMORY.md` 的 "Project: mobile-auto0423" 段，重建上下文
 5. （历史参考）`docs/runbook/B_RESUME_2026-04-23-EVENING.md` 是 B Claude 当时的恢复脚本
 
+## sibling Claude 长任务前置检查（2026-04-26 加，PR #111/#112 事故教训）
+
+启动**任何** commit/refactor 工作前必跑（任选其一）：
+
+1. **`repo_health.bat -Fetch`** — 一键 fetch + 看 branch + dirty + 仓库状态（推荐）
+2. **`sync_with_main.bat`** — 专项 fetch + 报告 ahead/behind（read-only，安全）
+
+**新分支创建**：用 **`branch_create.bat [name]`** 一键 `git checkout -b feat-ops-name-yyyy-MM-dd main`，避免手敲漏切。
+
+**rebase 同步**（feat-* 分支落后 origin/main 时）：**`sync_with_main.bat -Rebase`** 把当前分支 rebase 到 origin/main，自动检查 dirty + 冲突提示。
+
+### 事故案例（2026-04-26）
+
+- **PR #111** 合并期间：victor squash 我之前 6 个 commit 到 main，我不知情继续工作，第 7 个 commit (4fbee97) 误落 main。修复：`git branch new + reset --hard HEAD~1`。
+- **PR #112** 合并期间：又一次 squash 我 4fbee97 到 main，stage-b 分支 obsolete。修复：基于 main 起 stage-c + cherry-pick 新 commit。
+
+频率: ~7 min 一次 PR 合到 main。**每个 commit 前必查 origin/main 状态**。
+
+### 防呆工具链
+
+| 工具 | 时机 | 抓什么 |
+|------|------|------|
+| `repo_health.bat` | 任何时候 | branch + dirty + behind local main |
+| `repo_health.bat -Fetch` | commit/push 前 | + behind origin/main（实时） |
+| `sync_with_main.bat` | sibling 协同期间 | fetch + ahead/behind 报告 |
+| `sync_with_main.bat -Rebase` | feat-* 落后 origin/main 时 | fetch + rebase + 冲突提示 |
+| `branch_create.bat` | 开新工作前 | 一键建 feat-ops-* 分支 |
+| `start.ps1` | 启动服务前（自动） | main+dirty 警告 |
+
+### 崩溃恢复扩展
+
+**Claude 新 session / 崩溃后**：除了上面"崩溃恢复"5 步，还应跑 `repo_health.bat -Fetch` 看 sibling 期间发生了什么。
+
 ## 日常测试
 
 ```bash

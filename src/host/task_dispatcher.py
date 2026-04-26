@@ -91,16 +91,16 @@ def dispatch_after_create(
                 resp = _ur.urlopen(req, timeout=10)
                 remote = _json.loads(resp.read().decode())
                 from . import task_store
-                task_store.update_task(
-                    task_id, status="running",
-                    result={
-                        "dispatched_to": worker["ip"],
-                        "remote_task_id": remote.get("task_id", ""),
-                    },
+                # Phase-13 fix: 用 set_task_running (task_store 没 update_task)
+                task_store.set_task_running(task_id)
+                logger.info(
+                    "[dispatch] task=%s → worker %s (remote_id=%s)",
+                    task_id[:8], worker["ip"],
+                    str(remote.get("task_id", ""))[:8],
                 )
-                result.update(dispatched=True, mode="worker", worker_ip=worker["ip"])
-                logger.info("[dispatch] task=%s → worker %s",
-                            task_id[:8], worker["ip"])
+                result.update(dispatched=True, mode="worker",
+                              worker_ip=worker["ip"],
+                              remote_task_id=remote.get("task_id", ""))
                 return result
             except Exception as err:
                 logger.info("[dispatch] 集群派发失败 task=%s，回落本机: %s",
