@@ -1812,6 +1812,92 @@ def cluster_customers_search(q: str = "", priority: str = "", status: str = "",
     )}
 
 
+@router.get("/cluster/ab/experiment/running",
+            dependencies=[Depends(verify_api_key)])
+def cluster_ab_running():
+    """Phase-7: 返当前 running A/B 实验."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return store.get_running_experiment() or {}
+
+
+@router.get("/cluster/ab/experiments",
+            dependencies=[Depends(verify_api_key)])
+def cluster_ab_list(limit: int = 20):
+    """Phase-7: 列所有 A/B 实验历史."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"experiments": store.list_experiments(limit=limit)}
+
+
+@router.post("/cluster/ab/graduate-and-restart",
+             dependencies=[Depends(requires_role("admin"))])
+def cluster_ab_graduate_restart(body: dict):
+    """Phase-7: 手动 graduate 当前实验 + 启新实验.
+
+    Body: {new_name, new_variants: list, note?}
+    自动用当前实验的 winner 作为新实验的对照基线.
+    """
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    current = store.get_running_experiment()
+    if current:
+        winner_state = store.compute_ab_winner()
+        if winner_state.get("winner"):
+            store.archive_experiment_with_winner(
+                experiment_id=current["experiment_id"],
+                winner=winner_state["winner"],
+                samples=winner_state.get("samples", {}),
+            )
+    new_id = store.start_new_experiment(
+        name=(body.get("new_name") or "").strip() or "auto_restart",
+        variants=body.get("new_variants") or ["v1", "v2"],
+        note=body.get("note") or "",
+    )
+    return {"new_experiment_id": new_id, "previous_winner": (current or {}).get("winner")}
+
+
+@router.get("/cluster/customer-views",
+            dependencies=[Depends(verify_api_key)])
+def cluster_views_list(owner: str = ""):
+    """Phase-7: 列保存的客户视图."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"views": store.list_views(owner=owner or None)}
+
+
+@router.post("/cluster/customer-views",
+             dependencies=[Depends(verify_api_key)])
+def cluster_views_save(body: dict):
+    """Phase-7: 保存客户视图. Body: {name, params, owner?}."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "name 必填")
+    store = _safe_get_store()
+    vid = store.save_view(
+        name=name,
+        owner=(body.get("owner") or "admin").strip(),
+        params=body.get("params") or {},
+    )
+    return {"view_id": vid, "name": name}
+
+
+@router.delete("/cluster/customer-views/{view_id}",
+               dependencies=[Depends(verify_api_key)])
+def cluster_views_delete(view_id: str, owner: str = ""):
+    """Phase-7: 删客户视图."""
+    if not _is_coordinator_role():
+        raise HTTPException(400, "central store 仅在 coordinator 节点可用")
+    store = _safe_get_store()
+    return {"deleted": store.delete_view(view_id, owner=owner or None)}
+
+
 @router.get("/cluster/customers/ab/winner",
             dependencies=[Depends(verify_api_key)])
 def cluster_customers_ab_winner(days: int = 30):
