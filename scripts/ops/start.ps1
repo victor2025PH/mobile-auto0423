@@ -38,8 +38,26 @@ if (Test-Path $envFile) {
     }
 }
 
-# ---- 0b. Warn if config/ has uncommitted changes (visibility, not blocking) ----
+# ---- 0b. Branch sanity + dirty config notice ----
+# Branch sanity (防 4fbee97-style 事故): warn if on main with dirty/staged.
 try {
+    $branch = (& git branch --show-current 2>$null).Trim()
+    if ($branch) {
+        if ($branch -eq 'main') {
+            $dirtyAll = & git status --porcelain 2>$null
+            $hasUncommitted = $dirtyAll | Where-Object { $_ -match '^[\sMARD?][MARD?]' -and $_ -notmatch 'config/(cluster_state|device_aliases|device_registry|notify_config|central_push)' }
+            if ($hasUncommitted) {
+                Write-Host ""
+                Write-Host "[WARN] on main with uncommitted changes!" -ForegroundColor Yellow
+                Write-Host "       CLAUDE.md says no direct commits to main." -ForegroundColor DarkYellow
+                Write-Host "       Consider: git checkout -b feat-ops-`$(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkYellow
+                Write-Host ""
+            }
+        } else {
+            Write-Host "[INFO] on branch: $branch" -ForegroundColor DarkGray
+        }
+    }
+    # Notice for dirty config files (will be loaded as-is)
     $dirtyConfig = & git status --porcelain config/ 2>$null | Where-Object { $_ -match '^\s*M\s' }
     if ($dirtyConfig) {
         Write-Host ""

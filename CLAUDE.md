@@ -54,6 +54,18 @@ Claude 崩溃后重入本 repo：
 4. 读 `~/.claude/projects/C--telegram-mtproto-ai/memory/MEMORY.md` 的 "Project: mobile-auto0423" 段，重建上下文
 5. （历史参考）`docs/runbook/B_RESUME_2026-04-23-EVENING.md` 是 B Claude 当时的恢复脚本
 
+## sibling Claude 长任务前置检查（2026-04-26 加，4fbee97 事故教训）
+
+启动**任何** commit/refactor 工作前先做：
+
+1. **`repo_health.bat`** — 一键看 branch + dirty + 仓库状态（最简）
+2. **`git fetch origin && git status`** — 看是否 behind origin/main（sibling Claude 期间可能合 PR）
+3. **`git branch --show-current`** — 确认不在 main（CLAUDE.md "不直推 main" 约定）
+
+**事故案例**：2026-04-26 我（ops Claude）做 stage-B commit 期间，victor 用 PR #111 把我之前 6 个 commit squash 合到 main。我不知情继续工作，第 7 个 commit (4fbee97) 误落 main。修复：`git branch new + reset --hard HEAD~1`。
+
+**`start.ps1`** / **`repo_health.ps1`** 已加 main+dirty 警告防呆。但**主动 fetch 仍是工程师责任**。
+
 ## 日常测试
 
 ```bash

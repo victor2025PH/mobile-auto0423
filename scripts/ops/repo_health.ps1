@@ -44,6 +44,17 @@ if (-not $branch) {
     }
 }
 
+# Branch sanity (added 2026-04-26 after 4fbee97 incident):
+# CLAUDE.md says no direct commits to main. Detect "main + dirty/staged" early.
+$_dirty_pre = & git status --porcelain 2>$null
+$_mod_pre = ($_dirty_pre | Where-Object { $_ -match '^\s*M' }).Count
+$_staged_pre = ($_dirty_pre | Where-Object { $_ -match '^[AMRD]' -and $_ -notmatch '^\?\?' }).Count
+if ($branch -eq 'main' -and ($_mod_pre -gt 0 -or $_staged_pre -gt 0)) {
+    Write-Host "   [WARN] on main with uncommitted changes — CLAUDE.md says no direct commits to main." -ForegroundColor Yellow
+    Write-Host "          Fix:  git checkout -b feat-ops-yourname-`$(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkYellow
+    Bump-Exit 1
+}
+
 # ---- [2/6] Working tree dirty ----
 Write-Host ""
 Write-Host "[2/6] Working tree status"
