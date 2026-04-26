@@ -213,6 +213,25 @@
     </table>
   </div>
 
+  <!-- Agent SLA 主管视角 -->
+  <div class="panel">
+    <h2>🏆 客服 SLA <span class="panel-hint">近 30 天 · 按接管量倒序</span></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>客服</th>
+          <th>接管</th>
+          <th>成交</th>
+          <th>流失</th>
+          <th>跟进中</th>
+          <th>转化率</th>
+          <th>平均处理 (min)</th>
+        </tr>
+      </thead>
+      <tbody id="sla-tbody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
   <!-- Events stats -->
   <div class="panel">
     <h2>📈 7 天事件统计</h2>
@@ -383,6 +402,33 @@ async function loadCustomers() {
     ).join('');
   } catch (e) {
     document.getElementById('customers-tbody').innerHTML = '<tr><td colspan="6" class="empty">加载失败: ' + safeText(e.message) + '</td></tr>';
+  }
+}
+
+async function loadAgentSla() {
+  try {
+    const data = await fetchJson('/cluster/customers/sla/agents?days=30');
+    const agents = data.agents || [];
+    if (agents.length === 0) {
+      document.getElementById('sla-tbody').innerHTML = '<tr><td colspan="7" class="empty">还没有真人接管记录</td></tr>';
+      return;
+    }
+    document.getElementById('sla-tbody').innerHTML = agents.map(a => {
+      const rate = (a.conversion_rate || 0);
+      const rateColor = rate >= 0.5 ? '#22c55e' : rate >= 0.3 ? '#f59e0b' : '#ef4444';
+      const avg = a.avg_minutes != null ? a.avg_minutes.toFixed(1) : '—';
+      return '<tr>'
+        + '<td><b>' + safeText(a.accepted_by_human) + '</b></td>'
+        + '<td>' + (a.handled || 0) + '</td>'
+        + '<td style="color:#22c55e;font-weight:600">' + (a.converted_n || 0) + '</td>'
+        + '<td style="color:#ef4444">' + (a.lost_n || 0) + '</td>'
+        + '<td style="color:#f59e0b">' + (a.pending_n || 0) + '</td>'
+        + '<td><b style="color:' + rateColor + '">' + (rate * 100).toFixed(1) + '%</b></td>'
+        + '<td class="mono">' + avg + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch (e) {
+    document.getElementById('sla-tbody').innerHTML = '<tr><td colspan="7" class="empty">加载失败: ' + safeText(e.message) + '</td></tr>';
   }
 }
 
@@ -561,7 +607,7 @@ function showToast(msg, color) {
 // ─── refresh all ────────────────────────────────────────────────
 async function refresh() {
   document.getElementById('last-update').innerText = '刷新中…';
-  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadPushMetrics()]);
+  await Promise.all([loadFunnel(), loadHandoffPending(), loadCustomers(), loadAgentSla(), loadPushMetrics()]);
   document.getElementById('last-update').innerText = '更新于 ' + new Date().toLocaleTimeString();
 }
 

@@ -433,6 +433,46 @@ class CentralCustomerStore:
 
             return cust
 
+    def agent_sla_stats(self, days: int = 30) -> List[Dict[str, Any]]:
+        """主管 SLA 看板: 按客服 username 统计接管 / 转化 / 平均处理时长.
+
+        返回 list of dict, 每项含:
+            - accepted_by_human (username)
+            - handled (接管总数)
+            - converted / lost / pending_count
+            - conversion_rate (0-1)
+            - avg_assign_to_complete_minutes (None if no completed)
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    accepted_by_human,
+                    COUNT(*) AS handled,
+                    SUM(CASE WHEN outcome='converted' THEN 1 ELSE 0 END) AS converted_n,
+                    SUM(CASE WHEN outcome='lost' THEN 1 ELSE 0 END) AS lost_n,
+                    SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS pending_n,
+                    AVG(EXTRACT(EPOCH FROM (completed_at - accepted_at))/60.0)
+                        FILTER (WHERE completed_at IS NOT NULL AND accepted_at IS NOT NULL)
+                        AS avg_minutes
+                FROM customer_handoffs
+                WHERE accepted_by_human IS NOT NULL
+                  AND accepted_at > NOW() - (INTERVAL '1 day' * %s)
+                GROUP BY accepted_by_human
+                ORDER BY handled DESC
+                """,
+                (max(1, min(int(days), 365)),),
+            )
+            rows = []
+            for r in cur.fetchall():
+                d = dict(r)
+                handled = int(d.get("handled") or 0)
+                conv = int(d.get("converted_n") or 0)
+                d["conversion_rate"] = (conv / handled) if handled else 0.0
+                d["avg_minutes"] = float(d["avg_minutes"]) if d.get("avg_minutes") is not None else None
+                rows.append(d)
+            return rows
+
     def list_pending_handoffs(self, limit: int = 100) -> List[Dict[str, Any]]:
         """L3 人工接管面板: 列出待接管 (accepted_by_human IS NULL)."""
         with self._cursor() as cur:
