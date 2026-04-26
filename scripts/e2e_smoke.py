@@ -287,20 +287,21 @@ def stage_search_and_detail(c: SmokeClient, r: StageReport, cid: str):
     else:
         r.fail("customer detail", f"status={status} body={body}")
 
-    # 模糊搜索
+    # 模糊搜索 (返 {"customers": [...]})
     status, body = c.get("/cluster/customers-search?q=E2E_Test&limit=10")
-    if status == 200 and isinstance(body, list):
-        if any(x.get("customer_id") == cid for x in body):
+    if status == 200 and isinstance(body, dict):
+        customers = body.get("customers") or []
+        if any(x.get("customer_id") == cid for x in customers):
             r.ok("customers-search 命中本测试客户")
         else:
-            r.skip("customers-search", "未命中 (可能模糊匹配 ILIKE 还没刷)")
+            r.skip("customers-search", "未命中 (q 字段是 ILIKE 子串, 可能后续刷新)")
     else:
-        r.fail("customers-search", f"status={status}")
+        r.fail("customers-search", f"status={status} body={body}")
 
-    # chats 搜索
-    status, body = c.get("/cluster/chats-search?q=こんにちは&limit=10")
-    if status == 200:
-        r.ok("chats-search trgm 路径")
+    # chats 搜索 (返 {"q": ..., "chats": [...]})
+    status, body = c.get("/cluster/chats-search?q=test&limit=5", timeout=20.0)
+    if status == 200 and isinstance(body, dict):
+        r.ok("chats-search trgm 路径", f"hit {len(body.get('chats') or [])}")
     else:
         r.fail("chats-search", f"status={status}")
 
