@@ -917,23 +917,10 @@ class FacebookAutomation(BaseAutomation):
 
         给 join_group 等"对启动状态敏感"的任务做入口护栏.
         """
+        # 2026-04-27 P2: 内嵌 fallback marker 已统一搬到 fb_search_markers.py
+        # (FB_NEWS_FEED_RID / FB_FEED_STORY_ROOT_RID + JP A/B 新 placeholder),
+        # 直接用 hierarchy_looks_like_fb_home, 与全局 helper 保持单源.
         from .fb_search_markers import hierarchy_looks_like_fb_home
-
-        # 2026-04-27 IJ8HZLOR 真机暴露: FB A/B 新版日语 home placeholder
-        # "その気持ち、シェアしよう" 不在 fb_search_markers 旧 marker 列表里,
-        # hierarchy_looks_like_fb_home 永远 False → 入口护栏死等超时.
-        # 在公共 marker 库改动 scope 大, 先在本 helper 内嵌 fallback marker
-        # (跨语言稳定子串), 待后续 PR 把 marker 库统一扩.
-        _EXTRA_FB_HOME_MARKERS = (
-            "その気持ち、シェアしよう",  # JP A/B
-            "id/feed_story_root",     # FB feed item resource-id (跨语言)
-            "id/news_feed",            # FB Home feed root
-        )
-
-        def _looks_like_home(xml: str) -> bool:
-            if hierarchy_looks_like_fb_home(xml):
-                return True
-            return any(m in xml for m in _EXTRA_FB_HOME_MARKERS)
 
         def _cur_pkg() -> str:
             try:
@@ -994,7 +981,7 @@ class FacebookAutomation(BaseAutomation):
                 xml = d.dump_hierarchy() or ""
             except Exception:
                 xml = ""
-            if _looks_like_home(xml):
+            if hierarchy_looks_like_fb_home(xml):
                 stable += 1
                 if stable >= STABLE_TICKS:
                     log.info("[fb_home_strict] FB home ready (orca_kills=%d, stable_ticks=%d)",
