@@ -293,6 +293,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="status-pill"><span class="status-dot ok" id="h-dot"></span><span id="h-status">连接中...</span></div>
       <div id="node-role-badge" style="display:none;margin-left:6px;font-size:10px;padding:2px 8px;border-radius:4px;font-weight:500"></div>
       <div id="gate-policy-pill" style="display:none;margin-left:6px;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:500;cursor:pointer;border:1px solid var(--border);white-space:nowrap" onclick="_showGatePolicyDetail()" title="任务门禁策略实时状态（点击查看详情并可热加载）"></div>
+      <span id="reject-chip" style="display:none;margin-left:6px;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:500;border:1px solid transparent;white-space:nowrap;cursor:help" title="peer_name sanitize reject 计数 — 监控 sanitize 误杀复发"></span>
       <span class="kbd" style="margin-left:8px" title="搜索导航">Ctrl+K</span>
     </div>
     <div class="topbar-right">
@@ -309,6 +310,40 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span id="clock" style="font-size:11px;font-family:monospace;min-width:60px"></span>
     </div>
   </header>
+  <script>
+  // P12.1 — peer_name sanitize reject 实时监控 chip
+  // 阶段 6 P1.7 修了 _is_valid_peer_name ASCII 启发误杀英文名 bug.
+  // 本 chip 实时显示 reject 计数, 防 sanitize 规则未来再次 over-restrict.
+  // 阈值: 0 绿 / 1-10 黄 / >10 红. 每 30s 自动刷新.
+  (function _initRejectChip(){
+    function _updateChip() {
+      fetch('/stats/peer-name-rejects', {cache: 'no-store'})
+        .then(r => r.json())
+        .then(d => {
+          var el = document.getElementById('reject-chip');
+          if (!el || !d) return;
+          var total = parseInt(d.total || 0, 10);
+          var byEvent = d.by_event_type || {};
+          var color, label;
+          if (total === 0) { color = '#10b981'; label = 'Reject: 0'; }
+          else if (total <= 10) { color = '#f59e0b'; label = 'Reject: ' + total; }
+          else { color = '#ef4444'; label = 'Reject: ' + total + ' ⚠'; }
+          el.textContent = label;
+          el.style.display = 'inline-block';
+          el.style.background = color;
+          el.style.color = '#fff';
+          var byEventStr = Object.keys(byEvent).map(function(k){
+            return k + ': ' + byEvent[k];
+          }).join(', ') || '(none)';
+          el.title = 'peer_name sanitize reject 总计: ' + total + '\nby_event_type: ' + byEventStr +
+                     '\n(每 30s 自动刷新, /stats/peer-name-rejects)';
+        })
+        .catch(function(){});
+    }
+    _updateChip();
+    setInterval(_updateChip, 30000);  // 30s refresh
+  })();
+  </script>
   <!-- 告警通知面板 -->
   <div id="alert-panel" style="display:none;position:absolute;top:50px;right:20px;width:360px;max-height:480px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5);z-index:300;overflow:hidden">
     <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
