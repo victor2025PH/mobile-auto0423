@@ -546,7 +546,7 @@ def error_analysis(hours: int = 24, include_samples: bool = False):
         suggestions.append({
             "priority": "high" if categories["ui_not_found"] >= 3 else "medium",
             "category": "ui_not_found", "icon": "📱",
-            "action": "TikTok 界面可能已更新，建议重启所有设备 TikTok 应用",
+            "action": "界面可能已更新，重启目标 App + 清缓存 (建议人工介入)",
             "endpoint": None, "method": None,
         })
     if categories["device_offline"] > 0:
@@ -567,15 +567,15 @@ def error_analysis(hours: int = 24, include_samples: bool = False):
         suggestions.append({
             "priority": "medium",
             "category": "network_timeout", "icon": "🌐",
-            "action": "网络超时频繁，建议检查 WiFi/SIM 信号",
-            "endpoint": None, "method": None,
+            "action": "网络超时频繁，对全部设备做 VPN e2e 重探 + 重连失败的",
+            "endpoint": "/vpn/reconnect-all", "method": "POST",
         })
     if categories["geo_mismatch"] > 0:
         suggestions.append({
             "priority": "high",
             "category": "geo_mismatch", "icon": "🗺️",
-            "action": "IP 地理位置不符，检查 VPN 节点是否为意大利出口",
-            "endpoint": None, "method": None,
+            "action": "IP 地理位置不符，触发全量 Geo 验证 (vpn_health 自动重连漂移设备)",
+            "endpoint": "/vpn/geo-verify-all", "method": "POST",
         })
 
     # ── 聚合集群 Worker 数据 ──
@@ -723,6 +723,134 @@ def cancel_task(task_id: str):
     pool.cancel_task(task_id)
     task_store.set_task_cancelled(task_id)
     return {"ok": True, "task_id": task_id, "message": "取消信号已发送"}
+
+
+@router.post("/tasks/{task_id}/smart-retry", dependencies=_auth)
+def smart_retry_task(task_id: str):
+    """一键智能重试: 比 auto-retry 多做"先修网络再重派"。
+
+    步骤:
+      1. 校验 task 在 failed 状态 (running/pending 不允许 — 走 cancel)
+      2. 对 task.device_id 跑 vpn_e2e_probe(force_refresh=True) — 真探测
+      3. 若 e2e 失败 → 调 vpn_health.check_device(allow_reconnect=True) 触发 L1-L3 升级重连
+      4. 清 next_retry_at + 状态置 pending + retry_count+=1
+      5. 立即 dispatch_after_create 重派 (不等指数退避)
+
+    Returns:
+      {task_id, fixed_actions: [str], requeued: bool, vpn_eprobe: dict, error?: str}
+
+    与现有 auto-retry (task_store.set_task_result 内置) 区别:
+      - auto-retry: 仅指数退避后重排, 不修底层网络
+      - smart-retry: 先 e2e + 必要时重连 VPN, 再立即派 — 用户手点的 "一键修+派"
+    """
+    from datetime import datetime, timezone
+    from ..api import task_store
+    from ..task_dispatcher import dispatch_after_create
+    from ..database import get_conn
+    from src.behavior.vpn_manager import vpn_e2e_probe
+
+    t = task_store.get_task(task_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    status = t.get("status", "")
+    if status not in ("failed", "cancelled"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"任务状态为 {status}, 只支持 failed/cancelled 的智能重试",
+        )
+
+    device_id = (t.get("device_id") or "").strip()
+    actions: List[str] = []
+    eprobe_result: Dict[str, Any] = {}
+
+    # 1) VPN e2e 真探测 + 必要时重连
+    if device_id:
+        try:
+            eprobe_result = vpn_e2e_probe(device_id, force_refresh=True)
+            if eprobe_result.get("ok"):
+                actions.append(
+                    f"VPN e2e ok ({eprobe_result.get('latency_ms', 0)}ms)"
+                )
+            else:
+                actions.append(
+                    f"VPN e2e 失败: {eprobe_result.get('error', '?')}; 触发重连"
+                )
+                try:
+                    from src.behavior.vpn_health import get_vpn_health_monitor
+                    mon = get_vpn_health_monitor()
+                    rc = mon.check_device(device_id, allow_reconnect=True)
+                    if rc.get("connected"):
+                        actions.append(f"VPN 重连成功 ({rc.get('action_taken', '?')})")
+                        # 重连后再探一次, 用最新结果
+                        eprobe_result = vpn_e2e_probe(device_id, force_refresh=True)
+                    else:
+                        actions.append(f"VPN 重连失败 ({rc.get('action_taken', '?')})")
+                except Exception as _re:
+                    actions.append(f"VPN 重连异常: {str(_re)[:80]}")
+        except Exception as _pe:
+            actions.append(f"VPN 探测异常: {str(_pe)[:80]}")
+    else:
+        actions.append("跳过 VPN 探测 (任务无 device_id)")
+
+    # 2) 重置任务状态 + 立即派 (不走指数退避)
+    task_type = t.get("type", "")
+    params = t.get("params") or {}
+    if isinstance(params, str):
+        try:
+            import json as _json_p
+            params = _json_p.loads(params)
+        except Exception:
+            params = {}
+    priority = int(t.get("priority") or 50)
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='pending', result='{}', "
+                "next_retry_at=NULL, retry_count=retry_count+1, updated_at=? "
+                "WHERE task_id=?",
+                (now_iso, task_id),
+            )
+            conn.commit()
+    except Exception as _ue:
+        return {
+            "task_id": task_id,
+            "fixed_actions": actions,
+            "vpn_eprobe": eprobe_result,
+            "requeued": False,
+            "error": f"DB 重置失败: {_ue}",
+        }
+
+    # 3) 立即派
+    try:
+        disp = dispatch_after_create(
+            task_id=task_id,
+            device_id=device_id or None,
+            task_type=task_type,
+            params=params or {},
+            priority=priority,
+        )
+        actions.append(
+            f"已立即重派 (mode={disp.get('mode')}, "
+            f"worker={disp.get('worker_ip') or 'local'})"
+        )
+        return {
+            "task_id": task_id,
+            "fixed_actions": actions,
+            "vpn_eprobe": eprobe_result,
+            "requeued": True,
+            "dispatch": disp,
+        }
+    except Exception as _de:
+        return {
+            "task_id": task_id,
+            "fixed_actions": actions,
+            "vpn_eprobe": eprobe_result,
+            "requeued": False,
+            "error": f"重派失败: {_de}",
+        }
 
 
 @router.post("/tasks/cancel-all", dependencies=_auth)

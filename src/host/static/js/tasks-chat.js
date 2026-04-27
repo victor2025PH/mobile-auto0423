@@ -317,7 +317,11 @@ function _taskRowInner(t,isTrashList){
     const delBtn=_taskRecordDeletable(t.status)
       ?`<button type="button" class="qa-btn" title="移入回收站（可在回收站恢复或永久删除）" style="font-size:10px;padding:2px 6px;color:#f87171;border-color:#f8717144" onclick="event.stopPropagation();deleteTaskRecord('${tid}')">移入回收站</button>`
       :'';
-    actions=`<span style="display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap"><button type="button" class="qa-btn" style="font-size:10px;padding:2px 8px" onclick="event.stopPropagation();showTaskDetail('${tid}')">详情</button>${delBtn}</span>`;
+    // 失败任务加 "一键智能重试": 先 VPN e2e 真探测 + 必要时重连, 再立即派 (跳过指数退避)
+    const retryBtn=(t.status==='failed'||t.status==='cancelled')
+      ?`<button type="button" class="qa-btn" title="智能重试 — 先做 VPN e2e 探测, 失败则触发重连, 再立即重派此任务 (跳过指数退避)" style="font-size:10px;padding:2px 6px;color:#22c55e;border-color:#22c55e44" onclick="event.stopPropagation();smartRetryTask('${tid}',this)">⚡ 智能重试</button>`
+      :'';
+    actions=`<span style="display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap"><button type="button" class="qa-btn" style="font-size:10px;padding:2px 8px" onclick="event.stopPropagation();showTaskDetail('${tid}')">详情</button>${retryBtn}${delBtn}</span>`;
     selCell=_taskRecordDeletable(t.status)
       ?`<input type="checkbox" aria-label="选择任务" style="accent-color:var(--accent);cursor:pointer" onclick="event.stopPropagation()" onchange="taskBulkToggle('${tid}',this.checked)" ${_taskBulkSelected.has(tid)?'checked':''} />`
       :'<span style="display:inline-block;width:14px" title="运行中/等待中不可删"></span>';
@@ -336,6 +340,30 @@ function taskRowForOverview(t){
 async function cancelTask(taskId){
   if(!confirm('确定取消此任务？'))return;
   try{await api('POST','/tasks/'+taskId+'/cancel');showToast('任务已取消','success');loadTasks();}catch(e){showToast('取消失败: '+e.message,'error');}
+}
+
+/** 一键智能重试：先 VPN e2e 真探测 + 必要时重连，再立即重派 (跳过指数退避).
+ *  与 task_store.set_task_result 自动重试区别: 那个只指数退避后重排, 不修网络;
+ *  这个先把网络修了再派, 用户手点的 "一键修+派". */
+async function smartRetryTask(taskId, btnEl){
+  const orig = btnEl ? btnEl.innerHTML : '';
+  if(btnEl){ btnEl.disabled = true; btnEl.innerHTML = '⏳ 修+派…'; }
+  try{
+    const r = await api('POST', '/tasks/' + taskId + '/smart-retry');
+    const acts = (r.fixed_actions || []).join(' → ');
+    if(r.requeued){
+      const ep = r.vpn_eprobe || {};
+      const epTag = ep.ok ? `VPN e2e ${ep.latency_ms||0}ms` : ('VPN e2e: '+(ep.error||'?'));
+      showToast('已智能重试: ' + epTag + ' · ' + acts, 'success');
+    }else{
+      showToast('重派失败: ' + (r.error || '未知') + ' · 修复动作: ' + acts, 'error');
+    }
+    setTimeout(loadTasks, 800);
+  }catch(e){
+    showToast('智能重试失败: ' + (e.message || e), 'error');
+  }finally{
+    if(btnEl){ btnEl.disabled = false; btnEl.innerHTML = orig; }
+  }
 }
 
 async function cancelAllTasks(){
