@@ -17,13 +17,25 @@ FB_FEED_LIST_MARKER: Final[str] = "id/feed_list"
 # 2026-04-24 中文 katana bottom tab content-desc: '首页，第1/6个选项卡'
 FB_HOME_TAB_MARKER_ZH: Final[str] = "首页，第1"
 
+# 2026-04-27 加 — IJ8HZLOR 圈层拓客真机重试发现 FB Home 跨语言稳定 resource-id.
+# 这两个 RID 跨所有语言 (日/英/中) 都存在, 比 placeholder text 更可靠;
+# 部分 ROM/账号下 placeholder 可能延迟出现 / A/B 替换文案, RID 是 home feed
+# 容器层标识, 出现即等于"home feed 容器已 mount". (从 _ensure_fb_home_ready_strict
+# 内嵌 fallback marker 提到此处, 让所有调用 hierarchy_looks_like_fb_home 的地方
+# 同步受益.)
+FB_NEWS_FEED_RID: Final[str] = "id/news_feed"
+FB_FEED_STORY_ROOT_RID: Final[str] = "id/feed_story_root"
+
 # 发帖框提示语（多语言 katana 常见文案，与英文逻辑并列；按需再扩）
 FB_HOME_COMPOSER_I18N_SUBSTRINGS: Tuple[str, ...] = (
     "A cosa stai pensando?",       # IT
-    "\u00bfEn qu\u00e9 est\u00e1s pensando?",  # ES: ¿En qué estás pensando?
-    "\u4eca\u306a\u306b\u3057\u3066\u308b\uff1f",  # JP: 今なにしてる？
-    "\u4f60\u5728\u60f3\u4ec0\u4e48\uff1f",       # zh-Hans: 你在想什么？
-    "\u5728\u60f3\u4e9b\u4ec0\u4e48\uff1f",        # zh-Hans alt
+    "¿En qué estás pensando?",  # ES: ¿En qué estás pensando?
+    "今なにしてる？",  # JP: 今なにしてる？(旧版)
+    # 2026-04-27 — IJ8HZLOR 圈层拓客真机重试暴露 FB A/B 新版日语 home placeholder.
+    # 旧 marker "今なにしてる？" 不识别 → _ensure_fb_home_ready_strict 死等超时.
+    "その気持ち、シェアしよう",  # JP: その気持ち、シェアしよう (A/B 新版)
+    "你在想什么？",       # zh-Hans: 你在想什么？
+    "在想些什么？",        # zh-Hans alt
 )
 
 # ── 搜索页（顶栏搜索：无发帖框 + 存在 EditText）────────────────────────
@@ -51,6 +63,8 @@ def hierarchy_looks_like_fb_home(xml: str) -> bool:
         or FB_HOME_TAB_MARKER in xml
         or FB_HOME_TAB_MARKER_ZH in xml
         or FB_FEED_LIST_MARKER in xml
+        or FB_NEWS_FEED_RID in xml
+        or FB_FEED_STORY_ROOT_RID in xml
     ):
         return True
     return any(s in xml for s in FB_HOME_COMPOSER_I18N_SUBSTRINGS)
