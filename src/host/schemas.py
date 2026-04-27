@@ -135,6 +135,12 @@ class TaskResponse(BaseModel):
     phase_caption: Optional[str] = None
     execution_policy_hint: Optional[str] = None
     stuck_reason_zh: Optional[str] = None  # pending 任务的卡住原因（便于用户一眼看明白）
+    # 2026-04-27 Phase 2 P0 #2: 当前业务步骤 (running task 实时可见)
+    # 业务方法调 task_store.set_task_step("搜索群组", "ママ友") → 写 checkpoint
+    # → _to_response 提取暴露. 旧 task / 未接入业务方法的 task 为 None.
+    current_step: Optional[str] = None
+    current_sub_step: Optional[str] = None
+    current_step_at: Optional[str] = None
     deleted_at: Optional[str] = None
 
 

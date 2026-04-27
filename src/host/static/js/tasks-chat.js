@@ -774,6 +774,21 @@ async function showTaskDetail(taskId){
   const originRow=t.task_origin_label_zh?`<div class="detail-row"><span class="detail-label">来源</span><span style="font-size:12px">${t.task_origin_label_zh}${t.task_origin?` <code style="font-size:9px;color:var(--text-muted)">${t.task_origin}</code>`:''}</span></div>`:'';
   const phaseRow=t.phase_caption?`<div class="detail-row"><span class="detail-label">phase 说明</span><span style="font-size:11px;color:var(--text-dim);line-height:1.45">${t.phase_caption}</span></div>`:'';
   const polRow=t.execution_policy_hint?`<div class="detail-row"><span class="detail-label">执行策略</span><span style="font-size:10px;color:var(--text-muted);line-height:1.45">${t.execution_policy_hint}</span></div>`:'';
+  // Phase 2 P0 #2: running task 的当前业务步骤 (业务方法调 set_task_step 写入 checkpoint)
+  // 显示形式: 「搜索群组 — ママ友」 (主+副) / 「打开 Members tab」 (仅主)
+  // current_step_at 显示"距上次刷新 N 秒/分", 让用户判断业务是否在动
+  let stepFreshness='';
+  if(t.current_step_at){
+    try{
+      // current_step_at 是 _now_iso() 写的 ISO 8601 UTC: '2026-04-27T01:23:45Z'
+      const ageMs=Date.now()-new Date(t.current_step_at).getTime();
+      const ageSec=Math.max(0,Math.round(ageMs/1000));
+      stepFreshness=ageSec<60?` <span style="font-size:10px;color:var(--text-muted)">${ageSec}s 前</span>`
+        :ageSec<3600?` <span style="font-size:10px;color:var(--text-muted)">${Math.round(ageSec/60)} 分钟前</span>`
+        :` <span style="font-size:10px;color:#f59e0b" title="超过 1 小时无步骤刷新, 可能卡死">${Math.round(ageSec/3600)} 小时前 ⚠</span>`;
+    }catch(_){}
+  }
+  const currentStepRow=(t.status==='running'&&t.current_step)?`<div class="detail-row"><span class="detail-label">当前步骤</span><span style="font-size:12px;color:var(--accent);font-weight:500">${t.current_step}${t.current_sub_step?` <span style="color:var(--text-dim);font-weight:normal">— ${t.current_sub_step}</span>`:''}${stepFreshness}</span></div>`:'';
   const ge=result.gate_evaluation;
   const geoGlossary=_taskDetailGeoGlossary(params,ge);
   const failHints=_taskDetailFailureHints(err, ge);
@@ -838,6 +853,7 @@ async function showTaskDetail(taskId){
       <div class="detail-row"><span class="detail-label">状态</span><span>${stLabel}</span></div>
       <div class="detail-row"><span class="detail-label">设备</span><div style="flex:1"><div style="color:var(--accent)">${alias}</div><div style="font-size:10px;color:var(--text-dim);font-family:monospace;margin-top:2px" title="ADB 序列号（与设备管理一致）">${t.device_id||'—'}</div></div></div>
       ${originRow}
+      ${currentStepRow}
       ${phaseRow}
       ${polRow}
       ${worker}

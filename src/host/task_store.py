@@ -334,6 +334,60 @@ def set_task_running(task_id: str) -> None:
     _push("task.running", task_id=task_id)
 
 
+def set_task_step(step: str, sub_step: str = "",
+                  task_id: str = "") -> bool:
+    """更新 running task 的当前业务步骤 — dashboard 实时可见 + Phase 2 P0 #2.
+
+    Args:
+        step: 主步骤 (e.g. "搜索群组" / "提取群成员" / "添加好友")
+        sub_step: 副步骤 (e.g. "ママ友" / "第 5/30 人" / "@john")
+        task_id: 任务 ID; 默认从 thread-local task_context 隐式取
+                 (executor.run_task 已 set_task_context → 业务方法不需显式传)
+
+    设计:
+        - 写到 checkpoint.current_step / current_sub_step / current_step_at
+        - 用 SQLite json_patch 原子合并 (避免 read-modify-write 竞态)
+        - 仅 status='running' 时写, 防止 SLA abort 后业务方法的 trailing 调用
+          污染 fail 后的 task 状态
+        - 同时刷 updated_at — 给 SLA tasks/orphan reaper 提供精确进展信号
+        - 失败静默 (写 step 不该影响业务) → 返回 False, 调用方可忽略
+
+    Returns:
+        True 写入生效 (1 行); False 没写 (任务不存在 / 不在 running / 异常)
+
+    2026-04-27 Phase 2 P0 #2 加: 用户 5h 死循环时手抓 9 张截图排查 — dashboard
+    任务详情应该实时显示"现在做到第几步".
+    """
+    if not step:
+        return False
+    if not task_id:
+        try:
+            from src.utils.log_config import _task_context
+            task_id = getattr(_task_context, "task_id", "") or ""
+        except Exception:
+            task_id = ""
+    if not task_id:
+        return False
+    now = _now_iso()
+    payload = json.dumps({
+        "current_step": step,
+        "current_sub_step": sub_step or "",
+        "current_step_at": now,
+    }, ensure_ascii=False)
+    try:
+        with get_conn() as conn:
+            cur = conn.execute(
+                "UPDATE tasks SET "
+                " checkpoint = json_patch(COALESCE(checkpoint, '{}'), ?), "
+                " updated_at = ? "
+                "WHERE task_id = ? AND status = 'running'",
+                (payload, now, task_id),
+            )
+        return cur.rowcount > 0
+    except Exception:
+        return False
+
+
 def set_task_result(task_id: str, success: bool, error: str = "",
                     screenshot_path: str = "", extra: Optional[dict] = None) -> None:
     result = {"success": success, "error": error,
