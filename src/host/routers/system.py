@@ -22,6 +22,43 @@ def system_probe_contacts_enriched():
     return run_contacts_enriched_probe()
 
 
+@router.get("/system/git-branch")
+def system_git_branch():
+    """当前 service 跑的 git 分支信息 — 用于 dashboard 顶栏 chip 显示.
+
+    返回::
+
+        {"branch": "feat-a-resume-2026-04-27", "ahead_of_main": 4, "is_main": false}
+
+    用途: P3 sibling 协同护栏 L3 — user 任何时候打开 dashboard 都能一眼看到
+    service 当前跑哪个分支, 防止"sibling 切了 main 重启 → 我看到没开发好的样子"
+    这种事故复发.
+    """
+    try:
+        proc1 = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, timeout=2,
+            cwd=str(PROJECT_ROOT),
+        )
+        branch = (proc1.stdout or "").strip()
+        if not branch:
+            return {"branch": "(detached)", "ahead_of_main": 0, "is_main": False}
+        proc2 = subprocess.run(
+            ["git", "rev-list", "--count", "main..HEAD"],
+            capture_output=True, text=True, timeout=2,
+            cwd=str(PROJECT_ROOT),
+        )
+        ahead_str = (proc2.stdout or "").strip()
+        ahead = int(ahead_str) if ahead_str.isdigit() else 0
+        return {
+            "branch": branch,
+            "ahead_of_main": ahead,
+            "is_main": branch == "main",
+        }
+    except Exception as e:
+        return {"branch": "(unknown)", "ahead_of_main": 0, "is_main": False, "error": str(e)}
+
+
 @router.post("/system/force-restart")
 def force_restart():
     """强制重启当前 Worker/Coordinator 进程。"""
