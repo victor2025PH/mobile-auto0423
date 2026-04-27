@@ -963,11 +963,14 @@ def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
         return 0
     # Phase 16/17.1: peer_name sanitize + by-event_type 细分 metrics
     # 2026-04-27 P5: pytest 模式自动 bypass — fixture data ("Alice"/"Bob"/"p1") 会被
-    # _is_valid_peer_name 的 ASCII 启发规则误杀, 让 14 处 test 调用不必逐个加 kwarg.
+    # _is_valid_peer_name 的启发/短串规则误杀, 让普通 test 不必逐个加 kwarg.
+    # 例外: sanitize-specific tests (phase15/16/17/_sanitize) 需要真走 sanitize
+    # 验证规则正确性, 不 bypass.
     # production 永远不设 PYTEST_CURRENT_TEST, 行为不变.
     if not skip_sanitize:
         import os as _os
-        if _os.environ.get("PYTEST_CURRENT_TEST"):
+        _cur_test = _os.environ.get("PYTEST_CURRENT_TEST", "")
+        if _cur_test and not any(_m in _cur_test for _m in ("phase15", "phase16", "phase17", "_sanitize")):
             skip_sanitize = True
     if not skip_sanitize:
         try:
