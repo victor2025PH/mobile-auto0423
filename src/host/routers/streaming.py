@@ -126,8 +126,14 @@ def change_stream_quality(device_id: str, body: dict):
 
 
 @router.get("/devices/{device_id}/stream/stats")
+@router.get("/cluster/devices/{device_id}/stream/stats")  # 兼容前端 cluster 前缀（修复 49 个 404）
 def stream_stats(device_id: str):
-    """Get real-time stream statistics. Proxies to owning worker for cluster devices."""
+    """Get real-time stream statistics. Proxies to owning worker for cluster devices.
+
+    Registered under both `/devices/...` and `/cluster/devices/...` because
+    the frontend (devices.js + video-stream.js) prepends `/cluster` for
+    cluster-resolved devices, but the proxy fallback already handles both cases.
+    """
     import urllib.request as _ur, json as _jj
     try:
         did, _ = _resolve_device_with_manager(device_id)

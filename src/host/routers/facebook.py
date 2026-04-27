@@ -966,6 +966,199 @@ def fb_risk_history(device_id: str):
         return {"device_id": device_id, "history": [], "error": str(e)}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# P2.1 账号画像聚合（替代前端并发 4 API）+ P2.4 智能建议
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.get("/devices/{device_id}/account-profile")
+def fb_account_profile(device_id: str):
+    """聚合账号画像 — 单次请求替代前端并发 4 API + 计算智能建议。
+
+    返回结构（前端 _pgRenderProfile 直接消费）::
+
+        {
+          "device_id": "...",
+          "account": {phase, friends_count, groups_count, friend_requests_sent_7d},
+          "risk":    {level: 'low|medium|high', count_24h, last_blocked_at, cooldown_remaining},
+          "recent_tasks": [{type, status, updated_at, error}, ...]  # 最多 3 条
+          "suggestion":   {tone: 'ok|info|warning', text}           # 智能建议（基于 phase × 风控）
+        }
+
+    所有内部数据源单独 try/except — 任一数据源失败不影响其他字段。
+    """
+    import datetime as _dt
+    out: Dict[str, Any] = {
+        "device_id": device_id,
+        "account": {"phase": "unknown", "friends_count": 0,
+                    "groups_count": 0, "friend_requests_sent_7d": 0},
+        "risk": {"level": "low", "count_24h": 0,
+                 "last_blocked_at": None, "cooldown_remaining": 0},
+        "recent_tasks": [],
+        "suggestion": {"tone": "info", "text": "✓ 账号状态正常"},
+    }
+
+    # ---- 1. phase（来自 fb_account_phase） ----
+    try:
+        from src.host.fb_account_phase import get_phase as _get_phase
+        ph = _get_phase(device_id) or {}
+        if ph.get("phase"):
+            out["account"]["phase"] = ph["phase"]
+    except Exception as _e:
+        logger.debug("[account-profile] phase fetch failed: %s", _e)
+
+    # ---- 2. 风控历史 + cooldown ----
+    try:
+        from src.host.fb_risk_listener import get_healer
+        healer = get_healer()
+        hist = healer.get_history(device_id) or []
+        cutoff_iso = (_dt.datetime.utcnow() - _dt.timedelta(hours=24)).isoformat() + "Z"
+        recent_risk = [e for e in hist
+                       if (e.get("detected_at") or e.get("at") or "") >= cutoff_iso]
+        out["risk"]["count_24h"] = len(recent_risk)
+        # 上次限流（最近一条 rate_limit/checkpoint/banned/policy/block）
+        for e in reversed(hist):
+            kind = str(e.get("kind") or e.get("type") or "").lower()
+            if any(k in kind for k in ("rate_limit", "checkpoint", "banned", "policy", "block")):
+                out["risk"]["last_blocked_at"] = e.get("detected_at") or e.get("at")
+                break
+        out["risk"]["cooldown_remaining"] = int(healer.get_cooldown_status(device_id) or 0)
+    except Exception as _e:
+        logger.debug("[account-profile] risk fetch failed: %s", _e)
+
+    # ---- 3. Funnel 数据（友数 / 群数 / 7天请求数）----
+    try:
+        from src.host.fb_store import get_funnel_metrics, list_groups
+        since_iso = (_dt.datetime.utcnow() - _dt.timedelta(hours=168)) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        m = get_funnel_metrics(device_id=device_id, since_iso=since_iso) or {}
+        out["account"]["friends_count"] = int(m.get("stage_friend_accepted", 0) or 0)
+        out["account"]["friend_requests_sent_7d"] = int(m.get("stage_friend_request_sent", 0) or 0)
+        groups = list_groups(device_id=device_id, status="joined", limit=500) or []
+        out["account"]["groups_count"] = len(groups)
+    except Exception as _e:
+        logger.debug("[account-profile] funnel fetch failed: %s", _e)
+
+    # ---- 4. 最近 3 条任务（修复 P1.1 contact-events 误用 bug）----
+    try:
+        from src.host.task_store import list_tasks
+        tasks = list_tasks(device_id=device_id, limit=3) or []
+        out["recent_tasks"] = [
+            {
+                "type": t.get("type"),
+                "status": t.get("status"),
+                "updated_at": t.get("updated_at"),
+                "error": (t.get("result") or {}).get("error")
+                         if isinstance(t.get("result"), dict) else None,
+            }
+            for t in tasks
+        ]
+    except Exception as _e:
+        logger.debug("[account-profile] tasks fetch failed: %s", _e)
+
+    # ---- 4.5 今日任务统计（P2.5: today_failed 进规则引擎）----
+    today_tasks_total = 0
+    today_failed_total = 0
+    try:
+        import datetime as _dt2
+        from src.host.task_store import list_tasks as _list_tasks
+        today_start = _dt2.datetime.utcnow().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for _t in (_list_tasks(device_id=device_id, limit=200) or []):
+            ua = _t.get("updated_at") or ""
+            if ua >= today_start:
+                today_tasks_total += 1
+                if _t.get("status") == "failed":
+                    today_failed_total += 1
+    except Exception as _e:
+        logger.debug("[account-profile] today task counts failed: %s", _e)
+
+    today_fail_rate = (today_failed_total / today_tasks_total) if today_tasks_total else 0.0
+    out["today_stats"] = {
+        "tasks": today_tasks_total,
+        "failed": today_failed_total,
+        "fail_rate": round(today_fail_rate, 2),
+    }
+
+    # ---- 5. 风控等级 + 智能建议 + CTA action（P2.5+P2.6 升级）----
+    # 优先级（高→低）: cooldown > 今日失败率 > 24h 风控 > phase
+    phase = out["account"]["phase"]
+    risk_24h = out["risk"]["count_24h"]
+    cd = out["risk"]["cooldown_remaining"]
+
+    _open_fail = {"label": "查看失败原因", "type": "open_failure_modal"}
+
+    if cd > 0:
+        out["risk"]["level"] = "high"
+        out["suggestion"] = {
+            "tone": "warning",
+            "text": f"⚠ 当前正在 cooldown（{cd}s 后解禁），请暂停所有外联动作",
+            "action": None,
+        }
+    elif today_fail_rate >= 0.5 and today_tasks_total >= 3:
+        # P2.5 关键修复：高失败率 override phase 推荐
+        out["risk"]["level"] = "high"
+        out["suggestion"] = {
+            "tone": "warning",
+            "text": f"🚨 今日失败率 {int(today_fail_rate*100)}% ({today_failed_total}/{today_tasks_total})，先停止外联 → 排查原因",
+            "action": _open_fail,
+        }
+    elif today_fail_rate >= 0.3 and today_tasks_total >= 5:
+        out["risk"]["level"] = "medium"
+        out["suggestion"] = {
+            "tone": "warning",
+            "text": f"⚠ 今日失败率偏高 {int(today_fail_rate*100)}% ({today_failed_total}/{today_tasks_total})，建议降频 + 检查 selector",
+            "action": _open_fail,
+        }
+    elif phase == "cooldown" or risk_24h >= 5:
+        out["risk"]["level"] = "high"
+        out["suggestion"] = {
+            "tone": "warning",
+            "text": "🔴 24h 风控信号 ≥5 次，建议立即停止外联 + 检查 selector 健康度",
+            "action": _open_fail,
+        }
+    elif risk_24h >= 2:
+        out["risk"]["level"] = "medium"
+        out["suggestion"] = {
+            "tone": "warning",
+            "text": "🟡 风控信号偏多，建议降频运行 + 避免连续相同动作",
+            "action": _open_fail,
+        }
+    elif phase == "cold_start":
+        out["risk"]["level"] = "low"
+        out["suggestion"] = {
+            "tone": "info",
+            "text": "🌱 冷启动期，建议先做 5-7 天内容浏览养号，再展开外联",
+            "action": {"label": "立即开始养号", "type": "run_task",
+                       "task_type": "facebook_browse_feed_by_interest"},
+        }
+    elif phase == "growth":
+        out["risk"]["level"] = "low"
+        out["suggestion"] = {
+            "tone": "info",
+            "text": "📈 健康成长期，可下发：加好友（中频）/ 群成员提取 / 群内互动",
+            "action": {"label": "发起加好友", "type": "run_task",
+                       "task_type": "facebook_add_friend"},
+        }
+    elif phase == "mature":
+        out["risk"]["level"] = "low"
+        out["suggestion"] = {
+            "tone": "ok",
+            "text": "🌳 账号成熟，可承担营销动作（私信、群发）— 保持节奏",
+            "action": {"label": "全链路获客", "type": "run_task",
+                       "task_type": "facebook_campaign_run"},
+        }
+    else:
+        out["risk"]["level"] = "low"
+        out["suggestion"] = {
+            "tone": "info",
+            "text": "✓ 账号状态正常，可按 phase 推荐执行任务",
+            "action": None,
+        }
+
+    return out
+
+
 @router.post("/risk/reload")
 def fb_risk_reload():
     """重新加载 config/facebook_risk.yaml(无需重启服务)。"""

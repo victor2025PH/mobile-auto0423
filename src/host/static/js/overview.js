@@ -241,13 +241,28 @@ async function _loadGatePolicyPill(){
     let color='#22c55e',bg='rgba(34,197,94,.12)',label='门禁: 放行';
     if(pre&&geo){color='#ef4444';bg='rgba(239,68,68,.14)';label='门禁: 严格';}
     else if(pre||geo){color='#eab308';bg='rgba(234,179,8,.14)';label='门禁: 部分';}
-    pill.textContent=label+' · '+mode;
+    // P0.3: 黑话翻译 + tooltip 说明含义
+    const _modeLabels={strict:'严格档',balanced:'平衡档',relaxed:'宽松档',loose:'宽松档'};
+    const modeLabel=_modeLabels[mode]||mode;
+    pill.textContent=label+' · '+modeLabel;
+    pill.title='🛡 反风控门禁策略 (Anti-detection Gate)\n'
+      +'─────────────────────────\n'
+      +'当前: '+label+' · '+modeLabel+'（'+mode+'）\n\n'
+      +'• 起飞前检查 (preflight): '+(pre?'✓ 开启':'✗ 关闭')+'\n'
+      +'• 高风险任务地理校验 (geo): '+(geo?'✓ 开启':'✗ 关闭')+'\n\n'
+      +'档位说明:\n'
+      +'  严格档 = 全检查，封号率最低（推荐养号期）\n'
+      +'  平衡档 = 关键检查，吞吐率与风控折中（默认）\n'
+      +'  宽松档 = 最少干预，吞吐率最高（仅测试）\n\n'
+      +'👉 点击查看详情 / 热加载 task_execution_policy.yaml';
     pill.style.color=color;
     pill.style.background=bg;
     pill.style.borderColor=color+'66';
     pill.style.display='inline-block';
+    pill.style.cursor='help';
   }catch(e){
     pill.textContent='门禁: ?';
+    pill.title='反风控门禁策略加载失败 — 检查 /task-dispatch/policy 接口';
     pill.style.color='#94a3b8';
     pill.style.background='transparent';
     pill.style.display='inline-block';
