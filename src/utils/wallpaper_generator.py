@@ -175,6 +175,76 @@ _HELPER_JAR_LOCAL = str(tools_dir() / "wallpaper_helper" / "openclaw_wp.jar")
 _REMOTE_JAR = "/data/local/tmp/openclaw_wp.jar"
 
 
+def _get_wallpaper_id(manager, device_id: str) -> tuple[Optional[int], Optional[int]]:
+    """读 dumpsys wallpaper 拿 (system_id, lock_id) 用作端到端校验基线。
+
+    Android WallpaperManagerService 每次 setBitmap/setStream 调用后内部 id +1
+    并落库到 /data/system/users/0/wallpaper_info.xml。id 是 monotonic counter，
+    比对前后 id 涨了即可断言"setBitmap 真的执行成功了"，杜绝任何 fallback 路径
+    的"派发成功 ≠ 真正写入"假象。
+
+    返回 (None, None) 表示读取失败，调用方应跳过校验。
+    """
+    import re
+    ok, out = manager._run_adb(
+        ['shell', 'dumpsys', 'wallpaper'], device_id, timeout=10)
+    if not ok or not out:
+        return (None, None)
+    sys_id: Optional[int] = None
+    lock_id: Optional[int] = None
+    # dumpsys 输出按"System wallpaper state:"/"Lock wallpaper state:"/"Fallback ..." 分段
+    section: Optional[str] = None
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('System wallpaper state'):
+            section = 'sys'
+            continue
+        if stripped.startswith('Lock wallpaper state'):
+            section = 'lock'
+            continue
+        if stripped.startswith('Fallback wallpaper state'):
+            section = 'other'
+            continue
+        if section in ('sys', 'lock'):
+            m = re.match(r'User\s+\d+:\s*id=(\d+)', stripped)
+            if m:
+                val = int(m.group(1))
+                if section == 'sys' and sys_id is None:
+                    sys_id = val
+                elif section == 'lock' and lock_id is None:
+                    lock_id = val
+                section = 'other'
+    return (sys_id, lock_id)
+
+
+def _verify_wallpaper_changed(manager, device_id: str,
+                              before: tuple[Optional[int], Optional[int]]) -> bool:
+    """对比部署前后 wallpaper id，sys 或 lock 任一涨了即视为真正生效。
+
+    用于消除所有 fallback 路径的"假成功"：root method 的 ROOT_WP_OK echo、
+    helper APK 的 broadcast result=0、app_process 的 stdout WP_SET_OK 都
+    可能在 service 内部异常被吞时仍然返回 True；只有 dumpsys id 涨了才是铁证。
+    """
+    sys_b, lock_b = before
+    if sys_b is None and lock_b is None:
+        # baseline 读取失败：宽松放行（不阻塞合法部署），由上层日志提示
+        log.debug("[壁纸] verify skipped %s: baseline 读取失败", device_id[:8])
+        return True
+    sys_a, lock_a = _get_wallpaper_id(manager, device_id)
+    if sys_a is None and lock_a is None:
+        log.debug("[壁纸] verify skipped %s: after 读取失败", device_id[:8])
+        return True
+    sys_changed = (sys_b is not None and sys_a is not None and sys_a > sys_b)
+    lock_changed = (lock_b is not None and lock_a is not None and lock_a > lock_b)
+    if sys_changed or lock_changed:
+        return True
+    log.warning(
+        "[壁纸] verify 失败 %s: sys %s→%s lock %s→%s, 视为假成功",
+        device_id[:8], sys_b, sys_a, lock_b, lock_a,
+    )
+    return False
+
+
 def _try_app_process_wallpaper(manager, device_id: str) -> bool:
     """通过 app_process + dex jar 直调 WallpaperManager hidden API 设壁纸。
 
@@ -218,42 +288,103 @@ def _try_root_method(manager, device_id: str) -> bool:
     return ok and 'ROOT_WP_OK' in out
 
 
-def _ensure_helper_installed(manager, device_id: str) -> bool:
-    """确保壁纸 Helper APK 已安装。未安装则自动安装+授权+禁用轮播。
+_HELPER_RUNTIME_PERMS = (
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.READ_MEDIA_IMAGES",
+)
 
-    走 src/utils/safe_apk_install.safe_install_apk（push + pm install），
-    绕开 MIUI 14+ 的 securitycenter/AdbInstallActivity 拦截。
-    主流程已优先走 _try_app_process_wallpaper（零安装），此函数仅作 fallback。
+
+def _grant_helper_perms(manager, device_id: str) -> bool:
+    """校验 Helper APK 运行时权限是否到位，未到位则补 grant。
+
+    历史 bug：旧 _ensure_helper_installed 只在「首次安装」分支跑 pm grant；
+    若首次 grant 因 MIUI 14 / Android 13 时机问题静默失败，后续永远不补。
+    现改为每次入口都查 dumpsys 校验，granted=false 才补 grant，幂等且代价小。
+    返回 True 表示当前两个权限都 granted=true（含已经 OK 与新 grant 成功）。
+    """
+    ok, out = manager._run_adb(
+        ['shell', 'dumpsys', 'package', _HELPER_PKG], device_id, timeout=10)
+    if not ok:
+        return False
+    text = out or ""
+    needs_grant = []
+    for perm in _HELPER_RUNTIME_PERMS:
+        # dumpsys 输出形如: "android.permission.X: granted=true"；
+        # 用 startswith 防止子串误匹配（READ_MEDIA_IMAGES_NEW 之类的扩展）
+        granted = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(perm + ":") and "granted=true" in stripped:
+                granted = True
+                break
+        if not granted:
+            needs_grant.append(perm)
+    if not needs_grant:
+        return True
+    log.info("[壁纸] Helper APK 权限缺失 %s: %s, 补 grant", device_id[:8], needs_grant)
+    for perm in needs_grant:
+        manager._run_adb(
+            ['shell', 'pm', 'grant', _HELPER_PKG, perm], device_id, timeout=10)
+    # 复查
+    ok2, out2 = manager._run_adb(
+        ['shell', 'dumpsys', 'package', _HELPER_PKG], device_id, timeout=10)
+    if not ok2:
+        return False
+    text2 = out2 or ""
+    for perm in _HELPER_RUNTIME_PERMS:
+        granted = any(
+            line.strip().startswith(perm + ":") and "granted=true" in line.strip()
+            for line in text2.splitlines()
+        )
+        if not granted:
+            log.warning("[壁纸] Helper APK 权限补 grant 后仍 false %s: %s",
+                        device_id[:8], perm)
+            return False
+    return True
+
+
+def _ensure_helper_installed(manager, device_id: str) -> bool:
+    """确保壁纸 Helper APK 已安装并具备运行时权限。
+
+    流程：
+      1) APK 没装 → safe_install_apk 安装（绕开 MIUI 14 securitycenter）
+      2) 不论是否新装，都跑 _grant_helper_perms 补齐 READ_EXTERNAL_STORAGE / READ_MEDIA_IMAGES
+      3) 关 MIUI 杂志锁屏 + 禁用 fashiongallery 轮播（幂等）
     """
     ok, out = manager._run_adb(
         ['shell', 'pm', 'list', 'packages', _HELPER_PKG], device_id)
-    if ok and _HELPER_PKG in out:
-        return True
+    already_installed = ok and _HELPER_PKG in out
 
-    if not os.path.exists(_HELPER_APK_LOCAL):
-        log.warning("[壁纸] Helper APK 不存在: %s", _HELPER_APK_LOCAL)
-        return False
-
-    from src.utils.safe_apk_install import safe_install_apk
-    adb = getattr(manager, 'adb_path', 'adb')
-    success, msg = safe_install_apk(
-        adb, device_id, _HELPER_APK_LOCAL, replace=True, test=True, timeout=30)
-    if not success:
-        log.warning("[壁纸] Helper APK 安装失败 %s: %s", device_id[:8], msg)
-        ok2, out2 = manager._run_adb(
-            ['shell', 'pm', 'list', 'packages', _HELPER_PKG], device_id)
-        if not (ok2 and _HELPER_PKG in out2):
+    if not already_installed:
+        if not os.path.exists(_HELPER_APK_LOCAL):
+            log.warning("[壁纸] Helper APK 不存在: %s", _HELPER_APK_LOCAL)
             return False
-    log.info("[壁纸] Helper APK 安装成功: %s", device_id[:8])
 
-    # 授权 + 禁用壁纸轮播
+        from src.utils.safe_apk_install import safe_install_apk
+        adb = getattr(manager, 'adb_path', 'adb')
+        success, msg = safe_install_apk(
+            adb, device_id, _HELPER_APK_LOCAL,
+            replace=True, test=True, timeout=30)
+        if not success:
+            log.warning("[壁纸] Helper APK 安装失败 %s: %s", device_id[:8], msg)
+            ok2, out2 = manager._run_adb(
+                ['shell', 'pm', 'list', 'packages', _HELPER_PKG], device_id)
+            if not (ok2 and _HELPER_PKG in out2):
+                return False
+        log.info("[壁纸] Helper APK 安装成功: %s", device_id[:8])
+
+    # 关 MIUI 杂志壁纸 + 禁用 fashiongallery（幂等，不论 APK 是否新装）
     manager._run_adb(['shell',
-        'pm grant com.openclaw.wallpaperhelper android.permission.READ_MEDIA_IMAGES 2>/dev/null;'
-        'pm grant com.openclaw.wallpaperhelper android.permission.READ_EXTERNAL_STORAGE 2>/dev/null;'
         'settings put secure lock_screen_magazine_status 0;'
         'settings put secure miui_wallpaper_content_type 0;'
         'pm disable-user --user 0 com.miui.android.fashiongallery 2>/dev/null'
     ], device_id)
+
+    # 每次都校验运行时权限，未到位补 grant（修复 06 号症结）
+    if not _grant_helper_perms(manager, device_id):
+        log.warning("[壁纸] Helper APK 权限未到位 %s, broadcast 将失败",
+                    device_id[:8])
+        return False
 
     return True
 
@@ -261,9 +392,12 @@ def _ensure_helper_installed(manager, device_id: str) -> bool:
 def _try_helper_apk_wallpaper(manager, device_id: str) -> bool:
     """通过 Helper APK 的 BroadcastReceiver 设壁纸（秒级，无UI交互）。
 
-    说明：默认 `am broadcast` 会等待 Receiver 跑完再返回。WallpaperManager.setBitmap
-    在部分 MIUI/Android 13 上可能阻塞数十秒，导致主机侧 ADB 超时（旧版仅用 10s 超时易失败）。
-    使用 `--async` 只派发广播、不等待完成，避免误报失败；极老系统无该参数时再回退同步并加长超时。
+    历史 bug：旧版用 `am broadcast --async` 只派发不等结果，主机侧把"派发成功"
+    误当部署成功，导致 Receiver 内部 BitmapFactory.decodeFile 因权限缺失返回 null
+    （result=3）也被记为"成功"，wallpaper_error 被错误清除。
+
+    现改为同步 broadcast：等 Receiver 的 onReceive 跑完，解析 result=0 才视为成功。
+    timeout=120s 应对部分 MIUI/Android 13 上 setBitmap 阻塞数十秒的情况。
     """
     if not _ensure_helper_installed(manager, device_id):
         return False
@@ -273,18 +407,20 @@ def _try_helper_apk_wallpaper(manager, device_id: str) -> bool:
         '--es', 'path', _REMOTE_PATH,
         '-n', f'{_HELPER_PKG}/.WallpaperReceiver',
     ]
-    ok, out = manager._run_adb(['shell', 'am', 'broadcast', '--async'] + base, device_id, timeout=30)
-    if ok:
-        log.info("[壁纸] Helper APK 异步派发 %s: %s", device_id[:8], (out or '')[:100])
-        return True
-    if out and ('Unknown option' in out or 'unknown option' in out.lower()):
-        ok2, out2 = manager._run_adb(['shell', 'am', 'broadcast'] + base, device_id, timeout=120)
-        if ok2 and 'result=0' in (out2 or ''):
-            log.info("[壁纸] Helper APK 同步成功 %s", device_id[:8])
-            return True
-        log.warning("[壁纸] Helper APK 同步失败 %s: %s", device_id[:8], out2)
+    ok, out = manager._run_adb(
+        ['shell', 'am', 'broadcast'] + base, device_id, timeout=120)
+    text = out or ""
+    if not ok:
+        log.warning("[壁纸] Helper APK broadcast 命令失败 %s: %s",
+                    device_id[:8], text[:200])
         return False
-    log.warning("[壁纸] Helper APK 异步派发失败 %s: %s", device_id[:8], out)
+    if 'result=0' in text:
+        log.info("[壁纸] Helper APK 同步成功 %s: result=0", device_id[:8])
+        return True
+    # result≠0：把 Receiver 返回的 data 透传到日志，便于诊断
+    # 例 result=3, data="Failed to decode: ..." → 权限/文件路径问题
+    log.warning("[壁纸] Helper APK Receiver 失败 %s: %s",
+                device_id[:8], text[:300])
     return False
 
 
@@ -512,24 +648,36 @@ def deploy_wallpaper(manager, device_id: str, number: int,
 
         _set_device_label(manager, device_id, number)
 
+        # 端到端校验基线：拿部署前的 wallpaper id (system, lock)
+        # 部署后 id 涨了才算真成功，杜绝各 fallback 路径的"假成功"
+        before = _get_wallpaper_id(manager, device_id)
+
         # Method 1: Root (最快, 秒级)
         if _try_root_method(manager, device_id):
-            log.info("[壁纸] 设备 %s root壁纸设置成功 (#%02d)",
-                     device_id[:8], number)
-            return True
+            if _verify_wallpaper_changed(manager, device_id, before):
+                log.info("[壁纸] 设备 %s root壁纸设置成功 (#%02d)",
+                         device_id[:8], number)
+                return True
+            log.info("[壁纸] root 命令 OK 但 wallpaper id 未涨 %s, 尝试 fallback",
+                     device_id[:8])
 
         # Method 2: Helper APK broadcast ★主路径（safe_install_apk 不弹手机管家）
         helper_ok = _try_helper_apk_wallpaper(manager, device_id)
         if helper_ok:
-            log.info("[壁纸] 设备 %s APK 壁纸设置成功 (#%02d)",
-                     device_id[:8], number)
-            return True
+            if _verify_wallpaper_changed(manager, device_id, before):
+                log.info("[壁纸] 设备 %s APK 壁纸设置成功 (#%02d)",
+                         device_id[:8], number)
+                return True
+            log.warning(
+                "[壁纸] APK result=0 但 wallpaper id 未涨 %s, 尝试 fallback",
+                device_id[:8])
 
-        # Method 4: MIUI Gallery 自动化（无需 APK，与旧版 bundle 行为一致）
+        # Method 3: MIUI Gallery 自动化（无需 APK，与旧版 bundle 行为一致）
         if _try_miui_auto_wallpaper(manager, device_id):
-            log.info("[壁纸] 设备 %s MIUI 自动壁纸设置成功 (#%02d)",
-                     device_id[:8], number)
-            return True
+            if _verify_wallpaper_changed(manager, device_id, before):
+                log.info("[壁纸] 设备 %s MIUI 自动壁纸设置成功 (#%02d)",
+                         device_id[:8], number)
+                return True
 
         # Method 4: 至少打开相册，便于手动点「设为壁纸」
         if _try_gallery_wallpaper(manager, device_id):
