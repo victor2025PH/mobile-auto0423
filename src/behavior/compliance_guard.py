@@ -298,6 +298,41 @@ class ComplianceGuard:
             "daily_used": daily,
         }
 
+    def get_next_slot_eta(self, platform: str, action: str,
+                          account: str = "") -> float:
+        """返回下一次能派任务的 ETA（秒）, 0 = 现在就能派.
+
+        sliding window 语义: hourly limit 满 = window 内已有 N 条 log,
+        最老的那条 ts 在 (ts + 3600) 时滑出 window, 那时即可再派一次.
+        如果 hourly + daily 都满, 取较大的 ETA (更晚 unblock).
+
+        2026-04-27 P4: dashboard 给用户显示 "X 分钟后可派下一个" 用,
+        以及 _execute_facebook catch QuotaExceeded 时做友好 message.
+        """
+        limits = self._get_action_limit(platform, action)
+        now = time.time()
+        eta = 0.0
+        with self._conn() as conn:
+            for window_sec, cap in (
+                (3600, limits.hourly),
+                (86400, limits.daily),
+            ):
+                if cap <= 0:
+                    continue
+                cnt = self._count(conn, platform, action, account, now - window_sec)
+                if cnt < cap:
+                    continue
+                # window 满, 找最老 log 的 ts
+                row = conn.execute(
+                    "SELECT MIN(ts) FROM action_log "
+                    "WHERE platform=? AND action=? AND account=? AND ts >= ?",
+                    (platform, action, account, now - window_sec),
+                ).fetchone()
+                if row and row[0]:
+                    window_eta = max(0.0, row[0] + window_sec - now)
+                    eta = max(eta, window_eta)
+        return eta
+
     def get_cooldown(self, platform: str, action: str, account: str = "") -> float:
         """Seconds until cooldown expires.  0 = ready now."""
         limits = self._get_action_limit(platform, action)

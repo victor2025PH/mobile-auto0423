@@ -1076,6 +1076,28 @@ def _execute_facebook(manager, resolved, task_type, params):
 
         return False, f"不支持的 Facebook 任务类型: {task_type}", None
 
+    except QuotaExceeded as qe:
+        # 2026-04-27 P4: quota 满是预期的限流保护, 不该走 exception 路径污染日志.
+        # 转友好中文 + 推算下次可派的 ETA, dashboard 直接显示 "X 分钟后可派下一个".
+        eta_sec = 0.0
+        try:
+            from src.behavior.compliance_guard import get_compliance_guard
+            eta_sec = get_compliance_guard().get_next_slot_eta(
+                qe.platform, qe.action, qe.account)
+        except Exception:
+            pass
+        eta_min = max(1, int((eta_sec + 30) // 60)) if eta_sec > 0 else 0
+        eta_hint = f", 约 {eta_min} 分钟后可派" if eta_min > 0 else ""
+        msg = (f"[quota] {qe.platform}/{qe.action} 已达 {qe.window} 上限 "
+               f"({qe.current}/{qe.limit}){eta_hint}.")
+        meta = {"quota": {"platform": qe.platform, "action": qe.action,
+                          "window": qe.window, "current": qe.current,
+                          "limit": qe.limit, "eta_seconds": int(eta_sec),
+                          "eta_minutes": eta_min}}
+        # info level 而非 exception (不告警, 不刷 traceback)
+        logger.info("[quota] %s/%s blocked: %s", qe.platform, qe.action, msg)
+        return False, msg, meta
+
     except Exception as e:
         logger.exception("Facebook 任务执行异常: %s", task_type)
         return False, f"{task_type} 异常: {e}", None
