@@ -96,6 +96,30 @@ def _stale_alias_key_count(device_ids: set[str], aliases: dict) -> int:
     return sum(1 for k in aliases if k not in device_ids)
 
 
+def _purge_orphan_wallpaper_errors(online_ids: set[str]) -> int:
+    """清掉离线设备上的 wallpaper_error 字段（保留 alias 条目本身）。
+
+    历史包袱：device_aliases.json 长期累积幽灵记录（例：旧 主控-06 的 192.168.0.160:5555
+    被新设备替换后仍带 wallpaper_error: deploy_failed），会污染 dashboard 红字。
+    设备在线时若真有问题，下次部署会重新标 error；离线时保留 error 没有诊断价值。
+
+    返回清掉的字段数。被 health-summary 每次调用，幂等且 lazy（无 orphan 时不写盘）。
+    """
+    aliases = _load_aliases()
+    cleared = 0
+    for did, info in aliases.items():
+        if did in online_ids:
+            continue
+        if isinstance(info, dict) and "wallpaper_error" in info:
+            del info["wallpaper_error"]
+            cleared += 1
+    if cleared:
+        _save_aliases(aliases)
+        logger.info(
+            "[wp] 清理 %d 条离线设备的过期 wallpaper_error 字段", cleared)
+    return cleared
+
+
 def _iter_stale_offline_devices(manager, max_age_seconds: float):
     """离线超过 max_age_seconds 的设备（与 POST /devices/cleanup 判定一致）。"""
     import time as _time
@@ -484,6 +508,14 @@ def get_device_health_summary():
     manager = get_device_manager(_config_path)
     manager.discover_devices()
     all_devices = manager.get_all_devices()
+
+    # 自愈：清掉离线设备上残留的 wallpaper_error，避免幽灵 alias 污染红字
+    online_ids = {
+        d.device_id for d in all_devices
+        if d.status in (DeviceStatus.CONNECTED, DeviceStatus.BUSY)
+    }
+    _purge_orphan_wallpaper_errors(online_ids)
+
     aliases = _load_aliases()
 
     online = 0       # 在线且编号正常且壁纸最新
