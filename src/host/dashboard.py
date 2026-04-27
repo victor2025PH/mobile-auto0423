@@ -725,6 +725,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <span id="task-count-info" class="oc-task-toolbar__count"></span>
           <button type="button" id="task-count-help-btn" class="oc-task-count-help" title="" aria-label="条数说明" onclick="var i=document.getElementById('task-count-info');if(i&&i.title&&typeof showToast==='function')showToast(i.title,'info',9000,'task-count-hint')">?</button>
         </span>
+        <div class="task-health-chips" id="task-health-chips" aria-label="任务中心健康状态">
+          <span class="task-health-chip gray" id="chip-vpn" title="加载中..."><span class="dot"></span>VPN —</span>
+          <span class="task-health-chip gray" id="chip-success" title="加载中..."><span class="dot"></span>今日 —</span>
+        </div>
       </div>
       <div class="oc-task-toolbar__row2">
         <p class="oc-task-toolbar__hint">批量操作：勾选列表后使用「移入所选」；<strong>失败</strong>下「清空失败」由服务端一次性批量移入回收站（本机 SQL + 通知各 Worker）。</p>

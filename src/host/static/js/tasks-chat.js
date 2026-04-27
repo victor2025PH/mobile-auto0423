@@ -214,6 +214,50 @@ async function eraseSelectedTasksBulk(){
   }catch(e){showToast('删除失败: '+e.message,'error');}
 }
 
+/** Phase 2 P0 — 失败原因归因: 把 raw error 文本映射到 emoji+一句话+严重度,
+ *  让用户一眼分清"基础设施挂 / 限速 / 业务" 三类失败. 顺序: 最具体 → 最一般. */
+function _attributeError(text){
+  if(!text) return null;
+  const t=String(text);
+  if(/quota exceeded/i.test(t))                              return {emoji:'⏰',hint:'配额到 (等下个 window)',tone:'amber',full:t};
+  if(/无法访问外网|\[gate\]\s*预检未通过.*network/i.test(t))    return {emoji:'🔌',hint:'VPN 不通 (修网络再派)',tone:'red',full:t};
+  if(/加入群组失败|join_group.*fail|无法找到.*Join/i.test(t)) return {emoji:'❌',hint:'Vision 找不到 Join 按钮 (重试可能修复)',tone:'red',full:t};
+  if(/SLA.*timeout|SLA.*abort|30min.*无业务/i.test(t))       return {emoji:'⏱️',hint:'SLA 超时 (30min 无业务事件)',tone:'amber',full:t};
+  if(/circuit.*open|熔断/i.test(t))                          return {emoji:'🚧',hint:'熔断保护 (设备/路由器异常)',tone:'amber',full:t};
+  if(/timeout|超时/i.test(t))                                return {emoji:'⏳',hint:'超时',tone:'amber',full:t};
+  return {emoji:'⚠️',hint:t.length>60?t.substring(0,60)+'…':t,tone:'red',full:t};
+}
+
+/** Phase 2 P0 — 任务中心顶部健康 chip (VPN + 今日成功率).
+ *  loadTasks() 后调用, 让用户一眼看到"系统能不能干活". */
+async function _refreshTaskHealthChips(){
+  const setChip=(id,tone,html,title)=>{
+    const el=document.getElementById(id); if(!el) return;
+    el.className=`task-health-chip ${tone}`;
+    el.innerHTML=`<span class="dot"></span>${html}`;
+    el.title=title;
+  };
+  try{
+    const [vpn,funnel]=await Promise.all([
+      fetch('/proxy/health/summary').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/tasks/today-funnel').then(r=>r.ok?r.json():null).catch(()=>null),
+    ]);
+    if(vpn){
+      const ok=vpn.ok||0,total=vpn.total||0,cb=vpn.circuit_breakers_open||0;
+      const tone=total===0?'gray':(ok===total?'green':(ok===0?'red':'amber'));
+      setChip('chip-vpn',tone,`VPN ${ok}/${total}`,
+        `${ok} ok · ${vpn.no_ip||0} no_ip · ${vpn.leak||0} leak · ${vpn.unverified||0} unverified · ${cb} 熔断`);
+    }
+    if(funnel){
+      const f=funnel.created||0,ok=funnel.completed||0,fail=funnel.failed||0;
+      const rate=f>0?Math.round(ok/f*100):0;
+      const tone=f===0?'gray':(rate>=80?'green':rate>=40?'amber':'red');
+      setChip('chip-success',tone,`今日 ${ok}/${f} (${rate}%)`,
+        `今日派 ${f} · 成 ${ok} · 败 ${fail} · 待 ${funnel.pending||0} · 跑 ${funnel.running||0}`);
+    }
+  }catch(e){console.warn('[health-chips] refresh failed',e);}
+}
+
 function _getTaskOutcome(t){
   if(!t.result||t.status==='pending'||t.status==='cancelled')return '';
   const r=t.result;
@@ -228,8 +272,11 @@ function _getTaskOutcome(t){
   if(newMsg!=null) parts.push(newMsg>0?`<span class="task-outcome hot">🔔${newMsg}新消息</span>`:`<span class="task-outcome dim">0新消息</span>`);
   // 升级/引流
   if(r.escalated!=null&&r.escalated>0) parts.push(`<span class="task-outcome escalate">⚡${r.escalated}升级</span>`);
-  // 错误摘要
-  if(t.status==='failed'&&r.error) parts.push(`<span class="task-outcome err" title="${r.error.substring(0,120)}">${r.error.substring(0,30)}…</span>`);
+  // 错误摘要 — P0 改用归因引擎: emoji + 一句话 + 严重度色
+  if(t.status==='failed'&&r.error){
+    const a=_attributeError(r.error);
+    parts.push(`<span class="task-outcome err" title="${(a.full||r.error).substring(0,200)}">${a.emoji} ${a.hint}</span>`);
+  }
   return parts.join('');
 }
 
@@ -239,9 +286,13 @@ function _taskRowInner(t,isTrashList){
   const alias=t.device_label||ALIAS[t.device_id]||t.device_id?.substring(0,8)||'全部';
   const originTag=t.task_origin_label_zh?`<span style="font-size:9px;color:var(--text-muted);margin-left:4px">· ${t.task_origin_label_zh}</span>`:'';
   const tname=t.type_label_zh||TASK_NAMES[t.type]||t.type?.replace('tiktok_','').replace('telegram_','')||'未知';
+  // P0 — 任务名加 group_name + persona, 不再混淆 8 行同名"FB 加入群组"
+  const _p=t.params||{};
+  const tnameMeta=(_p.group_name||_p.persona_key||_p.target_country)?
+    `<span style="font-size:10px;color:var(--text-muted);margin-left:4px;font-weight:normal">${_p.group_name?'『'+_p.group_name+'』':''}${_p.persona_key?' · '+_p.persona_key:(_p.target_country?' · '+_p.target_country:'')}</span>`:'';
   const trashMeta=isTrashList&&t.deleted_at?`<span style="font-size:9px;color:var(--text-muted);margin-left:6px">删于 ${new Date(t.deleted_at).toLocaleString('zh-CN')}</span>`:'';
   const tm=t.updated_at?new Date(t.updated_at).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit',second:'2-digit'}):'—';
-  const err=(t.status==='failed'&&t.result?.error)?t.result.error.substring(0,60):'';
+  const errAttr=(t.status==='failed'&&t.result?.error)?_attributeError(t.result.error):null;
   const stLabel={running:'运行中',completed:'已完成',failed:'失败',pending:'等待中',cancelled:'已取消'}[t.status]||t.status;
   let progressHtml='';
   if(t.status==='running'&&t.result?.progress!=null){
@@ -250,7 +301,9 @@ function _taskRowInner(t,isTrashList){
     progressHtml=`<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div><div class="progress-text">${pct}% ${stepDesc?'· '+stepDesc:''}</div>`;
   }
   const outcomeHtml=_getTaskOutcome(t);
-  const errHtml=(t.status==='failed'&&err&&!outcomeHtml)?`<div style="color:#f87171;font-size:11px;margin-top:2px">${err}</div>`:'';
+  // P0 — errHtml 也走归因引擎: emoji + 一句话, 跟 outcomeHtml 同款
+  const errHtml=(t.status==='failed'&&errAttr&&!outcomeHtml)?
+    `<div style="color:#f87171;font-size:11px;margin-top:2px" title="${errAttr.full.substring(0,200)}">${errAttr.emoji} ${errAttr.hint}</div>`:'';
   const stuckHtml=(t.status==='pending'&&t.stuck_reason_zh)?`<div style="color:#f59e0b;font-size:11px;margin-top:2px" title="点击「详情」查看完整原因">⏸ ${t.stuck_reason_zh}</div>`:'';
   const wh=t.worker_host||t._worker||'';
   const workerHint=wh?`<span style="font-size:9px;color:var(--accent)" title="Worker IP">@${wh}</span>`:'';
@@ -269,7 +322,7 @@ function _taskRowInner(t,isTrashList){
       ?`<input type="checkbox" aria-label="选择任务" style="accent-color:var(--accent);cursor:pointer" onclick="event.stopPropagation()" onchange="taskBulkToggle('${tid}',this.checked)" ${_taskBulkSelected.has(tid)?'checked':''} />`
       :'<span style="display:inline-block;width:14px" title="运行中/等待中不可删"></span>';
   }
-  return `<tr style="cursor:pointer" onclick="showTaskDetail('${tid}')"><td style="text-align:center;width:40px;vertical-align:middle" onclick="event.stopPropagation()">${selCell}</td><td><b>${tname}</b>${trashMeta}${originTag}${outcomeHtml?'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+outcomeHtml+'</div>':''}${progressHtml}${errHtml}${stuckHtml}</td><td>${alias} ${workerHint}${t.device_id&&!t.device_label?' '+_workerBadgeById(t.device_id):''}</td><td><span class="badge ${bcls}">${stLabel}</span></td><td style="color:var(--text-muted)">${tm}</td><td>${actions}</td></tr>`;
+  return `<tr style="cursor:pointer" onclick="showTaskDetail('${tid}')"><td style="text-align:center;width:40px;vertical-align:middle" onclick="event.stopPropagation()">${selCell}</td><td><b>${tname}</b>${tnameMeta}${trashMeta}${originTag}${outcomeHtml?'<div style="margin-top:3px;display:flex;gap:4px;flex-wrap:wrap">'+outcomeHtml+'</div>':''}${progressHtml}${errHtml}${stuckHtml}</td><td>${alias} ${workerHint}${t.device_id&&!t.device_label?' '+_workerBadgeById(t.device_id):''}</td><td><span class="badge ${bcls}">${stLabel}</span></td><td style="color:var(--text-muted)">${tm}</td><td>${actions}</td></tr>`;
 }
 
 function taskRow(t){
@@ -391,6 +444,7 @@ async function loadTasks(){
       else if(!trash&&!_taskRecordDeletable(t.status)) _taskBulkSelected.delete(id);
     });
     renderTasks();
+    _refreshTaskHealthChips();   // P0 — VPN/今日成功率 chip, 跟列表同步刷新
     _updateOpsStatusBar();
     const ovBody=document.getElementById('ov-tasks-body');
     if(ovBody){
