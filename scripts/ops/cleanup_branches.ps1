@@ -37,6 +37,7 @@ if (-not $hasOriginMain) {
 # List local branches matching pattern (excludes current branch via filter)
 $current = (& git branch --show-current 2>$null).Trim()
 $allBranches = & git for-each-ref --format='%(refname:short)' "refs/heads/$Pattern" 2>$null
+$mainHead = (& git rev-parse origin/main 2>$null).Trim()
 
 $obsolete = @()
 $keep = @()
@@ -52,6 +53,7 @@ foreach ($br in $allBranches) {
     $squashCnt = @($cherryOut | Where-Object { $_ -match '^\-\s+' }).Count
     $totalCnt = $freshCnt + $squashCnt
     $sha = (& git rev-parse --short $br 2>$null).Trim()
+    $brHead = (& git rev-parse $br 2>$null).Trim()
 
     $info = @{
         branch = $br
@@ -60,7 +62,13 @@ foreach ($br in $allBranches) {
         fresh = $freshCnt
         squashed = $squashCnt
     }
-    if ($totalCnt -gt 0 -and $freshCnt -eq 0) {
+    # Obsolete iff branch has zero commits "ahead of" origin/main, i.e. branch
+    # is fully consumed by main (squash-merged OR identical-to-ancestor).
+    # Protect a freshly-checked-out branch sitting *exactly* on origin/main HEAD
+    # (likely active-but-empty, deleting would just lose the ref name); abandoned
+    # branches at older main ancestors are real leftovers and get cleaned.
+    $isObsolete = ($freshCnt -eq 0) -and ($brHead -ne $mainHead)
+    if ($isObsolete) {
         $obsolete += $info
     } else {
         $keep += $info
