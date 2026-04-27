@@ -293,6 +293,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="status-pill"><span class="status-dot ok" id="h-dot"></span><span id="h-status">连接中...</span></div>
       <div id="node-role-badge" style="display:none;margin-left:6px;font-size:10px;padding:2px 8px;border-radius:4px;font-weight:500"></div>
       <div id="gate-policy-pill" style="display:none;margin-left:6px;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:500;cursor:pointer;border:1px solid var(--border);white-space:nowrap" onclick="_showGatePolicyDetail()" title="任务门禁策略实时状态（点击查看详情并可热加载）"></div>
+      <span id="branch-chip" style="display:none;margin-left:6px;font-size:10px;padding:2px 8px;border-radius:10px;font-weight:500;border:1px solid transparent;white-space:nowrap;cursor:help" title="service 当前 git 分支"></span>
       <span class="kbd" style="margin-left:8px" title="搜索导航">Ctrl+K</span>
     </div>
     <div class="topbar-right">
@@ -309,6 +310,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <span id="clock" style="font-size:11px;font-family:monospace;min-width:60px"></span>
     </div>
   </header>
+  <script>
+  // P3 L3 sibling 协同护栏 — 顶栏 git branch chip
+  (function _initBranchChip(){
+    fetch('/system/git-branch', {cache: 'no-store'})
+      .then(r => r.json())
+      .then(d => {
+        var el = document.getElementById('branch-chip');
+        if (!el || !d || !d.branch) return;
+        var isMain = !!d.is_main;
+        var ahead = parseInt(d.ahead_of_main || 0, 10);
+        var label = d.branch;
+        if (!isMain && ahead > 0) label += ' (+' + ahead + ')';
+        el.textContent = label;
+        el.style.display = 'inline-block';
+        el.style.background = isMain ? '#10b981' : '#f59e0b';
+        el.style.color = '#fff';
+        el.title = 'Git branch: ' + d.branch + (ahead > 0 ? ' — ' + ahead + ' commits ahead of main' : '');
+      })
+      .catch(function(){});
+  })();
+  </script>
   <!-- 告警通知面板 -->
   <div id="alert-panel" style="display:none;position:absolute;top:50px;right:20px;width:360px;max-height:480px;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 40px rgba(0,0,0,.5);z-index:300;overflow:hidden">
     <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
