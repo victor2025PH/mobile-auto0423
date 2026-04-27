@@ -48,16 +48,20 @@ class TestRecordContactEventSanitize:
         assert get_peer_name_reject_count() == 3
 
     def test_skip_sanitize_explicit_bypass(self, tmp_db):
-        """skip_sanitize=True 显式 bypass (合法 e2e seed 用)."""
+        """skip_sanitize=True 显式 bypass (合法 e2e seed 用).
+
+        2026-04-27 P5: 反例改用 "p0" (规则 7: ASCII 短串含数字) — 删 ASCII 启发后
+        "Alice" 是合法英文名, 不再被拒.
+        """
         from src.host.fb_store import (record_contact_event,
                                           count_contact_events,
                                           reset_peer_name_reject_count)
         reset_peer_name_reject_count()
-        rid = record_contact_event("D1", "Alice", "greeting_sent",
+        rid = record_contact_event("D1", "p0", "greeting_sent",
                                      skip_sanitize=True)
         assert rid > 0
-        # 但默认会被拦
-        rid2 = record_contact_event("D1", "Alice", "greeting_replied")
+        # 但默认会被拦 (规则 7: ASCII 短串 ≤4 含数字 = 测试残留)
+        rid2 = record_contact_event("D1", "p0", "greeting_replied")
         assert rid2 == 0
 
 
