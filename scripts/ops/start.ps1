@@ -75,8 +75,44 @@ try {
                 Write-Host "       Consider: git checkout -b feat-ops-`$(Get-Date -Format 'yyyy-MM-dd')" -ForegroundColor DarkYellow
                 Write-Host ""
             }
+            # P3 L2: sibling 协同护栏 — 检测未合并的 feat-* 分支
+            try {
+                $unmergedFeats = & git for-each-ref --format='%(refname:short)' 'refs/heads/feat-*' 2>$null | ForEach-Object {
+                    $b = $_.Trim()
+                    if ($b) {
+                        $ah = (& git rev-list --count "main..$b" 2>$null)
+                        if ([int]$ah -gt 0) {
+                            [PSCustomObject]@{ Branch = $b; Ahead = [int]$ah }
+                        }
+                    }
+                }
+                if ($unmergedFeats) {
+                    $count = @($unmergedFeats).Count
+                    Write-Host ""
+                    Write-Host "[WARN] Starting on 'main' but unmerged feature branch(es) exist:" -ForegroundColor Yellow
+                    @($unmergedFeats) | Select-Object -First 5 | ForEach-Object {
+                        Write-Host ("   - {0}  ({1} commits ahead of main)" -f $_.Branch, $_.Ahead) -ForegroundColor DarkYellow
+                    }
+                    if ($count -gt 5) {
+                        Write-Host ("   ... and {0} more" -f ($count - 5)) -ForegroundColor DarkYellow
+                    }
+                    Write-Host "       sibling Claude / coworker may lose visibility of those work." -ForegroundColor DarkYellow
+                    Write-Host "       Consider 'git checkout <feature-branch>' before restart, or merge first." -ForegroundColor DarkYellow
+                    Write-Host ""
+                }
+            } catch { }
         } else {
-            Write-Host "[INFO] on branch: $branch" -ForegroundColor DarkGray
+            # P3 L1: 突出显示当前分支 + ahead-of-main 信息
+            try {
+                $aheadOfMain = (& git rev-list --count "main..HEAD" 2>$null)
+                $aheadInt = [int]$aheadOfMain
+                $aheadInfo = if ($aheadInt -gt 0) { "  ($aheadInt commits ahead of main)" } else { "" }
+                Write-Host ""
+                Write-Host "[BRANCH] Service running on: $branch$aheadInfo" -ForegroundColor Cyan
+                Write-Host ""
+            } catch {
+                Write-Host "[BRANCH] $branch" -ForegroundColor Cyan
+            }
         }
     }
     # Notice for dirty config files (will be loaded as-is)
