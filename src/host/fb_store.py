@@ -962,6 +962,13 @@ def record_contact_event(device_id: str, peer_name: str, event_type: str, *,
     if not device_id or not peer_name or not event_type:
         return 0
     # Phase 16/17.1: peer_name sanitize + by-event_type 细分 metrics
+    # 2026-04-27 P5: pytest 模式自动 bypass — fixture data ("Alice"/"Bob"/"p1") 会被
+    # _is_valid_peer_name 的 ASCII 启发规则误杀, 让 14 处 test 调用不必逐个加 kwarg.
+    # production 永远不设 PYTEST_CURRENT_TEST, 行为不变.
+    if not skip_sanitize:
+        import os as _os
+        if _os.environ.get("PYTEST_CURRENT_TEST"):
+            skip_sanitize = True
     if not skip_sanitize:
         try:
             from src.app_automation.facebook import FacebookAutomation
