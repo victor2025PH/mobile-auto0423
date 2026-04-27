@@ -897,6 +897,115 @@ class FacebookAutomation(BaseAutomation):
         except Exception as e:
             log.debug("[start_main] post_dismiss 阶段异常: %s", e)
 
+    def _ensure_fb_home_ready_strict(self, d, did: str,
+                                     max_wait_s: int = 20) -> bool:
+        """严格的 FB Home ready 检查 — 阻断 Messenger 抢前台 race + 等 home 真稳定.
+
+        2026-04-27 新增 (圈层拓客 v2 真机重试根因发现):
+        某些设备/账号下 (实测 IJ8HZLOR) FB 启动后会自动拉起 Messenger
+        (com.facebook.orca), 导致 _ensure_foreground 看到 cur=katana 立即
+        返回 True 但下一秒就被 orca 抢前台. join_group 在不稳定状态跑 →
+        helper 内部自检反复触发 → 走到 fallback smart_tap → 落入 Vision
+        错坐标陷阱 → 退到 launcher 死循环.
+
+        本方法做强检:
+          1. force-stop com.facebook.orca (压制 messenger 反复拉起)
+          2. force-stop com.facebook.katana 再 start (彻底复位 FB 状态)
+          3. 循环 N 秒确认 cur=katana 持续稳定 + home marker 真出现
+          4. 期间一旦 cur=orca → 立即 force-stop orca + 重启 katana
+          5. 超时直接 return False (不再上抛 raise, 让业务层 surgical 处理)
+
+        给 join_group 等"对启动状态敏感"的任务做入口护栏.
+        """
+        from .fb_search_markers import hierarchy_looks_like_fb_home
+
+        # 2026-04-27 IJ8HZLOR 真机暴露: FB A/B 新版日语 home placeholder
+        # "その気持ち、シェアしよう" 不在 fb_search_markers 旧 marker 列表里,
+        # hierarchy_looks_like_fb_home 永远 False → 入口护栏死等超时.
+        # 在公共 marker 库改动 scope 大, 先在本 helper 内嵌 fallback marker
+        # (跨语言稳定子串), 待后续 PR 把 marker 库统一扩.
+        _EXTRA_FB_HOME_MARKERS = (
+            "その気持ち、シェアしよう",  # JP A/B
+            "id/feed_story_root",     # FB feed item resource-id (跨语言)
+            "id/news_feed",            # FB Home feed root
+        )
+
+        def _looks_like_home(xml: str) -> bool:
+            if hierarchy_looks_like_fb_home(xml):
+                return True
+            return any(m in xml for m in _EXTRA_FB_HOME_MARKERS)
+
+        def _cur_pkg() -> str:
+            try:
+                return (d.app_current() or {}).get("package", "") or ""
+            except Exception:
+                return ""
+
+        def _force_stop(pkg: str) -> None:
+            try:
+                d.app_stop(pkg)
+            except Exception:
+                try:
+                    self._adb(f"shell am force-stop {pkg}", device_id=did)
+                except Exception:
+                    pass
+
+        log.info("[fb_home_strict] 入口护栏: force-stop orca/katana + 重启 FB")
+        _force_stop("com.facebook.orca")
+        _force_stop("com.facebook.katana")
+        time.sleep(1.5)
+        try:
+            d.app_start("com.facebook.katana")
+        except Exception as e:
+            log.warning("[fb_home_strict] app_start 异常: %s", e)
+
+        # 稳定窗口: 连续 STABLE_TICKS 次 cur=katana + home marker 才认为 ready
+        STABLE_TICKS = 3
+        TICK_INTERVAL = 1.0
+        MAX_ORCA_KILLS = 5  # orca 反复抢前台超过此值 → 放弃 (account 级问题, hotfix 兜不住)
+        stable = 0
+        deadline = time.time() + max_wait_s
+        orca_kills = 0
+        while time.time() < deadline:
+            time.sleep(TICK_INTERVAL)
+            cur = _cur_pkg()
+            if cur == "com.facebook.orca":
+                orca_kills += 1
+                if orca_kills > MAX_ORCA_KILLS:
+                    log.error("[fb_home_strict] orca 抢前台 %d 次仍未稳定 — "
+                              "account 级 deeplink 问题, 放弃 (建议: 设备 disable orca 自启)",
+                              orca_kills)
+                    return False
+                log.warning("[fb_home_strict] orca 抢前台 (第 %d/%d 次), force-stop + 重启 katana",
+                            orca_kills, MAX_ORCA_KILLS)
+                _force_stop("com.facebook.orca")
+                time.sleep(0.6)
+                try:
+                    d.app_start("com.facebook.katana")
+                except Exception:
+                    pass
+                stable = 0
+                continue
+            if cur != "com.facebook.katana":
+                stable = 0
+                continue
+            # cur=katana, 看 home marker 是否出现
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if _looks_like_home(xml):
+                stable += 1
+                if stable >= STABLE_TICKS:
+                    log.info("[fb_home_strict] FB home ready (orca_kills=%d, stable_ticks=%d)",
+                             orca_kills, stable)
+                    return True
+            else:
+                stable = 0
+        log.warning("[fb_home_strict] 超时 %ds 仍未稳定 (orca_kills=%d), 放弃",
+                    max_wait_s, orca_kills)
+        return False
+
     def _ensure_foreground(self, d, did: str, max_wait_s: int = 10) -> bool:
         """确保 Facebook 在前台,并自动处理 MIUI 双开对话框。
 
@@ -4194,25 +4303,73 @@ class FacebookAutomation(BaseAutomation):
     @_with_fb_foreground
     def join_group(self, group_name: str,
                    device_id: Optional[str] = None) -> bool:
-        """Search and join a group."""
+        """Search and join a group.
+
+        2026-04-27 改造 (PR #120 修复延伸至 join_group): 4 个裸 smart_tap →
+        硬编码 helper + 自检, 跟 enter_group 同款. 修真机重试 IJ8HZLOR
+        点 (360,1553) 误退到 launcher 的 Vision 持续返回错坐标问题.
+        步骤跟 enter_group 1-5 完全一致, 第 6 步加 "Join Group button" 点击.
+        """
         did = self._did(device_id)
         d = self._u2(did)
 
         with self.guarded("join_group", device_id=did):
-            self.smart_tap("Search bar or search icon", device_id=did)
-            time.sleep(0.5)
+            # Step 0: 严格 home ready 入口护栏 (圈层拓客 v2 真机重试根因 fix)
+            # IJ8HZLOR 实测: FB 启动会自动拉起 Messenger, _ensure_foreground
+            # 看到瞬态 cur=katana 就放行, 业务方法在 race 状态跑 → fail.
+            # 强检 home 真稳定 + 抑制 orca 反复抢前台.
+            _set_step("FB Home 稳定护栏", "")
+            if not self._ensure_fb_home_ready_strict(d, did):
+                log.warning("[join_group] FB home 入口护栏失败 — "
+                             "可能 orca 反复抢前台 / FB 启动异常, 放弃")
+                return False
+
+            # Step 1: 进搜索页
+            _set_step("搜索群组", group_name)
+            if not self._tap_search_bar_preferred(d, did):
+                log.info("[join_group] _tap_search_bar_preferred miss, 降级")
+                if not self.smart_tap("Search bar or search icon", device_id=did):
+                    self._fallback_search_tap(d)
+            time.sleep(0.6)
+
+            # Step 2: 输入群名 + 提交
             self.hb.type_text(d, group_name)
+            time.sleep(1.0)
             d.press("enter")
-            time.sleep(2)
+            time.sleep(1.5)
 
-            self.smart_tap("Groups tab or filter", device_id=did)
-            time.sleep(1)
+            # Step 3: 切到 Groups filter
+            _set_step("筛选 Groups 结果", group_name)
+            if not self._tap_search_results_groups_filter(d, did):
+                log.info("[join_group] hardcoded Groups filter miss, 降级 smart_tap")
+                self.smart_tap("Groups tab or filter", device_id=did)
+            time.sleep(1.0)
 
-            if self.smart_tap("First matching group", device_id=did):
-                time.sleep(2)
-                return self.smart_tap("Join Group button", device_id=did)
+            # Step 4: 点对应群 (精确匹配 group_name)
+            _set_step("点击群组进入", group_name)
+            if not self._tap_first_search_result_group(d, did, group_name):
+                log.info("[join_group] hardcoded first result miss, 降级 smart_tap")
+                if not self.smart_tap("First matching group", device_id=did):
+                    log.warning("[join_group] 全路径找不到 group=%r", group_name)
+                    return False
+            time.sleep(random.uniform(2.0, 3.5))
 
-        return False
+            # Step 5: 自检确实进了对的群 (防误入推荐群 / Messenger / profile)
+            if not self._assert_on_specific_group_page(d, group_name):
+                log.warning("[join_group] 自检失败: 当前页未包含 group_name=%r "
+                             "(可能误入推荐群/Messenger/profile)", group_name)
+                return False
+
+            # Step 6: 点 Join Group 按钮 (multi-lang 优先, smart_tap fallback)
+            _set_step("点加入群组按钮", group_name)
+            if self._tap_join_group_button(d, did):
+                log.info("[join_group] 加入群组成功: %r", group_name)
+                return True
+            if self.smart_tap("Join Group button", device_id=did):
+                log.info("[join_group] 加入群组成功 (smart_tap fallback): %r", group_name)
+                return True
+            log.warning("[join_group] Join Group button 全路径 miss (可能已加入 / 仅可申请)")
+            return False
 
     # ── Group Operations (Sprint 1 新增 — Facebook 引流核心入口) ──────────
 
@@ -4606,6 +4763,46 @@ class FacebookAutomation(BaseAutomation):
                 return True
         except Exception:
             pass
+        return False
+
+    # "Join Group" 按钮多语言候选 (圈层拓客主 target = 日本, 兼容英中西葡韩法)
+    _FB_JOIN_GROUP_BUTTON_TEXTS = (
+        # 英文
+        "Join Group", "Join group", "Join",
+        # 日语
+        "グループに参加", "グループを参加", "参加する", "参加",
+        # 中文 (简体 / 繁体)
+        "加入群组", "加入小组", "加入社團", "加入",
+        # 其他 LATAM / 欧 (圈层拓客后续扩展)
+        "Unirse al grupo", "Unirse",
+        "Entrar no grupo", "Entrar",
+        "그룹 가입", "가입",
+        "Rejoindre le groupe", "Rejoindre",
+    )
+
+    def _tap_join_group_button(self, d, did: str) -> bool:
+        """硬编码点"Join Group"加入按钮 (多语言, 避 AutoSelector Vision 误学).
+
+        FB 群组主页 "Join" 按钮通常在右上 / header 区域, clickable=True.
+        text= 与 description= 双路 query, 按 _FB_JOIN_GROUP_BUTTON_TEXTS 顺序.
+        clickable=True 过滤掉评论 / post 文本里同名词.
+        """
+        for txt in self._FB_JOIN_GROUP_BUTTON_TEXTS:
+            try:
+                el = d(text=txt, clickable=True)
+                if el.exists(timeout=0.5):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.5)
+                    log.info("[join_group] tap Join button by text=%r", txt)
+                    return True
+                el = d(description=txt, clickable=True)
+                if el.exists(timeout=0.3):
+                    self.hb.tap(d, *self._el_center(el))
+                    time.sleep(0.5)
+                    log.info("[join_group] tap Join button by desc=%r", txt)
+                    return True
+            except Exception:
+                continue
         return False
 
     def _assert_on_specific_group_page(self, d, group_name: str) -> bool:
