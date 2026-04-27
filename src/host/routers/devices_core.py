@@ -96,22 +96,31 @@ def _stale_alias_key_count(device_ids: set[str], aliases: dict) -> int:
     return sum(1 for k in aliases if k not in device_ids)
 
 
+_WP_ERR_FIELDS = ("wallpaper_error", "wallpaper_error_detail", "wallpaper_error_at")
+
+
 def _purge_orphan_wallpaper_errors(online_ids: set[str]) -> int:
-    """清掉离线设备上的 wallpaper_error 字段（保留 alias 条目本身）。
+    """清掉离线设备上的 wallpaper_error 三件套字段（保留 alias 条目本身）。
 
     历史包袱：device_aliases.json 长期累积幽灵记录（例：旧 主控-06 的 192.168.0.160:5555
     被新设备替换后仍带 wallpaper_error: deploy_failed），会污染 dashboard 红字。
     设备在线时若真有问题，下次部署会重新标 error；离线时保留 error 没有诊断价值。
 
-    返回清掉的字段数。被 health-summary 每次调用，幂等且 lazy（无 orphan 时不写盘）。
+    返回清掉的字段数（每个设备最多算 1）。被 health-summary 每次调用，幂等 + lazy。
     """
     aliases = _load_aliases()
     cleared = 0
     for did, info in aliases.items():
         if did in online_ids:
             continue
-        if isinstance(info, dict) and "wallpaper_error" in info:
-            del info["wallpaper_error"]
+        if not isinstance(info, dict):
+            continue
+        had = False
+        for f in _WP_ERR_FIELDS:
+            if f in info:
+                del info[f]
+                had = True
+        if had:
             cleared += 1
     if cleared:
         _save_aliases(aliases)
@@ -213,23 +222,43 @@ def _update_wallpaper_status(did: str, num: int):
         logger.debug("[wp-status] failed to update wallpaper_number for %s: %s", did[:8], e)
 
 
-def _mark_wallpaper_error(did: str, reason: str):
-    """记录壁纸部署失败原因到 aliases，供前端健康巡检展示。"""
+def _mark_wallpaper_error(did: str, kind: str, detail: str = ""):
+    """记录壁纸部署失败到 aliases (3 字段套件) 供前端 chip / 日志展示。
+
+    - wallpaper_error: 短代码 (perm_denied/decode_failed/file_not_found/...);
+      前端按它分类样式 (红色 vs 橙色), 后端按它做 metric 聚合.
+    - wallpaper_error_detail: 人类可读详细信息 (Receiver result data 透传或自定义说明);
+      dashboard chip hover tooltip 显示.
+    - wallpaper_error_at: ISO 时间戳, 让 UI 显示 "5min ago" 之类.
+    """
     try:
+        import datetime as _dt
         aliases = _load_aliases()
         if did in aliases:
-            aliases[did]["wallpaper_error"] = reason
+            aliases[did]["wallpaper_error"] = kind or "deploy_failed"
+            if detail:
+                aliases[did]["wallpaper_error_detail"] = detail[:300]
+            else:
+                aliases[did].pop("wallpaper_error_detail", None)
+            aliases[did]["wallpaper_error_at"] = _dt.datetime.now().isoformat(
+                timespec="seconds")
             _save_aliases(aliases)
     except Exception:
         pass
 
+
 def _clear_wallpaper_error(did: str):
-    """壁纸部署成功后清除错误标记。"""
+    """壁纸部署成功后清除 3 字段错误标记。"""
     try:
         aliases = _load_aliases()
-        if did in aliases and "wallpaper_error" in aliases[did]:
-            del aliases[did]["wallpaper_error"]
-            _save_aliases(aliases)
+        if did in aliases and isinstance(aliases[did], dict):
+            had = False
+            for f in _WP_ERR_FIELDS:
+                if f in aliases[did]:
+                    del aliases[did][f]
+                    had = True
+            if had:
+                _save_aliases(aliases)
     except Exception:
         pass
 
@@ -317,21 +346,40 @@ def _ensure_ime_unified(did: str):
 
 
 def _deploy_wallpaper_smart(manager, did: str, number: int, display_name: str = "") -> bool:
-    """本地 ADB 优先部署壁纸，成功则记录 wallpaper_number；失败则代理到 Worker（Worker 侧自行记录）。"""
-    from src.utils.wallpaper_generator import deploy_wallpaper
+    """本地 ADB 优先部署壁纸，成功则记录 wallpaper_number；失败则代理到 Worker。
+
+    deploy_wallpaper bool 返回 + threading.local 暴露的细化结果双联体:
+    - bool=True 且 result.ok=True → 真成功, 清 error 三字段
+    - bool=True 但 result.ok=False → 走到 Method 4 兜底 (no_auto_method/verify_failed),
+      legacy 行为保留 (写 wallpaper_number), 但同时把细化分类写到 wallpaper_error_*,
+      让 dashboard 能显示 "等手动设置" / "verify 未通过" 等具体语义.
+    - bool=False → 真失败, 写细化 error 三字段; 然后 fallback 到 worker proxy.
+    """
+    from src.utils.wallpaper_generator import (
+        deploy_wallpaper, get_last_deploy_result,
+    )
     if manager:
         _ensure_hardened(did)
         try:
             ok = deploy_wallpaper(manager, did, number, display_name=display_name)
-            if ok:
-                _update_wallpaper_status(did, number)  # 本地成功：记录到本地 aliases
+            result = get_last_deploy_result(did)
+            if ok and result and result.ok:
+                _update_wallpaper_status(did, number)
                 _clear_wallpaper_error(did)
                 return True
+            if ok and result and not result.ok:
+                # legacy 兜底路径: deploy_wallpaper 返回 True 但 wallpaper id 实际未涨
+                _update_wallpaper_status(did, number)
+                _mark_wallpaper_error(did, result.kind, result.detail)
+                return True
+            if result and not result.ok:
+                _mark_wallpaper_error(did, result.kind, result.detail)
             else:
                 _mark_wallpaper_error(did, "deploy_failed")
         except Exception as e:
             logger.debug("[wp] deploy error %s: %s", did[:8], e)
-            _mark_wallpaper_error(did, f"exception:{type(e).__name__}")
+            _mark_wallpaper_error(
+                did, f"exception:{type(e).__name__}", str(e)[:200])
     return _proxy_wallpaper_to_worker(did, number, display_name)
 
 

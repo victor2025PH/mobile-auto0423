@@ -159,10 +159,15 @@ body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;backgroun
 .dev-btn.wp.wp-ok:hover{background:#16a34a;border-color:#16a34a;color:#fff}
 .dev-btn.wp.wp-outdated{color:#f59e0b;border-color:#f59e0b;animation:wp-pulse 2s ease-in-out infinite}
 .dev-btn.wp.wp-outdated:hover{background:#d97706;border-color:#d97706;color:#fff}
+/* wp-error: 部署失败明确分类 (perm_denied/decode_failed/...) - 比 outdated 更显眼的红, hover title 显具体原因 */
+.dev-btn.wp.wp-error{color:#ef4444;border-color:#ef4444;animation:wp-error-pulse 1.6s ease-in-out infinite}
+.dev-btn.wp.wp-error:hover{background:#dc2626;border-color:#dc2626;color:#fff}
 @keyframes wp-pulse{0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,.4)}50%{box-shadow:0 0 0 3px rgba(245,158,11,0)}}
+@keyframes wp-error-pulse{0%,100%{box-shadow:0 0 0 0 rgba(239,68,68,.5)}50%{box-shadow:0 0 0 3px rgba(239,68,68,0)}}
 .wp-dot{position:absolute;top:1px;right:1px;width:6px;height:6px;border-radius:50%;border:1px solid var(--bg-card)}
 .wp-dot.ok{background:#22c55e}
 .wp-dot.outdated{background:#f59e0b}
+.wp-dot.error{background:#ef4444}
 
 .dev-info{flex:1;min-width:0}
 .dev-info .dev-name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
