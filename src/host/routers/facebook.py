@@ -966,6 +966,60 @@ def fb_risk_history(device_id: str):
         return {"device_id": device_id, "history": [], "error": str(e)}
 
 
+@router.get("/devices/{device_id}/quota-status")
+def fb_quota_status(device_id: str):
+    """单台设备的 facebook 各 action quota 余量 + 下次可派 ETA.
+
+    2026-04-27 P4: 圈层拓客真机重试时 quota 满任务 fail 但 dashboard 看不见
+    quota 状态. 本 endpoint 给 dashboard chip / preflight UI 显示用.
+
+    返回 schema:
+      {
+        "device_id": "...",
+        "actions": {
+          "join_group": {
+            "hourly_used": 3, "hourly_limit": 3,
+            "daily_used": 5, "daily_limit": 50,
+            "hourly_remaining": 0, "daily_remaining": 45,
+            "next_slot_eta_seconds": 1234,
+            "next_slot_eta_minutes": 21,
+            "available_now": false
+          },
+          ...
+        }
+      }
+
+    注: account 参数在 ComplianceGuard 里默认空字符串("一台设备一个 facebook 账号"
+    现行假设, 见 compliance_guard.py 写入语义), 所以不需 device 上的账号 id.
+    """
+    try:
+        from src.behavior.compliance_guard import get_compliance_guard
+        guard = get_compliance_guard()
+        plimits = guard._limits.get("facebook")
+        if not plimits:
+            return {"device_id": device_id, "actions": {},
+                    "error": "facebook platform 限制未配置"}
+        actions: dict = {}
+        for action_name in plimits.actions:
+            remaining = guard.get_remaining("facebook", action_name)
+            eta_sec = guard.get_next_slot_eta("facebook", action_name)
+            eta_min = max(1, int((eta_sec + 30) // 60)) if eta_sec > 0 else 0
+            actions[action_name] = {
+                "hourly_used": remaining["hourly_used"],
+                "hourly_limit": plimits.actions[action_name].hourly,
+                "hourly_remaining": remaining["hourly_remaining"],
+                "daily_used": remaining["daily_used"],
+                "daily_limit": plimits.actions[action_name].daily,
+                "daily_remaining": remaining["daily_remaining"],
+                "next_slot_eta_seconds": int(eta_sec),
+                "next_slot_eta_minutes": eta_min,
+                "available_now": eta_sec <= 0,
+            }
+        return {"device_id": device_id, "actions": actions}
+    except Exception as e:
+        return {"device_id": device_id, "actions": {}, "error": str(e)}
+
+
 @router.post("/risk/reload")
 def fb_risk_reload():
     """重新加载 config/facebook_risk.yaml(无需重启服务)。"""
