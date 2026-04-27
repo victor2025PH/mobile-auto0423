@@ -798,11 +798,16 @@ def _to_response(t: dict) -> TaskResponse:
     from src.host.task_dispatch_gate import result_dict_with_gate_hints
     from src.host.task_ui_enrich import build_task_ui_enrichment
     from src.host.task_labels_zh import task_label_zh
+    from src.host.error_classifier import classify_task_error
 
     raw = t.get("result")
     result = result_dict_with_gate_hints(raw) if raw is not None else None
     ui = build_task_ui_enrichment(t)
     task_type = t.get("type", "")
+
+    # P1 — 后端归类 last_error → {layer, code, msg, tone, emoji} 让前端不脆弱
+    err_text = (result or {}).get("error") if isinstance(result, dict) else None
+    error_classification = classify_task_error(err_text)
 
     # 2026-04-27 Phase 2 P0 #2: 从 checkpoint 提取 current_step (业务方法
     # 调 task_store.set_task_step 写入). 容错: checkpoint 可能是 dict / JSON
@@ -842,5 +847,6 @@ def _to_response(t: dict) -> TaskResponse:
         current_step=current_step,
         current_sub_step=current_sub_step,
         current_step_at=current_step_at,
+        error_classification=error_classification,
         deleted_at=t.get("deleted_at") or None,
     )

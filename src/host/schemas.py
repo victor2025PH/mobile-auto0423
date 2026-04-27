@@ -141,6 +141,10 @@ class TaskResponse(BaseModel):
     current_step: Optional[str] = None
     current_sub_step: Optional[str] = None
     current_step_at: Optional[str] = None
+    # 2026-04-27 Phase 2 P1 后端 normalize: 失败原因归类
+    # {layer, code, msg, tone, emoji} - 详见 src/host/error_classifier.py
+    # 旧 task / 未失败 / 无 last_error 为 None. 前端优先用本字段, fallback regex.
+    error_classification: Optional[dict] = None
     deleted_at: Optional[str] = None
 
 
