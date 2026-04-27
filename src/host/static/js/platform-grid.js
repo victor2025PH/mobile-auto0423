@@ -131,6 +131,9 @@ function _pgBuildSkeleton(platform, icon, slogan, color, cfg) {
       .pg-card.state-busy{border-left-color:#3b82f6}
       .pg-card.state-idle{border-left-color:#94a3b8}
       .pg-card.state-offline{border-left-color:#ef4444;opacity:.65}
+      .pg-card.failed-heavy{box-shadow:inset 0 0 0 1px #ef4444,0 0 14px rgba(239,68,68,.35)}
+      .pg-stat-failed-clickable{cursor:pointer;transition:all .15s}
+      .pg-stat-failed-clickable:hover{background:rgba(239,68,68,.12)!important;border-color:#ef4444!important;transform:translateY(-1px)}
       .pg-card-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
       .pg-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
       .pg-alias{font-size:12px;font-weight:600;color:var(--text)}
@@ -220,18 +223,28 @@ function _pgRenderCard(dev, platform, color) {
   if (online && dev.running_task) state = 'busy';
   else if (online && dev.today_tasks > 0) state = 'online';
   else if (online) state = 'idle';
+  // P0.2: 失败率 > 30% 且至少有 3 个任务时，标记为高失败状态（红光警告）
+  const _t = dev.today_tasks || 0, _f = dev.today_failed || 0;
+  const failedHeavy = online && _t >= 3 && (_f / _t) > 0.3;
+  const _failPct = _t > 0 ? Math.round((_f / _t) * 100) : 0;
 
   const taskTag = dev.running_task
     ? `<span class="pg-task-tag" style="background:${color}22;color:${color}">${TASK_NAMES[dev.running_task]||dev.running_task.replace(platform+'_','')}</span>`
     : (online ? '<span class="pg-task-tag" style="color:var(--text-dim)">😴 空闲</span>' : '<span class="pg-task-tag" style="color:#ef4444">离线</span>');
 
   const cfg = PLAT_GRID_CFG[platform] || {};
+  // P0.4: 数字加 hover tooltip 显示完整 label；失败数字红色高亮
   const statItems = (cfg.stats||[]).map(s => {
     const v = dev[s.key] ?? 0;
-    return `<span style="${v===0?'opacity:.4':''}">${s.icon}<b>${v}</b></span>`;
+    const isFailed = s.key === 'today_failed';
+    const failColor = (isFailed && v > 0) ? ';color:#ef4444' : '';
+    return `<span style="${v===0?'opacity:.4':''}${failColor}" title="${s.label}: ${v}">${s.icon}<b>${v}</b></span>`;
   }).join('');
 
-  return `<div class="pg-card state-${state}" data-did="${dev.device_id}" onclick="_pgOpenPanel('${platform}','${dev.device_id}')">
+  const _cardTitle = failedHeavy
+    ? `⚠ 失败率 ${_failPct}% — 点击查看失败原因`
+    : `${alias} · 点击查看详情`;
+  return `<div class="pg-card state-${state}${failedHeavy?' failed-heavy':''}" data-did="${dev.device_id}" onclick="_pgOpenPanel('${platform}','${dev.device_id}')" title="${_cardTitle}">
     <div class="pg-card-head">
       <span class="pg-dot" style="background:${dotColor}"></span>
       <span class="pg-alias">${alias}</span>
@@ -261,7 +274,13 @@ function _pgRenderQuickActions(platform, taskTypes) {
 
   const icon = PLAT_ICONS[platform] || '';
 
-  el.innerHTML = '<div style="font-size:13px;font-weight:600;margin-bottom:10px">快捷操作</div>' +
+  // P0.1: 拆分双"快捷操作"语义 — 这里是【全局批量入口】
+  const _onlineN = (_pgCache[platform]?.devices||[]).filter(d=>d.online).length;
+  const _totalN = (_pgCache[platform]?.devices||[]).length;
+  el.innerHTML = `<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px;padding:8px 10px;background:rgba(34,197,94,.06);border:1px dashed rgba(34,197,94,.25);border-radius:8px">
+    <span style="font-size:13px;font-weight:600;color:var(--text)">🚀 批量任务下发</span>
+    <span style="font-size:10px;color:var(--text-dim)">作用于全部 <b style="color:#22c55e">${_onlineN}</b>/${_totalN} 台在线设备 · 想给单台下发请点上方设备卡 →</span>
+  </div>` +
     '<div style="display:flex;flex-direction:column;gap:10px">' +
     phases.map(phase => {
       const phaseTasks = taskTypes.filter(t => phase.types.includes(t.type));
@@ -310,6 +329,10 @@ function _pgOpenPanel(platform, deviceId) {
   content.innerHTML = _pgBuildPanel(platform, dev);
   panel.classList.add('open');
   if (overlay) overlay.style.display = 'block';
+  // P1.1: 异步加载账号画像（仅 Facebook，其他平台后续扩展）
+  if (platform === 'facebook' && typeof _pgLoadAccountProfile === 'function') {
+    _pgLoadAccountProfile(platform, dev);
+  }
 }
 
 function _pgClosePanel(platform) {
@@ -337,20 +360,34 @@ function _pgBuildPanel(platform, dev) {
     suggestion = `<div style="background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.25);border-radius:6px;padding:8px 10px;font-size:11px;color:#60a5fa;margin-bottom:12px">🔄 正在执行: ${TASK_NAMES[dev.running_task]||dev.running_task}</div>`;
   }
 
-  // 统计格子
+  // 统计格子（P0.2: 失败格子可点击钻取查看失败原因）
   const statBoxes = (cfg.stats||[]).map(s => {
     const v = dev[s.key] ?? '-';
-    return `<div style="text-align:center;padding:8px;background:var(--bg-main);border:1px solid var(--border);border-radius:8px;min-width:60px">
-      <div style="font-size:18px;font-weight:700;color:var(--text)">${v}</div>
+    const isFailed = s.key === 'today_failed';
+    const clickable = isFailed && (typeof v === 'number' ? v > 0 : false);
+    const cls = clickable ? 'pg-stat-failed-clickable' : '';
+    const onclickAttr = clickable
+      ? ` onclick="_pgShowFailureDetail('${platform}','${dev.device_id}');event.stopPropagation()"`
+      : '';
+    const valColor = (isFailed && v > 0) ? '#ef4444' : 'var(--text)';
+    const hint = clickable
+      ? '<div style="font-size:8px;color:#f87171;margin-top:1px;font-weight:600">点击查看 →</div>'
+      : '';
+    return `<div class="${cls}" style="text-align:center;padding:8px;background:var(--bg-main);border:1px solid var(--border);border-radius:8px;min-width:60px"${onclickAttr} title="${clickable?'查看 '+s.label+' 详情':s.label+': '+v}">
+      <div style="font-size:18px;font-weight:700;color:${valColor}">${v}</div>
       <div style="font-size:9px;color:var(--text-muted);margin-top:2px">${s.icon} ${s.label}</div>
+      ${hint}
     </div>`;
   }).join('');
 
-  // 快捷操作按钮
+  // 快捷操作按钮（P0.3: 加 hover tooltip 显示完整说明，缓解 TASK_NAMES 被后端覆盖导致的黑话残留）
   const quickBtns = (cfg.quickActions || []).map(taskType => {
     const tIcon = PLAT_TASK_ICONS[taskType] || '▶';
     const label = TASK_NAMES[taskType] || taskType.replace(platform+'_','');
+    const tHint = (typeof PLAT_TASK_HINTS !== 'undefined' && PLAT_TASK_HINTS[taskType]) || '';
+    const tipText = label + (tHint ? ' — ' + tHint : '') + '\n\n👉 点击下发到 ' + alias;
     return `<button onclick="_pgPanelTask('${platform}','${taskType}','${dev.device_id}');event.stopPropagation()"
+      title="${tipText.replace(/"/g,'&quot;')}"
       style="flex:1;min-width:80px;padding:8px 6px;font-size:11px;background:${color}15;border:1px solid ${color}30;color:${color};border-radius:6px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px">
       <span style="font-size:16px">${tIcon}</span>${label}
     </button>`;
@@ -397,11 +434,27 @@ function _pgBuildPanel(platform, dev) {
 
       ${flowBtnHtml}
 
-      <!-- 快捷操作 -->
-      <div style="font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:8px">快捷操作</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">${quickBtns}</div>
+      <!-- P0.1: 单机快捷操作（与全局批量明确区分） -->
+      <div style="background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.20);border-radius:8px;padding:10px;margin-bottom:14px">
+        <div style="font-size:11px;font-weight:600;color:#a5b4fc;margin-bottom:8px;display:flex;align-items:center;gap:6px">
+          <span>⚡</span><span>单机操作 · ${alias}</span>
+          <span style="margin-left:auto;font-size:9px;color:var(--text-dim);font-weight:normal">仅作用于这一台设备</span>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">${quickBtns}</div>
+      </div>
 
-      <!-- 设备信息 -->
+      <!-- P1.1: 账号画像区（仅 Facebook 显示，前端聚合 4 个 API） -->
+      ${platform === 'facebook' ? `
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:6px;display:flex;align-items:center;gap:6px">
+          <span>📊 账号画像</span>
+          <span style="margin-left:auto;font-size:9px;color:var(--text-dim);font-weight:normal">前端聚合 · risk/funnel/events</span>
+        </div>
+        <div id="pg-profile-${dev.device_id}" style="background:var(--bg-main);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px;font-size:11px">
+          <div style="text-align:center;color:var(--text-dim);padding:12px;font-size:11px">⏳ 加载账号画像...</div>
+        </div>
+      ` : ''}
+
+      <!-- 基础设备信息 -->
       <div style="font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:6px">设备信息</div>
       <div style="font-size:11px;color:var(--text-muted);background:var(--bg-main);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:14px">
         <div style="display:flex;justify-content:space-between;margin-bottom:4px"><span>设备 ID</span><span style="color:var(--text);font-family:monospace;font-size:10px">${dev.device_id.substring(0,16)}</span></div>
@@ -492,4 +545,397 @@ function _pgStartAutoRefresh(platform) {
 function _pgSetText(id, val) {
   const el = document.getElementById(id);
   if (el) el.textContent = val;
+}
+
+// ═══════════════════════════════════════════════════
+// P0.2 失败钻取 Modal — 消费 GET /tasks/error-analysis
+// ═══════════════════════════════════════════════════
+const _PG_ERROR_CAT_LABELS = {
+  vpn_failure: '🌐 VPN 故障',
+  network_timeout: '⏱ 网络超时',
+  ui_not_found: '🎯 UI 元素未找到',
+  account_limited: '🚫 账号限流/风控',
+  device_offline: '📵 设备离线',
+  geo_mismatch: '📍 地理位置不匹配',
+  task_timeout: '⌛ 任务超时',
+  unknown: '❓ 未分类',
+};
+const _PG_CAT_TIPS = {
+  vpn_failure: '检查 VPN 配置 / 代理 IP 是否过期；尝试切换节点',
+  network_timeout: '检查网络稳定性，必要时重启代理或换上行链路',
+  ui_not_found: 'Facebook UI 可能更新，需要更新 selector / VLM fallback 检查',
+  account_limited: '账号触发风控，建议停一段时间或换号；查看 cookies 健康度',
+  device_offline: '检查 ADB 连接，重启 uiautomator 服务',
+  geo_mismatch: '设备 GPS 与账号注册地不一致 — 检查 VPN 区域 / 设备伪造位置',
+  task_timeout: '任务执行超时，可能是 UI 卡顿、网络慢或被风控',
+  unknown: '请查看具体 error 字段，向工程师反馈完整 task_id',
+};
+
+async function _pgShowFailureDetail(platform, deviceId) {
+  let modal = document.getElementById('_pg-fail-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = '_pg-fail-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px';
+    modal.onclick = (e) => { if (e.target === modal) _pgCloseFailModal(); };
+    document.body.appendChild(modal);
+  }
+  const alias = (typeof ALIAS !== 'undefined' && ALIAS[deviceId]) || deviceId.substring(0, 8);
+  modal.innerHTML = `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;width:720px;max-width:100%;max-height:88vh;overflow-y:auto;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border)">
+      <div>
+        <div style="font-size:15px;font-weight:700;color:var(--text)">⚠ 失败任务详情 · ${alias}</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:2px">最近 24 小时窗口 · 数据来自 /tasks/error-analysis</div>
+      </div>
+      <button onclick="_pgCloseFailModal()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:22px;line-height:1">✕</button>
+    </div>
+    <div id="_pg-fail-modal-body">
+      <div style="text-align:center;padding:30px;color:var(--text-dim);font-size:12px">⏳ 加载失败详情...</div>
+    </div>
+  </div>`;
+  modal.style.display = 'flex';
+
+  try {
+    const [analysis, tasksResp] = await Promise.all([
+      api('GET', '/tasks/error-analysis?hours=24&include_samples=true'),
+      api('GET', '/tasks?status=failed&limit=80'),
+    ]);
+    const tasksAll = Array.isArray(tasksResp) ? tasksResp : (tasksResp.tasks || []);
+    const myFails = tasksAll.filter(t => t.device_id === deviceId).slice(0, 30);
+    const byDev = (analysis && analysis.by_device) || {};
+    const myStats = byDev[deviceId] || { total_failed: myFails.length, top_category: 'unknown' };
+    const byType = {};
+    myFails.forEach(t => {
+      const tp = t.type || 'unknown';
+      (byType[tp] = byType[tp] || []).push(t);
+    });
+
+    const summaryHtml = `
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px">
+        <div style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:#ef4444">${myStats.total_failed||myFails.length}</div>
+          <div style="font-size:10px;color:var(--text-muted);margin-top:2px">📛 总失败数</div>
+        </div>
+        <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:13px;font-weight:600;color:var(--text);min-height:18px">${_PG_ERROR_CAT_LABELS[myStats.top_category]||myStats.top_category||'-'}</div>
+          <div style="font-size:10px;color:var(--text-muted);margin-top:4px">主要原因</div>
+        </div>
+        <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:10px;text-align:center">
+          <div style="font-size:22px;font-weight:700;color:var(--text)">${Object.keys(byType).length}</div>
+          <div style="font-size:10px;color:var(--text-muted);margin-top:2px">涉及任务种类</div>
+        </div>
+      </div>
+    `;
+
+    const tipKey = myStats.top_category || 'unknown';
+    const tipHtml = `
+      <div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:8px;padding:10px;margin-bottom:14px;font-size:12px">
+        <div style="font-weight:600;color:#60a5fa;margin-bottom:4px">💡 修复建议</div>
+        <div style="color:var(--text-muted);line-height:1.5">${_PG_CAT_TIPS[tipKey] || '请查看具体错误信息'}</div>
+      </div>
+    `;
+
+    let listHtml = '<div style="font-weight:600;color:var(--text);margin-bottom:8px;font-size:12px">📋 失败任务列表（按任务类型分组）</div>';
+    if (!myFails.length) {
+      listHtml += '<div style="text-align:center;padding:20px;color:var(--text-dim);font-size:12px">最近 24 小时该设备无失败记录</div>';
+    } else {
+      Object.keys(byType).forEach(tp => {
+        const items = byType[tp];
+        const taskName = (typeof TASK_NAMES !== 'undefined' && TASK_NAMES[tp]) || tp;
+        const tIcon = (typeof PLAT_TASK_ICONS !== 'undefined' && PLAT_TASK_ICONS[tp]) || '▶';
+        listHtml += `
+          <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;margin-bottom:8px;overflow:hidden">
+            <div style="padding:8px 10px;border-bottom:1px solid var(--border);font-size:11px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px;background:rgba(239,68,68,.04)">
+              <span>${tIcon}</span><span>${taskName}</span>
+              <button onclick="_pgRetryFromFailure('${platform}','${tp}','${deviceId}')" title="重新发起一个相同类型的任务（如有参数会弹出配置框）" style="margin-left:auto;padding:3px 9px;font-size:10px;background:#3b82f6;border:none;color:#fff;border-radius:4px;cursor:pointer;font-weight:600">⟳ 重试</button>
+              <span style="color:#ef4444;font-weight:700">×${items.length}</span>
+            </div>
+            <div style="padding:4px 10px 6px">
+              ${items.slice(0,5).map(it => {
+                let r = it.result || {};
+                if (typeof r === 'string') { try { r = JSON.parse(r); } catch(e) { r = {error: r}; } }
+                const err = r.error || '(无错误信息)';
+                const ts = (it.updated_at || '').replace('T',' ').substring(0,16);
+                return `<div style="font-size:10px;color:var(--text-muted);padding:5px 0;border-bottom:1px dashed var(--border)">
+                  <span style="color:var(--text-dim);font-family:monospace">${ts}</span>
+                  <div style="color:#f87171;margin-top:2px;line-height:1.4">${String(err).substring(0,160)}${String(err).length>160?'...':''}</div>
+                </div>`;
+              }).join('')}
+              ${items.length > 5 ? `<div style="font-size:10px;color:var(--text-dim);padding:4px 0;text-align:center">… 还有 ${items.length-5} 条</div>` : ''}
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    document.getElementById('_pg-fail-modal-body').innerHTML = summaryHtml + tipHtml + listHtml + `
+      <div style="display:flex;gap:8px;margin-top:12px;justify-content:flex-end">
+        <button onclick="_pgCloseFailModal()" style="padding:6px 14px;font-size:12px;background:var(--bg-main);border:1px solid var(--border);color:var(--text);border-radius:6px;cursor:pointer">关闭</button>
+        <button onclick="if(typeof navigateToPage==='function')navigateToPage('tasks');_pgCloseFailModal()" style="padding:6px 14px;font-size:12px;background:#3b82f6;border:none;color:#fff;border-radius:6px;cursor:pointer">查看任务中心 →</button>
+      </div>
+    `;
+  } catch (e) {
+    document.getElementById('_pg-fail-modal-body').innerHTML = `<div style="color:#f87171;padding:20px;text-align:center;font-size:12px">加载失败: ${e.message||e}</div>`;
+  }
+}
+
+function _pgCloseFailModal() {
+  const modal = document.getElementById('_pg-fail-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+// ESC 键关闭失败 modal
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const modal = document.getElementById('_pg-fail-modal');
+    if (modal && modal.style.display !== 'none') _pgCloseFailModal();
+  }
+});
+
+// ═══════════════════════════════════════════════════
+// P1.5 失败 modal — 一键重试（关 modal + 复用 _pgPanelTask）
+// ═══════════════════════════════════════════════════
+async function _pgRetryFromFailure(platform, taskType, deviceId) {
+  _pgCloseFailModal();
+  // 复用 _pgPanelTask：含参数的任务会自动弹出参数 modal，无参数的直接 POST 创建
+  if (typeof _pgPanelTask === 'function') {
+    try {
+      await _pgPanelTask(platform, taskType, deviceId);
+    } catch (e) {
+      if (typeof showToast === 'function') showToast('重试失败: ' + (e.message || e), 'error');
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// P1.1 + P2.1 + P2.4 账号画像
+//   - 主路径: GET /facebook/devices/{id}/account-profile (后端聚合 + 智能建议)
+//   - Fallback: 前端 3 API 并发（risk/status + risk/history + funnel）
+//   - 智能建议 banner: 顶部 P2.4 突出展示「现在该做什么」
+// ═══════════════════════════════════════════════════
+const _PG_PHASE_MAP = {
+  cold_start: { emoji: '🌱', label: '冷启动', color: '#22c55e', tip: '账号刚开始养，建议低频互动 + 内容浏览为主' },
+  growth:     { emoji: '📈', label: '成长期', color: '#3b82f6', tip: '加好友/互动可适度增加，避免突发量' },
+  mature:     { emoji: '🌳', label: '成熟期', color: '#8b5cf6', tip: '可承担营销动作，但保持节奏' },
+  cooldown:   { emoji: '❄️', label: '冷却期', color: '#f59e0b', tip: '⚠ 触发风控，建议停止外联动作 24h+' },
+};
+
+const _PG_RISK_LEVEL_MAP = {
+  low:    { color: '#22c55e', label: '🟢 健康',   bg: 'rgba(34,197,94,.1)',  tip: '可正常运行' },
+  medium: { color: '#f59e0b', label: '🟡 中风险', bg: 'rgba(245,158,11,.1)', tip: '降频运行' },
+  high:   { color: '#ef4444', label: '🔴 高风险', bg: 'rgba(239,68,68,.1)',  tip: '建议暂停外联动作' },
+};
+
+async function _pgLoadAccountProfile(platform, dev) {
+  const target = document.getElementById('pg-profile-' + dev.device_id);
+  if (!target) return;
+  const deviceId = dev.device_id;
+  // P2.1 主路径: 先调后端聚合 API（含智能建议）
+  let profile = null;
+  try {
+    profile = await api('GET', `/facebook/devices/${deviceId}/account-profile`);
+  } catch (e) {
+    // 404 / 5xx → fallback 到前端 3 API 并发
+    profile = await _pgFallbackProfile(deviceId, dev);
+  }
+  if (!profile) {
+    target.innerHTML = `<div style="text-align:center;color:#f87171;padding:8px;font-size:10px">画像加载失败</div>`;
+    return;
+  }
+  // race guard: 用户秒切设备时，确保画像渲染到正确占位符
+  const stillTarget = document.getElementById('pg-profile-' + deviceId);
+  if (!stillTarget) return;
+  _pgRenderProfile(stillTarget, profile);
+}
+
+// Fallback：后端聚合 API 不可用时前端用 3 个独立 API 拼出同结构对象
+async function _pgFallbackProfile(deviceId, dev) {
+  try {
+    const [riskStatus, riskHistory, funnel] = await Promise.allSettled([
+      api('GET', '/facebook/risk/status'),
+      api('GET', `/facebook/risk/history/${deviceId}`),
+      api('GET', `/facebook/funnel?device_id=${deviceId}&since_hours=168`),
+    ]);
+    let phase = (dev && dev.phase) || 'unknown';
+    let risk24h = 0, lastBlockedAt = null;
+    let friends = 0, groups = 0, friendReqs = 0;
+    if (riskStatus.status === 'fulfilled') {
+      const v = riskStatus.value;
+      const arr = Array.isArray(v) ? v : (v && (v.devices || v.list)) || [];
+      const me = arr.find(d => d.device_id === deviceId) || {};
+      phase = me.phase || phase;
+      risk24h = me.risk_count_24h ?? me.risk_count ?? me.events_24h ?? 0;
+    }
+    if (riskHistory.status === 'fulfilled') {
+      const v = riskHistory.value;
+      const list = Array.isArray(v) ? v : (v && (v.events || v.history)) || [];
+      const blockEvents = list.filter(e => /rate_limit|checkpoint|banned|policy|block/i.test(e.kind || e.type || ''));
+      if (blockEvents.length) lastBlockedAt = blockEvents[0].detected_at || blockEvents[0].at;
+    }
+    if (funnel.status === 'fulfilled') {
+      const f = funnel.value || {};
+      friends = f.stage_friend_accepted ?? 0;
+      groups = f.stage_groups_joined ?? f.groups_joined ?? 0;
+      friendReqs = f.stage_friend_request_sent ?? 0;
+    }
+    // P2.5: today 数据从 dev.today_xxx 读（前端缓存有）→ 与后端规则引擎优先级保持一致
+    // P2.6: 每条建议带 action 字段（CTA 按钮）
+    const _todayTotal = (dev && dev.today_tasks) || 0;
+    const _todayFailed = (dev && dev.today_failed) || 0;
+    const _todayFailRate = _todayTotal > 0 ? _todayFailed / _todayTotal : 0;
+    const _openFail = { label: '查看失败原因', type: 'open_failure_modal' };
+    let level, suggestion;
+    // 优先级（高→低）: 今日失败率 > phase=cooldown OR 24h 风控 ≥5 > 24h 风控 ≥2 > phase 推荐
+    if (_todayFailRate >= 0.5 && _todayTotal >= 3) {
+      level = 'high';
+      suggestion = { tone: 'warning',
+        text: `🚨 今日失败率 ${Math.round(_todayFailRate*100)}% (${_todayFailed}/${_todayTotal})，先停止外联 → 排查原因`,
+        action: _openFail };
+    } else if (_todayFailRate >= 0.3 && _todayTotal >= 5) {
+      level = 'medium';
+      suggestion = { tone: 'warning',
+        text: `⚠ 今日失败率偏高 ${Math.round(_todayFailRate*100)}% (${_todayFailed}/${_todayTotal})，建议降频`,
+        action: _openFail };
+    } else if (phase === 'cooldown' || risk24h >= 5) {
+      level = 'high';
+      suggestion = { tone: 'warning', text: '🔴 高风控状态，建议立即停止外联动作', action: _openFail };
+    } else if (risk24h >= 2) {
+      level = 'medium';
+      suggestion = { tone: 'warning', text: '🟡 风控信号偏多，建议降频运行', action: _openFail };
+    } else if (phase === 'cold_start') {
+      level = 'low';
+      suggestion = { tone: 'info', text: '🌱 冷启动期，建议先内容浏览养号 5-7 天',
+        action: { label: '立即开始养号', type: 'run_task', task_type: 'facebook_browse_feed_by_interest' } };
+    } else if (phase === 'growth') {
+      level = 'low';
+      suggestion = { tone: 'info', text: '📈 健康成长期，可下发加好友/群成员提取/群内互动',
+        action: { label: '发起加好友', type: 'run_task', task_type: 'facebook_add_friend' } };
+    } else if (phase === 'mature') {
+      level = 'low';
+      suggestion = { tone: 'ok', text: '🌳 账号成熟，可承担营销动作 — 保持节奏',
+        action: { label: '全链路获客', type: 'run_task', task_type: 'facebook_campaign_run' } };
+    } else {
+      level = 'low';
+      suggestion = { tone: 'info', text: '✓ 账号状态正常', action: null };
+    }
+    return {
+      device_id: deviceId,
+      account: { phase, friends_count: friends, groups_count: groups, friend_requests_sent_7d: friendReqs },
+      risk: { level, count_24h: risk24h, last_blocked_at: lastBlockedAt, cooldown_remaining: 0 },
+      recent_tasks: [],  // fallback 不取 task list（避免额外开销，主路径才返）
+      today_stats: { tasks: _todayTotal, failed: _todayFailed, fail_rate: Math.round(_todayFailRate*100)/100 },
+      suggestion,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 渲染：聚合 API 和 fallback 都返回相同结构 → 同一渲染函数
+// P2.5/P2.6/P2.7 升级：CTA 按钮 + 失败行可点击 + 空态提示 + tip 卡片内永久显示（修 tooltip 浮动 bug）
+function _pgRenderProfile(target, p) {
+  const acc = p.account || {};
+  const risk = p.risk || {};
+  const today = p.today_stats || {};
+  const phase = acc.phase || 'unknown';
+  const phaseInfo = _PG_PHASE_MAP[phase] || { emoji: '❓', label: String(phase), color: '#94a3b8', tip: '' };
+  const riskLevel = _PG_RISK_LEVEL_MAP[risk.level] || _PG_RISK_LEVEL_MAP.low;
+  const risk24h = risk.count_24h ?? 0;
+  const lastBlockedAt = risk.last_blocked_at;
+  const friends = acc.friends_count ?? '-';
+  const groups = acc.groups_count ?? '-';
+  const friendReqs = acc.friend_requests_sent_7d ?? '-';
+  const recentTasks = p.recent_tasks || [];
+  const suggestion = p.suggestion || {};
+  const action = suggestion.action;
+  const deviceId = p.device_id;
+  const platform = 'facebook';
+
+  // P2.4 智能建议 banner 配色 + P2.6 CTA 按钮配色
+  const _toneStyle = {
+    warning: { bg: 'rgba(239,68,68,.10)',  border: 'rgba(239,68,68,.3)',  color: '#f87171', btnBg: '#ef4444' },
+    info:    { bg: 'rgba(99,102,241,.10)', border: 'rgba(99,102,241,.3)', color: '#a5b4fc', btnBg: '#6366f1' },
+    ok:      { bg: 'rgba(34,197,94,.10)',  border: 'rgba(34,197,94,.3)',  color: '#86efac', btnBg: '#22c55e' },
+  }[suggestion.tone] || { bg: 'rgba(99,102,241,.10)', border: 'rgba(99,102,241,.3)', color: '#a5b4fc', btnBg: '#6366f1' };
+
+  // P2.6 CTA 按钮 — 根据 action.type 路由（前端只做路由，不写业务规则）
+  let ctaBtnHtml = '';
+  if (action && action.label) {
+    const onclickStr = action.type === 'open_failure_modal'
+      ? `_pgShowFailureDetail('${platform}','${deviceId}')`
+      : action.type === 'run_task' && action.task_type
+      ? `_pgPanelTask('${platform}','${action.task_type}','${deviceId}')`
+      : '';
+    if (onclickStr) {
+      ctaBtnHtml = `<button onclick="${onclickStr}" style="margin-left:8px;padding:4px 10px;font-size:10px;background:${_toneStyle.btnBg};border:none;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;flex-shrink:0;white-space:nowrap">${action.label} →</button>`;
+    }
+  }
+
+  // P2.5 失败率 chip（数据透明度 — 让"5/7" 这种关键信号可见在风控卡里）
+  const todayTasks = today.tasks ?? 0;
+  const todayFailed = today.failed ?? 0;
+  const todayFailRate = today.fail_rate ?? 0;
+  const failChipColor = todayFailRate >= 0.3 ? '#f87171' : 'var(--text-dim)';
+  const failChipBg = todayFailRate >= 0.3 ? 'rgba(239,68,68,.15)' : 'rgba(255,255,255,.05)';
+  const failChipHtml = todayTasks > 0
+    ? `<div style="margin-top:4px;font-size:9px;color:${failChipColor};background:${failChipBg};padding:2px 6px;border-radius:3px;font-weight:600;display:inline-block">今日 ${todayTasks} · 失败 ${Math.round(todayFailRate*100)}%</div>`
+    : '';
+
+  // P2.10 空数据提示（friends/groups/reqs 全 0 时解释）
+  const emptyDataHint = (friends === 0 && groups === 0 && friendReqs === 0)
+    ? `<div style="font-size:9px;color:var(--text-dim);text-align:center;padding:4px;font-style:italic;margin-bottom:8px">📭 该号尚未产生 funnel 数据 — 可能是新号或任务全失败</div>`
+    : '';
+
+  target.innerHTML = `
+    ${suggestion.text ? `<div style="background:${_toneStyle.bg};border:1px solid ${_toneStyle.border};color:${_toneStyle.color};border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:11px;line-height:1.45;font-weight:500;display:flex;align-items:center;gap:4px">
+      <span style="flex:1">${suggestion.text}</span>${ctaBtnHtml}
+    </div>` : ''}
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
+      <div style="background:${phaseInfo.color}10;border:1px solid ${phaseInfo.color}40;border-radius:6px;padding:8px">
+        <div style="font-size:9px;color:var(--text-dim);margin-bottom:2px">账号阶段</div>
+        <div style="font-size:13px;font-weight:600;color:${phaseInfo.color}">${phaseInfo.emoji} ${phaseInfo.label}</div>
+        ${phaseInfo.tip ? `<div style="font-size:9px;color:var(--text-dim);margin-top:3px;line-height:1.3">${phaseInfo.tip}</div>` : ''}
+      </div>
+      <div style="background:${riskLevel.bg};border:1px solid ${riskLevel.color}40;border-radius:6px;padding:8px">
+        <div style="font-size:9px;color:var(--text-dim);margin-bottom:2px">风控等级 · 24h ${risk24h} 次</div>
+        <div style="font-size:13px;font-weight:600;color:${riskLevel.color}">${riskLevel.label}</div>
+        ${failChipHtml}
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px">
+      <div title="累计已通过的好友数" style="text-align:center;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
+        <div style="font-size:14px;font-weight:700;color:var(--text)">${friends}</div>
+        <div style="font-size:9px;color:var(--text-dim)">👥 好友</div>
+      </div>
+      <div title="已加入的群组数" style="text-align:center;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
+        <div style="font-size:14px;font-weight:700;color:var(--text)">${groups}</div>
+        <div style="font-size:9px;color:var(--text-dim)">👨‍👩‍👧 群组</div>
+      </div>
+      <div title="近 7 天发出的好友请求" style="text-align:center;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
+        <div style="font-size:14px;font-weight:700;color:var(--text)">${friendReqs}</div>
+        <div style="font-size:9px;color:var(--text-dim)">📨 7天请求</div>
+      </div>
+    </div>
+    ${emptyDataHint}
+    ${lastBlockedAt ? `<div style="background:rgba(239,68,68,.06);border-left:3px solid #ef4444;padding:6px 8px;margin-bottom:8px;font-size:10px;color:#f87171">⚠ 上次限流: ${String(lastBlockedAt).replace('T',' ').substring(0,16)}</div>` : ''}
+    ${recentTasks.length ? `
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">📋 最近任务（失败行可点击）</div>
+      ${recentTasks.map(t => {
+        const ts = String(t.updated_at||'').replace('T',' ').substring(11,16);
+        const tname = (typeof TASK_NAMES !== 'undefined' && TASK_NAMES[t.type]) || t.type || '-';
+        const statusColor = t.status==='completed' ? '#22c55e' : t.status==='failed' ? '#ef4444' : '#94a3b8';
+        // P2.7: 失败行 onclick 进失败 modal
+        const isFailed = t.status === 'failed';
+        const onclickAttr = isFailed
+          ? ` onclick="_pgShowFailureDetail('${platform}','${deviceId}')"`
+          : '';
+        return `<div title="${isFailed?'点击查看失败原因':''}"${onclickAttr} style="font-size:10px;color:var(--text-muted);padding:5px 4px;border-bottom:1px dashed var(--border);display:flex;align-items:center;gap:6px;${isFailed?'cursor:pointer':''}">
+          <span style="color:var(--text-dim);font-family:monospace;flex-shrink:0">${ts}</span>
+          <span style="color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${tname}</span>
+          <span style="font-size:9px;color:${statusColor};flex-shrink:0">${t.status||''}</span>
+          ${isFailed?'<span style="font-size:9px;color:#f87171;flex-shrink:0">→</span>':''}
+        </div>`;
+      }).join('')}
+    ` : ''}
+  `;
 }
