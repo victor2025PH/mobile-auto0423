@@ -26,6 +26,7 @@ import logging
 import os
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -173,6 +174,70 @@ _HELPER_PKG = "com.openclaw.wallpaperhelper"
 _HELPER_APK_LOCAL = str(tools_dir() / "wallpaper_helper" / "openclaw_wp_helper.apk")
 _HELPER_JAR_LOCAL = str(tools_dir() / "wallpaper_helper" / "openclaw_wp.jar")
 _REMOTE_JAR = "/data/local/tmp/openclaw_wp.jar"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Deploy 失败原因分类（替代笼统 "deploy_failed"，让 dashboard/日志能精确诊断）
+# ═══════════════════════════════════════════════════════════════════════════
+WP_ERR_OK = ""
+WP_ERR_GENERATE = "generate_failed"        # PIL 生成 PNG 失败
+WP_ERR_PUSH = "push_failed"                # adb push 文件失败
+WP_ERR_HELPER_INSTALL = "helper_install_failed"  # APK 装不上 / 权限补不齐
+WP_ERR_BROADCAST_CMD = "broadcast_cmd_failed"   # am broadcast 命令本身失败 (ADB 断/超时)
+WP_ERR_FILE_NOT_FOUND = "file_not_found"   # Receiver result=2: 文件路径在设备上找不到
+WP_ERR_DECODE = "decode_failed"            # Receiver result=3: BitmapFactory 解码失败 (≈权限缺失)
+WP_ERR_IO = "io_error"                     # Receiver result=4: setBitmap IOException
+WP_ERR_RESULT_OTHER = "result_other"       # Receiver 返回未知 result code
+WP_ERR_VERIFY = "verify_no_id_change"      # 命令 OK 但 dumpsys wallpaper id 没涨
+WP_ERR_NO_AUTO_METHOD = "no_auto_method"   # root/helper/MIUI Gallery 全失败, 走兜底
+WP_ERR_EXCEPTION = "exception"             # Python 层异常 (后跟 type name)
+
+
+@dataclass
+class WallpaperDeployResult:
+    """部署结果 + 细化失败分类。
+
+    `__bool__` 让 `if deploy_wallpaper(...)` 旧调用写法保持工作；新 caller 可以
+    读 .kind / .detail 拿到具体原因写入 alias 或日志。
+    """
+    ok: bool
+    kind: str = WP_ERR_OK
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+    @classmethod
+    def success(cls) -> "WallpaperDeployResult":
+        return cls(ok=True)
+
+    @classmethod
+    def failure(cls, kind: str, detail: str = "") -> "WallpaperDeployResult":
+        return cls(ok=False, kind=kind, detail=detail)
+
+
+def _classify_helper_result(text: str) -> tuple[str, str]:
+    """把 am broadcast 同步输出解析成 (kind, detail)。
+
+    Helper APK Receiver 协议（见 tools/wallpaper_helper/apk_src/WallpaperReceiver.java）：
+      result=0 → OK
+      result=2 → File not found: <path>
+      result=3 → Failed to decode: <path>   （多半是 READ_EXTERNAL_STORAGE 缺失）
+      result=4 → Error: <IOException msg>
+    """
+    import re
+    # 提取 result data="..." 段作为 detail
+    m_data = re.search(r'data="([^"]*)"', text or "")
+    detail = m_data.group(1) if m_data else (text or "")[:200]
+    if 'result=0' in text:
+        return (WP_ERR_OK, detail)
+    if 'result=2' in text:
+        return (WP_ERR_FILE_NOT_FOUND, detail)
+    if 'result=3' in text:
+        return (WP_ERR_DECODE, f"{detail} (通常是 READ_EXTERNAL_STORAGE/READ_MEDIA_IMAGES 未授予)")
+    if 'result=4' in text:
+        return (WP_ERR_IO, detail)
+    return (WP_ERR_RESULT_OTHER, detail)
 
 
 def _get_wallpaper_id(manager, device_id: str) -> tuple[Optional[int], Optional[int]]:
@@ -389,7 +454,7 @@ def _ensure_helper_installed(manager, device_id: str) -> bool:
     return True
 
 
-def _try_helper_apk_wallpaper(manager, device_id: str) -> bool:
+def _try_helper_apk_wallpaper(manager, device_id: str) -> WallpaperDeployResult:
     """通过 Helper APK 的 BroadcastReceiver 设壁纸（秒级，无UI交互）。
 
     历史 bug：旧版用 `am broadcast --async` 只派发不等结果，主机侧把"派发成功"
@@ -398,9 +463,13 @@ def _try_helper_apk_wallpaper(manager, device_id: str) -> bool:
 
     现改为同步 broadcast：等 Receiver 的 onReceive 跑完，解析 result=0 才视为成功。
     timeout=120s 应对部分 MIUI/Android 13 上 setBitmap 阻塞数十秒的情况。
+    返回 WallpaperDeployResult, 失败时带分类 (kind) 和可读 detail, 由上层写到 alias。
     """
     if not _ensure_helper_installed(manager, device_id):
-        return False
+        return WallpaperDeployResult.failure(
+            WP_ERR_HELPER_INSTALL,
+            "Helper APK 未装齐或运行时权限补齐失败 (READ_EXTERNAL_STORAGE / READ_MEDIA_IMAGES)",
+        )
 
     base = [
         '-a', 'com.openclaw.SET_WALLPAPER',
@@ -413,15 +482,16 @@ def _try_helper_apk_wallpaper(manager, device_id: str) -> bool:
     if not ok:
         log.warning("[壁纸] Helper APK broadcast 命令失败 %s: %s",
                     device_id[:8], text[:200])
-        return False
-    if 'result=0' in text:
+        return WallpaperDeployResult.failure(
+            WP_ERR_BROADCAST_CMD, f"am broadcast 失败: {text[:200]}")
+    kind, detail = _classify_helper_result(text)
+    if kind == WP_ERR_OK:
         log.info("[壁纸] Helper APK 同步成功 %s: result=0", device_id[:8])
-        return True
+        return WallpaperDeployResult.success()
     # result≠0：把 Receiver 返回的 data 透传到日志，便于诊断
-    # 例 result=3, data="Failed to decode: ..." → 权限/文件路径问题
-    log.warning("[壁纸] Helper APK Receiver 失败 %s: %s",
-                device_id[:8], text[:300])
-    return False
+    log.warning("[壁纸] Helper APK Receiver 失败 %s [%s]: %s",
+                device_id[:8], kind, detail)
+    return WallpaperDeployResult.failure(kind, detail)
 
 
 def _try_gallery_wallpaper(manager, device_id: str) -> bool:
