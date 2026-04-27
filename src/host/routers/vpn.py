@@ -187,6 +187,46 @@ def vpn_stop(device_id: str):
     return {"device_id": s.device_id, "connected": s.connected}
 
 
+@router.get("/vpn/eprobe/{device_id}", dependencies=[Depends(verify_api_key)])
+def vpn_eprobe(device_id: str,
+               target: str = "https://www.facebook.com",
+               refresh: bool = False):
+    """E2E 真探测：在设备上 curl 真实 URL 验证 VPN 通畅 (30s 缓存).
+
+    与 /vpn/status (浅层 tun0 检查) 互补，前端启动前确认条调它做"探测灯"。
+    """
+    from src.behavior.vpn_manager import vpn_e2e_probe
+    return vpn_e2e_probe(device_id, target=target, force_refresh=refresh)
+
+
+@router.post("/vpn/reconnect-all", dependencies=[Depends(verify_api_key)])
+def vpn_reconnect_all():
+    """一键重连所有设备 VPN (被 error-analysis suggestion 引用，原本是 dead reference)。
+
+    流程: 对每台设备调 vpn_health.check_device(allow_reconnect=True)，触发
+    L1→L3 升级重连。返回 {total, ok, results: [{device_id, ok, action}]}。
+    """
+    from src.behavior.vpn_health import get_vpn_health_monitor
+    mon = get_vpn_health_monitor()
+    manager = get_device_manager(_config_path)
+    results = []
+    for d in manager.get_all_devices():
+        did = getattr(d, "device_id", "") if not isinstance(d, dict) else d.get("device_id", "")
+        if not did:
+            continue
+        try:
+            r = mon.check_device(did, allow_reconnect=True)
+            results.append({
+                "device_id": did,
+                "ok": bool(r.get("connected")),
+                "action": r.get("action_taken"),
+            })
+        except Exception as e:
+            results.append({"device_id": did, "ok": False, "error": str(e)})
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return {"total": len(results), "ok": ok_count, "results": results}
+
+
 @router.get("/vpn/health", dependencies=[Depends(verify_api_key)])
 def vpn_health_status():
     """Return VPN health status for all devices."""

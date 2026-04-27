@@ -476,6 +476,87 @@ def set_facebook_referral_config(body: dict = Body(default={})):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 启动前真探测 — 替代弹窗里"VPN 已连接到 X 地区"静态文案
+# ─────────────────────────────────────────────────────────────────────────
+
+@router.get("/device/{device_id}/precheck")
+def fb_device_precheck(device_id: str,
+                       persona_key: Optional[str] = None,
+                       refresh: bool = False):
+    """启动前真探测：VPN 隧道 + Facebook e2e 可达 + Geo 期望国家匹配。
+
+    前端启动方案弹窗调用，把"启动前确认"静态文案换成实时红/绿/黄探测灯。
+    30s 缓存 (vpn_e2e_probe 内置)，refresh=true 强制刷新。
+
+    Returns:
+        {
+          device_id, persona_key,
+          vpn_tunnel: {ok, config_name},          # tun0 浅层
+          fb_reachable: {ok, http_code, latency_ms, error},  # e2e
+          geo: {ok, expected_country, verified_ip} | None,
+          can_launch: bool,                       # 4 项全 ok 才 True
+          blocking_issues: [str]                  # 阻塞列表 (按优先级)
+        }
+    """
+    from src.behavior.vpn_manager import check_vpn_status, vpn_e2e_probe
+
+    out: Dict[str, Any] = {
+        "device_id": device_id,
+        "persona_key": persona_key or "",
+        "blocking_issues": [],
+    }
+
+    # 1) VPN tunnel (浅层)
+    try:
+        s = check_vpn_status(device_id)
+        out["vpn_tunnel"] = {"ok": bool(s.connected), "config_name": s.config_name}
+        if not s.connected:
+            out["blocking_issues"].append("VPN 隧道未建立 (tun0 down)")
+    except Exception as e:
+        out["vpn_tunnel"] = {"ok": False, "error": str(e)[:120]}
+        out["blocking_issues"].append(f"VPN 状态查询异常: {str(e)[:80]}")
+
+    # 2) Facebook e2e 真探测 (这个才是"VPN 真的通"的判据)
+    try:
+        eprobe = vpn_e2e_probe(device_id, target="https://www.facebook.com",
+                               force_refresh=refresh)
+        out["fb_reachable"] = eprobe
+        if not eprobe.get("ok"):
+            out["blocking_issues"].append(
+                f"Facebook 不可达: {eprobe.get('error', 'unknown')}"
+            )
+    except Exception as e:
+        out["fb_reachable"] = {"ok": False, "error": str(e)[:120]}
+        out["blocking_issues"].append(f"FB 探测异常: {str(e)[:80]}")
+
+    # 3) Geo (用 vpn_health 缓存的最近一次 verified_ip + expected_country)
+    try:
+        from src.behavior.vpn_health import get_vpn_health_monitor
+        mon = get_vpn_health_monitor()
+        health = (mon.get_status() or {}).get(device_id, {}) if mon else {}
+        expected = mon._expected_countries.get(device_id, "") if mon else ""
+        verified_ip = health.get("verified_ip", "")
+        ip_verified = bool(health.get("ip_verified", False))
+        if expected:
+            out["geo"] = {
+                "ok": ip_verified,
+                "expected_country": expected,
+                "verified_ip": verified_ip,
+            }
+            if not ip_verified and verified_ip:
+                out["blocking_issues"].append(
+                    f"IP 不在期望国 ({expected}); 当前 {verified_ip}"
+                )
+        else:
+            out["geo"] = None  # 未配置预期国家 → 跳过 geo gate
+    except Exception as e:
+        out["geo"] = {"ok": False, "error": str(e)[:80]}
+
+    out["can_launch"] = len(out["blocking_issues"]) == 0
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # 设备级一键启动 — 与 TikTok device/{id}/launch 同构
 # ─────────────────────────────────────────────────────────────────────────
 

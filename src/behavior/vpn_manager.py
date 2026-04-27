@@ -411,6 +411,89 @@ def is_vpn_healthy(device_id: str) -> bool:
     return s.connected
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# E2E 真探测 — 杜绝 "tun0 up 但实际不通" 的假正
+# ─────────────────────────────────────────────────────────────────────────
+# Why: check_vpn_status() 只看 tun0 接口 (浅层), 多次出现 "VPN 不通(疑网络重试)"
+# 失败但启动前 status='connected' 的脱节. e2e 探测在设备上 curl 真目标,
+# 用 HTTP code 判定. 30s 缓存避免 hammering 设备.
+_EPROBE_CACHE: Dict[str, tuple] = {}
+_EPROBE_TTL_SEC = 30
+_EPROBE_DEFAULT_TARGET = "https://www.facebook.com"
+
+
+def vpn_e2e_probe(device_id: str,
+                  target: str = _EPROBE_DEFAULT_TARGET,
+                  timeout: int = 6,
+                  force_refresh: bool = False) -> dict:
+    """端到端 VPN 真探测：在设备上 curl 真实 URL，验证能否走 VPN 出网。
+
+    与 check_vpn_status 区别:
+      - check_vpn_status: 只看 tun0 接口存在 + UP (浅层, 可能假正)
+      - vpn_e2e_probe:    实际发 HTTPS 请求, HTTP 2xx/3xx 才算 ok (端到端)
+
+    Returns:
+        {
+          "ok": bool,                  # True = HTTP 2xx/3xx
+          "http_code": int,            # 0 表示 timeout/连接失败
+          "latency_ms": int,           # 实际耗时
+          "error": str,                # ok=True 时为空
+          "target": str,               # 探测目标 URL
+          "ts_cached": int,            # 0=刚探测; >0=该秒数前的缓存
+        }
+    """
+    now = time.time()
+
+    # 同 target 30s 内复用缓存
+    if not force_refresh:
+        cached = _EPROBE_CACHE.get(device_id)
+        if cached and (now - cached[0]) < _EPROBE_TTL_SEC and cached[1].get("target") == target:
+            r = dict(cached[1])
+            r["ts_cached"] = int(now - cached[0])
+            return r
+
+    # curl -s: silent, -o /dev/null: 不要 body, -m timeout: 总超时
+    # -w 输出 "http_code|time_total" 便于解析
+    cmd = (f'shell curl -s -o /dev/null -m {timeout} '
+           f'-w "%{{http_code}}|%{{time_total}}" "{target}"')
+    t0 = time.time()
+    out = _adb(device_id, cmd, timeout=timeout + 4) or ""
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    parts = out.strip().split("|", 1)
+    code_str = parts[0].strip() if parts else ""
+    try:
+        code = int(code_str)
+    except (ValueError, TypeError):
+        code = 0
+
+    if 200 <= code < 400:
+        result = {"ok": True, "http_code": code, "latency_ms": elapsed_ms,
+                  "error": "", "target": target, "ts_cached": 0}
+    else:
+        # code=0 通常是 dns/路由/防火墙挂; 4xx/5xx 是 server 端
+        if code == 0:
+            err = "无法访问外网 (dns/路由/防火墙)"
+        elif code in (407, 502, 503):
+            err = f"代理/上游异常 (HTTP {code})"
+        else:
+            err = f"HTTP {code}"
+        result = {"ok": False, "http_code": code, "latency_ms": elapsed_ms,
+                  "error": err, "target": target, "ts_cached": 0}
+
+    _EPROBE_CACHE[device_id] = (now, result)
+    return result
+
+
+def vpn_e2e_probe_clear_cache(device_id: Optional[str] = None) -> int:
+    """清缓存，让下次探测强制刷新。device_id=None 清全部。"""
+    if device_id is None:
+        n = len(_EPROBE_CACHE)
+        _EPROBE_CACHE.clear()
+        return n
+    return 1 if _EPROBE_CACHE.pop(device_id, None) else 0
+
+
 # ═══════════════════════════════════════════════════════════════
 # UI automation helpers
 # ═══════════════════════════════════════════════════════════════

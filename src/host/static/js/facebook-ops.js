@@ -407,8 +407,20 @@
           <span style="font-size:10px;color:var(--text-dim)">留空时自动使用客群默认种子群</span>
         </div>
 
-        <div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:8px 12px;font-size:11px;color:#fbbf24;margin-bottom:14px">
-          ⚠ 启动前确认：账号已登录、Messenger 已就绪、VPN 已连接到 <b id="fb-geo-hint">${persona.country_code || '目标'}</b> 地区
+        <div id="fb-precheck-bar" style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:8px 12px;font-size:11px;color:#fbbf24;margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-weight:600">⚡ 启动前真探测</span>
+          <span class="fb-pc-dot" data-key="vpn"   title="VPN 隧道 (tun0)">🔌 VPN <span class="fb-pc-state">…</span></span>
+          <span class="fb-pc-dot" data-key="fb"    title="Facebook e2e 真可达">🌐 FB <span class="fb-pc-state">…</span></span>
+          <span class="fb-pc-dot" data-key="geo"   title="出口 IP 国家匹配">🗺️ Geo <span class="fb-pc-state">…</span></span>
+          <span style="margin-left:auto">
+            <span id="fb-precheck-summary" style="color:#9ca3af">未探测 (无设备 ID)</span>
+            <button onclick="fbRunPrecheck(true)" id="fb-precheck-refresh" style="background:none;border:1px solid rgba(245,158,11,.4);color:#fbbf24;padding:2px 8px;border-radius:4px;font-size:10px;cursor:pointer;margin-left:6px" title="强制刷新探测 (跳过 30s 缓存)">↻ 重探</button>
+          </span>
+        </div>
+        <div style="font-size:10px;color:var(--text-dim);margin:-10px 0 12px 4px">
+          目标客群: <b id="fb-geo-hint">${persona.country_code || '目标'}</b> 地区
+          ｜ 全绿 = 可放心一键启动；红 = 启动会被业务 gate 拒，先点
+          <button onclick="_eapAction('POST','/vpn/reconnect-all')" style="background:none;border:none;color:#60a5fa;cursor:pointer;text-decoration:underline;font-size:10px;padding:0">[一键重连全部 VPN]</button>
         </div>
 
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px">
@@ -422,6 +434,90 @@
         </div>
       </div>
     `;
+
+    // 启动前真探测：弹窗打开就跑一次 (有 deviceId 时)
+    if (preselectedDevice) {
+      window._fbPrecheckDeviceId = preselectedDevice;
+      setTimeout(function () { fbRunPrecheck(false); }, 50);
+    } else {
+      window._fbPrecheckDeviceId = '';
+      const sumEl = document.getElementById('fb-precheck-summary');
+      if (sumEl) sumEl.textContent = '未指定设备 (启动会下发到全部在线 FB 设备)';
+    }
+  };
+
+  // 启动前真探测：renderer + fetch
+  window.fbRunPrecheck = async function (force) {
+    const did = window._fbPrecheckDeviceId || '';
+    if (!did) return;
+
+    const setDot = (key, tone, label, title) => {
+      const dot = document.querySelector(`#fb-precheck-bar .fb-pc-dot[data-key="${key}"]`);
+      if (!dot) return;
+      const colors = { ok: '#22c55e', err: '#ef4444', warn: '#f59e0b', wait: '#9ca3af' };
+      dot.style.color = colors[tone] || '#9ca3af';
+      const st = dot.querySelector('.fb-pc-state');
+      if (st) st.textContent = label;
+      if (title) dot.title = title;
+    };
+    const sumEl = document.getElementById('fb-precheck-summary');
+    const refreshBtn = document.getElementById('fb-precheck-refresh');
+
+    setDot('vpn', 'wait', '探测中…');
+    setDot('fb', 'wait', '探测中…');
+    setDot('geo', 'wait', '探测中…');
+    if (sumEl) { sumEl.textContent = '探测中…'; sumEl.style.color = '#9ca3af'; }
+    if (refreshBtn) refreshBtn.disabled = true;
+
+    try {
+      const url = '/facebook/device/' + encodeURIComponent(did) + '/precheck'
+        + (force ? '?refresh=true' : '');
+      const d = await api('GET', url);
+
+      // VPN tunnel
+      const v = d.vpn_tunnel || {};
+      setDot('vpn', v.ok ? 'ok' : 'err', v.ok ? 'OK' : '断',
+        v.ok ? ('config: ' + (v.config_name || '?')) : (v.error || 'tun0 未建立'));
+
+      // FB e2e
+      const f = d.fb_reachable || {};
+      const cachedTag = (f.ts_cached > 0) ? ` (缓存 ${f.ts_cached}s 前)` : '';
+      setDot('fb', f.ok ? 'ok' : 'err',
+        f.ok ? ('OK ' + (f.latency_ms || 0) + 'ms') : '不通',
+        f.ok ? ('HTTP ' + f.http_code + ' ' + (f.latency_ms || 0) + 'ms' + cachedTag) : (f.error || ''));
+
+      // Geo
+      if (d.geo === null || d.geo === undefined) {
+        setDot('geo', 'warn', '未配置', '未给该设备设期望国 — 跳过 geo gate');
+      } else {
+        const g = d.geo;
+        setDot('geo', g.ok ? 'ok' : 'err',
+          g.ok ? (g.expected_country || 'OK') : '不匹配',
+          g.ok ? ('IP ' + (g.verified_ip || '?') + ' @ ' + g.expected_country) : ('期望 ' + g.expected_country + ', 实 ' + (g.verified_ip || '?')));
+      }
+
+      // Summary
+      if (sumEl) {
+        if (d.can_launch) {
+          sumEl.textContent = '✅ 全绿 可启动';
+          sumEl.style.color = '#22c55e';
+        } else {
+          sumEl.textContent = '⚠ ' + (d.blocking_issues || []).length + ' 项阻塞';
+          sumEl.style.color = '#ef4444';
+          sumEl.title = (d.blocking_issues || []).join(' ｜ ');
+        }
+      }
+    } catch (e) {
+      setDot('vpn', 'err', '失败');
+      setDot('fb', 'err', '失败');
+      setDot('geo', 'err', '失败');
+      if (sumEl) {
+        sumEl.textContent = '探测失败: ' + (e.message || e);
+        sumEl.style.color = '#ef4444';
+      }
+    } finally {
+      if (refreshBtn) refreshBtn.disabled = false;
+    }
   };
 
   // persona 切换时更新兴趣提示 + GEO 提示
