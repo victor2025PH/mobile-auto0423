@@ -22,7 +22,11 @@ logger = logging.getLogger(__name__)
 
 _cache: Dict[str, Tuple[dict, float]] = {}
 _cache_lock = threading.Lock()
-_CACHE_TTL = 90
+# 2026-04-27 P3: TTL 90 → 180s. 圈层拓客真机重试观察单 task 序列内 v3 (12:14:14)
+# preflight fail 后 v4 (12:15:35, +81s 命中 cache) PASS. 90s TTL 太短导致同一
+# task 链反复真探测, 抖动概率高. 180s 让一个 task 序列复用 cache 合理 (单任务
+# 1-3min), 真断网时仍 180s 后重检, 兜底信任 _check_vpn 的反向校验.
+_CACHE_TTL = 180
 
 
 @dataclass
@@ -278,6 +282,34 @@ def _check_network(device_id: str) -> Tuple[bool, str]:
             if r2.returncode == 0:
                 return True, f"connected(ping {host})"
 
+        # 2026-04-27 P3 新增 — TCP 443 nc 探测 (跨 ICMP 不转 / curl 不存在的 ROM):
+        # 圈层拓客真机重试 IJ8HZLOR 实测 chrome 加载 fb.com 真通, 但 curl/ping
+        # 全 fail (设备无 curl + VPN 不转 ICMP). nc 是 TCP 层探测, 反映业务真实路径.
+        # 多 host fallback: gstatic.com 走 DNS, 8.8.8.8 直接 IP (绕 DNS 故障).
+        # 多 nc binary: toybox nc (Android 6+ 标配) 和 /system/bin/nc (旧版备选).
+        #
+        # 命令语法 (真机 IJ8HZLOR 实测正确):
+        #   echo '' | toybox nc -w 5 -W 1 HOST 443
+        # 说明:
+        #   echo '' 喂空 stdin 让 nc 不等用户输入立即建连;
+        #   -w 5  connection timeout 5s (建连超时);
+        #   -W 1  idle timeout 1s (连上后 1s 没数据就退出, returncode=0 = 连过).
+        #   注: Android toybox nc 不支持 -z (port scan mode), 只能用 stdin 重定向.
+        for nc_label, nc_bin in (("toybox-nc", "toybox nc"),
+                                  ("sys-nc", "/system/bin/nc")):
+            for host in ("connectivitycheck.gstatic.com", "8.8.8.8"):
+                try:
+                    r3 = _sp_run_text(
+                        ["adb", "-s", device_id, "shell",
+                         f"echo '' | {nc_bin} -w 5 -W 1 {host} 443 > /dev/null 2>&1 && echo TCP_OK"],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if "TCP_OK" in (r3.stdout or ""):
+                        return True, f"connected(tcp443 via {nc_label} -> {host})"
+                except Exception:
+                    continue
+
         parts = []
         if not code:
             parts.append(
@@ -286,6 +318,7 @@ def _check_network(device_id: str) -> Tuple[bool, str]:
         else:
             parts.append(f"HTTP 状态码={code!r}（最后尝试={last_label}）")
         parts.append("ICMP 探测也未通过")
+        parts.append("TCP 443 nc 探测也未通过")
         return False, (
             "无法访问外网（"
             + "；".join(parts)
