@@ -260,6 +260,7 @@ _initTheme();
 
 let ALIAS={};
 window.WP_NUM = {};       // {device_id: wallpaper_number} 壁纸状态追踪
+window.WP_ERR = {};       // {device_id: {kind,detail,at}} 壁纸部署失败细分原因 (chip hover 显示)
 window._globalRanges = {}; // {host_id: {start,end}} 全局编号段配置
 
 async function loadAliases(){
@@ -267,11 +268,19 @@ async function loadAliases(){
     const data=await api('GET','/devices/aliases');
     ALIAS={};
     window.WP_NUM={};
+    window.WP_ERR={};
     for(const[did,info] of Object.entries(data)){
       ALIAS[did]=info.alias||`${(info.number||0).toString().padStart(2,'0')}号`;
       if(info.wallpaper_number) window.WP_NUM[did]=info.wallpaper_number;
+      if(info.wallpaper_error){
+        window.WP_ERR[did]={
+          kind: info.wallpaper_error,
+          detail: info.wallpaper_error_detail || '',
+          at: info.wallpaper_error_at || '',
+        };
+      }
     }
-  }catch(e){ALIAS={}; window.WP_NUM={};}
+  }catch(e){ALIAS={}; window.WP_NUM={}; window.WP_ERR={};}
   // 预加载全局编号段配置（供 _updateUnsetCount 和 devCard 使用）
   try{
     window._globalRanges = await api('GET','/cluster/number-ranges');

@@ -345,12 +345,15 @@ function devCard(d,compact){
         <button class="dev-btn screen" onclick="event.stopPropagation();openScreenModal('${did}')">&#128247; 屏幕</button>
         ${(()=>{
           const wpN = window.WP_NUM&&window.WP_NUM[did];
-          const wpOk = numVal&&wpN===numVal;
-          const wpOutdated = numVal&&wpN&&wpN!==numVal;
-          const wpTitle = !numVal?'请先设置编号':wpOk?`壁纸最新 #${String(numVal).padStart(2,'0')}`:wpOutdated?`壁纸已过期 (#${wpN}→#${numVal})，点击更新`:'未知状态，点击部署';
-          const cls = `dev-btn wp${wpOk?' wp-ok':wpOutdated?' wp-outdated':''}`;
-          const dot = wpOutdated?'<span class="wp-dot outdated"></span>':wpOk?'<span class="wp-dot ok"></span>':'';
-          return `<button class="${cls}" id="wp-${didShort}" onclick="event.stopPropagation();_deployWallpaperSingle('${did}')" title="${wpTitle}">🖼${dot}</button>`;
+          const wpErr = window.WP_ERR&&window.WP_ERR[did];
+          const wpOk = numVal&&wpN===numVal&&!wpErr;
+          const wpOutdated = numVal&&wpN&&wpN!==numVal&&!wpErr;
+          // wpErr 存在时优先显示具体失败原因 (kind/detail/at), hover 即看出根因
+          const wpErrTitle = wpErr ? (`壁纸部署失败 [${wpErr.kind}]`+(wpErr.detail?` · ${wpErr.detail}`:'')+(wpErr.at?` · ${wpErr.at}`:'')) : '';
+          const wpTitle = !numVal?'请先设置编号':wpErr?wpErrTitle:wpOk?`壁纸最新 #${String(numVal).padStart(2,'0')}`:wpOutdated?`壁纸已过期 (#${wpN}→#${numVal})，点击更新`:'未知状态，点击部署';
+          const cls = `dev-btn wp${wpErr?' wp-error':wpOk?' wp-ok':wpOutdated?' wp-outdated':''}`;
+          const dot = wpErr?'<span class="wp-dot error"></span>':wpOutdated?'<span class="wp-dot outdated"></span>':wpOk?'<span class="wp-dot ok"></span>':'';
+          return `<button class="${cls}" id="wp-${didShort}" onclick="event.stopPropagation();_deployWallpaperSingle('${did}')" title="${wpTitle.replace(/"/g,'&quot;')}">🖼${dot}</button>`;
         })()}
         ${isUnset&&!compact?`<button class="dev-btn" style="color:#f59e0b;border-color:#f59e0b;font-weight:600" onclick="event.stopPropagation();_avatarEdit(event,document.getElementById('av-${didShort}'),'${did}')" title="点击分配编号">📋 编号</button>`:''}
         ${compact?'':`<button class="dev-btn" onclick="event.stopPropagation();quickCmdDev('${alias||did.substring(0,4)}','养号30分钟')">养号</button>`}
