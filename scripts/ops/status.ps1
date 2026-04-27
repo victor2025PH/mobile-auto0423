@@ -374,6 +374,30 @@ if ($tail.Count -eq 0) {
 }
 
 # ---- Summary ----
+# ---- (informational) Temporary config TTL scan ----
+# 不影响 verdict, 只提醒配置临时改动是否过期 (4-21 VPN gate / 4-26
+# enabled_probability 同类潜伏事故的元工程防护). 见 Phase 2 P1.5.
+# JSON 模式跳过 (避免污染 -Json 输出); 失败静默 (扫描器是 nice-to-have).
+if (-not $Json) {
+    try {
+        $tempScript = Join-Path $PSScriptRoot "check_temp_configs.ps1"
+        if (Test-Path $tempScript) {
+            $ttlOut = & $tempScript -Json 2>&1 | Out-String
+            $ttlData = $null
+            try { $ttlData = $ttlOut | ConvertFrom-Json } catch {}
+            if ($ttlData -and $ttlData.expired -gt 0) {
+                Write-Host ""
+                Write-Host ("[!] {0} expired temporary config marker(s) — run check_temp_configs.ps1 for details" -f $ttlData.expired) -ForegroundColor Red
+            } elseif ($ttlData -and $ttlData.soon -gt 0) {
+                Write-Host ""
+                Write-Host ("[i] {0} temporary config marker(s) due within {1}d — run check_temp_configs.ps1" -f $ttlData.soon, $ttlData.days_ahead) -ForegroundColor Yellow
+            }
+        }
+    } catch {
+        # silent — 扫描器异常不该影响 status verdict
+    }
+}
+
 Write-Host ""
 Write-Host "==========================================="
 if ($foundPort) {
