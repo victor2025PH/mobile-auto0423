@@ -983,6 +983,18 @@ body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;backgroun
 .oc-task-toolbar__count{font-size:11px;color:var(--text-dim);white-space:nowrap;padding:2px 0;}
 .oc-task-count-help{width:18px;height:18px;padding:0;border-radius:50%;border:1px solid var(--border);background:var(--bg-input);color:var(--text-muted);font-size:11px;font-weight:600;line-height:1;cursor:help;flex-shrink:0;transition:border-color .15s,color .15s;}
 .oc-task-count-help:hover,.oc-task-count-help:focus-visible{border-color:var(--accent);color:var(--accent);outline:none;}
+/* Phase 2 P0 — 任务中心顶部健康 chip (VPN / 今日成功率) */
+.task-health-chips{display:inline-flex;align-items:center;gap:6px;flex-shrink:0;}
+.task-health-chip{display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:2px 8px;border-radius:10px;border:1px solid var(--border);background:var(--bg-input);color:var(--text-dim);white-space:nowrap;cursor:help;}
+.task-health-chip .dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--text-muted);}
+.task-health-chip.green{border-color:#22c55e44;color:#22c55e;}
+.task-health-chip.green .dot{background:#22c55e;}
+.task-health-chip.amber{border-color:#f59e0b44;color:#f59e0b;}
+.task-health-chip.amber .dot{background:#f59e0b;}
+.task-health-chip.red{border-color:#f8717144;color:#f87171;}
+.task-health-chip.red .dot{background:#f87171;}
+.task-health-chip.gray{border-color:var(--border);color:var(--text-muted);}
+.task-health-chip.gray .dot{background:var(--text-muted);}
 .oc-task-list-card{background:var(--bg-card);border-radius:12px;border:1px solid var(--border);overflow:hidden;transition:box-shadow .15s;}
 .oc-task-list-card.oc-task-list-flash{animation:oc-task-list-flash 0.75s ease-out;}
 @keyframes oc-task-list-flash{
