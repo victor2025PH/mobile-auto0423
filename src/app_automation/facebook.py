@@ -1891,6 +1891,17 @@ class FacebookAutomation(BaseAutomation):
                     hint=("post_send_verify_failed: 可能 send 按钮被点但消息 "
                           "没真发 (网络问题 / FB 静默拒发 / tap 错对话页). "
                           "上层应重试或换路径"))
+            # OPT-FP6 (2026-04-28): 最后一道防线 — dumpsys window 强制
+            # 校验 orca 在前台. 消灭 Q4N7 类 false positive (send_message
+            # 返 True 但实际跑到 FB 主 app 备份页 / 别 app, OPT-FP3
+            # dump-based verify 被 substring 误放行).
+            if not self._verify_messenger_in_foreground(did):
+                raise MessengerError(
+                    "send_button_missing",
+                    f"send_message 末尾 orca 不在前台 (activity check failed)",
+                    hint=("post_send_activity_check_failed: send_message 路径 "
+                          "中途切到错 app (Q4N7 实测进 FB 主 app 备份页). "
+                          "上层应重试或换路径"))
             return True
         # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
@@ -2703,6 +2714,58 @@ class FacebookAutomation(BaseAutomation):
                 "messenger_unavailable",
                 "force-stop + am-start LAUNCHER + monkey 都没把 orca 拉前台",
                 hint="launch_failed: 设备状态异常 / orca 安装损坏 / 锁屏中")
+
+    def _verify_messenger_in_foreground(self, did: str) -> bool:
+        """OPT-FP6 (2026-04-28): send_message return True 前最后一道防线 —
+        dumpsys window 检查 com.facebook.orca 在前台.
+
+        消灭 Q4N7 类 false positive (实测 send_message 返 True 但截图显示
+        在 katana FB 主 app 备份页 MibCloudBackupNuxActivity, OPT-FP3
+        dump-based verify 被 substring 误放行).
+
+        策略:
+          1. dumpsys window grep com.facebook.orca 在 mCurrentFocus / mFocusedApp
+          2. miss → retry 1 次 (1s 间隔, 防真机偶发 dumpsys 慢)
+          3. 2 次都 miss + dumpsys 调用成功 → return False (调用方 raise)
+          4. dumpsys 调用失败 / 异常 → fail-safe True (让 OPT-FP3 当主防线)
+
+        Args:
+            did: adb device serial
+
+        Returns:
+            True orca 在前台 (或 fail-safe)
+            False orca 不在前台 (调用方应 raise)
+        """
+        for retry_idx in range(2):
+            try:
+                ok, out = self.dm._run_adb(
+                    ["shell", "dumpsys", "window"], did, timeout=5)
+                if not ok:
+                    log.debug(
+                        "[opt-fp6] dumpsys window retry=%d 失败 fail-safe",
+                        retry_idx)
+                    return True
+                if MESSENGER_PACKAGE in (out or ""):
+                    return True
+                if retry_idx == 0:
+                    time.sleep(1.0)
+                    continue
+                # 2 次都 miss + dumpsys 成功 → 真不在前台
+                snippet = ""
+                for line in (out or "").splitlines():
+                    if "mCurrentFocus" in line or "mFocusedApp" in line:
+                        snippet = line.strip()
+                        break
+                log.warning(
+                    "[opt-fp6] send_message 末尾 orca 不在前台! "
+                    "snippet=%r", snippet[:200])
+                return False
+            except Exception as e:
+                log.debug(
+                    "[opt-fp6] dumpsys retry=%d 异常 fail-safe: %s",
+                    retry_idx, e)
+                return True
+        return True  # pragma: no cover
 
     def _verify_message_actually_sent(self, d, message: str) -> bool:
         """OPT-FP3 (2026-04-28): tap Send 之后 dump 对话页验证刚发 message
