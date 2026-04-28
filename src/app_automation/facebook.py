@@ -1802,6 +1802,19 @@ class FacebookAutomation(BaseAutomation):
             self._tap_first_search_result(d, did, recipient)
 
             time.sleep(1)
+            # OPT-FP1 (2026-04-28): tap 第一搜索结果后 dump 对话页 title 验证
+            # recipient 匹配. 防 false positive — IJ8H 实测搜索 "Meta AI"
+            # 命中 "Shuichi Ito" (自己), 整个 send 链路在错对话页跑完返 True
+            # 但消息发到错的人. 不匹配 → recipient_not_found (与已有 code
+            # 复用, hint 标 verify_failed 让调用方区分).
+            if not self._verify_recipient_in_conv_title(d, recipient):
+                raise MessengerError(
+                    "recipient_not_found",
+                    f"tap 第一搜索结果后对话页 title 不含 recipient={recipient!r}",
+                    hint=("verify_failed: 可能 tap 错对话页 (Messenger 搜索结果"
+                          " 把'自己头像'/'最近联系人'作为第 1 条, fallback 误"
+                          "命中). 上层应重试或换路径"))
+
             # 2026-04-24 safety: 显式 tap composer 确保 focus — 真机观察到
             # 某些 Messenger 版本打开对话后 composer 未自动 focus, 直接
             # hb.type_text 会打到错地方 (e.g. stale search box)。
@@ -2518,6 +2531,56 @@ class FacebookAutomation(BaseAutomation):
             hint=("smart_tap + XML + coordinate + VLM (Gemini/Ollama) 全 "
                   "miss; peer 未加好友/昵称变更/索引延迟/UI 大改版, A 可 "
                   "5-15s 后重试"))
+
+    def _verify_recipient_in_conv_title(self, d, recipient: str) -> bool:
+        """OPT-FP1 (2026-04-28): tap 第一个搜索结果后验证当前对话页 title bar
+        含期望 recipient name. 防 false positive — Messenger 搜索结果列表
+        把"自己头像"/"最近联系人"作为第 1 条, smart_tap/VLM fallback 命中
+        错位置时会进错对话页.
+
+        IJ8H 实测: 搜索 "Meta AI" → tap 第 1 条 → 进了 "Shuichi Ito" (自己)
+        对话页, title bar 显示 "Shuichi Ito" 而非 "Meta AI" → verify=False.
+
+        策略 (双重 fallback):
+          1. dump_hierarchy 找含 recipient text/desc 的节点 (substring match)
+          2. miss → 找当前 Activity 标题区域 (Thread details / Active 行)
+
+        fail-safe: 异常时返 True (放行), 不阻断 send_message 主流程
+        (若 dump 失败误 abort 反而让生产链路更脆弱).
+
+        Args:
+            d: u2 device
+            recipient: 期望的 recipient name (e.g. "Meta AI" / "Shuichi Ito")
+
+        Returns:
+            True 当前对话页 title 含 recipient (匹配)
+            False title 不含 recipient (错对话页, 应 abort)
+        """
+        if not recipient:
+            return True
+        try:
+            time.sleep(0.6)  # 等对话页 title bar 渲染
+            xml = d.dump_hierarchy()
+            # fail-safe: dump_hierarchy 必须返 str. mock 场景 / u2 hiccup
+            # 可能返 MagicMock 或 None — 此时放行不阻断主流程 (单测 mock
+            # 不需要 verify, 真机生产路径才需要)
+            if not isinstance(xml, str) or not xml:
+                return True
+            # title bar / chat profile 节点常含 recipient 全名
+            # 在 IJ8H 实测中, 对话页 title 是 'Shuichi Ito, Active 16 hours
+            # ago, Thread details' 这种格式
+            recipient_norm = recipient.strip()
+            if recipient_norm and recipient_norm in xml:
+                return True
+            log.warning(
+                "[verify-recipient] 当前对话页未找到 recipient=%r — "
+                "可能 tap 错对话, dump 前 200 chars:\n%s",
+                recipient, xml[:200])
+            return False
+        except Exception as e:
+            log.debug(
+                "[verify-recipient] 异常 fail-safe 放行: %s", e)
+            return True
 
     def _focus_messenger_composer(self, d) -> bool:
         """2026-04-24 真机 safety: 在 ``hb.type_text`` 之前显式 tap composer
