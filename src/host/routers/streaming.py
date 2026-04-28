@@ -66,6 +66,39 @@ def stop_stream(device_id: str):
     return {"ok": True, "device_id": did}
 
 
+@router.post("/devices/{device_id}/stream/reconnect-control",
+             dependencies=[Depends(verify_api_key)])
+def reconnect_stream_control(device_id: str):
+    """P2-③ 仅重连 control 通道, 保持 video stream.
+
+    当用户看到投屏只读 banner (control socket 未建立但 video 正常) 时调用,
+    比 stop+start 快 5-10s, 不影响视频画面.
+
+    返回 {ok, device_id, has_control, message}.
+    若 session 不存在或 video 未启动则 404.
+    """
+    did, _ = _resolve_device_with_manager(device_id)
+    from src.host.scrcpy_manager import get_scrcpy_manager
+    mgr = get_scrcpy_manager()
+    session = mgr.get_session(did) if hasattr(mgr, "get_session") else mgr._sessions.get(did)
+    if not session or not session.is_running:
+        raise HTTPException(
+            status_code=404,
+            detail="No active stream session — please start the stream first",
+        )
+    try:
+        ok = session.reconnect_control()
+        return {
+            "ok": ok,
+            "device_id": did,
+            "has_control": session.has_control,
+            "message": "control reconnected" if ok else "still video-only after retries",
+        }
+    except Exception as e:
+        logger.error("[reconnect-control] %s failed: %s", did[:8], e)
+        raise HTTPException(status_code=500, detail=f"reconnect failed: {e}")
+
+
 @router.get("/streams")
 def list_streams():
     """List active scrcpy streaming sessions with stats."""
