@@ -817,7 +817,8 @@ class FacebookAutomation(BaseAutomation):
     # ── Smart Tap with Post-Tap Self-Healing (Sprint 4 P0) ─────────────────
 
     def smart_tap(self, target_desc: str, context: str = "",
-                  device_id: Optional[str] = None) -> bool:
+                  device_id: Optional[str] = None,
+                  *, expected_pkg: Optional[str] = None) -> bool:
         """FB 专用 smart_tap: 点击成功后立刻检查是否误点把 app 切走。
 
         动机(Sprint 3 P3.8 add_friend 失败复盘):
@@ -825,29 +826,39 @@ class FacebookAutomation(BaseAutomation):
           右上角 Messenger 💬 icon (text/desc=Search 容易命中周边元素),
           结果整个流程进了 Messenger 的 "New message" 页,后续全部对错目标。
 
+        OPT-7 (2026-04-28): expected_pkg kwarg
+          attach_image 等 Messenger 内操作期望 current_pkg = orca 而非 katana,
+          原默认 PACKAGE (katana) 比较会让 orca 内每次 tap 都触发 heal 误报
+          + 多余 BACK + 重启 FB。传 expected_pkg=MESSENGER_PACKAGE 即可。
+          send_message 等已稳定的 caller 不传, 维持 backward-compat。
+
         修复策略:
           ① 调父类 smart_tap 执行真点击(tap 后 AdbFallbackDevice 已 invalidate cache)
           ② 等 UI 稳定 (700ms) — 避免 activity 切换中途 app_current 瞬时不准
           ③ 强制 invalidate app_cache,读最新 app_current
-          ④ 如果脱离 FB:先试 _handle_xspace_dialog(Select app sheet),
-             不行就 BACK,再不行就 _adb_start_main_user 重启
+          ④ 如果脱离期望 pkg: 先试 _handle_xspace_dialog(Select app sheet),
+             不行就 BACK, 再不行就 _adb_start_main_user 重启
           ⑤ **2026-04-20 真机回归二次优化**: 自愈成功后如果 app 已回到
              FB,**自动再 tap 一次**(递归深度最多 1 层),第二次 tap
              会基于最新 dump 重新解析位置 → 大概率命中真正的目标控件;
              仍漂移/失败才返回 False。避免"自愈成功但业务意图未达成 →
              上层后续步骤连锁失败"。
         """
-        return self._smart_tap_with_heal(target_desc, context, device_id,
-                                         _heal_retry=True)
+        return self._smart_tap_with_heal(
+            target_desc, context, device_id,
+            _heal_retry=True, expected_pkg=expected_pkg)
 
     def _smart_tap_with_heal(self, target_desc: str, context: str,
                              device_id: Optional[str],
-                             _heal_retry: bool) -> bool:
+                             _heal_retry: bool,
+                             expected_pkg: Optional[str] = None) -> bool:
         ok = super().smart_tap(target_desc, context, device_id)
         if not ok:
             return False
         did = self._did(device_id)
         d = self._u2(did)
+        # OPT-7: caller 显式声明的 expected_pkg 优先, 否则默认 katana
+        target_pkg = expected_pkg or PACKAGE
         try:
             import time as _t
             _t.sleep(0.7)
@@ -859,11 +870,11 @@ class FacebookAutomation(BaseAutomation):
                 current_pkg = (d.app_current() or {}).get("package", "")
             except Exception:
                 current_pkg = ""
-            if not current_pkg or current_pkg == PACKAGE:
-                return ok  # tap 后仍在 FB 下,正常
+            if not current_pkg or current_pkg == target_pkg:
+                return ok  # tap 后仍在期望 pkg 下,正常
 
             log.warning("[smart_tap-heal] tap '%s' 后 app 漂移: %s != %s,启动自愈",
-                        target_desc, current_pkg, PACKAGE)
+                        target_desc, current_pkg, target_pkg)
             self._handle_xspace_dialog(d, did)
             _t.sleep(0.4)
             try:
@@ -872,7 +883,7 @@ class FacebookAutomation(BaseAutomation):
             except Exception:
                 current_pkg = ""
 
-            if current_pkg != PACKAGE:
+            if current_pkg != target_pkg:
                 self._adb(f"shell input keyevent 4", device_id=did)
                 _t.sleep(0.6)
                 try:
@@ -881,7 +892,7 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     current_pkg = ""
 
-            if current_pkg != PACKAGE:
+            if current_pkg != target_pkg:
                 log.warning("[smart_tap-heal] BACK 失败 (current=%s),重启 FB",
                             current_pkg)
                 self._adb_start_main_user(did)
@@ -893,12 +904,13 @@ class FacebookAutomation(BaseAutomation):
                     current_pkg = (d.app_current() or {}).get("package", "")
                 except Exception:
                     current_pkg = ""
-                if current_pkg == PACKAGE:
-                    log.info("[smart_tap-heal] 已回到 FB,对 '%s' 做一次 retry tap",
-                             target_desc)
+                if current_pkg == target_pkg:
+                    log.info("[smart_tap-heal] 已回到 %s,对 '%s' 做一次 retry tap",
+                             target_pkg, target_desc)
                     _t.sleep(1.0)
-                    return self._smart_tap_with_heal(target_desc, context,
-                                                    device_id, _heal_retry=False)
+                    return self._smart_tap_with_heal(
+                        target_desc, context, device_id,
+                        _heal_retry=False, expected_pkg=expected_pkg)
             log.warning("[smart_tap-heal] '%s' 自愈后仍异常(current=%s),放弃",
                         target_desc, current_pkg)
             return False
@@ -1929,7 +1941,10 @@ class FacebookAutomation(BaseAutomation):
         失败抛 :class:`AttachImageError(code='gallery_button_missing')`。
         """
         # L1: smart_tap (AutoSelector 学习库)
-        if self.smart_tap("Open photo gallery", device_id=did):
+        # OPT-7 (2026-04-28): expected_pkg=MESSENGER_PACKAGE — Messenger 内
+        # 操作不应触发 heal 误报 (orca != katana 误判)
+        if self.smart_tap("Open photo gallery", device_id=did,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         # L2: multi-locale selector
         obj = self._find_messenger_ui_fallback(
