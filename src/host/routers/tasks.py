@@ -3,6 +3,8 @@
 
 import logging
 import os
+import threading
+import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +16,39 @@ from ..schemas import TaskBatchDelete, TaskCreate, TaskResponse, TaskResultRepor
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["tasks"])
+
+# P2-④ smart_retry 风暴防护:
+# - 同 device_id 5 分钟内最多 3 次手动 smart_retry（防运营连点）
+# - retry 链路总深度（系统 retry_count + 手动 _retry_of 链）≥ 5 时拒绝
+_RETRY_THROTTLE_LOCK = threading.Lock()
+_RETRY_THROTTLE: dict = {}  # device_id → list[timestamp]
+_RETRY_THROTTLE_WINDOW_S = 300
+_RETRY_THROTTLE_MAX = 3
+_RETRY_DEPTH_MAX = 5
+
+
+def _retry_throttle_check(device_id: str) -> tuple:
+    """返回 (allowed, recent_count). 不允许时 recent_count 用于 UI 提示."""
+    if not device_id:
+        return True, 0
+    now = time.time()
+    cutoff = now - _RETRY_THROTTLE_WINDOW_S
+    with _RETRY_THROTTLE_LOCK:
+        bucket = _RETRY_THROTTLE.setdefault(device_id, [])
+        bucket[:] = [t for t in bucket if t > cutoff]
+        if len(bucket) >= _RETRY_THROTTLE_MAX:
+            return False, len(bucket)
+        bucket.append(now)
+        return True, len(bucket)
+
+
+def _compute_retry_depth(task: dict) -> int:
+    """估算 retry 链路深度: 系统 retry_count + 手动 _retry_of 链长度."""
+    depth = int(task.get("retry_count") or 0)
+    params = task.get("params") or {}
+    if isinstance(params, dict) and params.get("_retry_of"):
+        depth += 1
+    return depth
 
 
 # ---------------------------------------------------------------------------
@@ -773,9 +808,35 @@ def retry_task_endpoint(task_id: str):
     device_id = t.get("device_id")
     task_type = t.get("type") or ""
     params = dict(t.get("params") or {})
+
+    # P2-④ 风暴防护: 链路深度 + 设备 throttle 双闸
+    depth = _compute_retry_depth(t)
+    if depth >= _RETRY_DEPTH_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "retry_depth_exceeded",
+                "depth": depth,
+                "max": _RETRY_DEPTH_MAX,
+                "hint": f"该任务已重试 {depth} 次（系统自动 + 手动）。请先用「🩺 诊断」排查根因，避免无效风暴。",
+            },
+        )
+    allowed, recent = _retry_throttle_check(str(device_id or ""))
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "retry_throttled",
+                "recent_count": recent,
+                "window_seconds": _RETRY_THROTTLE_WINDOW_S,
+                "hint": f"该设备 {_RETRY_THROTTLE_WINDOW_S//60} 分钟内已 {recent} 次手动重试，请等待或换设备。",
+            },
+        )
+
     # 标记 retry 来源便于审计 + dashboard 区分原始/重试
     params["_retry_of"] = task_id
     params["_created_via"] = "smart_retry"
+    params["_retry_depth"] = depth + 1  # 让下游知道这是第几跳，便于看板分析
 
     invalidated = False
     if device_id:

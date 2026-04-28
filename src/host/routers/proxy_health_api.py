@@ -223,3 +223,128 @@ def configure_all_devices_geo(body: GeoAllRequest):
         "results": results,
         "errors": errors,
     }
+
+
+# ── P2-① 代理质量看板 ──
+
+@router.get("/quality")
+def get_proxy_quality(hours: int = 24):
+    """代理质量聚合看板 — 单设备维度合并 proxy_health 当前状态 + 任务窗口失败归因.
+
+    数据源 (read-only, 不做新埋点):
+      A. proxy_health_monitor.get_all_status() — 4 态（ok/leak/no_ip/unverified）+ circuit
+      B. task_store SQL — 近 N 小时各设备 total/failed task 数
+      C. error_classifier.classify_task_error — 把每个失败 error 归到 layer (infra/business/...)
+
+    输出 per_device 数组：每设备一行，含
+      - current_state, current_ip, expected_country (来自 A)
+      - tasks_total, tasks_failed, infra_failed, business_failed (来自 B+C)
+      - infra_health_score = 100 × (1 - infra_failed / total)
+      - top_error_code = error_classifier 归类最频繁的 code（如 proxy_hijack）
+
+    用途：dashboard 顶部「代理质量」tab 一次性展示哪台手机代理出问题、是基建还是业务挂.
+    """
+    import json as _j
+    import time as _t
+    from src.host.error_classifier import classify_task_error
+    from ..database import get_conn
+    from ..task_store import _alive_sql
+
+    monitor = get_proxy_health_monitor()
+    statuses = monitor.get_all_status()  # device_id → status dict
+
+    cutoff = _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(_t.time() - hours * 3600))
+    _aq = _alive_sql()
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT device_id, status, result FROM tasks "
+            f"WHERE updated_at > ? AND {_aq}",
+            (cutoff,),
+        ).fetchall()
+
+    # 聚合 per device
+    per_device_agg: dict = {}
+    layer_totals = {"infra": 0, "business": 0, "quota": 0, "timing": 0, "safety": 0, "unknown": 0}
+    for row in rows:
+        did = row[0] or "unknown"
+        status = row[1]
+        agg = per_device_agg.setdefault(did, {
+            "total": 0, "failed": 0, "infra_failed": 0,
+            "business_failed": 0, "code_counts": {},
+        })
+        agg["total"] += 1
+        if status != "failed":
+            continue
+        agg["failed"] += 1
+        result_raw = row[2]
+        result = {}
+        if isinstance(result_raw, str):
+            try:
+                result = _j.loads(result_raw)
+            except Exception:
+                pass
+        elif isinstance(result_raw, dict):
+            result = result_raw
+        err = result.get("error", "") or ""
+        cls = classify_task_error(err)
+        if not cls:
+            continue
+        layer = cls.get("layer", "unknown")
+        code = cls.get("code", "unclassified")
+        layer_totals[layer] = layer_totals.get(layer, 0) + 1
+        agg["code_counts"][code] = agg["code_counts"].get(code, 0) + 1
+        if layer == "infra":
+            agg["infra_failed"] += 1
+        elif layer == "business":
+            agg["business_failed"] += 1
+
+    # 装配 per_device 列表（含未在 task 窗口里出现但 proxy_health 注册了的设备）
+    all_dids = set(per_device_agg.keys()) | set(statuses.keys())
+    per_device_out = []
+    for did in sorted(all_dids):
+        agg = per_device_agg.get(did, {"total": 0, "failed": 0, "infra_failed": 0,
+                                       "business_failed": 0, "code_counts": {}})
+        ph = statuses.get(did) or {}
+        score = 100
+        if agg["total"] > 0:
+            score = max(0, round((1 - agg["infra_failed"] / agg["total"]) * 100))
+        top_code = ""
+        if agg["code_counts"]:
+            top_code = max(agg["code_counts"], key=lambda k: agg["code_counts"][k])
+        per_device_out.append({
+            "device_id": did,
+            "router_id": ph.get("router_id", ""),
+            "current_state": ph.get("state", "unknown"),
+            "current_ip": ph.get("actual_ip", ""),
+            "expected_ip": ph.get("expected_ip", ""),
+            "ip_match": ph.get("ip_match"),
+            "circuit_open": ph.get("circuit_open", False),
+            "tasks_total": agg["total"],
+            "tasks_failed": agg["failed"],
+            "infra_failed": agg["infra_failed"],
+            "business_failed": agg["business_failed"],
+            "infra_health_score": score,
+            "top_error_code": top_code,
+        })
+
+    # 顶部汇总
+    state_counts = {"ok": 0, "leak": 0, "no_ip": 0, "unverified": 0, "circuit_open": 0}
+    for s in statuses.values():
+        st = s.get("state", "unverified")
+        state_counts[st] = state_counts.get(st, 0) + 1
+        if s.get("circuit_open"):
+            state_counts["circuit_open"] += 1
+
+    return {
+        "window_hours": hours,
+        "summary": {
+            "devices_total": len(statuses),
+            "tasks_total": sum(d["tasks_total"] for d in per_device_out),
+            "tasks_failed": sum(d["tasks_failed"] for d in per_device_out),
+            "infra_failed": sum(d["infra_failed"] for d in per_device_out),
+            "business_failed": sum(d["business_failed"] for d in per_device_out),
+            **state_counts,
+        },
+        "by_error_layer": layer_totals,
+        "per_device": per_device_out,
+    }
