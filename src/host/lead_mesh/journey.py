@@ -144,7 +144,7 @@ def count_actions(canonical_id: str,
         params.append(action)
     if since_hours > 0:
         import datetime as _dt
-        cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=since_hours)).strftime(
+        cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=since_hours)).strftime(
             "%Y-%m-%dT%H:%M:%SZ")
         sql += " AND at >= ?"
         params.append(cutoff)

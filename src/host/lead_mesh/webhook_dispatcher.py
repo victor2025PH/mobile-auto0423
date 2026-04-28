@@ -48,14 +48,14 @@ _CONFIG_LOADED_AT = 0.0
 
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _next_retry_iso(attempt: int) -> str:
     schedule = list(DEFAULT_RETRY_SCHEDULE)
     idx = min(max(0, attempt - 1), len(schedule) - 1)
     sec = schedule[idx]
-    return (_dt.datetime.utcnow() + _dt.timedelta(seconds=sec)).strftime(
+    return (_dt.datetime.now(_dt.UTC) + _dt.timedelta(seconds=sec)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
 
 

@@ -105,7 +105,7 @@ class FunnelStats:
 
 
 def _iso_since(days: int) -> str:
-    dt = _dt.datetime.utcnow() - _dt.timedelta(days=int(days))
+    dt = _dt.datetime.now(_dt.UTC) - _dt.timedelta(days=int(days))
     # lead_journey.at 格式 "YYYY-MM-DD HH:MM:SS" (SQLite datetime('now'))
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -215,7 +215,7 @@ def compute_funnel_timeseries(days: int = 7,
           Python 侧填 0 + 按 date 对齐.
     """
     days = max(1, min(90, int(days)))
-    today = _dt.datetime.utcnow().date()
+    today = _dt.datetime.now(_dt.UTC).date()
     # 近 N 天: 包括今天, 所以起点是 today - (days-1)
     start_date = today - _dt.timedelta(days=days - 1)
     date_list = [(start_date + _dt.timedelta(days=i)).isoformat()

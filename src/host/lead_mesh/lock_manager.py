@@ -29,11 +29,11 @@ DEFAULT_TTL_SEC = 180
 
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _expires_iso(ttl_sec: int) -> str:
-    return (_dt.datetime.utcnow() + _dt.timedelta(seconds=int(ttl_sec))).strftime(
+    return (_dt.datetime.now(_dt.UTC) + _dt.timedelta(seconds=int(ttl_sec))).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
 
 

@@ -54,7 +54,7 @@ STATUS_FAILED = "failed"
 
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def send_message(*,
@@ -248,7 +248,7 @@ def reply_to(query_message: Dict[str, Any],
 
 def cleanup_old_messages(older_than_days: int = 30) -> int:
     """删除 acknowledged/failed 的旧消息 (归档/节省空间)。pending/delivered 不动。"""
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=older_than_days)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=older_than_days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     try:
         with _connect() as conn:

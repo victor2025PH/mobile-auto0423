@@ -36,7 +36,7 @@ TERMINAL_OUTCOMES = (OUTCOME_CONVERTED, OUTCOME_LOST)
 
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _human_actor(username: str) -> str:

@@ -139,7 +139,7 @@ def _today_start_iso(tz_offset: str = "+00:00") -> str:
         offset = _dt.timedelta(hours=hh * sign, minutes=mm * sign)
     except Exception:
         offset = _dt.timedelta(0)
-    now_utc = _dt.datetime.utcnow()
+    now_utc = _dt.datetime.now(_dt.UTC)
     now_local = now_utc + offset
     local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     utc_midnight = local_midnight - offset
