@@ -1730,8 +1730,13 @@ class FacebookAutomation(BaseAutomation):
                 message, {"platform": "facebook", "recipient": recipient})
 
             # ── 1. 进 Messenger ─────────────────────────────────────────
+            # OPT-7-v2 (2026-04-28): tap 后期望 current_pkg=orca (而非默认
+            # PACKAGE=katana), 否则 heal 会把成功 tap 误判为漂移 → BACK +
+            # 重启 FB 兜底, send_message 第一步浪费 1-3s. 传 expected_pkg
+            # 修正语义, smart_tap 直接 return True.
             launched_via_icon = self.smart_tap(
-                "Messenger or chat icon", device_id=did)
+                "Messenger or chat icon", device_id=did,
+                expected_pkg=MESSENGER_PACKAGE)
             if not launched_via_icon:
                 try:
                     d.app_start(MESSENGER_PACKAGE)
@@ -2276,7 +2281,9 @@ class FacebookAutomation(BaseAutomation):
         Level 4 VLM 是为 Messenger 2026 Compose UI 加的 — search bar 不在
         AccessibilityNode tree, 前 3 级全 miss 时用图像识别兜底。
         """
-        if self.smart_tap("Search in Messenger", device_id=device_id):
+        # OPT-7-v2 (2026-04-28): 期望 orca (Messenger 内 tap)
+        if self.smart_tap("Search in Messenger", device_id=device_id,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         obj = self._find_messenger_ui_fallback(
             d, self._MESSENGER_SEARCH_SELECTORS)
@@ -2362,7 +2369,9 @@ class FacebookAutomation(BaseAutomation):
         对更大屏幕也按比例缩放。Level 4 VLM 应对 Compose UI 下 AccessibilityNode
         查不到 send button 的情况。
         """
-        if self.smart_tap("Send message button", device_id=device_id):
+        # OPT-7-v2 (2026-04-28): 期望 orca (Messenger composer 内 tap)
+        if self.smart_tap("Send message button", device_id=device_id,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         obj = self._find_messenger_ui_fallback(
             d, self._MESSENGER_SEND_SELECTORS)
@@ -2437,7 +2446,9 @@ class FacebookAutomation(BaseAutomation):
             recipient: 目标联系人名 (用于 L2 query match + L4 VLM context)
         """
         # L1: smart_tap (AutoSelector 学习库命中率最高)
-        if self.smart_tap("First matching contact", device_id=device_id):
+        # OPT-7-v2 (2026-04-28): 期望 orca (Messenger 搜索结果列表内 tap)
+        if self.smart_tap("First matching contact", device_id=device_id,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         # L2: XML 语义扫描 — 对 query_hint plausible-match, 最高 confidence
         # 在 smart_tap miss 之后 (semantic, 非坐标猜测)

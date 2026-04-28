@@ -143,3 +143,71 @@ class TestAttachImageCallsSmartTapWithExpectedPkg:
         # smart_tap 调用应传 expected_pkg=MESSENGER_PACKAGE
         kwargs = fb.smart_tap.call_args.kwargs
         assert kwargs.get("expected_pkg") == MESSENGER_PACKAGE
+
+
+# ════════════════════════════════════════════════════════════════════════
+# OPT-7-v2: send_message 链路 4 处 smart_tap caller 都应透传 expected_pkg
+# ════════════════════════════════════════════════════════════════════════
+
+class TestOpt7v2SendMessageChainPassesExpectedPkg:
+    """OPT-7-v2 (2026-04-28): send_message 全链路在 orca 内 tap 都应传
+    expected_pkg=MESSENGER_PACKAGE 修 heal 误报. 改 4 处:
+      - send_message_impl line ~1734: "Messenger or chat icon" (从 katana
+        切 orca 的过渡, tap 后期望 orca)
+      - _enter_messenger_search: "Search in Messenger" (orca 内)
+      - _tap_messenger_send: "Send message button" (orca composer 内)
+      - _tap_first_search_result: "First matching contact" (orca 搜索内)
+
+    每改一处可能 break 现有 send_message_errors 测试 (assert_called_once_with
+    精确参数), 必须同步更新测试 — 故 4 处分别有契约保护单测."""
+
+    def test_enter_messenger_search_l1_passes_expected_pkg(self):
+        """_enter_messenger_search L1 smart_tap 必须传 expected_pkg=
+        MESSENGER_PACKAGE, 否则 heal 误判 orca 为漂移."""
+        from src.app_automation.facebook import (
+            FacebookAutomation, MESSENGER_PACKAGE,
+        )
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=True)
+        fb._enter_messenger_search(MagicMock(), "devA")
+        kwargs = fb.smart_tap.call_args.kwargs
+        assert kwargs.get("expected_pkg") == MESSENGER_PACKAGE
+
+    def test_tap_messenger_send_l1_passes_expected_pkg(self):
+        from src.app_automation.facebook import (
+            FacebookAutomation, MESSENGER_PACKAGE,
+        )
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=True)
+        fb._tap_messenger_send(MagicMock(), "devA")
+        kwargs = fb.smart_tap.call_args.kwargs
+        assert kwargs.get("expected_pkg") == MESSENGER_PACKAGE
+
+    def test_tap_first_search_result_l1_passes_expected_pkg(self):
+        from src.app_automation.facebook import (
+            FacebookAutomation, MESSENGER_PACKAGE,
+        )
+        fb = FacebookAutomation.__new__(FacebookAutomation)
+        fb.smart_tap = MagicMock(return_value=True)
+        fb._tap_first_search_result(MagicMock(), "devA", "Alice")
+        kwargs = fb.smart_tap.call_args.kwargs
+        assert kwargs.get("expected_pkg") == MESSENGER_PACKAGE
+
+    def test_send_message_impl_messenger_icon_passes_expected_pkg(self):
+        """send_message_impl 第一步 'Messenger or chat icon' tap 也应传
+        expected_pkg=MESSENGER_PACKAGE — tap 后期望切到 orca, heal 之前
+        默认 katana 误判会触发不必要的 BACK + 重启 FB. 这是 send_message
+        每条消息浪费 1-3s 的根因."""
+        # 直接 grep 源码找该 caller 是否传了 kwarg (避免跑完整 send_message_impl)
+        import inspect
+        from src.app_automation.facebook import FacebookAutomation
+        src = inspect.getsource(FacebookAutomation._send_message_impl)
+        # 应该含 'Messenger or chat icon' 调用 + expected_pkg=MESSENGER_PACKAGE
+        assert "Messenger or chat icon" in src
+        # 找该 smart_tap 调用块, 确保 expected_pkg= 在附近 (5 行内)
+        idx = src.find("Messenger or chat icon")
+        nearby = src[max(0, idx - 200):idx + 300]
+        assert "expected_pkg" in nearby and "MESSENGER_PACKAGE" in nearby, (
+            f"send_message_impl 'Messenger or chat icon' smart_tap 缺 "
+            f"expected_pkg=MESSENGER_PACKAGE; 附近代码:\n{nearby}"
+        )

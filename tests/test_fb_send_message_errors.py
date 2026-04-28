@@ -538,8 +538,11 @@ class TestMessengerUIFallback:
         fb = _make_fb()
         fb.smart_tap = MagicMock(return_value=True)
         fb._enter_messenger_search(MagicMock(), "devA")  # 不抛
+        # OPT-7-v2 (2026-04-28): expected_pkg=MESSENGER_PACKAGE 透传防 heal 误报
+        from src.app_automation.facebook import MESSENGER_PACKAGE
         fb.smart_tap.assert_called_once_with(
-            "Search in Messenger", device_id="devA")
+            "Search in Messenger", device_id="devA",
+            expected_pkg=MESSENGER_PACKAGE)
 
     def test_enter_search_multi_locale_hit(self):
         fb = _make_fb()
@@ -593,8 +596,11 @@ class TestMessengerUIFallback:
         fb = _make_fb()
         fb.smart_tap = MagicMock(return_value=True)
         fb._tap_messenger_send(MagicMock(), "devA")
+        # OPT-7-v2 (2026-04-28): expected_pkg=MESSENGER_PACKAGE 透传
+        from src.app_automation.facebook import MESSENGER_PACKAGE
         fb.smart_tap.assert_called_once_with(
-            "Send message button", device_id="devA")
+            "Send message button", device_id="devA",
+            expected_pkg=MESSENGER_PACKAGE)
 
     def test_tap_send_multi_locale_hit(self):
         fb = _make_fb()
@@ -940,8 +946,11 @@ class TestFirstContactFallback:
         fb = self._mk_fb_unmocked()
         fb.smart_tap = MagicMock(return_value=True)
         fb._tap_first_search_result(MagicMock(), "devA", "Alice")
+        # OPT-7-v2 (2026-04-28): expected_pkg=MESSENGER_PACKAGE 透传
+        from src.app_automation.facebook import MESSENGER_PACKAGE
         fb.smart_tap.assert_called_once_with(
-            "First matching contact", device_id="devA")
+            "First matching contact", device_id="devA",
+            expected_pkg=MESSENGER_PACKAGE)
 
     # ── L2 XML semantic hit ────────────────────────────────────────
 
