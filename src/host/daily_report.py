@@ -49,7 +49,9 @@ def _date_window_iso(date_str: Optional[str] = None) -> tuple:
         except ValueError as e:
             raise ValueError(f"date_str 必须是 YYYY-MM-DD: {date_str}") from e
     else:
-        d = _dt.datetime.utcnow().date()
+        # Python 3.11+ 用 _dt.UTC 替代 deprecated utcnow().
+        # 同 utcnow().date() 行为: 取 UTC 当前日期 (无时区信息).
+        d = _dt.datetime.now(_dt.UTC).date()
     start = _dt.datetime.combine(d, _dt.time.min)
     end = start + _dt.timedelta(days=1)
     return (start.strftime("%Y-%m-%d %H:%M:%S"),
