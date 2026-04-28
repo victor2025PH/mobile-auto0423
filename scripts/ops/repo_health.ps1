@@ -171,9 +171,9 @@ Write-Host "==========================================="
 Write-Host "  OpenClaw Repo Health"
 Write-Host "==========================================="
 
-# ---- [1/6] Branch + commits ahead/behind main / origin/main ----
+# ---- [1/7] Branch + commits ahead/behind main / origin/main ----
 Write-Host ""
-Write-Host "[1/6] Branch + commits"
+Write-Host "[1/7] Branch + commits"
 
 # -Fetch: pull latest origin refs first (5-10s network call, opt-in)
 if ($Fetch) {
@@ -244,9 +244,9 @@ $_dirty_pre = & git status --porcelain 2>$null
 $_mod_pre = ($_dirty_pre | Where-Object { $_ -match '^\s*M' }).Count
 $_staged_pre = ($_dirty_pre | Where-Object { $_ -match '^[AMRD]' -and $_ -notmatch '^\?\?' }).Count
 
-# ---- [2/6] Working tree dirty ----
+# ---- [2/7] Working tree dirty ----
 Write-Host ""
-Write-Host "[2/6] Working tree status"
+Write-Host "[2/7] Working tree status"
 $dirty = & git status --porcelain 2>$null
 $modCount = ($dirty | Where-Object { $_ -match '^\s*M' }).Count
 $untrackedCount = ($dirty | Where-Object { $_ -match '^\?\?' }).Count
@@ -261,9 +261,9 @@ if ($modCount -eq 0 -and $untrackedCount -eq 0 -and $stagedCount -eq 0) {
     }
 }
 
-# ---- [3/6] 4 runtime config files (expected dirty after server start) ----
+# ---- [3/7] 4 runtime config files (expected dirty after server start) ----
 Write-Host ""
-Write-Host "[3/6] Runtime config files (expected dirty after server start)"
+Write-Host "[3/7] Runtime config files (expected dirty after server start)"
 $runtimeConfigs = @(
     'config/cluster_state.json',
     'config/device_aliases.json',
@@ -280,9 +280,9 @@ foreach ($cfg in $runtimeConfigs) {
 }
 Write-Host "       (these are runtime state; do NOT commit unless intentional)" -ForegroundColor DarkGray
 
-# ---- [4/6] launch.env ----
+# ---- [4/7] launch.env ----
 Write-Host ""
-Write-Host "[4/6] config/launch.env"
+Write-Host "[4/7] config/launch.env"
 $envFile = Join-Path $ProjectRoot "config\launch.env"
 $envExample = Join-Path $ProjectRoot "config\launch.env.example"
 if (Test-Path $envFile) {
@@ -298,9 +298,9 @@ if (Test-Path $envFile) {
     }
 }
 
-# ---- [5/6] Disk usage hotspots ----
+# ---- [5/7] Disk usage hotspots ----
 Write-Host ""
-Write-Host "[5/6] Disk usage hotspots"
+Write-Host "[5/7] Disk usage hotspots"
 $hotspots = @(
     'logs',
     'logs\_archive',
@@ -326,9 +326,9 @@ foreach ($h in $hotspots) {
     }
 }
 
-# ---- [6/6] vendor/ integrity ----
+# ---- [6/7] vendor/ integrity ----
 Write-Host ""
-Write-Host "[6/6] vendor/ integrity"
+Write-Host "[6/7] vendor/ integrity"
 $vendor = Join-Path $ProjectRoot "vendor"
 if (Test-Path $vendor) {
     $dllCount = (Get-ChildItem $vendor -Filter "*.dll").Count
@@ -341,6 +341,70 @@ if (Test-Path $vendor) {
 } else {
     Write-Host "   [WARN] vendor/ directory missing" -ForegroundColor Yellow
     Bump-Exit 1
+}
+
+# ---- [7/7] P2-⑥ Sibling collision risk ----
+# 同机多 Claude session 共享 worktree 的实际事故信号. 不阻塞健康分但显眼提示.
+# 加这一节的根因: PR #142/#144 实施过程中两次被 sibling 切分支或 git commit -a
+# 把我 staged 文件卷入它的 commit (6f80638 OPT-FP1 messenger 误打包事故).
+Write-Host ""
+Write-Host "[7/7] Sibling collision risk (P2-⑥)"
+$collisionRisks = 0
+
+# 7.1 stash 列表条数 > 3 = 工作流压力信号
+$stashCount = @(& git stash list 2>$null).Count
+if ($stashCount -gt 3) {
+    Write-Host ("   [WARN] git stash list 有 {0} 条 — 累积太多, 易丢失上下文" -f $stashCount) -ForegroundColor Yellow
+    Write-Host "          先 git stash list 看清, 不需要的 git stash drop" -ForegroundColor DarkYellow
+    $collisionRisks++
+} elseif ($stashCount -gt 0) {
+    Write-Host ("   [INFO] {0} stash entr(y/ies) — OK" -f $stashCount) -ForegroundColor DarkGray
+} else {
+    Write-Host "   [OK]   no stash entries" -ForegroundColor DarkGreen
+}
+
+# 7.2 跨 src/ 模块 dirty 警告 (modified + staged + untracked 合并)
+$allDirty = & git status --porcelain 2>$null
+$dirtySrcDirs = @($allDirty | Where-Object { $_ -match 'src/' } |
+    ForEach-Object {
+        $f = ($_ -replace '^.{3}', '')  # strip status prefix
+        if ($f -match '^src/[^/]+/') { $matches[0].TrimEnd('/') } else { $null }
+    } |
+    Where-Object { $_ } |
+    Sort-Object -Unique)
+if ($dirtySrcDirs.Count -ge 2) {
+    Write-Host ("   [WARN] dirty 跨 {0} 个 src/ 子模块 — sibling 可能也在动这个 worktree" -f $dirtySrcDirs.Count) -ForegroundColor Yellow
+    foreach ($d in $dirtySrcDirs) {
+        Write-Host ("          {0}/" -f $d) -ForegroundColor DarkYellow
+    }
+    Write-Host "          commit 前先 git status --short 核对所有权" -ForegroundColor DarkYellow
+    $collisionRisks++
+}
+
+# 7.3 最近 1h 内 sibling commit (signal 多 session 同时活跃)
+$recent1hCount = @(& git log --since='1 hour ago' --oneline 2>$null).Count
+if ($recent1hCount -gt 3) {
+    Write-Host ("   [WARN] 最近 1h 有 {0} 个 commit — sibling 活跃, 切分支/commit 谨慎" -f $recent1hCount) -ForegroundColor Yellow
+    & git log --since='1 hour ago' --oneline -5 2>$null | ForEach-Object {
+        Write-Host ("          {0}" -f $_) -ForegroundColor DarkYellow
+    }
+    $collisionRisks++
+} else {
+    Write-Host ("   [OK]   {0} commit(s) in last 1h" -f $recent1hCount) -ForegroundColor DarkGreen
+}
+
+# 7.4 branch 命名 vs dirty 文件位置启发式
+if ($branch -match '^feat-ops-' -and ($dirtySrcDirs -contains 'src/app_automation')) {
+    Write-Host "   [WARN] branch=$branch 但 src/app_automation 有 dirty — 这分支期望只动 src/host/" -ForegroundColor Yellow
+    Write-Host "          建议: git stash 那部分给 sibling, 或先切到对方分支再 commit" -ForegroundColor DarkYellow
+    $collisionRisks++
+}
+
+if ($collisionRisks -gt 0) {
+    Write-Host ("       collision risk score: {0} — 建议跑 safe_commit.bat 替代 git commit -a" -f $collisionRisks) -ForegroundColor DarkYellow
+    Bump-Exit 1
+} else {
+    Write-Host "       collision risk: low OK" -ForegroundColor DarkGreen
 }
 
 # ---- Summary ----
