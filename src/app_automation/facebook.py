@@ -2576,47 +2576,56 @@ class FacebookAutomation(BaseAutomation):
         """
         if not recipient:
             return False
-        try:
-            time.sleep(0.5)  # 等搜索结果渲染
-            xml = d.dump_hierarchy()
-            if not isinstance(xml, str) or not xml:
-                return False
-            recipient_norm = recipient.strip()
-            if not recipient_norm:
-                return False
-            import re as _re
-            bounds_re = _re.compile(
-                r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
-            # 找 content-desc 含 recipient 的位置
-            for m in _re.finditer(
-                    r'content-desc="([^"]*'
-                    + _re.escape(recipient_norm)
-                    + r'[^"]*)"', xml):
-                # 从 m.start() +500 chars 内找 bounds (一个 node < 500 chars)
-                chunk = xml[m.start():m.start() + 500]
-                bm = bounds_re.search(chunk)
-                if not bm:
-                    continue
-                x1, y1, x2, y2 = (int(bm.group(1)), int(bm.group(2)),
-                                  int(bm.group(3)), int(bm.group(4)))
-                # 跳过 search bar (y < 300) 和 active-now stories
-                # (height < 100, 通常是头像缩略图)
-                if y1 < 300 or (y2 - y1) < 100:
-                    continue
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                d.click(cx, cy)
-                log.info(
-                    "[opt-fp4] _tap_search_result_by_recipient_match hit "
-                    "recipient=%r bounds=[%d,%d][%d,%d] tap=(%d,%d)",
-                    recipient, x1, y1, x2, y2, cx, cy)
-                return True
-            log.debug(
-                "[opt-fp4] 没找到含 recipient=%r 的 search row, fall back",
-                recipient)
+        recipient_norm = recipient.strip()
+        if not recipient_norm:
             return False
-        except Exception as e:
-            log.debug("[opt-fp4] 异常 fall back: %s", e)
-            return False
+        import re as _re
+        bounds_re = _re.compile(
+            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+        # OPT-FP4-v2 (2026-04-28): 3 次 retry × 0.7s 间隔, 任意一次命中即返.
+        # XW8T 真机首次回归 FP4 未命中 → 推测 search 结果还没渲染完
+        # (dump miss). 多次 retry 给搜索结果加载时间.
+        for retry_idx in range(3):
+            try:
+                time.sleep(0.7)  # 等搜索结果渲染 (累计 0.7/1.4/2.1s)
+                xml = d.dump_hierarchy()
+                if not isinstance(xml, str) or not xml:
+                    continue
+                # 找 content-desc 含 recipient 的位置
+                for m in _re.finditer(
+                        r'content-desc="([^"]*'
+                        + _re.escape(recipient_norm)
+                        + r'[^"]*)"', xml):
+                    # 从 m.start() +500 chars 内找 bounds
+                    chunk = xml[m.start():m.start() + 500]
+                    bm = bounds_re.search(chunk)
+                    if not bm:
+                        continue
+                    x1, y1, x2, y2 = (
+                        int(bm.group(1)), int(bm.group(2)),
+                        int(bm.group(3)), int(bm.group(4)))
+                    # 跳过 search bar (y < 300) 和 stories 头像
+                    # (height < 100, 通常是头像缩略图)
+                    if y1 < 300 or (y2 - y1) < 100:
+                        continue
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    d.click(cx, cy)
+                    log.info(
+                        "[opt-fp4] _tap_search_result_by_recipient_match "
+                        "hit recipient=%r retry=%d bounds=[%d,%d][%d,%d] "
+                        "tap=(%d,%d)",
+                        recipient, retry_idx, x1, y1, x2, y2, cx, cy)
+                    return True
+                log.debug(
+                    "[opt-fp4] retry=%d 没找到含 recipient=%r 的 search row",
+                    retry_idx, recipient)
+            except Exception as e:
+                log.debug(
+                    "[opt-fp4] retry=%d 异常 (将再试): %s", retry_idx, e)
+        log.debug(
+            "[opt-fp4] 3 次 retry 均没找到 recipient=%r, fall back to L1-L4",
+            recipient)
+        return False
 
     def _launch_messenger_stable(self, did: str) -> None:
         """OPT-FP2 (2026-04-28): 强制把 Messenger 拉前台 (smoke v6 真机

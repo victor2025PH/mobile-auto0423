@@ -145,6 +145,73 @@ class TestRecipientMatch:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# OPT-FP4-v2 retry — search 结果渲染慢时多次尝试
+# ════════════════════════════════════════════════════════════════════════
+
+class TestRetryBehavior:
+    def test_first_attempt_hits_no_retry_needed(self):
+        """第 1 次 dump 就命中 → 不应有 retry log."""
+        fb = _make_fb()
+        xml = (
+            '<node class="android.widget.Button" '
+            'content-desc="Meta AI" '
+            'bounds="[0,500][720,650]"/>'
+        )
+        d = _mock_d_with_xml(xml)
+        ok = fb._tap_search_result_by_recipient_match(d, "Meta AI")
+        assert ok is True
+        # dump_hierarchy 只调 1 次
+        assert d.dump_hierarchy.call_count == 1
+
+    def test_third_attempt_hits_after_two_misses(self):
+        """前 2 次 dump 没命中 (返空 / 不含 recipient), 第 3 次命中."""
+        fb = _make_fb()
+        xml_with = (
+            '<node class="android.widget.Button" '
+            'content-desc="Meta AI" '
+            'bounds="[0,500][720,650]"/>'
+        )
+        d = MagicMock()
+        # 前 2 次返空, 第 3 次返 xml
+        d.dump_hierarchy = MagicMock(
+            side_effect=["", "", xml_with])
+        d.click = MagicMock()
+        ok = fb._tap_search_result_by_recipient_match(d, "Meta AI")
+        assert ok is True
+        assert d.dump_hierarchy.call_count == 3
+        d.click.assert_called_once()
+
+    def test_three_retries_all_miss_returns_false(self):
+        """3 次 retry 都没命中 → 返 False 让 L1-L4 fallback."""
+        fb = _make_fb()
+        d = MagicMock()
+        # 3 次都返空
+        d.dump_hierarchy = MagicMock(return_value="")
+        d.click = MagicMock()
+        ok = fb._tap_search_result_by_recipient_match(d, "Meta AI")
+        assert ok is False
+        assert d.dump_hierarchy.call_count == 3
+        d.click.assert_not_called()
+
+    def test_intermediate_exception_swallowed_continues_retry(self):
+        """中间 retry 抛异常应被吞, 继续后续 retry."""
+        fb = _make_fb()
+        xml_with = (
+            '<node class="android.widget.Button" '
+            'content-desc="Meta AI" '
+            'bounds="[0,500][720,650]"/>'
+        )
+        d = MagicMock()
+        # 第 1 次抛, 第 2 次命中
+        d.dump_hierarchy = MagicMock(
+            side_effect=[RuntimeError("u2 hiccup"), xml_with, ""])
+        d.click = MagicMock()
+        ok = fb._tap_search_result_by_recipient_match(d, "Meta AI")
+        assert ok is True
+        assert d.dump_hierarchy.call_count == 2  # 第 2 次命中后 break
+
+
+# ════════════════════════════════════════════════════════════════════════
 # 集成 — _tap_first_search_result 应 L0 调 recipient_match
 # ════════════════════════════════════════════════════════════════════════
 
