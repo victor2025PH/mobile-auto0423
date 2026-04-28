@@ -871,6 +871,43 @@ def retry_task_endpoint(task_id: str):
     }
 
 
+# P2-② 失败任务证据查询 (列表 + 单文件下载 + 清理)
+@router.get("/tasks/{task_id}/forensics", dependencies=_auth)
+def list_task_forensics(task_id: str):
+    """返回该 task_id 的所有失败现场快照清单 (按时间倒序).
+
+    输出每项含 ts (UTC 时间戳目录名) / files (含 size) / meta (从 meta.json).
+    供前端任务详情对话框 "📸 失败证据" 折叠面板消费.
+    """
+    from src.host.task_forensics import list_forensics
+    return {"task_id": task_id, "snapshots": list_forensics(task_id)}
+
+
+@router.get("/tasks/{task_id}/forensics/{ts}/{filename}", dependencies=_auth)
+def download_forensics_file(task_id: str, ts: str, filename: str):
+    """下载/预览单个证据文件 (screencap.png / logcat.txt / meta.json).
+
+    含路径穿越防护 (forensics_path 内部校验). 任何失败都返 404 而非 500.
+    """
+    from fastapi.responses import FileResponse
+    from src.host.task_forensics import forensics_path
+    p = forensics_path(task_id, ts, filename)
+    if not p:
+        raise HTTPException(status_code=404, detail="forensics file not found or unsafe path")
+    media_type = "image/png" if filename.endswith(".png") else (
+        "application/json" if filename.endswith(".json") else "text/plain"
+    )
+    return FileResponse(p, media_type=media_type, filename=filename)
+
+
+@router.post("/admin/forensics/cleanup", dependencies=_auth)
+def admin_forensics_cleanup(retention_days: int = 7):
+    """运维清理 > N 天的失败证据 (启动时 + 定时调一次)."""
+    from src.host.task_forensics import startup_cleanup
+    n = startup_cleanup(retention_days=retention_days)
+    return {"ok": True, "removed": n, "retention_days": retention_days}
+
+
 @router.post("/tasks/cancel-all", dependencies=_auth)
 def cancel_all_tasks():
     """Cancel all running and pending tasks (local + cluster workers)."""

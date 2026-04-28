@@ -1086,6 +1086,7 @@ async function showTaskDetail(taskId){
       ${failHints}
       ${gateBlock}
       ${resultHtml}
+      ${t.status==='failed'?`<div class="detail-row" id="forensics-row"><span class="detail-label">📸 失败证据</span><div id="forensics-panel" style="flex:1;font-size:11px;color:var(--text-dim)">加载中...</div></div>`:''}
       <div style="display:flex;gap:8px;margin-top:20px;flex-wrap:wrap">
         ${canHunt?`<button class="qa-btn" style="color:#a78bfa;border-color:#8b5cf6;background:rgba(139,92,246,.15);font-weight:600" onclick="_tdLaunchHunt('${taskId}','${t.device_id||''}',${memberCount})">🧠 用这批 ${memberCount} 人做画像识别</button>`:''}
         ${canCancel?`<button class="qa-btn" style="color:var(--yellow);border-color:var(--yellow)" onclick="_tdAction('cancel','${taskId}')">⏹ 取消任务</button>`:''}
@@ -1099,6 +1100,66 @@ async function showTaskDetail(taskId){
   document.getElementById('task-detail-modal')?.remove();
   document.body.appendChild(modal);
   modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+  // P2-② 异步 lazy-load 失败证据 (仅 failed task 触发)
+  if(t.status==='failed') _loadForensicsPanel(taskId);
+}
+
+/** P2-② 拉 /tasks/{id}/forensics 渲染失败证据折叠面板.
+ *  内部对 screencap.png 用 fetch+blob → object URL 喂给 <img>, 因为
+ *  <img src> 不会自动带 X-API-Key header. */
+async function _loadForensicsPanel(taskId){
+  const panel=document.getElementById('forensics-panel');
+  if(!panel) return;
+  try{
+    const data=await api('GET','/tasks/'+encodeURIComponent(taskId)+'/forensics');
+    const snaps=(data&&data.snapshots)||[];
+    if(!snaps.length){
+      panel.innerHTML='<span style="color:var(--text-muted)">该任务尚未生成失败证据 (可能任务在 P2-② 上线前失败的, 或设备已离线无法截图).</span>';
+      return;
+    }
+    panel.innerHTML=snaps.map((s,i)=>{
+      const m=s.meta||{};
+      const cap=(m.screencap||{}).ok?'✅':'❌';
+      const lc=(m.logcat||{}).ok?`✅ (${m.logcat.lines||0}行)`:'❌';
+      const pngUrl=`/tasks/${encodeURIComponent(taskId)}/forensics/${encodeURIComponent(s.ts)}/screencap.png`;
+      const logUrl=`/tasks/${encodeURIComponent(taskId)}/forensics/${encodeURIComponent(s.ts)}/logcat.txt`;
+      const tsHuman=s.ts.replace(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/,'$1-$2-$3 $4:$5:$6 UTC');
+      const imgId=`fimg-${i}`;
+      return `<div style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px"><div style="display:flex;justify-content:space-between;font-weight:600;margin-bottom:4px"><span>📅 ${tsHuman}</span><span style="font-weight:normal;font-size:10px;color:var(--text-muted)">截图 ${cap} · logcat ${lc}</span></div>${m.error?`<div style="color:#f87171;font-size:10px;margin-bottom:4px">${String(m.error).substring(0,200)}</div>`:''}<div style="display:flex;gap:8px;align-items:flex-start"><img id="${imgId}" style="width:120px;height:auto;border:1px solid var(--border);border-radius:3px;cursor:pointer;background:var(--bg-input)" alt="loading..." onclick="this.style.width=this.style.width==='120px'?'auto':'120px';this.style.maxWidth='80vw'"><div style="flex:1;font-size:10px"><a href="javascript:_viewForensicsLog('${taskId}','${s.ts}')" style="color:#22d3ee">📜 查看 logcat</a><br><a href="javascript:_viewForensicsLog('${taskId}','${s.ts}','meta.json')" style="color:#22d3ee">📋 查看 meta.json</a></div></div></div>`;
+    }).join('');
+    // 异步 fetch 截图 blob (fetch 自动带 X-API-Key)
+    snaps.forEach(async (s,i)=>{
+      const imgEl=document.getElementById(`fimg-${i}`);
+      if(!imgEl) return;
+      try{
+        const r=await fetch(`/tasks/${encodeURIComponent(taskId)}/forensics/${encodeURIComponent(s.ts)}/screencap.png`,{headers:{'X-API-Key':window.OPENCLAW_API_KEY||''}});
+        if(!r.ok){imgEl.alt='no screencap'; imgEl.style.padding='6px'; imgEl.replaceWith(Object.assign(document.createElement('span'),{textContent:'(无截图)',style:'color:var(--text-muted);font-size:10px'})); return;}
+        const blob=await r.blob();
+        imgEl.src=URL.createObjectURL(blob);
+      }catch(e){console.warn('[forensics] img load failed',e);}
+    });
+  }catch(e){
+    panel.innerHTML=`<span style="color:#ef4444">加载证据失败: ${e.message||e}</span>`;
+  }
+}
+
+/** P2-② 在新窗口/modal 看 logcat / meta.json 文本内容. */
+async function _viewForensicsLog(taskId, ts, filename){
+  filename=filename||'logcat.txt';
+  try{
+    const r=await fetch(`/tasks/${encodeURIComponent(taskId)}/forensics/${encodeURIComponent(ts)}/${encodeURIComponent(filename)}`,{headers:{'X-API-Key':window.OPENCLAW_API_KEY||''}});
+    if(!r.ok){showToast(`加载失败: HTTP ${r.status}`,'error');return;}
+    const text=await r.text();
+    document.getElementById('forensics-log-modal')?.remove();
+    const m=document.createElement('div');
+    m.id='forensics-log-modal';
+    m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center';
+    m.innerHTML=`<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:14px;width:min(900px,95vw);max-height:84vh;display:flex;flex-direction:column"><div style="display:flex;justify-content:space-between;margin-bottom:8px"><b>${filename} (${ts})</b><button onclick="document.getElementById('forensics-log-modal').remove()" style="background:none;border:none;color:#fff;cursor:pointer;font-size:16px">✕</button></div><pre style="flex:1;overflow:auto;background:var(--bg-input);padding:10px;border-radius:4px;font-size:10px;white-space:pre-wrap;line-height:1.4">${text.replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre></div>`;
+    m.onclick=(e)=>{if(e.target===m) m.remove();};
+    document.body.appendChild(m);
+  }catch(e){
+    showToast('加载失败: '+(e.message||e),'error');
+  }
 }
 
 async function purgeTasks(days){
