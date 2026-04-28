@@ -93,6 +93,19 @@ Claude 崩溃后重入本 repo：
 - **`pre_commit.ps1`** 加 4 个新检查（warning 不 block）：跨 src/ 模块 staged / `feat-ops-*` 分支 staged facebook.py / stash > 5 / untracked > 8
 - **`repo_health.bat \[7/7\]`** 章节：stash count / 跨模块 dirty / 1h 内 sibling commit / branch vs dirty 不匹配，输出 collision risk score
 
+### P3-A stacked PR 链 merge 教训（2026-04-28 加，事故 #141 → #154 教训）
+
+**绝对不要建 stacked PR 链**（`#142 base=#141`, `#143 base=#142` ...）。GitHub 的 squash merge + delete-branch 会**直接 close 下游 PR**（不是改 base 到 main），且 **closed PR 无法 reopen**（API 拒绝 `Cannot change base branch of closed PR`）。
+
+**遇到了怎么救**：
+
+1. **新 worktree 隔离 sibling**：`git worktree add ../mobile-auto-pr-recover origin/main` 起独立工作树，sibling 切主 worktree 不影响。
+2. **累积 cherry-pick + 多分支 ref**：在新 worktree 上 `cherry-pick` 每个上游 PR 的 commit，每步 `git branch recover-N HEAD` 打 ref。最后 push 6 个分支 + create 6 个 PR base=main。
+3. **每个 PR diff 显示累积，但 squash 时 GitHub 自动 patch-id dedup**：`gh pr merge --squash --delete-branch` 顺序合并 6 个，main 上每个 commit 只含 net diff，0 conflict。
+4. **`UNSTABLE != blocked`**：CI 还在跑就显示 UNSTABLE，但只要 `mergeable=MERGEABLE` + repo 没强制 required checks，可以直接 squash merge，省下 ~14min × N 的 CI 等待。
+
+**正确 PR 工作流**：每个独立改动建一个 base=main 的 PR；如果改动逻辑相关但跨多个独立模块，**用累积 cherry-pick 拆 N 个独立 PR**（base 都=main，diff 累积，merge 时自然 dedup）。**绝不让任何 PR base = 另一个未 merge 的 PR**。
+
 ### 崩溃恢复扩展
 
 **Claude 新 session / 崩溃后**：除了上面"崩溃恢复"5 步，还应跑 `repo_health.bat -Fetch` 看 sibling 期间发生了什么。
