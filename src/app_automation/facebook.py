@@ -2732,7 +2732,8 @@ class FacebookAutomation(BaseAutomation):
                 hint="launch_failed: 设备状态异常 / orca 安装损坏 / 锁屏中")
 
     def _tap_inbox_row_by_recipient(self, d, recipient: str,
-                                    max_scrolls: int = 3) -> bool:
+                                    max_scrolls: int = 5,
+                                    initial_wait_s: float = 2.5) -> bool:
         """OPT-FP7 (2026-04-28): inbox 直接 tap recipient row, 替代 search.
 
         真消灭 false positive 根因: search 路径不可靠 (Messenger 把"自己"
@@ -2740,9 +2741,16 @@ class FacebookAutomation(BaseAutomation):
         inbox-direct-tap 直接在 inbox 列表找含 recipient name 的 row → tap
         row 中心进对话页, 跳过整个 search 阶段.
 
-        策略: dump → finditer content-desc 含 recipient → 跳 stories /
-        search bar (y<300, height<100) → tap row 中心 → miss 则 scroll
-        inbox down 重试. fail-safe: 异常返 False (调用方 fallback search).
+        策略 (OPT-FP7-v2 2026-04-28 fine-tune):
+          0. initial_wait_s=2.5s 让 inbox lazy load 完
+          1. dump → finditer content-desc 含 recipient
+          2. 跳 stories / search bar (y<300, height<100)
+          3. tap row 中心
+          4. miss → swipe 长滑 (y 0.85→0.15) inbox down → 等 1.5s 再 dump
+          5. dump 失败 retry 2 次 (短间隔 0.5s)
+          6. max_scrolls=5 覆盖 inbox 较长 (Meta AI 可能在第 7+ 位)
+
+        fail-safe: 异常返 False (调用方 fallback search).
         """
         if not recipient:
             return False
@@ -2753,21 +2761,33 @@ class FacebookAutomation(BaseAutomation):
         bounds_re = _re.compile(
             r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
 
+        # OPT-FP7-v2: 初始等 inbox lazy load (Messenger StartScreen 后
+        # 列表渲染需 2-3s, 之前 0s 导致 dump 抓到空 hierarchy)
+        if initial_wait_s > 0:
+            time.sleep(initial_wait_s)
+
         for scroll_idx in range(max_scrolls):
-            try:
-                xml = d.dump_hierarchy()
-            except Exception as e:
-                log.debug(
-                    "[opt-fp7] dump 异常 scroll=%d: %s", scroll_idx, e)
+            # OPT-FP7-v2: dump 失败 retry 2 次 (而不是 1 次)
+            xml = None
+            for dump_retry in range(2):
+                try:
+                    xml = d.dump_hierarchy()
+                    if isinstance(xml, str) and xml:
+                        break
+                    xml = None
+                except Exception as e:
+                    log.debug(
+                        "[opt-fp7] dump retry=%d scroll=%d 异常: %s",
+                        dump_retry, scroll_idx, e)
+                    xml = None
+                if dump_retry < 1:
+                    time.sleep(0.5)
+            if xml is None:
                 if scroll_idx < max_scrolls - 1:
                     time.sleep(0.5)
                     continue
                 return False
-            if not isinstance(xml, str) or not xml:
-                if scroll_idx < max_scrolls - 1:
-                    time.sleep(0.5)
-                    continue
-                return False
+
             for m in _re.finditer(
                     r'content-desc="([^"]*'
                     + _re.escape(recipient_norm)
@@ -2792,13 +2812,15 @@ class FacebookAutomation(BaseAutomation):
                     "scroll=%d row=[%d,%d][%d,%d] tap=(%d,%d)",
                     recipient, scroll_idx, x1, y1, x2, y2, cx, cy)
                 return True
-            # 没找到 → swipe scroll inbox down
+
+            # 没找到 → 长滑 inbox down (OPT-FP7-v2: 0.85→0.15 比 0.7→0.3
+            # 滑得更长, 一次能跨越更多 row; 间隔 1.5s 让新 row 渲染)
             if scroll_idx < max_scrolls - 1:
                 try:
                     w, h = d.window_size()
-                    d.swipe(w // 2, int(h * 0.7),
-                            w // 2, int(h * 0.3), 0.5)
-                    time.sleep(0.8)
+                    d.swipe(w // 2, int(h * 0.85),
+                            w // 2, int(h * 0.15), 0.6)
+                    time.sleep(1.5)
                 except Exception as e:
                     log.debug("[opt-fp7] swipe 异常: %s", e)
         log.debug(
