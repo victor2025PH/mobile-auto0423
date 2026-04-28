@@ -12,11 +12,15 @@ live smoke 需要真机才能完整跑, 本测试只覆盖:
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# P2-⑫: spawn 子 Python 进程时强制 UTF-8 防 Windows cp936 emoji 解码挂.
+_UTF8_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -29,7 +33,7 @@ class TestCliList:
     def test_list_flag_lists_steps(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--list", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 0
         # 所有 step key 应该在输出里
@@ -40,7 +44,7 @@ class TestCliList:
     def test_no_args_prints_error(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         # argparse error → exit 2
         assert r.returncode == 2
@@ -52,7 +56,7 @@ class TestCliList:
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--device", "fake",
              "--step", "bogus_step_xyz", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 2
 
@@ -150,7 +154,7 @@ class TestCliCleanup:
         """--cleanup 不需要 --device。"""
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--cleanup", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 0
         # 日志应该有"删除"提示
