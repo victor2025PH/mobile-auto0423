@@ -39,6 +39,7 @@ class PreflightResult:
     vpn_skipped_geo_match: bool = False
     vpn_skip_note: str = ""
     geo_snapshot: Optional[Dict[str, Any]] = None
+    network_code: str = ""  # 见 NET_* 常量；空="legacy/skipped"
 
     def to_dict(self) -> dict:
         return {
@@ -54,6 +55,7 @@ class PreflightResult:
             "vpn_skipped_geo_match": self.vpn_skipped_geo_match,
             "vpn_skip_note": self.vpn_skip_note,
             "geo_snapshot": self.geo_snapshot,
+            "network_code": self.network_code,
         }
 
 
@@ -100,6 +102,7 @@ def _preflight_from_cache_dict(data: dict) -> PreflightResult:
     base.setdefault("vpn_skipped_geo_match", False)
     base.setdefault("vpn_skip_note", "")
     base.setdefault("geo_snapshot", None)
+    base.setdefault("network_code", "")
     return PreflightResult(
         device_id=base["device_id"],
         passed=base["passed"],
@@ -113,6 +116,7 @@ def _preflight_from_cache_dict(data: dict) -> PreflightResult:
         vpn_skipped_geo_match=base.get("vpn_skipped_geo_match", False),
         vpn_skip_note=base.get("vpn_skip_note", ""),
         geo_snapshot=base.get("geo_snapshot"),
+        network_code=base.get("network_code", ""),
     )
 
 
@@ -142,12 +146,13 @@ def _do_preflight(device_id: str, task_target_country: Optional[str] = None) -> 
     res = PreflightResult(device_id=device_id, passed=False, preflight_mode="full")
 
     # Step 1: 网络
-    net_ok, net_msg = _check_network(device_id)
+    net_ok, net_msg, net_code = _check_network_ex(device_id)
     res.network_ok = net_ok
+    res.network_code = net_code
     if not net_ok:
         res.blocked_step = "network"
         res.blocked_reason = net_msg
-        logger.warning("[preflight] %s 网络未通: %s", device_id[:8], net_msg)
+        logger.warning("[preflight] %s 网络未通(%s): %s", device_id[:8], net_code, net_msg)
         return res
 
     # Step 2: VPN（若本地出口已在目标国，则不必强制 v2ray）
@@ -201,12 +206,13 @@ def _do_preflight(device_id: str, task_target_country: Optional[str] = None) -> 
 def _do_preflight_network_only(device_id: str) -> PreflightResult:
     """仅外网：不要求 VPN（出口可为路由器/WiFi 等）。"""
     res = PreflightResult(device_id=device_id, passed=False, preflight_mode="network_only")
-    net_ok, net_msg = _check_network(device_id)
+    net_ok, net_msg, net_code = _check_network_ex(device_id)
     res.network_ok = net_ok
+    res.network_code = net_code
     if not net_ok:
         res.blocked_step = "network"
         res.blocked_reason = net_msg
-        logger.warning("[preflight] %s network_only 网络未通: %s", device_id[:8], net_msg)
+        logger.warning("[preflight] %s network_only 网络未通(%s): %s", device_id[:8], net_code, net_msg)
         return res
     res.vpn_ok = False
     res.account_ok = True
@@ -234,8 +240,35 @@ def check_device_network_connectivity(device_id: str) -> Tuple[bool, str]:
     return _check_network(device_id)
 
 
+# 网络探测错误码（供 error_classifier / 前端 fix_action 联动）
+NET_OK = "ok"
+NET_PROXY_PATH_MISMATCH = "proxy_path_mismatch"  # shell 探测路径不走代理，但出口已是预期国家
+NET_PROXY_HIJACK = "proxy_hijack"                # 状态码 301/302 等，被运营商劫持
+NET_ZERO = "network_zero"                        # TCP/ICMP/IP 全失败，真断网
+NET_TIMEOUT = "network_timeout"                  # USB/adb 超时
+NET_ERROR = "network_error"                      # 其它异常
+
+
 def _check_network(device_id: str) -> Tuple[bool, str]:
-    """外网探测：优先 HTTP 204，其次 ICMP，并给出可操作的失败原因。"""
+    """向后兼容入口：返回 (bool, msg)。新代码请用 _check_network_ex。"""
+    ok, msg, _code = _check_network_ex(device_id)
+    return ok, msg
+
+
+def _check_network_ex(device_id: str) -> Tuple[bool, str, str]:
+    """外网探测：返回 (passed, msg, code)。
+
+    code 见 NET_* 常量；UI / error_classifier 据此决定 fix_action（换IP / 重启代理 / 重连USB）。
+
+    判据顺序（任一通过即放行）：
+    1) gstatic generate_204 (204) — 经典基础联通
+    2) facebook.com/robots.txt (200/301/302) — 真实业务端点（避免运营商劫持 false negative）
+    3) ICMP 8.8.8.8 / 1.1.1.1
+    4) 兜底：能拿到设备 public_ip → 视作 proxy_path_mismatch 通过（warn）
+       —— 解决 911proxy 等 SOCKS Per-App 代理时 shell 探测不走代理的误报。
+
+    全失败时根据"是否拿到状态码 / 是否拿到 public_ip"区分 hijack vs zero。
+    """
     url = "http://connectivitycheck.gstatic.com/generate_204"
     curl_variants = (
         ("curl", f"curl -s --connect-timeout 5 -o /dev/null -w '%{{http_code}}' {url}"),
@@ -254,7 +287,7 @@ def _check_network(device_id: str) -> Tuple[bool, str]:
             )
             code = r.stdout.strip().strip("'").strip()
             if code == "204":
-                return True, f"connected({label})"
+                return True, f"connected({label})", NET_OK
         # 部分 ROM 对 generate_204 返回异常码，尝试 HEAD（优先标准 curl）
         for label, head_cmd in (
             ("curl", f"curl -s --connect-timeout 5 -I {url} 2>/dev/null | head -n1"),
@@ -267,34 +300,96 @@ def _check_network(device_id: str) -> Tuple[bool, str]:
             )
             h1 = (r_head.stdout or "").strip()
             if "204" in h1 or "No Content" in h1:
-                return True, f"connected(http_head,{label})"
+                return True, f"connected(http_head,{label})", NET_OK
 
-        for host in ("8.8.8.8", "1.1.1.1"):
+        # 业务真实端点探测（避免 gstatic 被运营商劫持的 false negative）
+        fb_url = "https://www.facebook.com/robots.txt"
+        for label, fb_cmd in (
+            ("curl", f"curl -s --connect-timeout 6 -o /dev/null -w '%{{http_code}}' -L {fb_url}"),
+            ("sys", f"/system/bin/curl -s --connect-timeout 6 -o /dev/null -w '%{{http_code}}' -L {fb_url}"),
+        ):
+            r_fb = _sp_run_text(
+                ["adb", "-s", device_id, "shell", fb_cmd],
+                capture_output=True,
+                timeout=14,
+            )
+            fb_code = r_fb.stdout.strip().strip("'").strip()
+            if fb_code in ("200", "301", "302"):
+                return True, f"connected(fb_robots,{label},{fb_code})", NET_OK
+
+        # ICMP 辅证：8.8.8.8/1.1.1.1（通用）+ 31.13.66.35（FB 自身段）
+        # P2-⑤: FB 段独立 ICMP 是为了在 gstatic/Google 被运营商劫持时仍能确认"业务真实可达"。
+        # 即使 HTTP 全部 302/timeout，只要 FB ICMP 通就视作可工作（业务流量走 TCP 仍可能成功）。
+        for host in ("8.8.8.8", "1.1.1.1", "31.13.66.35"):
             r2 = _sp_run_text(
                 ["adb", "-s", device_id, "shell", f"ping -c 1 -W 3 {host}"],
                 capture_output=True,
                 timeout=8,
             )
             if r2.returncode == 0:
-                return True, f"connected(ping {host})"
+                tag = "fb_icmp" if host.startswith("31.13.") else f"ping {host}"
+                return True, f"connected({tag})", NET_OK
 
-        parts = []
-        if not code:
-            parts.append(
-                "HTTP 状态码为空（常见于无 curl/toybox、DNS 异常或被策略拦截）"
+        # ── 关键兜底：geo 路径独立验证 ──
+        # 911proxy 等 Per-App SOCKS 代理只对申请代理的 App 生效，adb shell（uid=2000）
+        # 走默认路由 → 探测失败但业务 App 实际通。能拿到 public_ip 说明手机能上网。
+        public_ip = _try_get_public_ip(device_id)
+        if public_ip:
+            warn = (
+                f"shell 探测路径未通（HTTP={code!r}），但出口 IP={public_ip} 可达 — "
+                f"代理可能为 Per-App 模式，业务 App 流量预计可走代理。已放行。"
+            )
+            logger.warning("[preflight] %s 探测路径误报兜底: %s", device_id[:8], warn)
+            return True, warn, NET_PROXY_PATH_MISMATCH
+
+        # 区分 hijack vs zero：拿到状态码（如 302）= 运营商劫持；空 = 完全断网
+        is_hijack = bool(code) and code not in ("000", "204", "200")
+        err_code = NET_PROXY_HIJACK if is_hijack else NET_ZERO
+        if is_hijack:
+            msg = (
+                f"代理路径异常 — 探测被劫持/拒绝（HTTP={code!r}，最后尝试={last_label}）。"
+                "可能原因：① 911proxy/V2Ray 客户端未启动 ② 代理 IP 已被目标网站封禁 ③ Per-App 代理"
+                "未覆盖 shell。建议：先在手机上确认代理客户端连通，再点「换 IP」重试。"
             )
         else:
-            parts.append(f"HTTP 状态码={code!r}（最后尝试={last_label}）")
-        parts.append("ICMP 探测也未通过")
-        return False, (
-            "无法访问外网（"
-            + "；".join(parts)
-            + "）。请检查 SIM 卡或 Wi‑Fi、关闭飞行模式，并在设备页运行「诊断」。"
-        )
+            msg = (
+                "完全无外网（HTTP/ICMP/IP 三路全失败）。建议：① 检查 SIM/Wi‑Fi 信号 ② "
+                "重新插拔 USB ③ 在设备页运行「诊断」。"
+            )
+        return False, msg, err_code
     except subprocess.TimeoutExpired:
-        return False, "网络检查超时，请检查设备连接或 USB 稳定性"
+        return False, "网络检查超时，请检查 USB 稳定性或重新插拔设备。", NET_TIMEOUT
     except Exception as e:
-        return False, f"网络检查异常: {e}"
+        return False, f"网络检查异常: {e}", NET_ERROR
+
+
+def _try_get_public_ip(device_id: str) -> str:
+    """尝试通过设备 shell 拿到出口 IP（用于 path_mismatch 兜底）。
+
+    与 geo_check._get_public_ip 行为一致，但隔离失败：
+    - 即使 ifconfig.me 等 echo 服务超时也不抛异常，仅返回空字符串。
+    - 多源串行兜底，但单源 timeout 6s，整体最多 ~18s。
+    """
+    services = ("ifconfig.me", "api.ipify.org", "icanhazip.com")
+    for svc in services:
+        try:
+            r = _sp_run_text(
+                ["adb", "-s", device_id, "shell", f"curl -s --max-time 6 {svc}"],
+                capture_output=True,
+                timeout=8,
+            )
+            ip = (r.stdout or "").strip()
+            # 简单 IPv4 校验
+            parts = ip.split(".")
+            if len(parts) == 4:
+                try:
+                    if all(0 <= int(p) <= 255 for p in parts):
+                        return ip
+                except ValueError:
+                    continue
+        except Exception:
+            continue
+    return ""
 
 
 def _check_vpn(device_id: str) -> Tuple[bool, str]:

@@ -97,6 +97,13 @@ _FB_RISK_KEYWORDS = [
     "Please verify your account",
     "Your account has been disabled",
     "account is locked",
+    # OPT-4 (2026-04-28, SWZL 真机摸底产物): Community Standards 违规
+    # 后的 N 天 restriction 页面 — 跟 disabled 不同, restriction 期内仍可
+    # 收消息但不能 reply/start chat。文案: "Your account has been
+    # restricted for X days"。该页面只有 OK 按钮 (不在 _FB_RISK_BUTTONS),
+    # 因此 _detect_risk_dialog 走独立路径跳过 button 校验。
+    "Your account has been restricted",
+    "account has been restricted",  # 容错: 大小写或前缀缺失
 ]
 
 _FB_RISK_BUTTONS = [
@@ -107,6 +114,41 @@ _FB_RISK_BUTTONS = [
 
 _RISK_DETECT_VERIFY_DELAY = 1.6
 _RISK_DETECT_PROBE_TIMEOUT = 0.25
+
+
+# OPT-4 (2026-04-28): "Your account has been restricted for X days" 文案
+# 解析天数. 用 finditer 取第一个 X 数字 (Messenger 文案有 2 处: 标题"for 6
+# days" + 详情"for 6 days"; 取第一个即可)。返回 0 = 未匹配 (调用方应降级
+# 走默认 cooldown 时长)。
+import re as _opt4_re
+_OPT4_RESTRICTION_DAYS_RE = _opt4_re.compile(
+    r"restricted\s+for\s+(\d+)\s+day", _opt4_re.IGNORECASE)
+
+
+def _parse_restriction_days(text: str) -> int:
+    """从 FB restriction 文案抽取限制天数。
+
+    匹配 "restricted for 6 days" / "restricted for 1 day" 等模式。
+    返回 0 表示未匹配 (调用方应降级走默认 cooldown 时长 + log warning)。
+
+    >>> _parse_restriction_days("Your account has been restricted for 6 days")
+    6
+    >>> _parse_restriction_days("restricted FOR 1 day because of bullying")
+    1
+    >>> _parse_restriction_days("restricted")
+    0
+    >>> _parse_restriction_days("")
+    0
+    """
+    if not text:
+        return 0
+    m = _OPT4_RESTRICTION_DAYS_RE.search(text)
+    if m:
+        try:
+            return max(0, int(m.group(1)))
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 # ─── P0-1: browse_feed 真人节奏常量（2026-04-21 重写）─────────────────────
@@ -244,6 +286,34 @@ class MessengerError(Exception):
 
     def __repr__(self) -> str:  # 日志里更清晰
         return f"MessengerError(code={self.code!r})"
+
+
+class AttachImageError(Exception):
+    """attach_image 结构化错误 (D1-A 2026-04-28, B worker 内部专用)。
+
+    与 MessengerError 命名空间隔离 — attach_image 仅在 wa_referral 双轨发送
+    路径里被调用 (B 独占), A worker 的 A2 降级链不 catch 本异常, 因此 codes
+    无须登记到 INTEGRATION_CONTRACT §7.6。
+
+    Codes:
+      - push_failed:            image 文件 push 到设备 /sdcard/Pictures 失败
+      - permission_failed:      READ_MEDIA_IMAGES grant 系统调用失败
+      - media_scan_timeout:     MEDIA_SCANNER_SCAN_FILE 后图片在 picker 仍不可见
+      - gallery_button_missing: "Open photo gallery." 多语言 selector 全 miss
+      - picker_empty:           picker 出现但 dump 不到任何 "Photo taken X" 节点
+      - send_failed:            照片选中后 send 阶段失败 (复用 _tap_messenger_send)
+
+    调用方按 code 决定: push_failed / permission_failed → 重试; gallery_button_
+    missing → 重读 selector 再发版; picker_empty → 检查 push 路径与媒体扫描。
+    """
+
+    def __init__(self, code: str, message: str = "", hint: str = ""):
+        super().__init__(message or code)
+        self.code = code
+        self.hint = hint or ""
+
+    def __repr__(self) -> str:
+        return f"AttachImageError(code={self.code!r})"
 
 
 def _emit_contact_event_safe(device_id: str, peer_name: str,
@@ -747,7 +817,8 @@ class FacebookAutomation(BaseAutomation):
     # ── Smart Tap with Post-Tap Self-Healing (Sprint 4 P0) ─────────────────
 
     def smart_tap(self, target_desc: str, context: str = "",
-                  device_id: Optional[str] = None) -> bool:
+                  device_id: Optional[str] = None,
+                  *, expected_pkg: Optional[str] = None) -> bool:
         """FB 专用 smart_tap: 点击成功后立刻检查是否误点把 app 切走。
 
         动机(Sprint 3 P3.8 add_friend 失败复盘):
@@ -755,29 +826,39 @@ class FacebookAutomation(BaseAutomation):
           右上角 Messenger 💬 icon (text/desc=Search 容易命中周边元素),
           结果整个流程进了 Messenger 的 "New message" 页,后续全部对错目标。
 
+        OPT-7 (2026-04-28): expected_pkg kwarg
+          attach_image 等 Messenger 内操作期望 current_pkg = orca 而非 katana,
+          原默认 PACKAGE (katana) 比较会让 orca 内每次 tap 都触发 heal 误报
+          + 多余 BACK + 重启 FB。传 expected_pkg=MESSENGER_PACKAGE 即可。
+          send_message 等已稳定的 caller 不传, 维持 backward-compat。
+
         修复策略:
           ① 调父类 smart_tap 执行真点击(tap 后 AdbFallbackDevice 已 invalidate cache)
           ② 等 UI 稳定 (700ms) — 避免 activity 切换中途 app_current 瞬时不准
           ③ 强制 invalidate app_cache,读最新 app_current
-          ④ 如果脱离 FB:先试 _handle_xspace_dialog(Select app sheet),
-             不行就 BACK,再不行就 _adb_start_main_user 重启
+          ④ 如果脱离期望 pkg: 先试 _handle_xspace_dialog(Select app sheet),
+             不行就 BACK, 再不行就 _adb_start_main_user 重启
           ⑤ **2026-04-20 真机回归二次优化**: 自愈成功后如果 app 已回到
              FB,**自动再 tap 一次**(递归深度最多 1 层),第二次 tap
              会基于最新 dump 重新解析位置 → 大概率命中真正的目标控件;
              仍漂移/失败才返回 False。避免"自愈成功但业务意图未达成 →
              上层后续步骤连锁失败"。
         """
-        return self._smart_tap_with_heal(target_desc, context, device_id,
-                                         _heal_retry=True)
+        return self._smart_tap_with_heal(
+            target_desc, context, device_id,
+            _heal_retry=True, expected_pkg=expected_pkg)
 
     def _smart_tap_with_heal(self, target_desc: str, context: str,
                              device_id: Optional[str],
-                             _heal_retry: bool) -> bool:
+                             _heal_retry: bool,
+                             expected_pkg: Optional[str] = None) -> bool:
         ok = super().smart_tap(target_desc, context, device_id)
         if not ok:
             return False
         did = self._did(device_id)
         d = self._u2(did)
+        # OPT-7: caller 显式声明的 expected_pkg 优先, 否则默认 katana
+        target_pkg = expected_pkg or PACKAGE
         try:
             import time as _t
             _t.sleep(0.7)
@@ -789,11 +870,11 @@ class FacebookAutomation(BaseAutomation):
                 current_pkg = (d.app_current() or {}).get("package", "")
             except Exception:
                 current_pkg = ""
-            if not current_pkg or current_pkg == PACKAGE:
-                return ok  # tap 后仍在 FB 下,正常
+            if not current_pkg or current_pkg == target_pkg:
+                return ok  # tap 后仍在期望 pkg 下,正常
 
             log.warning("[smart_tap-heal] tap '%s' 后 app 漂移: %s != %s,启动自愈",
-                        target_desc, current_pkg, PACKAGE)
+                        target_desc, current_pkg, target_pkg)
             self._handle_xspace_dialog(d, did)
             _t.sleep(0.4)
             try:
@@ -802,7 +883,7 @@ class FacebookAutomation(BaseAutomation):
             except Exception:
                 current_pkg = ""
 
-            if current_pkg != PACKAGE:
+            if current_pkg != target_pkg:
                 self._adb(f"shell input keyevent 4", device_id=did)
                 _t.sleep(0.6)
                 try:
@@ -811,7 +892,7 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     current_pkg = ""
 
-            if current_pkg != PACKAGE:
+            if current_pkg != target_pkg:
                 log.warning("[smart_tap-heal] BACK 失败 (current=%s),重启 FB",
                             current_pkg)
                 self._adb_start_main_user(did)
@@ -823,12 +904,13 @@ class FacebookAutomation(BaseAutomation):
                     current_pkg = (d.app_current() or {}).get("package", "")
                 except Exception:
                     current_pkg = ""
-                if current_pkg == PACKAGE:
-                    log.info("[smart_tap-heal] 已回到 FB,对 '%s' 做一次 retry tap",
-                             target_desc)
+                if current_pkg == target_pkg:
+                    log.info("[smart_tap-heal] 已回到 %s,对 '%s' 做一次 retry tap",
+                             target_pkg, target_desc)
                     _t.sleep(1.0)
-                    return self._smart_tap_with_heal(target_desc, context,
-                                                    device_id, _heal_retry=False)
+                    return self._smart_tap_with_heal(
+                        target_desc, context, device_id,
+                        _heal_retry=False, expected_pkg=expected_pkg)
             log.warning("[smart_tap-heal] '%s' 自愈后仍异常(current=%s),放弃",
                         target_desc, current_pkg)
             return False
@@ -994,13 +1076,50 @@ class FacebookAutomation(BaseAutomation):
             log.warning("[xspace] 兜底失败: %s", e)
             return False
 
+    def _in_restriction_page(self, d) -> bool:
+        """OPT-5 v2 (2026-04-28): 检测当前是否在 account restriction page。
+
+        给 _dismiss_dialogs 等清场动作做 short-circuit — restriction page
+        只有 OK 按钮, 而 _FB_DISMISS_TEXTS 含 "OK", 误点会让 OPT-4
+        _detect_risk_dialog 后续命中不到 restriction (full_msg 已被关掉)。
+        """
+        try:
+            return d(textContains="Your account has been restricted").exists(
+                timeout=0.3)
+        except Exception:
+            return False
+
     def _dismiss_dialogs(self, d, max_attempts: int = 5, device_id: str = ""):
         """Dismiss common Facebook popups (permissions, notifications, etc.).
 
         Sprint 3 P3 真机加固: 任务执行过程中随时可能弹 MIUI "Select app"
         sheet(双开时点 Messenger 触发),必须先处理再跑通用 dismiss。
+
+        OPT-5 v2 (2026-04-28): 在 account restriction page 时一律 no-op,
+        否则 _FB_DISMISS_TEXTS 里的 "OK" 会被点掉, OPT-4 _detect_risk_dialog
+        后续命中不到 restriction 文案。restriction page 应让 _detect_risk_
+        dialog 抛 MessengerError(risk_detected) + OPT-6 写状态后由调度器处理。
         """
         did = device_id or getattr(self, "_current_device", "")
+        if self._in_restriction_page(d):
+            log.debug(
+                "[opt5v2] _dismiss_dialogs no-op: 在 account restriction "
+                "page, 保留 OPT-4 检测路径")
+            return
+        # OPT-5 v3-v2 (2026-04-28): 通用 startup dialog 模块前置 — 处理
+        # Previews are on / 中文区不支持 / 通知/通讯录权限请求 / e2e 介绍.
+        # restriction_page 在 KNOWN_DIALOGS 是 skip 类, 不会被 dismiss
+        # (双重保护 OPT-4 检测路径). FB 主 app caller (例如 6465 行的
+        # check_friend_requests) 跑时 marker 全 miss → no-op, 副作用 0.
+        try:
+            from .fb_dialog_dismisser import dismiss_known_dialogs
+            cleared = dismiss_known_dialogs(d, max_rounds=3)
+            if cleared:
+                log.info(
+                    "[opt5v3-v2] _dismiss_dialogs prefix cleared: %s",
+                    cleared)
+        except Exception as e:
+            log.debug("[opt5v3-v2] dismiss_known_dialogs 异常: %s", e)
         for _ in range(max_attempts):
             dismissed = False
             # 优先:MIUI XSpace/双开对话框 — 一旦出现业务流程都会卡死
@@ -1086,6 +1205,27 @@ class FacebookAutomation(BaseAutomation):
         if not hit_kw:
             return False, ""
 
+        # OPT-4 (2026-04-28, SWZL 真机摸底产物): "account has been restricted
+        # for X days" 是强持续 risk signal — 该页面**只有 OK 按钮**, OK 太
+        # 通用不能进 _FB_RISK_BUTTONS, 也**不会** 1.6s 内消失 (会持续到用户
+        # 主动 OK)。两条通用校验都会误判, 给独立路径。
+        # 同时抽取完整文案 (含 "for X days") 供 _classify_risk_kind 命中
+        # account_restricted kind, 并 log 解析出的天数供 OPT-6 调度器使用。
+        kw_lower = hit_kw.lower()
+        if "restricted" in kw_lower and "account" in kw_lower:
+            full_msg = self._extract_restriction_full_text(d) or hit_kw
+            days = _parse_restriction_days(full_msg)
+            did_hint = (getattr(d, "serial", "")
+                        or getattr(d, "_serial", "") or "")
+            log.warning(
+                "[risk-restricted] account restriction detected device=%s "
+                "days=%d full_msg=%r",
+                did_hint[:12] if did_hint else "?", days, full_msg[:200])
+            # OPT-6 (2026-04-28): 写 device_state 让调度器自动避开
+            self._mark_account_restricted_state(did_hint, full_msg, days)
+            self._report_risk(full_msg, device_id_hint=did_hint)
+            return True, full_msg
+
         try:
             has_button = False
             for btn in _FB_RISK_BUTTONS:
@@ -1108,6 +1248,98 @@ class FacebookAutomation(BaseAutomation):
 
         self._report_risk(hit_kw, device_id_hint=getattr(d, "serial", "") or getattr(d, "_serial", ""))
         return True, hit_kw
+
+    def _is_account_restricted(self, did: str) -> tuple:
+        """OPT-6 (2026-04-28): 检查 device 是否在 account restriction 期内
+        (读 OPT-4 写入的 device_state)。
+
+        本方法**纯读 + 0 副作用**, 同时给 _ai_reply_and_send 入口 guard 和
+        executor._opt6_check_restriction 调度器拦截使用。fail-open: 数据库
+        异常返 (False, 0.0) 让任务继续 (不能因为状态读不到就阻断生产)。
+
+        Returns:
+            (is_restricted, lifted_at_ts)
+              is_restricted=True  → did 在 restriction 期内, 不应主动发
+              is_restricted=False → 已过期 / 没记录 / 异常, 可正常发
+              lifted_at_ts        → 解封 epoch ts (0.0 表示无记录)
+        """
+        if not did:
+            return False, 0.0
+        try:
+            from src.host.device_state import DeviceStateStore
+            ds = DeviceStateStore(platform="facebook")
+            lifted_at = ds.get_float(did, "restriction_lifted_at", 0.0)
+            if lifted_at > time.time():
+                return True, lifted_at
+            return False, lifted_at
+        except Exception as e:
+            log.debug(
+                "[opt6] _is_account_restricted 异常 device=%s: %s",
+                did[:12] if did else "", e)
+            return False, 0.0
+
+    def _mark_account_restricted_state(self, did: str, full_msg: str,
+                                       days: int) -> None:
+        """OPT-6 (2026-04-28): N 天 restriction 状态写入 device_state, 让
+        调度器 (executor._opt6_check_restriction) + _ai_reply_and_send 入口
+        guard 自动避开该设备直到 restriction_lifted_at。
+
+        Fields written (platform='facebook'):
+          restriction_lifted_at   — float epoch ts; 调度器比较 now < lifted_at
+          restriction_full_msg    — 原始风控文案 (≤ 500 chars 截断)
+          restriction_days        — 解析出的限制天数 (int str)
+          restriction_detected_at — 检测到时的 epoch ts
+
+        days <= 0 (解析失败) 或 did 为空时 no-op (避免脏数据进 device_state)。
+        TTL 自然过期 — 调度器/guard 比较 now 即可, 不需主动清理 (省一个清理
+        task 的复杂度)。
+        """
+        if not did or days <= 0:
+            return
+        try:
+            from src.host.device_state import DeviceStateStore
+            ds = DeviceStateStore(platform="facebook")
+            now_ts = time.time()
+            lifted_at = now_ts + days * 86400
+            ds.set(did, "restriction_lifted_at", str(lifted_at))
+            ds.set(did, "restriction_full_msg", (full_msg or "")[:500])
+            ds.set(did, "restriction_days", str(days))
+            ds.set(did, "restriction_detected_at", str(now_ts))
+            log.warning(
+                "[opt6] device=%s restriction marked: lifted_at=%.0f "
+                "(still %d days, msg=%r)",
+                did[:12], lifted_at, days, (full_msg or "")[:60])
+        except Exception as e:
+            log.debug("[opt6] mark restriction state 失败 device=%s: %s",
+                      did[:12] if did else "", e)
+
+    def _extract_restriction_full_text(self, d) -> str:
+        """OPT-4 (2026-04-28): 从当前 hierarchy 抓出 restriction 完整文案
+        (含 "for X days"), 用于 _parse_restriction_days + 入库 raw_message。
+
+        优先策略: 找 textContains="restricted for" 的 EditText/TextView 节点;
+        失败回退到 textContains="account has been restricted" (没天数也比
+        没文案好)。两路都失败返空 — 调用方应降级用 hit_kw。
+        """
+        for needle in ("restricted for", "account has been restricted"):
+            try:
+                obj = d(textContains=needle)
+                if obj.exists(timeout=_RISK_DETECT_PROBE_TIMEOUT):
+                    txt = ""
+                    try:
+                        txt = (obj.get_text() or "").strip()
+                    except Exception:
+                        # u2 老版本无 get_text, 走 info dict
+                        try:
+                            info = obj.info or {}
+                            txt = (info.get("text") or "").strip()
+                        except Exception:
+                            pass
+                    if txt:
+                        return txt
+            except Exception:
+                continue
+        return ""
 
     def _report_risk(self, message: str, device_id_hint: str = ""):
         """上报风控事件 + 标记设备状态。
@@ -1498,8 +1730,13 @@ class FacebookAutomation(BaseAutomation):
                 message, {"platform": "facebook", "recipient": recipient})
 
             # ── 1. 进 Messenger ─────────────────────────────────────────
+            # OPT-7-v2 (2026-04-28): tap 后期望 current_pkg=orca (而非默认
+            # PACKAGE=katana), 否则 heal 会把成功 tap 误判为漂移 → BACK +
+            # 重启 FB 兜底, send_message 第一步浪费 1-3s. 传 expected_pkg
+            # 修正语义, smart_tap 直接 return True.
             launched_via_icon = self.smart_tap(
-                "Messenger or chat icon", device_id=did)
+                "Messenger or chat icon", device_id=did,
+                expected_pkg=MESSENGER_PACKAGE)
             if not launched_via_icon:
                 try:
                     d.app_start(MESSENGER_PACKAGE)
@@ -1553,18 +1790,47 @@ class FacebookAutomation(BaseAutomation):
             # ── 4. Messenger 搜索入口 (2026-04-24 改: 三级 fallback) ─────
             # smart_tap → multi-locale selector (_MESSENGER_SEARCH_SELECTORS)
             # → coordinate (top 20%)。详见 _enter_messenger_search docstring。
-            self._enter_messenger_search(d, did)
-            time.sleep(0.5)
-            self.hb.type_text(d, recipient)
-            time.sleep(1.5)
+            # OPT-FP7 (2026-04-28): 优先 inbox-direct-tap 跳过 search.
+            # 真消灭 false positive 根因 — Messenger 搜索把"自己"放第 1
+            # + FB 整合到 katana messaging-in-blue 后 search 切走 app.
+            # 直接在 inbox 列表找 recipient row → tap, miss 才 fallback
+            # 走 search 路径 (向后兼容).
+            inbox_direct_hit = self._tap_inbox_row_by_recipient(d, recipient)
+            if inbox_direct_hit:
+                log.info(
+                    "[opt-fp7] inbox-direct-tap 命中 recipient=%r, "
+                    "跳过 search 路径", recipient)
+                # tap row 后等 UI 切换到对话页
+                time.sleep(2.0)
+            else:
+                log.debug(
+                    "[opt-fp7] inbox 中没找到 recipient=%r, fallback search",
+                    recipient)
+                self._enter_messenger_search(d, did)
+                time.sleep(0.5)
+                self.hb.type_text(d, recipient)
+                time.sleep(1.5)
 
-            # ── 5. 选中搜索结果第一条 (2026-04-24: 4 级 fallback) ────────
-            # smart_tap → _first_search_result_element (XML, semantic, query
-            # plausible-match) → coordinate (w*0.5, h*0.26) → VLM vision。
-            # 详见 _tap_first_search_result docstring。
-            self._tap_first_search_result(d, did, recipient)
+                # ── 5. 选中搜索结果第一条 (2026-04-24: 4 级 fallback) ────────
+                # smart_tap → _first_search_result_element (XML, semantic,
+                # query plausible-match) → coordinate (w*0.5, h*0.26) →
+                # VLM vision. 详见 _tap_first_search_result docstring.
+                self._tap_first_search_result(d, did, recipient)
 
             time.sleep(1)
+            # OPT-FP1 (2026-04-28): tap 第一搜索结果后 dump 对话页 title 验证
+            # recipient 匹配. 防 false positive — IJ8H 实测搜索 "Meta AI"
+            # 命中 "Shuichi Ito" (自己), 整个 send 链路在错对话页跑完返 True
+            # 但消息发到错的人. 不匹配 → recipient_not_found (与已有 code
+            # 复用, hint 标 verify_failed 让调用方区分).
+            if not self._verify_recipient_in_conv_title(d, recipient):
+                raise MessengerError(
+                    "recipient_not_found",
+                    f"tap 第一搜索结果后对话页 title 不含 recipient={recipient!r}",
+                    hint=("verify_failed: 可能 tap 错对话页 (Messenger 搜索结果"
+                          " 把'自己头像'/'最近联系人'作为第 1 条, fallback 误"
+                          "命中). 上层应重试或换路径"))
+
             # 2026-04-24 safety: 显式 tap composer 确保 focus — 真机观察到
             # 某些 Messenger 版本打开对话后 composer 未自动 focus, 直接
             # hb.type_text 会打到错地方 (e.g. stale search box)。
@@ -1584,11 +1850,38 @@ class FacebookAutomation(BaseAutomation):
             # A 的 A2 降级可按 text_hash 去重并用更短 greeting 重试
             blocked_text = self._detect_send_blocked(d)
             if blocked_text:
+                # OPT-4-v2 (2026-04-28): blocked_text 含 restriction hint
+                # ("restricted" / "violated Community Standards" 等) →
+                # 补登记 device_state 让 OPT-6 调度器避开. 覆盖 OPT-4
+                # _detect_risk_dialog 自动路径在 restriction page 用户已
+                # OK 后的盲区. 不退化 send_blocked_by_content 现有 raise
+                # 路径 (双信号: 既记 risk_event 又 mark state).
+                #
+                # OPT-4-v3 (2026-04-28): 先尝试从 blocked_text 解析具体天数
+                # (FB 真机如果推送 "...for 6 days" 等文案), 解析失败回退
+                # 7 天默认猜测 (保守上限).
+                if self._detect_restriction_hint(blocked_text):
+                    parsed_days = _parse_restriction_days(blocked_text)
+                    days = parsed_days if parsed_days > 0 else 7
+                    src_tag = ("parsed" if parsed_days > 0
+                               else "default-7d")
+                    log.warning(
+                        "[opt4-v2/v3] send 失败含 restriction hint, 补登记 "
+                        "%d 天 (%s) device=%s text=%r",
+                        days, src_tag,
+                        did[:12] if did else "?", blocked_text[:100])
+                    self._mark_account_restricted_state(
+                        did, blocked_text, days=days)
+
                 try:
                     from src.host.fb_store import record_risk_event
                     # record_risk_event 用 raw_message 文本经 _RISK_KIND_RULES
                     # 自动分类到 'content_blocked' (该规则由 F4-support
-                    # commit 在 follow-up PR 里扩展)
+                    # commit 在 follow-up PR 里扩展)。OPT-4-v2 命中 restriction
+                    # hint 时 blocked_text 通常仍含"can't be sent"等 send
+                    # 失败短语 → 仍分到 content_blocked, **kind 分类不影响
+                    # OPT-6 拦截** (后者读 device_state.restriction_lifted_at,
+                    # 已由上面 _mark_account_restricted_state 写入).
                     record_risk_event(did, blocked_text,
                                       task_id=f"send_message:{recipient[:20]}")
                 except Exception as e:
@@ -1602,10 +1895,356 @@ class FacebookAutomation(BaseAutomation):
                     f"FB 拒绝发送 ({blocked_text[:80]})",
                     hint=(f"text_hash={text_hash}; A 可用更短/更自然的 "
                           f"greeting 重试, 或用此 hash 去重防重复触发"))
+            # OPT-FP3 (2026-04-28): post-send verify — FB 没主动拒发但
+            # 消息可能没真发 (网络 / 服务端 throttle / Send 按钮 tap 错位).
+            # dump 对话页历史验证 message 出现; 不出现抛 send_button_missing
+            # (复用既有 INTEGRATION_CONTRACT §7.6 code, 不引入新 code).
+            if not self._verify_message_actually_sent(d, rewritten):
+                raise MessengerError(
+                    "send_button_missing",
+                    f"send 按钮按了但对话页未找到刚发消息 "
+                    f"(前 30 chars: {rewritten[:30]!r})",
+                    hint=("post_send_verify_failed: 可能 send 按钮被点但消息 "
+                          "没真发 (网络问题 / FB 静默拒发 / tap 错对话页). "
+                          "上层应重试或换路径"))
+            # OPT-FP6 (2026-04-28): 最后一道防线 — dumpsys window 强制
+            # 校验 orca 在前台. 消灭 Q4N7 类 false positive (send_message
+            # 返 True 但实际跑到 FB 主 app 备份页 / 别 app, OPT-FP3
+            # dump-based verify 被 substring 误放行).
+            if not self._verify_messenger_in_foreground(did):
+                raise MessengerError(
+                    "send_button_missing",
+                    f"send_message 末尾 orca 不在前台 (activity check failed)",
+                    hint=("post_send_activity_check_failed: send_message 路径 "
+                          "中途切到错 app (Q4N7 实测进 FB 主 app 备份页). "
+                          "上层应重试或换路径"))
             return True
         # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
         return False  # pragma: no cover
+
+    # ════════════════════════════════════════════════════════════════════
+    # attach_image (D1-A, 2026-04-28) — 在 Messenger 当前对话页发送本地图片
+    # 用途: B worker 在 wa_referral 双轨发送时, 紧接 send_message 调本方法
+    #       发 LINE QR 图; A worker 不消费本方法的错误码 (AttachImageError
+    #       与 MessengerError 命名空间隔离)。
+    #
+    # 真机摸底 (IJ8H Redmi 13C / Android 13 / orca 556.0.0.60.64, 2026-04-28):
+    #   - 对话页底部 "Open photo gallery." button content-desc 稳定
+    #   - photo picker 内每张图 content-desc = "Photo taken DD MMM YYYY"
+    #   - resource-id 全被 ProGuard 混淆为 "(name removed)" → 只能用 desc/text
+    #   - 首次使用需 grant READ_MEDIA_IMAGES (Android 13+) 或
+    #     READ_EXTERNAL_STORAGE (Android 12-)
+    # ════════════════════════════════════════════════════════════════════
+
+    _MESSENGER_ATTACH_GALLERY_SELECTORS = (
+        # uiautomator2 d(**kwargs).exists() — 按优先级 try, 第一个 hit 返回
+        {"description": "Open photo gallery."},     # en (实测 IJ8H)
+        {"description": "打开图库"},                  # zh-CN 推测
+        {"description": "打開相簿"},                  # zh-TW 推测
+        {"description": "ギャラリーを開く"},           # ja 推测
+        {"description": "갤러리 열기"},                # ko 推测
+        {"descriptionContains": "photo gallery"},   # en 容错
+        {"descriptionContains": "图库"},              # zh 简容错
+        {"descriptionContains": "相簿"},              # zh 繁容错
+        {"descriptionContains": "ギャラリー"},         # ja 容错
+        {"descriptionContains": "갤러리"},             # ko 容错
+    )
+
+    _MESSENGER_PHOTO_NODE_SELECTORS = (
+        # 从 picker 半屏 RecyclerView 里选第一张图; "Photo taken DD MMM YYYY"
+        # 是 Android Photo Picker 标准 desc 模式 (Messenger 直接复用)
+        {"descriptionMatches": r"Photo taken \d+ \w+ \d{4}"},  # en
+        {"descriptionContains": "Photo taken"},     # en 容错
+        {"descriptionContains": "拍摄于"},           # zh 推测
+        {"descriptionContains": "撮影"},             # ja 推测
+    )
+
+    def attach_image(self, image_path: str, caption: str = "",
+                     device_id: Optional[str] = None,
+                     raise_on_error: bool = False,
+                     dry_run: bool = False) -> bool:
+        """在当前 Messenger 对话页发送一张本地图片附件。
+
+        前置: 当前 Messenger 必须已在某对话页 (典型用法 = 先调 send_message
+        进入对话页, 再调本方法发图片)。本方法不负责打开对话页。
+
+        流程分段, 失败抛对应 :class:`AttachImageError` code:
+          1. push image_path 到 /sdcard/Pictures/openclaw_<ts>.png → push_failed
+          2. grant READ_MEDIA_IMAGES (幂等)              → permission_failed
+          3. 触发 MEDIA_SCANNER_SCAN_FILE broadcast
+          4. tap "Open photo gallery."                  → gallery_button_missing
+          5. dump XML 找第一张 "Photo taken DATE" → tap → picker_empty
+                                                       / media_scan_timeout
+          6. (可选) tap composer + type caption — dry_run=True 跳过
+          7. tap Send (复用 _tap_messenger_send)        → send_failed
+                                                          dry_run=True 跳过 + back
+
+        Args:
+            image_path: 本地绝对路径 (.png / .jpg)
+            caption: 可选附文; 空串则只发图
+            device_id: 目标设备 (省略走 self._did)
+            raise_on_error: True 抛 AttachImageError; False 静默 return False
+            dry_run: QA / 真机 selector 验证模式 — 走完前 5 步 (push/grant/
+                tap gallery/photo node 命中/tap select), 不发送 + 自动 press
+                back 退回对话页, 不真发任何消息。**用于 selector 真机回归**,
+                不应在生产路径调用。
+
+        Returns:
+            True 成功 (dry_run=True 时含义 = 前 5 步全过); False (raise_on_error=False) 失败。
+        """
+        did = self._did(device_id)
+        d = self._u2(did)
+        try:
+            return self._attach_image_impl(d, did, image_path, caption, dry_run)
+        except AttachImageError as e:
+            if raise_on_error:
+                raise
+            log.warning("[attach_image] 失败 code=%s msg=%s", e.code, str(e))
+            return False
+
+    def _attach_image_impl(self, d, did: str, image_path: str,
+                           caption: str, dry_run: bool = False) -> bool:
+        """attach_image 内核 — 失败抛 :class:`AttachImageError` 不吞。"""
+        with self.guarded("attach_image", device_id=did):
+            # ── 1. push + grant + scan ────────────────────────────────────
+            self._grant_orca_media_permissions(did)
+            self._push_image_to_orca_gallery(image_path, did)
+
+            # ── 2. tap "Open photo gallery." ──────────────────────────────
+            self._open_messenger_photo_gallery(d, did)
+            time.sleep(1.2)
+
+            # ── 3. select first photo from picker ─────────────────────────
+            if not self._select_first_messenger_photo(d, did):
+                raise AttachImageError(
+                    "picker_empty",
+                    "photo picker 出现但 dump 不到 Photo taken X 节点",
+                    hint=("检查 /sdcard/Pictures 是否成功收到图 + 媒体扫描"
+                          " broadcast 是否触发; 可能 Android 13+ 用 cmd "
+                          "content insert MediaStore"))
+            time.sleep(0.6)
+
+            # ── dry_run 早退: 不发送 + press back 退出 picker ─────────────
+            if dry_run:
+                log.info(
+                    "[attach_image] dry_run=True, 已完成 push/grant/picker 选图; "
+                    "press back 退出, 不发送")
+                try:
+                    d.press("back")
+                except Exception as e:
+                    log.debug("[attach_image] dry_run press back 异常: %s", e)
+                return True
+
+            # ── 4. (可选) caption ─────────────────────────────────────────
+            if caption:
+                rewritten = self.rewrite_message(
+                    caption, {"platform": "facebook",
+                              "context": "attach_image_caption"})
+                self._focus_messenger_composer(d)
+                self.hb.type_text(d, rewritten)
+                self.hb.wait_think(0.4)
+
+            # ── 5. send ────────────────────────────────────────────────────
+            try:
+                self._tap_messenger_send(d, did)
+            except MessengerError as e:
+                # 复用现有 send_button_missing 4 级 fallback; 包成
+                # AttachImageError(send_failed) 让上层按 attach 域分流
+                raise AttachImageError(
+                    "send_failed",
+                    f"附件 send 阶段失败 ({e.code}): {e}",
+                    hint=e.hint or "")
+            return True
+        return False  # pragma: no cover
+
+    def _grant_orca_media_permissions(self, did: str) -> None:
+        """幂等给 com.facebook.orca 授读取媒体权限 (首次使用 picker 必需)。
+
+        Android 13+ (SDK 33) 用 READ_MEDIA_IMAGES; Android 12 及更早走
+        READ_EXTERNAL_STORAGE。两条都试, 失败的那条静默忽略 (SDK 不存在
+        会返 "Unknown permission")。pm grant 是幂等操作, 已 grant 也 OK。
+        """
+        cmds = [
+            ["shell", "pm", "grant", MESSENGER_PACKAGE,
+             "android.permission.READ_MEDIA_IMAGES"],
+            ["shell", "pm", "grant", MESSENGER_PACKAGE,
+             "android.permission.READ_EXTERNAL_STORAGE"],
+        ]
+        had_any_success = False
+        for cmd in cmds:
+            try:
+                ok, out = self.dm._run_adb(cmd, did, timeout=8)
+                if ok and "Unknown permission" not in (out or ""):
+                    had_any_success = True
+            except Exception as e:
+                log.debug("[attach_image] pm grant 异常 (%s): %s", cmd[-1], e)
+        if not had_any_success:
+            # 不抛 — 已授权过的设备 pm grant 也会"成功但无 effect", 进入下
+            # 一步看 picker 实际能否出图; picker_empty 时再归因到 permission
+            log.debug("[attach_image] pm grant 两条都没成功, 也许已授权")
+
+    def _push_image_to_orca_gallery(self, image_path: str, did: str) -> str:
+        """push 本地图到 /sdcard/Pictures/openclaw_<ts>.png + 触发媒体扫描。
+
+        Returns:
+            设备上的图片路径 (供调试/日志)
+        """
+        import os
+        if not os.path.isfile(image_path):
+            raise AttachImageError(
+                "push_failed",
+                f"本地图片不存在: {image_path}",
+                hint="检查 qr_generator 是否真生成了文件")
+        ts = int(time.time() * 1000)
+        ext = os.path.splitext(image_path)[1].lower() or ".png"
+        remote = f"/sdcard/Pictures/openclaw_{ts}{ext}"
+        try:
+            ok, out = self.dm._run_adb(
+                ["push", image_path, remote], did, timeout=15)
+        except Exception as e:
+            raise AttachImageError(
+                "push_failed", f"adb push 异常: {e}",
+                hint="检查设备连接 / 磁盘空间")
+        if not ok:
+            raise AttachImageError(
+                "push_failed", f"adb push 返回失败: {out}",
+                hint="可能 /sdcard/Pictures 不可写 (设备未解锁?)")
+        # 触发媒体扫描 (Android 13 已 deprecated 但兼容); 即使失败也继续 —
+        # 媒体扫描偶尔会异步处理, picker 内仍可能出图
+        try:
+            self.dm._run_adb(
+                ["shell", "am", "broadcast",
+                 "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                 "-d", f"file://{remote}"], did, timeout=8)
+        except Exception as e:
+            log.debug("[attach_image] MEDIA_SCANNER_SCAN_FILE 失败 (continuing): %s", e)
+        return remote
+
+    def _open_messenger_photo_gallery(self, d, did: str) -> None:
+        """点 "Open photo gallery." — smart_tap → multi-locale → coordinate
+        三级 fallback (本节点不上 VLM, picker 后续仍可被 picker_empty 兜底)。
+
+        失败抛 :class:`AttachImageError(code='gallery_button_missing')`。
+        """
+        # L1: smart_tap (AutoSelector 学习库)
+        # OPT-7 (2026-04-28): expected_pkg=MESSENGER_PACKAGE — Messenger 内
+        # 操作不应触发 heal 误报 (orca != katana 误判)
+        if self.smart_tap("Open photo gallery", device_id=did,
+                          expected_pkg=MESSENGER_PACKAGE):
+            return
+        # L2: multi-locale selector
+        obj = self._find_messenger_ui_fallback(
+            d, self._MESSENGER_ATTACH_GALLERY_SELECTORS)
+        if obj is not None:
+            try:
+                obj.click()
+                return
+            except Exception as e:
+                log.debug(
+                    "[_open_messenger_photo_gallery] L2 click 失败: %s", e)
+        # L3: coordinate fallback (gallery 在 composer toolbar 第 3 个 icon,
+        # 720x1438 实测 ≈ (200, 1412); 按比例缩放)
+        try:
+            w, h = d.window_size()
+            d.click(int(w * 0.278), int(h * 0.982))
+            time.sleep(0.6)
+            return
+        except Exception as e:
+            log.debug(
+                "[_open_messenger_photo_gallery] L3 coordinate 失败: %s", e)
+        raise AttachImageError(
+            "gallery_button_missing",
+            "Open photo gallery 按钮 3 级 fallback 都失败",
+            hint=("smart_tap + multi-locale selector + coordinate 全 miss; "
+                  "Messenger UI 大改或 composer 没 focus"))
+
+    def _select_first_messenger_photo(self, d, did: str) -> bool:
+        """从 photo picker 里选第一张图 — XML dump → 找首个匹配 selector
+        的 photo node → tap 其中心。返回 True 命中, False 没找到。
+
+        photo node = `Photo taken DD MMM YYYY` content-desc (Android Photo
+        Picker 标准模式, Messenger 直接复用)。
+        """
+        time.sleep(0.8)  # 等 picker 渲染
+        # 多次尝试 (媒体扫描可能异步)
+        for retry in range(3):
+            for kwargs in self._MESSENGER_PHOTO_NODE_SELECTORS:
+                try:
+                    obj = d(**kwargs)
+                    if obj.exists(timeout=1.5):
+                        obj.click()
+                        log.info(
+                            "[attach_image] photo node hit (selector=%s)",
+                            kwargs)
+                        return True
+                except Exception as e:
+                    log.debug(
+                        "[_select_first_messenger_photo] selector %s 异常: %s",
+                        kwargs, e)
+            if retry < 2:
+                time.sleep(1.5)  # 给媒体扫描更多时间
+        return False
+
+    def _send_line_qr_after_text(self, decision: str, channel: str,
+                                 line_id: str, did: str,
+                                 peer_name: str) -> bool:
+        """D1-B 双轨集成 (2026-04-28) — wa_referral + LINE 渠道时, 在文字
+        已发出后追加 LINE QR 图片附件。
+
+        触发条件 (全满足才发图):
+          1. decision == "wa_referral"
+          2. channel.lower() == "line"     (whatsapp/telegram 不走双轨)
+          3. line_id.strip() 非空           (没 line_id 没法生成 QR)
+
+        降级策略 (任一失败 → 仅文字成功, decision 不退化):
+          - build_line_qr 返 None         → 直接跳, log.debug
+          - attach_image 返 False         → log.warning 记账
+          - 任意异常                      → log.debug 吞, 返 False
+
+        反 spam: 文字与图之间加 1.0~2.5s 随机延迟模拟人类行为, 避免 FB 把
+        "立刻双发" 识别成 bot。
+
+        Args:
+            decision: _ai_reply_and_send 当前轮的 decision (reply/wa_referral)
+            channel:  引流渠道 (line / whatsapp / telegram / messenger / instagram)
+            line_id:  LINE ID 或完整 line.me URL
+            did:      adb 设备 ID
+            peer_name:对方 Messenger 名 (仅作 log 标识)
+
+        Returns:
+            True QR 已成功附加; False 不满足触发条件 / 跳过 / 失败。
+            返回值会写入 wa_referral_sent 事件 meta.qr_sent 供漏斗分析。
+        """
+        if decision != "wa_referral" \
+                or (channel or "").lower() != "line" \
+                or not (line_id or "").strip():
+            return False
+        try:
+            from src.utils.qr_generator import build_line_qr
+            qr_path = build_line_qr(line_id)
+            if not qr_path:
+                log.debug(
+                    "[qr-dual] build_line_qr 返 None line_id=%s peer=%s 降级 "
+                    "text-only", line_id, peer_name)
+                return False
+            time.sleep(random.uniform(1.0, 2.5))
+            ok = self.attach_image(
+                qr_path, device_id=did, raise_on_error=False)
+            if ok:
+                log.info(
+                    "[qr-dual] LINE QR 双轨发送成功 line_id=%s peer=%s",
+                    line_id, peer_name)
+            else:
+                log.warning(
+                    "[qr-dual] LINE QR 附件发送失败 (文字已发达, 降级 text-"
+                    "only) line_id=%s peer=%s", line_id, peer_name)
+            return ok
+        except Exception as e:
+            log.debug(
+                "[qr-dual] 双轨异常 (文字已发达, 降级 text-only) line_id=%s "
+                "peer=%s err=%s", line_id, peer_name, e)
+            return False
 
     # ── Messenger UI multi-locale selectors (2026-04-24 实测真机新增) ──
     # `smart_tap(target_desc)` 走 AutoSelector engine (自学习式 UI 定位), 对
@@ -1694,7 +2333,9 @@ class FacebookAutomation(BaseAutomation):
         Level 4 VLM 是为 Messenger 2026 Compose UI 加的 — search bar 不在
         AccessibilityNode tree, 前 3 级全 miss 时用图像识别兜底。
         """
-        if self.smart_tap("Search in Messenger", device_id=device_id):
+        # OPT-7-v2 (2026-04-28): 期望 orca (Messenger 内 tap)
+        if self.smart_tap("Search in Messenger", device_id=device_id,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         obj = self._find_messenger_ui_fallback(
             d, self._MESSENGER_SEARCH_SELECTORS)
@@ -1780,7 +2421,9 @@ class FacebookAutomation(BaseAutomation):
         对更大屏幕也按比例缩放。Level 4 VLM 应对 Compose UI 下 AccessibilityNode
         查不到 send button 的情况。
         """
-        if self.smart_tap("Send message button", device_id=device_id):
+        # OPT-7-v2 (2026-04-28): 期望 orca (Messenger composer 内 tap)
+        if self.smart_tap("Send message button", device_id=device_id,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         obj = self._find_messenger_ui_fallback(
             d, self._MESSENGER_SEND_SELECTORS)
@@ -1854,8 +2497,16 @@ class FacebookAutomation(BaseAutomation):
             device_id: adb device ID (for smart_tap knowledge base)
             recipient: 目标联系人名 (用于 L2 query match + L4 VLM context)
         """
+        # L0 (OPT-FP4 2026-04-28): recipient-aware match — dump 搜索结果
+        # hierarchy 找 row content-desc 含 recipient name → tap 中心.
+        # 解决 Messenger 搜索把"自己头像"放第 1 → tap 错对话页 (4 真机
+        # 实测命中此 bug). 命中即 return, miss 走 L1-L4 fallback.
+        if self._tap_search_result_by_recipient_match(d, recipient):
+            return
         # L1: smart_tap (AutoSelector 学习库命中率最高)
-        if self.smart_tap("First matching contact", device_id=device_id):
+        # OPT-7-v2 (2026-04-28): 期望 orca (Messenger 搜索结果列表内 tap)
+        if self.smart_tap("First matching contact", device_id=device_id,
+                          expected_pkg=MESSENGER_PACKAGE):
             return
         # L2: XML 语义扫描 — 对 query_hint plausible-match, 最高 confidence
         # 在 smart_tap miss 之后 (semantic, 非坐标猜测)
@@ -1926,6 +2577,401 @@ class FacebookAutomation(BaseAutomation):
                   "miss; peer 未加好友/昵称变更/索引延迟/UI 大改版, A 可 "
                   "5-15s 后重试"))
 
+    def _tap_search_result_by_recipient_match(self, d, recipient: str) -> bool:
+        """OPT-FP4 (2026-04-28): dump Messenger 搜索结果列表, 找 row
+        content-desc 含 recipient name → tap 它中心. 替代 tap 第 1 条
+        (Messenger 搜索"Meta AI"会把"自己头像"放第 1, fallback 命中导致
+        进自己对话页, OPT-FP1 已 catch 但还是要修真根因).
+
+        策略:
+          1. dump_hierarchy 整个搜索结果页
+          2. regex finditer content-desc 含 recipient (substring)
+          3. 每个匹配从 +500 chars 内找 bounds
+          4. 跳过 search bar (y < 300) + 跳过 stories 区 (y < 500 + height < 100)
+          5. 找到第一个有效 row → tap 中心
+          6. miss → return False, 调用方走 L1-L4 fallback
+
+        fail-safe: dump 异常 / 返非 str → 返 False (不阻断 fallback).
+
+        Args:
+            d: u2 device
+            recipient: 期望 recipient name (substring match)
+
+        Returns:
+            True 命中 + tap 完成
+            False 没找到 (调用方继续 L1-L4)
+        """
+        if not recipient:
+            return False
+        recipient_norm = recipient.strip()
+        if not recipient_norm:
+            return False
+        import re as _re
+        bounds_re = _re.compile(
+            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+        # OPT-FP4-v2 (2026-04-28): 3 次 retry × 0.7s 间隔, 任意一次命中即返.
+        # XW8T 真机首次回归 FP4 未命中 → 推测 search 结果还没渲染完
+        # (dump miss). 多次 retry 给搜索结果加载时间.
+        for retry_idx in range(3):
+            try:
+                time.sleep(0.7)  # 等搜索结果渲染 (累计 0.7/1.4/2.1s)
+                xml = d.dump_hierarchy()
+                if not isinstance(xml, str) or not xml:
+                    continue
+                # 找 content-desc 含 recipient 的位置
+                for m in _re.finditer(
+                        r'content-desc="([^"]*'
+                        + _re.escape(recipient_norm)
+                        + r'[^"]*)"', xml):
+                    # 从 m.start() +500 chars 内找 bounds
+                    chunk = xml[m.start():m.start() + 500]
+                    bm = bounds_re.search(chunk)
+                    if not bm:
+                        continue
+                    x1, y1, x2, y2 = (
+                        int(bm.group(1)), int(bm.group(2)),
+                        int(bm.group(3)), int(bm.group(4)))
+                    # 跳过 search bar (y < 300) 和 stories 头像
+                    # (height < 100, 通常是头像缩略图)
+                    if y1 < 300 or (y2 - y1) < 100:
+                        continue
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    d.click(cx, cy)
+                    log.info(
+                        "[opt-fp4] _tap_search_result_by_recipient_match "
+                        "hit recipient=%r retry=%d bounds=[%d,%d][%d,%d] "
+                        "tap=(%d,%d)",
+                        recipient, retry_idx, x1, y1, x2, y2, cx, cy)
+                    return True
+                log.debug(
+                    "[opt-fp4] retry=%d 没找到含 recipient=%r 的 search row",
+                    retry_idx, recipient)
+            except Exception as e:
+                log.debug(
+                    "[opt-fp4] retry=%d 异常 (将再试): %s", retry_idx, e)
+        log.debug(
+            "[opt-fp4] 3 次 retry 均没找到 recipient=%r, fall back to L1-L4",
+            recipient)
+        return False
+
+    def _launch_messenger_stable(self, did: str) -> None:
+        """OPT-FP2 (2026-04-28): 强制把 Messenger 拉前台 (smoke v6 真机
+        4/4 稳定方案), 替代 smart_tap("Messenger or chat icon") 旧路径.
+
+        smart_tap 实测命中 katana FB 主 app icon (而非 orca chat bubble),
+        heal 兜底死循环, send_message 第一步在错的 app 跑完造成 false
+        positive (4 真机截图证据). force-stop+am-start LAUNCHER intent
+        是 smoke v6 4/4 真机已稳定的 launch 方式.
+        """
+        try:
+            self.dm._run_adb(
+                ["shell", "cmd", "statusbar", "collapse"], did, timeout=4)
+        except Exception:
+            pass
+        time.sleep(0.4)
+        for _ in range(3):
+            try:
+                self.dm._run_adb(
+                    ["shell", "input", "keyevent", "KEYCODE_BACK"],
+                    did, timeout=4)
+                time.sleep(0.3)
+            except Exception:
+                pass
+        try:
+            self.dm._run_adb(
+                ["shell", "input", "keyevent", "KEYCODE_HOME"],
+                did, timeout=4)
+            time.sleep(0.6)
+        except Exception:
+            pass
+        try:
+            self.dm._run_adb(
+                ["shell", "am", "force-stop", MESSENGER_PACKAGE],
+                did, timeout=8)
+            time.sleep(1.0)
+        except Exception:
+            pass
+        try:
+            self.dm._run_adb(
+                ["shell", "am", "start",
+                 "-a", "android.intent.action.MAIN",
+                 "-c", "android.intent.category.LAUNCHER",
+                 f"{MESSENGER_PACKAGE}/.MainActivity"],
+                did, timeout=8)
+        except Exception as e:
+            raise MessengerError(
+                "messenger_unavailable",
+                f"am-start LAUNCHER 异常: {e}",
+                hint="launch_failed: orca apk 可能没装或被 disable")
+        time.sleep(5)
+        try:
+            ok, out = self.dm._run_adb(
+                ["shell", "dumpsys", "window"], did, timeout=8)
+        except Exception:
+            ok, out = False, ""
+        if MESSENGER_PACKAGE in (out or ""):
+            log.info(
+                "[opt-fp2] _launch_messenger_stable PASS: orca 在前台")
+            return
+        log.warning(
+            "[opt-fp2] am-start 后 orca 不在前台, 回退 monkey LAUNCHER")
+        try:
+            self.dm._run_adb(
+                ["shell", "monkey", "-p", MESSENGER_PACKAGE,
+                 "-c", "android.intent.category.LAUNCHER", "1"],
+                did, timeout=8)
+            time.sleep(4)
+            ok, out = self.dm._run_adb(
+                ["shell", "dumpsys", "window"], did, timeout=8)
+        except Exception:
+            ok, out = False, ""
+        if MESSENGER_PACKAGE not in (out or ""):
+            raise MessengerError(
+                "messenger_unavailable",
+                "force-stop + am-start LAUNCHER + monkey 都没把 orca 拉前台",
+                hint="launch_failed: 设备状态异常 / orca 安装损坏 / 锁屏中")
+
+    def _tap_inbox_row_by_recipient(self, d, recipient: str,
+                                    max_scrolls: int = 5,
+                                    initial_wait_s: float = 2.5) -> bool:
+        """OPT-FP7 (2026-04-28): inbox 直接 tap recipient row, 替代 search.
+
+        真消灭 false positive 根因: search 路径不可靠 (Messenger 把"自己"
+        放第 1 + FB 整合到 katana messaging-in-blue 后 search 切走 app).
+        inbox-direct-tap 直接在 inbox 列表找含 recipient name 的 row → tap
+        row 中心进对话页, 跳过整个 search 阶段.
+
+        策略 (OPT-FP7-v2 2026-04-28 fine-tune):
+          0. initial_wait_s=2.5s 让 inbox lazy load 完
+          1. dump → finditer content-desc 含 recipient
+          2. 跳 stories / search bar (y<300, height<100)
+          3. tap row 中心
+          4. miss → swipe 长滑 (y 0.85→0.15) inbox down → 等 1.5s 再 dump
+          5. dump 失败 retry 2 次 (短间隔 0.5s)
+          6. max_scrolls=5 覆盖 inbox 较长 (Meta AI 可能在第 7+ 位)
+
+        fail-safe: 异常返 False (调用方 fallback search).
+        """
+        if not recipient:
+            return False
+        recipient_norm = recipient.strip()
+        if not recipient_norm:
+            return False
+        import re as _re
+        bounds_re = _re.compile(
+            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+
+        # OPT-FP7-v2: 初始等 inbox lazy load (Messenger StartScreen 后
+        # 列表渲染需 2-3s, 之前 0s 导致 dump 抓到空 hierarchy)
+        if initial_wait_s > 0:
+            time.sleep(initial_wait_s)
+
+        for scroll_idx in range(max_scrolls):
+            # OPT-FP7-v2: dump 失败 retry 2 次 (而不是 1 次)
+            xml = None
+            for dump_retry in range(2):
+                try:
+                    xml = d.dump_hierarchy()
+                    if isinstance(xml, str) and xml:
+                        break
+                    xml = None
+                except Exception as e:
+                    log.debug(
+                        "[opt-fp7] dump retry=%d scroll=%d 异常: %s",
+                        dump_retry, scroll_idx, e)
+                    xml = None
+                if dump_retry < 1:
+                    time.sleep(0.5)
+            if xml is None:
+                if scroll_idx < max_scrolls - 1:
+                    time.sleep(0.5)
+                    continue
+                return False
+
+            for m in _re.finditer(
+                    r'content-desc="([^"]*'
+                    + _re.escape(recipient_norm)
+                    + r'[^"]*)"', xml):
+                chunk = xml[m.start():m.start() + 500]
+                bm = bounds_re.search(chunk)
+                if not bm:
+                    continue
+                x1, y1, x2, y2 = (
+                    int(bm.group(1)), int(bm.group(2)),
+                    int(bm.group(3)), int(bm.group(4)))
+                if y1 < 300 or (y2 - y1) < 100:
+                    continue
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                try:
+                    d.click(cx, cy)
+                except Exception as e:
+                    log.debug("[opt-fp7] click 异常: %s", e)
+                    return False
+                log.info(
+                    "[opt-fp7] inbox-direct-tap hit recipient=%r "
+                    "scroll=%d row=[%d,%d][%d,%d] tap=(%d,%d)",
+                    recipient, scroll_idx, x1, y1, x2, y2, cx, cy)
+                return True
+
+            # 没找到 → 长滑 inbox down (OPT-FP7-v2: 0.85→0.15 比 0.7→0.3
+            # 滑得更长, 一次能跨越更多 row; 间隔 1.5s 让新 row 渲染)
+            if scroll_idx < max_scrolls - 1:
+                try:
+                    w, h = d.window_size()
+                    d.swipe(w // 2, int(h * 0.85),
+                            w // 2, int(h * 0.15), 0.6)
+                    time.sleep(1.5)
+                except Exception as e:
+                    log.debug("[opt-fp7] swipe 异常: %s", e)
+        log.debug(
+            "[opt-fp7] inbox 中没找到 recipient=%r after %d scrolls",
+            recipient, max_scrolls)
+        return False
+
+    def _verify_messenger_in_foreground(self, did: str) -> bool:
+        """OPT-FP6 (2026-04-28): send_message return True 前最后一道防线 —
+        dumpsys window 检查 com.facebook.orca 在前台.
+
+        消灭 Q4N7 类 false positive (实测 send_message 返 True 但截图显示
+        在 katana FB 主 app 备份页 MibCloudBackupNuxActivity, OPT-FP3
+        dump-based verify 被 substring 误放行).
+
+        策略:
+          1. dumpsys window grep com.facebook.orca 在 mCurrentFocus / mFocusedApp
+          2. miss → retry 1 次 (1s 间隔, 防真机偶发 dumpsys 慢)
+          3. 2 次都 miss + dumpsys 调用成功 → return False (调用方 raise)
+          4. dumpsys 调用失败 / 异常 → fail-safe True (让 OPT-FP3 当主防线)
+
+        Args:
+            did: adb device serial
+
+        Returns:
+            True orca 在前台 (或 fail-safe)
+            False orca 不在前台 (调用方应 raise)
+        """
+        for retry_idx in range(2):
+            try:
+                ok, out = self.dm._run_adb(
+                    ["shell", "dumpsys", "window"], did, timeout=5)
+                if not ok:
+                    log.debug(
+                        "[opt-fp6] dumpsys window retry=%d 失败 fail-safe",
+                        retry_idx)
+                    return True
+                out_str = out or ""
+                # OPT-FP6-v2 (2026-04-28): 接受 com.facebook.orca OR
+                # katana 内嵌 messaging activity (FB messaging-in-blue
+                # 整合 — Messenger UI 现在跑在 com.facebook.katana/com.
+                # facebook.messaging.* activity).
+                if MESSENGER_PACKAGE in out_str:
+                    return True
+                if "com.facebook.katana" in out_str and (
+                        "ThreadActivity" in out_str
+                        or "ThreadViewActivity" in out_str
+                        or "ThreadSettings" in out_str):
+                    # 仅接受真对话相关 Thread* activity (FB messaging-in-blue
+                    # 整合). 不接受 katana 内嵌 messaging 但非对话类 activity
+                    # (e.g. MibCloudBackupNuxActivity / LoginActivity 等).
+                    log.info(
+                        "[opt-fp6] orca 不在但 katana 内嵌 Thread* activity "
+                        "在前台 (FB messaging-in-blue), 接受")
+                    return True
+                if retry_idx == 0:
+                    time.sleep(1.0)
+                    continue
+                # 2 次都 miss + dumpsys 成功 → 真不在前台
+                snippet = ""
+                for line in out_str.splitlines():
+                    if "mCurrentFocus" in line or "mFocusedApp" in line:
+                        snippet = line.strip()
+                        break
+                log.warning(
+                    "[opt-fp6] send_message 末尾不在 messaging activity! "
+                    "snippet=%r", snippet[:200])
+                return False
+            except Exception as e:
+                log.debug(
+                    "[opt-fp6] dumpsys retry=%d 异常 fail-safe: %s",
+                    retry_idx, e)
+                return True
+        return True  # pragma: no cover
+
+    def _verify_message_actually_sent(self, d, message: str) -> bool:
+        """OPT-FP3 (2026-04-28): tap Send 之后 dump 对话页验证刚发 message
+        出现在历史消息列表. 防"按了 Send 但消息没真发"的二次 false positive.
+        fail-safe: dump 异常 / 返非 str → 放行 True.
+        """
+        if not message:
+            return True
+        try:
+            time.sleep(1.5)
+            xml = d.dump_hierarchy()
+            if not isinstance(xml, str) or not xml:
+                return True
+            msg_norm = message.strip()
+            if msg_norm and msg_norm in xml:
+                return True
+            if len(msg_norm) > 30 and msg_norm[:30] in xml:
+                return True
+            log.warning(
+                "[verify-sent] 对话页 dump 未找到 message=%r 前 30 chars — "
+                "可能 send 按钮按了但消息没发出", message[:60])
+            return False
+        except Exception as e:
+            log.debug(
+                "[verify-sent] 异常 fail-safe 放行: %s", e)
+            return True
+
+    def _verify_recipient_in_conv_title(self, d, recipient: str) -> bool:
+        """OPT-FP1 (2026-04-28): tap 第一个搜索结果后验证当前对话页 title bar
+        含期望 recipient name. 防 false positive — Messenger 搜索结果列表
+        把"自己头像"/"最近联系人"作为第 1 条, smart_tap/VLM fallback 命中
+        错位置时会进错对话页.
+
+        IJ8H 实测: 搜索 "Meta AI" → tap 第 1 条 → 进了 "Shuichi Ito" (自己)
+        对话页, title bar 显示 "Shuichi Ito" 而非 "Meta AI" → verify=False.
+
+        策略 (双重 fallback):
+          1. dump_hierarchy 找含 recipient text/desc 的节点 (substring match)
+          2. miss → 找当前 Activity 标题区域 (Thread details / Active 行)
+
+        fail-safe: 异常时返 True (放行), 不阻断 send_message 主流程
+        (若 dump 失败误 abort 反而让生产链路更脆弱).
+
+        Args:
+            d: u2 device
+            recipient: 期望的 recipient name (e.g. "Meta AI" / "Shuichi Ito")
+
+        Returns:
+            True 当前对话页 title 含 recipient (匹配)
+            False title 不含 recipient (错对话页, 应 abort)
+        """
+        if not recipient:
+            return True
+        try:
+            time.sleep(0.6)  # 等对话页 title bar 渲染
+            xml = d.dump_hierarchy()
+            # fail-safe: dump_hierarchy 必须返 str. mock 场景 / u2 hiccup
+            # 可能返 MagicMock 或 None — 此时放行不阻断主流程 (单测 mock
+            # 不需要 verify, 真机生产路径才需要)
+            if not isinstance(xml, str) or not xml:
+                return True
+            # title bar / chat profile 节点常含 recipient 全名
+            # 在 IJ8H 实测中, 对话页 title 是 'Shuichi Ito, Active 16 hours
+            # ago, Thread details' 这种格式
+            recipient_norm = recipient.strip()
+            if recipient_norm and recipient_norm in xml:
+                return True
+            log.warning(
+                "[verify-recipient] 当前对话页未找到 recipient=%r — "
+                "可能 tap 错对话, dump 前 200 chars:\n%s",
+                recipient, xml[:200])
+            return False
+        except Exception as e:
+            log.debug(
+                "[verify-recipient] 异常 fail-safe 放行: %s", e)
+            return True
+
     def _focus_messenger_composer(self, d) -> bool:
         """2026-04-24 真机 safety: 在 ``hb.type_text`` 之前显式 tap composer
         确保 focus。返回是否成功找到并 tap。失败不抛, 让后续 type_text 自生自灭
@@ -1943,6 +2989,40 @@ class FacebookAutomation(BaseAutomation):
             log.debug(
                 "[_focus_messenger_composer] click 失败 (继续走 type_text): %s", e)
             return False
+
+    # OPT-4-v2 (2026-04-28): send 失败文案含 restriction 暗示关键词时,
+    # 补登记 _mark_account_restricted_state(days=7 默认猜测), 覆盖 OPT-4
+    # 自动路径在 user-acked restriction page 后的盲区. FB send 失败文案
+    # 通常不含具体天数 ("Your message can't be sent because your account
+    # is currently restricted." / "violated Community Standards" 等),
+    # days=7 是保守上限 (比观察到的 6 天长 1 天, 防提早恢复).
+    _FB_RESTRICTION_HINT_KEYWORDS = (
+        # en
+        "restricted",
+        "Community Standards",
+        "violated",
+        "can't reply",
+        "cannot reply",
+        "account is currently",
+        "limits on sending",
+        # zh-CN
+        "已限制",
+        "已被限制",
+        "违反社区准则",
+        # zh-TW
+        "已被限制",
+        "違反社群守則",
+        "違反 Facebook 社群守則",
+        # ja
+        "コミュニティ規定",
+        "制限されました",
+        # it
+        "limitato",
+        "Standard della community",
+        # es
+        "restringido",
+        "Normas de la Comunidad",
+    )
 
     # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (en/zh/ja/it/es 对齐
     # persona)。要改请同步改 src/host/fb_store.py::_RISK_KIND_RULES 的
@@ -1983,6 +3063,33 @@ class FacebookAutomation(BaseAutomation):
             if time.time() >= deadline:
                 return ""
             time.sleep(poll_interval_s)
+
+    def _detect_restriction_hint(self, text: str) -> bool:
+        """OPT-4-v2 (2026-04-28): 检查 send 失败的 blocked_text 是否含
+        restriction 暗示关键词.
+
+        用途: 补登记 OPT-4 自动路径错过的 restriction 状态. restriction
+        page 用户已 OK 后服务端账号属性仍 restricted, send 真发时 FB 返
+        snackbar 含 "restricted" / "violated Community Standards" / 等
+        关键词. 命中时调用方应:
+          1. _mark_account_restricted_state(did, text, days=7)  # 默认猜测
+          2. 不退化 raise MessengerError(send_blocked_by_content) 路径
+
+        Args:
+            text: _detect_send_blocked 返回的 blocked snippet (≤ 200 chars)
+
+        Returns:
+            True 含至少 1 个 restriction hint 关键词 (en/zh-CN/zh-TW/ja/
+                  it/es 多语言).
+            False 普通内容违禁 (走现有 content_blocked 路径).
+        """
+        if not text:
+            return False
+        low = text.lower()
+        for kw in self._FB_RESTRICTION_HINT_KEYWORDS:
+            if kw.lower() in low:
+                return True
+        return False
 
     def _xspace_select_sheet_visible(self, d) -> bool:
         """快速探测 MIUI 'Select app' 浅色底 sheet 是否仍在屏(P2 辅助)。"""
@@ -6511,6 +7618,18 @@ class FacebookAutomation(BaseAutomation):
                 return None, "human_takeover"
         except Exception:
             pass
+        # OPT-6 (2026-04-28): account restriction 期内不主动回复 — restriction
+        # 限制 reply/start chat, 但 inbox 仍可读, check_inbox 仍可跑;
+        # 把守在 _ai_reply_and_send 入口, 让 check_inbox 触发的 reply 也避开。
+        is_restricted, lifted_at = self._is_account_restricted(did)
+        if is_restricted:
+            remaining_days = (lifted_at - time.time()) / 86400
+            log.info(
+                "[opt6] peer=%s device=%s 在 restriction 期内 (剩 %.1f 天),"
+                " AI 不自动回",
+                peer_name, did, remaining_days,
+            )
+            return None, "account_restricted"
         target_lang = ""
         ab_style_hint = ""
         # P0 2026-04-23: incoming 侧语言检测,用于:
@@ -6853,6 +7972,12 @@ class FacebookAutomation(BaseAutomation):
             log.debug("[ai_reply] 发送失败: %s", e)
             return None, "skip"
 
+        # ── D1-B 双轨集成 (2026-04-28): wa_referral + LINE 追加 QR 图 ──
+        # 文字已发出 — QR 失败不退化 decision (降级 text-only)。详见
+        # _send_line_qr_after_text docstring。
+        qr_attach_success = self._send_line_qr_after_text(
+            decision, _r_channel, _r_val, did, peer_name)
+
         try:
             from src.host.fb_store import record_inbox_message
             record_inbox_message(
@@ -6905,6 +8030,9 @@ class FacebookAutomation(BaseAutomation):
                     "channel": _r_channel or "unknown",
                     "peer_type": peer_type,
                     "intent": intent_tag,  # P4 意图信号
+                    # D1-B (2026-04-28): LINE QR 双轨附件是否成功; non-LINE
+                    # 渠道恒为 False (不影响漏斗解读)
+                    "qr_sent": qr_attach_success,
                 },
             )
             # L2 双写 — 引流话术发出 (不升级 status, 等真发起 handoff 才升)

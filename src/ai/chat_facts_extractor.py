@@ -64,7 +64,8 @@ def _count_extractions_today(device_id: str) -> int:
         from src.host.database import _connect
     except Exception:
         return 0
-    today = _dt.datetime.utcnow().strftime("%Y-%m-%dT00:00:00Z")
+    # OPT-cleanup-utcnow (2026-04-28): strftime 路径安全替换
+    today = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT00:00:00Z")
     try:
         with _connect() as conn:
             row = conn.execute(

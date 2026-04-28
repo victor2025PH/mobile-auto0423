@@ -169,6 +169,57 @@ _TASK_TYPE_TIMEOUTS = {
 }
 
 
+# ════════════════════════════════════════════════════════════════════════
+# OPT-6 (2026-04-28): account restriction 期内跳过主动行为任务
+#
+# Community Standards N 天封禁期内 FB 限制 reply/start chat, 但 inbox 仍
+# 可读. 主动行为类任务 (send_message / send_greeting / add_friend) 直接跳
+# 过, 被动接收类 (check_inbox / browse_feed) 仍可跑, restriction 不限读.
+#
+# 数据源 = OPT-4 写入的 device_state (platform='facebook'):
+#   restriction_lifted_at  — float epoch ts; now < lifted_at 期间任务跳过
+#
+# fine-grained guard 也在 facebook.py::_ai_reply_and_send 入口, 防 check_
+# inbox 触发 send 路径绕过本拦截器。
+# ════════════════════════════════════════════════════════════════════════
+
+_OPT6_BLOCKED_TASK_TYPES = frozenset({
+    "facebook_send_message",
+    "facebook_send_greeting",
+    "facebook_add_friend",
+    "facebook_add_friend_and_greet",
+})
+
+
+def _opt6_check_restriction(device_id: str) -> tuple:
+    """检查设备是否在 account restriction 期内 (OPT-4 写入的 device_state)。
+
+    Returns (should_skip: bool, reason_msg: str)。device_id 为空 / 无
+    lifted_at / 已过期 → (False, "")。
+    """
+    if not device_id:
+        return False, ""
+    try:
+        from src.host.device_state import DeviceStateStore
+        ds = DeviceStateStore(platform="facebook")
+        lifted_at = ds.get_float(device_id, "restriction_lifted_at", 0.0)
+        if lifted_at <= 0.0:
+            return False, ""
+        now_ts = time.time()
+        if now_ts >= lifted_at:
+            return False, ""  # 已过期, 不跳
+        remaining_d = (lifted_at - now_ts) / 86400
+        days = ds.get_int(device_id, "restriction_days", 0)
+        return True, (
+            f"OPT-6 device {device_id[:12]} 在 account restriction 期内 "
+            f"(剩 {remaining_d:.1f} 天 / {days} 天总), 跳过主动行为任务"
+        )
+    except Exception as e:
+        logger.debug("[opt6] _opt6_check_restriction 异常 device=%s: %s",
+                     device_id[:12] if device_id else "", e)
+        return False, ""
+
+
 def _resolve_serial_from_config(config_path: str, device_id: str) -> str:
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -233,6 +284,16 @@ def _execute_with_retry(manager, resolved, task_type, params, config_path=None, 
             set_task_context(task_id=_task_id, device_id=resolved)
         except Exception:
             pass
+
+    # OPT-6 (2026-04-28): account restriction 期内跳过主动行为类任务.
+    # _OPT6_BLOCKED_TASK_TYPES = send_message / send_greeting / add_friend /
+    # add_friend_and_greet. 被动接收 (check_inbox 等) 仍跑, fine-grained
+    # guard 在 facebook.py::_ai_reply_and_send 入口防绕过。
+    if task_type in _OPT6_BLOCKED_TASK_TYPES:
+        skip, reason = _opt6_check_restriction(resolved)
+        if skip:
+            logger.warning("[opt6] %s", reason)
+            return False, reason, None
 
     # ★ P0 新增: 通讯录→LeadsStore 同步（不需要 UI 操作，只读 DB）
     if task_type == "contacts_sync_leads":

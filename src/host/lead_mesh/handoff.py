@@ -74,7 +74,7 @@ def _sanitize_snapshot(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _now_iso() -> str:
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ─── CRUD ────────────────────────────────────────────────────────────
@@ -376,7 +376,7 @@ def expire_pending_handoffs(expire_hours: int = DEFAULT_EXPIRE_HOURS) -> int:
 
     返回: 被过期的条数。
     """
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=expire_hours)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=expire_hours)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     try:
         with _connect() as conn:
@@ -414,7 +414,7 @@ def check_duplicate_handoff(canonical_id: str,
     """
     if not canonical_id or not channel:
         return None
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=since_days)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=since_days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     try:
         with _connect() as conn:
@@ -459,7 +459,7 @@ def check_peer_cooldown_handoff(canonical_id: str,
     """
     if not canonical_id:
         return None
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=int(cooldown_days))).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=int(cooldown_days))).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     # 构造排除状态: honor_rejected 时 rejected/expired 不算; 否则都算
     if honor_rejected:

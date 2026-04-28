@@ -3,6 +3,8 @@
 
 import logging
 import os
+import threading
+import time
 import urllib.parse
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +16,39 @@ from ..schemas import TaskBatchDelete, TaskCreate, TaskResponse, TaskResultRepor
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="", tags=["tasks"])
+
+# P2-④ smart_retry 风暴防护:
+# - 同 device_id 5 分钟内最多 3 次手动 smart_retry（防运营连点）
+# - retry 链路总深度（系统 retry_count + 手动 _retry_of 链）≥ 5 时拒绝
+_RETRY_THROTTLE_LOCK = threading.Lock()
+_RETRY_THROTTLE: dict = {}  # device_id → list[timestamp]
+_RETRY_THROTTLE_WINDOW_S = 300
+_RETRY_THROTTLE_MAX = 3
+_RETRY_DEPTH_MAX = 5
+
+
+def _retry_throttle_check(device_id: str) -> tuple:
+    """返回 (allowed, recent_count). 不允许时 recent_count 用于 UI 提示."""
+    if not device_id:
+        return True, 0
+    now = time.time()
+    cutoff = now - _RETRY_THROTTLE_WINDOW_S
+    with _RETRY_THROTTLE_LOCK:
+        bucket = _RETRY_THROTTLE.setdefault(device_id, [])
+        bucket[:] = [t for t in bucket if t > cutoff]
+        if len(bucket) >= _RETRY_THROTTLE_MAX:
+            return False, len(bucket)
+        bucket.append(now)
+        return True, len(bucket)
+
+
+def _compute_retry_depth(task: dict) -> int:
+    """估算 retry 链路深度: 系统 retry_count + 手动 _retry_of 链长度."""
+    depth = int(task.get("retry_count") or 0)
+    params = task.get("params") or {}
+    if isinstance(params, dict) and params.get("_retry_of"):
+        depth += 1
+    return depth
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +758,117 @@ def cancel_task(task_id: str):
     pool.cancel_task(task_id)
     task_store.set_task_cancelled(task_id)
     return {"ok": True, "task_id": task_id, "message": "取消信号已发送"}
+
+
+# P1-A fix_action: smart_retry — 复制原 task params 重派 + 失效预检缓存
+@router.post("/tasks/{task_id}/retry", dependencies=_auth)
+def retry_task_endpoint(task_id: str):
+    """前端「🔁 智能重试」按钮端点 (fix_action=smart_retry)。
+
+    与「重派」语义不同：retry 是 **基于失败任务的快照** 复制一份新 task，
+    并主动失效该设备的预检缓存（让兜底逻辑重跑而不是读 90s 的 fail 缓存）。
+
+    跨集群：若 task_id 不在本地，按 cancel_task 的模式 proxy 到所属 worker。
+
+    返回 {ok, new_task_id, original_task_id, preflight_invalidated}
+    """
+    from ..api import task_store, _audit
+    from ..task_dispatcher import dispatch_after_create
+    import urllib.request as _ur, json as _jj, urllib.error as _ue
+
+    t = task_store.get_task(task_id, include_deleted=True)
+
+    if not t:
+        # 跨集群代理（同 cancel_task 模式）
+        try:
+            from ..multi_host import get_cluster_coordinator
+            coord = get_cluster_coordinator()
+            for h in coord._hosts.values():
+                if not h.online or not h.host_ip:
+                    continue
+                try:
+                    _req = _ur.Request(
+                        f"http://{h.host_ip}:{h.port}/tasks/{task_id}/retry",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    _resp = _ur.urlopen(_req, timeout=8)
+                    return {**_jj.loads(_resp.read().decode()), "_proxied_to": h.host_ip}
+                except _ue.HTTPError as _he:
+                    if _he.code == 404:
+                        continue
+                    raise
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="任务不存在（本地及所有节点均未找到）")
+
+    device_id = t.get("device_id")
+    task_type = t.get("type") or ""
+    params = dict(t.get("params") or {})
+
+    # P2-④ 风暴防护: 链路深度 + 设备 throttle 双闸
+    depth = _compute_retry_depth(t)
+    if depth >= _RETRY_DEPTH_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "retry_depth_exceeded",
+                "depth": depth,
+                "max": _RETRY_DEPTH_MAX,
+                "hint": f"该任务已重试 {depth} 次（系统自动 + 手动）。请先用「🩺 诊断」排查根因，避免无效风暴。",
+            },
+        )
+    allowed, recent = _retry_throttle_check(str(device_id or ""))
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "retry_throttled",
+                "recent_count": recent,
+                "window_seconds": _RETRY_THROTTLE_WINDOW_S,
+                "hint": f"该设备 {_RETRY_THROTTLE_WINDOW_S//60} 分钟内已 {recent} 次手动重试，请等待或换设备。",
+            },
+        )
+
+    # 标记 retry 来源便于审计 + dashboard 区分原始/重试
+    params["_retry_of"] = task_id
+    params["_created_via"] = "smart_retry"
+    params["_retry_depth"] = depth + 1  # 让下游知道这是第几跳，便于看板分析
+
+    invalidated = False
+    if device_id:
+        try:
+            from src.host.preflight import invalidate_cache
+            invalidate_cache(device_id)
+            invalidated = True
+        except Exception as e:
+            logger.warning("[tasks/retry] %s preflight invalidate_cache failed: %s", str(device_id)[:8], e)
+
+    new_task_id = task_store.create_task(
+        task_type=task_type,
+        device_id=device_id,
+        params=params,
+        policy_id=t.get("policy_id"),
+        batch_id=t.get("batch_id") or "",
+        priority=t.get("priority", 50),
+    )
+    dispatch_after_create(
+        task_id=new_task_id,
+        device_id=device_id,
+        task_type=task_type,
+        params=params,
+        priority=t.get("priority", 50),
+    )
+    _audit("retry_task", str(device_id or ""), f"orig={task_id} new={new_task_id}")
+    return {
+        "ok": True,
+        "new_task_id": new_task_id,
+        "original_task_id": task_id,
+        "preflight_invalidated": invalidated,
+    }
 
 
 @router.post("/tasks/cancel-all", dependencies=_auth)

@@ -214,22 +214,133 @@ async function eraseSelectedTasksBulk(){
   }catch(e){showToast('删除失败: '+e.message,'error');}
 }
 
-/** Phase 2 P0 — 失败原因归因: 把 raw error 文本映射到 emoji+一句话+严重度,
- *  让用户一眼分清"基础设施挂 / 限速 / 业务" 三类失败. 顺序: 最具体 → 最一般. */
+/** Phase 2 P0 — 失败原因归因: 把 raw error 文本映射到 emoji+一句话+严重度+一键修复,
+ *  让用户一眼分清"基础设施挂 / 限速 / 业务" 三类失败. 顺序: 最具体 → 最一般.
+ *  返回字段: {emoji, hint, tone, full, fix_action}
+ *  fix_action 见 src/host/error_classifier.py::_FIX_ACTIONS */
 function _attributeError(text){
   if(!text) return null;
   const t=String(text);
-  if(/quota exceeded/i.test(t))                              return {emoji:'⏰',hint:'配额到 (等下个 window)',tone:'amber',full:t};
-  if(/无法访问外网|\[gate\]\s*预检未通过.*network/i.test(t))    return {emoji:'🔌',hint:'VPN 不通 (修网络再派)',tone:'red',full:t};
-  if(/加入群组失败|join_group.*fail|无法找到.*Join/i.test(t)) return {emoji:'❌',hint:'Vision 找不到 Join 按钮 (重试可能修复)',tone:'red',full:t};
-  if(/SLA.*timeout|SLA.*abort|30min.*无业务/i.test(t))       return {emoji:'⏱️',hint:'SLA 超时 (30min 无业务事件)',tone:'amber',full:t};
-  if(/circuit.*open|熔断/i.test(t))                          return {emoji:'🚧',hint:'熔断保护 (设备/路由器异常)',tone:'amber',full:t};
-  if(/timeout|超时/i.test(t))                                return {emoji:'⏳',hint:'超时',tone:'amber',full:t};
-  return {emoji:'⚠️',hint:t.length>60?t.substring(0,60)+'…':t,tone:'red',full:t};
+  if(/quota exceeded/i.test(t))                              return {emoji:'⏰',hint:'配额到 (等下个 window)',tone:'amber',full:t,fix_action:'wait_window'};
+  // P0-2: 三态网络错误细分（更具体的优先匹配）
+  if(/代理路径异常|代理.*被劫持|HTTP=.*'?(301|302|403|418|451)'?/i.test(t)) return {emoji:'🚫',hint:'代理 IP 被劫持/封禁 (建议换 IP)',tone:'red',full:t,fix_action:'rotate_ip'};
+  if(/完全无外网|三路全失败|HTTP\/ICMP\/IP/i.test(t))         return {emoji:'📡',hint:'彻底断网 (检查 SIM/Wi‑Fi/USB)',tone:'red',full:t,fix_action:'reconnect_usb'};
+  if(/网络检查超时|USB 稳定性|adb.*timeout/i.test(t))         return {emoji:'🔌',hint:'USB/adb 抖动 (重新插拔)',tone:'red',full:t,fix_action:'reconnect_usb'};
+  if(/无法访问外网|\[gate\]\s*预检未通过.*network/i.test(t))   return {emoji:'🔌',hint:'VPN 不通 (修网络再派)',tone:'red',full:t,fix_action:'rotate_ip'};
+  if(/加入群组失败|join_group.*fail|无法找到.*Join/i.test(t)) return {emoji:'❌',hint:'Vision 找不到 Join 按钮 (重试可能修复)',tone:'red',full:t,fix_action:'smart_retry'};
+  if(/SLA.*timeout|SLA.*abort|30min.*无业务/i.test(t))       return {emoji:'⏱️',hint:'SLA 超时 (30min 无业务事件)',tone:'amber',full:t,fix_action:'smart_retry'};
+  if(/circuit.*open|熔断/i.test(t))                          return {emoji:'🚧',hint:'熔断保护 (设备/路由器异常)',tone:'amber',full:t,fix_action:'diagnose'};
+  if(/timeout|超时/i.test(t))                                return {emoji:'⏳',hint:'超时',tone:'amber',full:t,fix_action:'smart_retry'};
+  return {emoji:'⚠️',hint:t.length>60?t.substring(0,60)+'…':t,tone:'red',full:t,fix_action:'diagnose'};
 }
 
-/** Phase 2 P0 — 任务中心顶部健康 chip (VPN + 今日成功率).
- *  loadTasks() 后调用, 让用户一眼看到"系统能不能干活". */
+/** P1-A 前端: fix_action → 后端端点元数据 (前后端契约见 src/host/error_classifier.py::_FIX_ACTIONS).
+ *  endpoint 含 {device_id} / {task_id} 占位符，调用时由 _executeFixAction 填充. */
+const _FIX_ACTIONS_FE={
+  rotate_ip:     {label:'🔄 换 IP 重试',   endpoint:'/devices/{device_id}/proxy/rotate', method:'POST', needs:'device_id'},
+  reconnect_usb: {label:'🔌 重连 USB',     endpoint:'/devices/{device_id}/reconnect',     method:'POST', needs:'device_id'},
+  smart_retry:   {label:'🔁 智能重试',     endpoint:'/tasks/{task_id}/retry',             method:'POST', needs:'task_id'},
+  diagnose:      {label:'🩺 诊断',         endpoint:'/devices/{device_id}/diagnose',      method:'GET',  needs:'device_id'},
+  wait_window:   {label:'⏰ 移入回收站',   endpoint:'/tasks/{task_id}',                   method:'DELETE', needs:'task_id'},
+};
+
+/** P1-A: 渲染失败任务的「一键修复」按钮 — 入参 errAttr (来自 _attributeError) + task (用于占位符替换).
+ *  返回 HTML 字符串；当 fix_action 为空或缺必要 ID 时返回空串. */
+function _renderFixActionButton(errAttr, task){
+  if(!errAttr||!errAttr.fix_action) return '';
+  const meta=_FIX_ACTIONS_FE[errAttr.fix_action];
+  if(!meta) return '';
+  const taskId=task&&(task.task_id||task.id);
+  const deviceId=task&&task.device_id;
+  if(meta.needs==='device_id'&&!deviceId) return '';
+  if(meta.needs==='task_id'&&!taskId) return '';
+  return `<button class="qa-btn" style="color:#22d3ee;border-color:#0891b2;background:rgba(8,145,178,.12);font-weight:600;font-size:11px" onclick="_executeFixAction('${errAttr.fix_action}','${taskId||''}','${deviceId||''}',this)">${meta.label}</button>`;
+}
+
+/** P1-A: 一键修复执行器 — 替换 endpoint 占位符 → 调 fetch → toast 反馈 → 刷新列表. */
+async function _executeFixAction(actionKey, taskId, deviceId, btnEl){
+  const meta=_FIX_ACTIONS_FE[actionKey];
+  if(!meta){showToast('未知 fix_action: '+actionKey,'error');return;}
+  let url=meta.endpoint.replace('{task_id}',encodeURIComponent(taskId||'')).replace('{device_id}',encodeURIComponent(deviceId||''));
+  if(btnEl){btnEl.disabled=true; btnEl.textContent='执行中...';}
+  try{
+    const r=await api(meta.method, url, {});
+    const okMsg={
+      rotate_ip:'已重连代理，下次任务自动用新 IP',
+      reconnect_usb:r&&r.ok?'USB 重连成功':'USB 重连未确认（可能仍离线）',
+      smart_retry:r&&r.new_task_id?`已重派 → ${String(r.new_task_id).substring(0,8)}`:'已重派',
+      diagnose:r&&r.online===false?'诊断: 设备离线':'诊断完成（详见控制台）',
+      wait_window:'已移入回收站',
+    }[actionKey]||'操作完成';
+    showToast('✅ '+okMsg,'success',3000);
+    if(actionKey==='diagnose') console.log('[fix_action diagnose]',r);
+    // 刷新任务列表 + 关闭详情对话框（如果开着）
+    document.getElementById('task-detail-modal')?.remove();
+    if(typeof loadTasks==='function') setTimeout(loadTasks,500);
+  }catch(e){
+    console.error('[fix_action]',actionKey,e);
+    showToast('❌ 修复失败: '+(e.message||e),'error',5000);
+    if(btnEl){btnEl.disabled=false; btnEl.textContent=meta.label;}
+  }
+}
+
+/** P2-① 代理质量看板 modal — 拉 /proxy/quality 后用一张表展示分设备数据.
+ *  入口: chip-infra 或 chip-proxy-quality 点击触发.
+ *  关闭: 点击叉/外层背景. */
+async function showProxyQualityModal(){
+  document.getElementById('proxy-quality-modal')?.remove();
+  const modal=document.createElement('div');
+  modal.id='proxy-quality-modal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)';
+  modal.innerHTML=`<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:20px;width:min(900px,95vw);max-height:84vh;overflow-y:auto"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div style="font-size:15px;font-weight:700">📊 代理质量看板 (24h)</div><button onclick="document.getElementById('proxy-quality-modal').remove()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:18px">✕</button></div><div id="pq-body" style="font-size:12px;color:var(--text-dim)">加载中...</div></div>`;
+  modal.onclick=(e)=>{if(e.target===modal) modal.remove();};
+  document.body.appendChild(modal);
+  try{
+    const data=await api('GET','/proxy/quality?hours=24');
+    const s=data.summary||{};
+    const layerMap=data.by_error_layer||{};
+    const rows=(data.per_device||[]).map(d=>{
+      const tone=d.infra_health_score>=90?'#22c55e':(d.infra_health_score>=70?'#f59e0b':'#ef4444');
+      const stTone={ok:'#22c55e',leak:'#ef4444',no_ip:'#ef4444',unverified:'#94a3b8',unknown:'#94a3b8'}[d.current_state]||'#94a3b8';
+      const aliasShort=(window.ALIAS&&window.ALIAS[d.device_id])||d.device_id?.substring(0,8)||'?';
+      return `<tr style="border-bottom:1px solid var(--border)"><td style="padding:6px;font-family:monospace">${aliasShort}</td><td style="padding:6px"><span style="color:${stTone}">${d.current_state}</span>${d.circuit_open?' 🚧':''}</td><td style="padding:6px;font-family:monospace;font-size:10px">${d.current_ip||'—'}</td><td style="padding:6px;text-align:right">${d.tasks_total}</td><td style="padding:6px;text-align:right;color:#ef4444">${d.tasks_failed}</td><td style="padding:6px;text-align:right;color:#f59e0b">${d.infra_failed}</td><td style="padding:6px;text-align:right;color:#a78bfa">${d.business_failed}</td><td style="padding:6px;text-align:right;font-weight:600;color:${tone}">${d.infra_health_score}</td><td style="padding:6px;font-size:10px;color:var(--text-muted)">${d.top_error_code||'—'}</td></tr>`;
+    }).join('');
+    document.getElementById('pq-body').innerHTML=`
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;font-size:11px">
+        <div><b>设备</b> ${s.devices_total||0}</div>
+        <div><b>任务</b> ${s.tasks_total||0}</div>
+        <div style="color:#ef4444"><b>失败</b> ${s.tasks_failed||0}</div>
+        <div style="color:#f59e0b"><b>基建</b> ${s.infra_failed||0}</div>
+        <div style="color:#a78bfa"><b>业务</b> ${s.business_failed||0}</div>
+        <div style="color:#22c55e"><b>ok</b> ${s.ok||0}</div>
+        <div style="color:#ef4444"><b>leak</b> ${s.leak||0}</div>
+        <div style="color:#ef4444"><b>no_ip</b> ${s.no_ip||0}</div>
+        <div style="color:#94a3b8"><b>unverified</b> ${s.unverified||0}</div>
+        ${s.circuit_open?`<div style="color:#ef4444"><b>🚧 熔断</b> ${s.circuit_open}</div>`:''}
+      </div>
+      <div style="font-size:11px;margin-bottom:10px;color:var(--text-muted)">错误层级分布: infra=${layerMap.infra||0} · business=${layerMap.business||0} · timing=${layerMap.timing||0} · quota=${layerMap.quota||0} · unknown=${layerMap.unknown||0}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="background:var(--bg-input);text-align:left"><th style="padding:6px">设备</th><th style="padding:6px">代理状态</th><th style="padding:6px">出口 IP</th><th style="padding:6px;text-align:right">任务</th><th style="padding:6px;text-align:right">败</th><th style="padding:6px;text-align:right">基建</th><th style="padding:6px;text-align:right">业务</th><th style="padding:6px;text-align:right">健康分</th><th style="padding:6px">主因</th></tr></thead>
+        <tbody>${rows||'<tr><td colspan="9" style="padding:20px;text-align:center;color:var(--text-muted)">最近 24h 没有任务记录</td></tr>'}</tbody>
+      </table>`;
+  }catch(e){
+    document.getElementById('pq-body').innerHTML=`<div style="color:#ef4444">加载失败: ${e.message||e}</div>`;
+  }
+}
+
+/** P1-B: 把后端 _classify_error 的 8 类映射到 error_classifier.py 的 layer.
+ *  保持前后端口径一致，让 dashboard "基建 vs 业务" 跟 fix_action 联动. */
+const _CAT_TO_LAYER={
+  vpn_failure:'infra', network_timeout:'infra', device_offline:'infra', geo_mismatch:'infra',
+  account_limited:'quota',
+  ui_not_found:'business',
+  task_timeout:'timing',
+  unknown:'unknown',
+};
+
+/** Phase 2 P0 → P1-B 升级 — 任务中心顶部健康 chip.
+ *  P0 只看"VPN 健康 + 今日成功率"，P1-B 拆成"基建健康分 + 业务成功率"两条独立指标，
+ *  让用户/客户/老板看到的 KPI 不再被基建噪声污染. */
 async function _refreshTaskHealthChips(){
   const setChip=(id,tone,html,title)=>{
     const el=document.getElementById(id); if(!el) return;
@@ -238,9 +349,10 @@ async function _refreshTaskHealthChips(){
     el.title=title;
   };
   try{
-    const [vpn,funnel]=await Promise.all([
+    const [vpn,funnel,errAna]=await Promise.all([
       fetch('/proxy/health/summary').then(r=>r.ok?r.json():null).catch(()=>null),
       fetch('/tasks/today-funnel').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/tasks/error-analysis?hours=24').then(r=>r.ok?r.json():null).catch(()=>null),
     ]);
     if(vpn){
       const ok=vpn.ok||0,total=vpn.total||0,cb=vpn.circuit_breakers_open||0;
@@ -250,10 +362,57 @@ async function _refreshTaskHealthChips(){
     }
     if(funnel){
       const f=funnel.created||0,ok=funnel.completed||0,fail=funnel.failed||0;
-      const rate=f>0?Math.round(ok/f*100):0;
-      const tone=f===0?'gray':(rate>=80?'green':rate>=40?'amber':'red');
-      setChip('chip-success',tone,`今日 ${ok}/${f} (${rate}%)`,
-        `今日派 ${f} · 成 ${ok} · 败 ${fail} · 待 ${funnel.pending||0} · 跑 ${funnel.running||0}`);
+      // P1-B: 把失败按 layer 拆成基建/业务
+      let infraFail=0,businessFail=0,otherFail=0;
+      if(errAna&&errAna.categories){
+        for(const [cat,n] of Object.entries(errAna.categories)){
+          const layer=_CAT_TO_LAYER[cat]||'unknown';
+          if(layer==='infra') infraFail+=n;
+          else if(layer==='business') businessFail+=n;
+          else otherFail+=n;
+        }
+      }
+      // 业务成功率: 剔除基建失败的分母 (基建挂了不算业务的锅)
+      const businessDenom=Math.max(0,f-infraFail);
+      const businessRate=businessDenom>0?Math.round(ok/businessDenom*100):0;
+      const businessTone=businessDenom===0?'gray':(businessRate>=80?'green':businessRate>=40?'amber':'red');
+      setChip('chip-success',businessTone,`业务 ${ok}/${businessDenom} (${businessRate}%)`,
+        `业务真实成功率 (已剔除 ${infraFail} 条基建失败) · 派 ${f} · 成 ${ok} · 业务败 ${businessFail} · 基建败 ${infraFail} · 其它败 ${otherFail} · 待 ${funnel.pending||0} · 跑 ${funnel.running||0}`);
+
+      // 基建健康分 = 100 × (1 - infra_failed / total_dispatched)，越高越好
+      // 注入/复用一个 chip-infra 元素（HTML 没改，按需 lazy-create 在 chip-success 旁）
+      let infraEl=document.getElementById('chip-infra');
+      if(!infraEl){
+        const sibling=document.getElementById('chip-success');
+        if(sibling&&sibling.parentNode){
+          infraEl=document.createElement('span');
+          infraEl.id='chip-infra';
+          infraEl.className='task-health-chip gray';
+          infraEl.style.marginLeft='8px';
+          sibling.parentNode.insertBefore(infraEl,sibling.nextSibling);
+        }
+      }
+      if(infraEl){
+        const score=f>0?Math.max(0,Math.round((1-infraFail/f)*100)):100;
+        const infraTone=f===0?'gray':(score>=90?'green':score>=70?'amber':'red');
+        infraEl.className=`task-health-chip ${infraTone}`;
+        infraEl.innerHTML=`<span class="dot"></span>基建 ${score}/100`;
+        infraEl.title=`基建健康分 (代理/USB/网络挂掉的占比)：infra_failed=${infraFail} / dispatched=${f}. 越高越好. 点开"📊 代理质量"看分设备明细.`;
+        infraEl.style.cursor='pointer';
+        infraEl.onclick=showProxyQualityModal;
+      }
+      // P2-① 代理质量明细按钮（chip-infra 旁挂一个 trigger，运营点开看 per-device 表）
+      let pqEl=document.getElementById('chip-proxy-quality');
+      if(!pqEl&&infraEl){
+        pqEl=document.createElement('span');
+        pqEl.id='chip-proxy-quality';
+        pqEl.className='task-health-chip gray';
+        pqEl.style.cssText='margin-left:8px;cursor:pointer';
+        pqEl.innerHTML=`<span class="dot"></span>📊 代理质量`;
+        pqEl.title='点击查看 24h 单设备代理 × 业务/基建失败分布';
+        pqEl.onclick=showProxyQualityModal;
+        infraEl.parentNode.insertBefore(pqEl,infraEl.nextSibling);
+      }
     }
   }catch(e){console.warn('[health-chips] refresh failed',e);}
 }
@@ -917,6 +1076,13 @@ async function showTaskDetail(taskId){
       ${Object.keys(_taskParamsDisplay(params)).length?`<div class="detail-row"><span class="detail-label">参数</span><pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;margin:0;flex:1">${JSON.stringify(_taskParamsDisplay(params),null,2)}</pre></div>`:''}
       ${geoGlossary}
       ${err?`<div class="detail-row"><span class="detail-label">错误</span><span style="color:#f87171;font-size:12px">${err}</span></div>`:''}
+      ${(()=>{
+        // P1-A: 失败任务挂一键修复按钮（点击调对应 endpoint）
+        if(t.status!=='failed'||!err) return '';
+        const a=_attributeError(err);
+        const btn=_renderFixActionButton(a, t);
+        return btn?`<div class="detail-row"><span class="detail-label">一键修复</span><div style="flex:1;display:flex;gap:6px;align-items:center"><span style="font-size:11px;color:var(--text-dim)">${a.emoji} ${a.hint}</span>${btn}</div></div>`:'';
+      })()}
       ${failHints}
       ${gateBlock}
       ${resultHtml}
