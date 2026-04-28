@@ -2470,6 +2470,12 @@ class FacebookAutomation(BaseAutomation):
             device_id: adb device ID (for smart_tap knowledge base)
             recipient: 目标联系人名 (用于 L2 query match + L4 VLM context)
         """
+        # L0 (OPT-FP4 2026-04-28): recipient-aware match — dump 搜索结果
+        # hierarchy 找 row content-desc 含 recipient name → tap 中心.
+        # 解决 Messenger 搜索把"自己头像"放第 1 → tap 错对话页 (4 真机
+        # 实测命中此 bug). 命中即 return, miss 走 L1-L4 fallback.
+        if self._tap_search_result_by_recipient_match(d, recipient):
+            return
         # L1: smart_tap (AutoSelector 学习库命中率最高)
         # OPT-7-v2 (2026-04-28): 期望 orca (Messenger 搜索结果列表内 tap)
         if self.smart_tap("First matching contact", device_id=device_id,
@@ -2543,6 +2549,74 @@ class FacebookAutomation(BaseAutomation):
             hint=("smart_tap + XML + coordinate + VLM (Gemini/Ollama) 全 "
                   "miss; peer 未加好友/昵称变更/索引延迟/UI 大改版, A 可 "
                   "5-15s 后重试"))
+
+    def _tap_search_result_by_recipient_match(self, d, recipient: str) -> bool:
+        """OPT-FP4 (2026-04-28): dump Messenger 搜索结果列表, 找 row
+        content-desc 含 recipient name → tap 它中心. 替代 tap 第 1 条
+        (Messenger 搜索"Meta AI"会把"自己头像"放第 1, fallback 命中导致
+        进自己对话页, OPT-FP1 已 catch 但还是要修真根因).
+
+        策略:
+          1. dump_hierarchy 整个搜索结果页
+          2. regex finditer content-desc 含 recipient (substring)
+          3. 每个匹配从 +500 chars 内找 bounds
+          4. 跳过 search bar (y < 300) + 跳过 stories 区 (y < 500 + height < 100)
+          5. 找到第一个有效 row → tap 中心
+          6. miss → return False, 调用方走 L1-L4 fallback
+
+        fail-safe: dump 异常 / 返非 str → 返 False (不阻断 fallback).
+
+        Args:
+            d: u2 device
+            recipient: 期望 recipient name (substring match)
+
+        Returns:
+            True 命中 + tap 完成
+            False 没找到 (调用方继续 L1-L4)
+        """
+        if not recipient:
+            return False
+        try:
+            time.sleep(0.5)  # 等搜索结果渲染
+            xml = d.dump_hierarchy()
+            if not isinstance(xml, str) or not xml:
+                return False
+            recipient_norm = recipient.strip()
+            if not recipient_norm:
+                return False
+            import re as _re
+            bounds_re = _re.compile(
+                r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+            # 找 content-desc 含 recipient 的位置
+            for m in _re.finditer(
+                    r'content-desc="([^"]*'
+                    + _re.escape(recipient_norm)
+                    + r'[^"]*)"', xml):
+                # 从 m.start() +500 chars 内找 bounds (一个 node < 500 chars)
+                chunk = xml[m.start():m.start() + 500]
+                bm = bounds_re.search(chunk)
+                if not bm:
+                    continue
+                x1, y1, x2, y2 = (int(bm.group(1)), int(bm.group(2)),
+                                  int(bm.group(3)), int(bm.group(4)))
+                # 跳过 search bar (y < 300) 和 active-now stories
+                # (height < 100, 通常是头像缩略图)
+                if y1 < 300 or (y2 - y1) < 100:
+                    continue
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                d.click(cx, cy)
+                log.info(
+                    "[opt-fp4] _tap_search_result_by_recipient_match hit "
+                    "recipient=%r bounds=[%d,%d][%d,%d] tap=(%d,%d)",
+                    recipient, x1, y1, x2, y2, cx, cy)
+                return True
+            log.debug(
+                "[opt-fp4] 没找到含 recipient=%r 的 search row, fall back",
+                recipient)
+            return False
+        except Exception as e:
+            log.debug("[opt-fp4] 异常 fall back: %s", e)
+            return False
 
     def _launch_messenger_stable(self, did: str) -> None:
         """OPT-FP2 (2026-04-28): 强制把 Messenger 拉前台 (smoke v6 真机
