@@ -35,3 +35,86 @@ def tmp_db(tmp_path):
     db_mod.init_db()
     yield db_mod.DB_PATH
     db_mod.DB_PATH = original
+
+
+# ── P2-⑨ 跨测试状态污染防护 (autouse, 全套测试都生效) ──
+#
+# 根因:
+#   全套 pytest 累计 fail 在涨 (1 → 2 → 6+), 全部"单独跑都 PASS"才挂.
+#   多个 module 有 module-level dict/counter (_metrics / _device_fail_streak /
+#   _RETRY_THROTTLE / _LAST_CLEANUP_TS / _cache / _state ...), 上一 test 留的状
+#   态污染下一 test.
+#
+# 修复:
+#   作者们已经在 8 个模块暴露了 reset_*_for_tests / reset_for_tests / _reset_*
+#   helper. conftest autouse fixture 在每个 test 跑前后调一次, 让 module-level
+#   全局回到"刚 import"状态.
+#
+#   设计要点:
+#   - 失败时静默 (importlib 找不到 / 模块没装某个属性 → continue)
+#     防 e.g. tests/test_unrelated.py 里没 import 某 module 的子集场景下 reset
+#     抛 ImportError 把 test 自己拖死
+#   - reset 在 test 跑*前*和*后*各一次. 前清以防上一 test 没自清; 后清以防本
+#     test 出错跳出 fixture cleanup 把 dirty 留给下一 test.
+#   - 不删既有 reset_state fixture (test_central_push_drain 已用), autouse 会
+#     先跑, 然后 reset_state 再跑一次 (幂等 reset 无副作用).
+def _p29_reset_global_state():
+    """P2-⑨ 调所有已暴露的 reset helper, 静默吞 import / attr error."""
+    import importlib
+
+    # 形如 (module, fn_name): 调用 fn() 即重置.
+    # 注意: 只挂"清运行期状态(metrics/cache/queue)"的 reset, **不挂**
+    # gate_registry._reset_for_tests — 它清空 _TASK_GATES dict 但不重新调用
+    # _register_default_gates(), 会让后续 test 看到空 registry → fail.
+    # 这种"清后不重建"型 reset 必须 test 自己显式调用, 不适合 autouse.
+    reset_targets = [
+        ("src.host.central_push_client", "reset_push_metrics_for_tests"),
+        ("src.host.central_push_drain", "reset_for_tests"),
+        ("src.host.fb_concurrency", "reset_metrics_for_tests"),
+        ("src.host.cluster_lock_client", "reset_caches_for_tests"),
+    ]
+    for mod_name, fn_name in reset_targets:
+        try:
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
+
+    # P2-⑨ 涉及但作者没暴露 reset helper 的全局: inline 清
+    inline_clears = [
+        # (module_path, attribute_name, expected_type, action)
+        ("src.host.routers.tasks", "_RETRY_THROTTLE", "dict", "clear"),
+        ("src.host.task_store", "_device_fail_streak", "dict", "clear"),
+        ("src.host.fb_store", "_PEER_NAME_REJECT_COUNTER", "dict", "reset_count"),
+        ("src.host.preflight", "_cache", "dict", "clear"),
+        ("src.host.routers.cluster", "_WEBHOOK_COOLDOWN", "dict", "clear"),
+    ]
+    for mod_name, attr, _typ, action in inline_clears:
+        try:
+            mod = importlib.import_module(mod_name)
+            obj = getattr(mod, attr, None)
+            if obj is None:
+                continue
+            if action == "clear" and hasattr(obj, "clear"):
+                obj.clear()
+            elif action == "reset_count" and isinstance(obj, dict) and "count" in obj:
+                obj["count"] = 0
+        except Exception:
+            pass
+
+    # task_forensics 的 timestamp scalar (非 dict, 单独处理)
+    try:
+        import src.host.task_forensics as tf_mod
+        tf_mod._LAST_CLEANUP_TS = 0.0
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _p29_isolation():
+    """P2-⑨ 每 test 前后清一次核心全局状态. 静默, 0 维护成本."""
+    _p29_reset_global_state()
+    yield
+    _p29_reset_global_state()
