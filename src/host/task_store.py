@@ -458,6 +458,13 @@ def set_task_result(task_id: str, success: bool, error: str = "",
         )
     _push(f"task.{status}", task_id=task_id, success=success,
           error=error, device_id=device_id)
+    # P2-② 失败任务自动留证据 (异步 fail-safe, 不阻塞当前调用)
+    if status == "failed" and device_id:
+        try:
+            from .task_forensics import capture_forensics
+            capture_forensics(task_id=task_id, device_id=device_id, error_text=error)
+        except Exception as _fe:
+            logger.debug("forensics 触发异常 (已忽略): %s", _fe)
     # 连续失败追踪 → Telegram 告警
     if device_id:
         if success:
