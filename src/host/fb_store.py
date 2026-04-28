@@ -13,8 +13,11 @@ from .database import _connect
 
 
 def _now_iso() -> str:
+    """OPT-cleanup-utcnow (2026-04-28): 5 处 utcnow → now(UTC).strftime
+    全是 strftime 输出路径 (不参与 datetime 比较), 行为与原 utcnow 完全
+    一致 — strftime 不输出时区, 字符串结果 identical."""
     import datetime as _dt
-    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +183,7 @@ def count_friend_requests_sent_since(device_id: str, hours: int = 24) -> int:
     if not device_id or hours <= 0:
         return 0
     import datetime as _dt
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=hours)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     with _connect() as conn:
         row = conn.execute(
@@ -254,7 +257,7 @@ def count_outgoing_messages_since(device_id: str,
     if not device_id or hours <= 0:
         return 0
     import datetime as _dt
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=hours)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     # COALESCE(sent_at, seen_at) 让新旧行都能正确比较
     sql = ("SELECT COUNT(*) FROM facebook_inbox_messages"
@@ -415,7 +418,7 @@ def mark_greeting_replied_back(device_id: str, peer_name: str, *,
     if not device_id or not peer_name or window_days <= 0:
         return 0
     import datetime as _dt
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=window_days)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(days=window_days)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     ts = replied_at or _now_iso()
     sql = (
@@ -1525,7 +1528,7 @@ def get_greeting_reply_rate_by_template(device_id: Optional[str] = None,
     if hours <= 0:
         return []
     import datetime as _dt
-    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime(
+    cutoff = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=hours)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
 
     # 先查各模板的 sent / replied 数
