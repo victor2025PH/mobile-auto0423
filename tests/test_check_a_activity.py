@@ -2,6 +2,7 @@
 """`scripts/check_a_activity.py` 单元测试 — 纯逻辑 + git/API mock。"""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +14,10 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "check_a_activity.py"
 
+# P2-⑩: spawn 子 Python 进程时强制 stdout 用 UTF-8 编码, 防 Windows cp936
+# 默认编码遇中文 print 时父进程读取乱码导致 assert "中文" in stdout 失败.
+_UTF8_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -22,7 +27,7 @@ class TestCli:
         r = subprocess.run(
             [sys.executable, str(SCRIPT),
              "--no-fetch", "--no-color", "--hours", "1"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=60,
         )
         # 不管 exit code 是啥, 应该输出报告 (可能 warn 说没 token)
         assert r.returncode == 0
@@ -31,7 +36,7 @@ class TestCli:
     def test_bad_hours_rejected(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--hours", "abc", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 2
 
@@ -78,7 +83,7 @@ class TestGitRecentCommits:
         from scripts.check_a_activity import git_recent_commits_on_branch
         # 在实际 repo 里跑, 任何可能的分支
         branches_found = subprocess.run(
-            ["git", "branch", "-r"], capture_output=True, text=True,
+            ["git", "branch", "-r"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV,
             timeout=10,
         ).stdout
         # 挑一个 feat-b- 分支跑
@@ -497,7 +502,7 @@ class TestReviewsCli:
                 [sys.executable, str(SCRIPT),
                  "--reviews", "99999999",
                  "--no-fetch", "--no-color"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=60,
             )
         # no-token → PR error → not ready → exit 1
         assert r.returncode == 1
@@ -507,7 +512,7 @@ class TestReviewsCli:
             [sys.executable, str(SCRIPT),
              "--reviews", " , ,",
              "--no-fetch", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 2
 
