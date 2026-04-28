@@ -1790,16 +1790,32 @@ class FacebookAutomation(BaseAutomation):
             # ── 4. Messenger 搜索入口 (2026-04-24 改: 三级 fallback) ─────
             # smart_tap → multi-locale selector (_MESSENGER_SEARCH_SELECTORS)
             # → coordinate (top 20%)。详见 _enter_messenger_search docstring。
-            self._enter_messenger_search(d, did)
-            time.sleep(0.5)
-            self.hb.type_text(d, recipient)
-            time.sleep(1.5)
+            # OPT-FP7 (2026-04-28): 优先 inbox-direct-tap 跳过 search.
+            # 真消灭 false positive 根因 — Messenger 搜索把"自己"放第 1
+            # + FB 整合到 katana messaging-in-blue 后 search 切走 app.
+            # 直接在 inbox 列表找 recipient row → tap, miss 才 fallback
+            # 走 search 路径 (向后兼容).
+            inbox_direct_hit = self._tap_inbox_row_by_recipient(d, recipient)
+            if inbox_direct_hit:
+                log.info(
+                    "[opt-fp7] inbox-direct-tap 命中 recipient=%r, "
+                    "跳过 search 路径", recipient)
+                # tap row 后等 UI 切换到对话页
+                time.sleep(2.0)
+            else:
+                log.debug(
+                    "[opt-fp7] inbox 中没找到 recipient=%r, fallback search",
+                    recipient)
+                self._enter_messenger_search(d, did)
+                time.sleep(0.5)
+                self.hb.type_text(d, recipient)
+                time.sleep(1.5)
 
-            # ── 5. 选中搜索结果第一条 (2026-04-24: 4 级 fallback) ────────
-            # smart_tap → _first_search_result_element (XML, semantic, query
-            # plausible-match) → coordinate (w*0.5, h*0.26) → VLM vision。
-            # 详见 _tap_first_search_result docstring。
-            self._tap_first_search_result(d, did, recipient)
+                # ── 5. 选中搜索结果第一条 (2026-04-24: 4 级 fallback) ────────
+                # smart_tap → _first_search_result_element (XML, semantic,
+                # query plausible-match) → coordinate (w*0.5, h*0.26) →
+                # VLM vision. 详见 _tap_first_search_result docstring.
+                self._tap_first_search_result(d, did, recipient)
 
             time.sleep(1)
             # OPT-FP1 (2026-04-28): tap 第一搜索结果后 dump 对话页 title 验证
@@ -2715,6 +2731,81 @@ class FacebookAutomation(BaseAutomation):
                 "force-stop + am-start LAUNCHER + monkey 都没把 orca 拉前台",
                 hint="launch_failed: 设备状态异常 / orca 安装损坏 / 锁屏中")
 
+    def _tap_inbox_row_by_recipient(self, d, recipient: str,
+                                    max_scrolls: int = 3) -> bool:
+        """OPT-FP7 (2026-04-28): inbox 直接 tap recipient row, 替代 search.
+
+        真消灭 false positive 根因: search 路径不可靠 (Messenger 把"自己"
+        放第 1 + FB 整合到 katana messaging-in-blue 后 search 切走 app).
+        inbox-direct-tap 直接在 inbox 列表找含 recipient name 的 row → tap
+        row 中心进对话页, 跳过整个 search 阶段.
+
+        策略: dump → finditer content-desc 含 recipient → 跳 stories /
+        search bar (y<300, height<100) → tap row 中心 → miss 则 scroll
+        inbox down 重试. fail-safe: 异常返 False (调用方 fallback search).
+        """
+        if not recipient:
+            return False
+        recipient_norm = recipient.strip()
+        if not recipient_norm:
+            return False
+        import re as _re
+        bounds_re = _re.compile(
+            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+
+        for scroll_idx in range(max_scrolls):
+            try:
+                xml = d.dump_hierarchy()
+            except Exception as e:
+                log.debug(
+                    "[opt-fp7] dump 异常 scroll=%d: %s", scroll_idx, e)
+                if scroll_idx < max_scrolls - 1:
+                    time.sleep(0.5)
+                    continue
+                return False
+            if not isinstance(xml, str) or not xml:
+                if scroll_idx < max_scrolls - 1:
+                    time.sleep(0.5)
+                    continue
+                return False
+            for m in _re.finditer(
+                    r'content-desc="([^"]*'
+                    + _re.escape(recipient_norm)
+                    + r'[^"]*)"', xml):
+                chunk = xml[m.start():m.start() + 500]
+                bm = bounds_re.search(chunk)
+                if not bm:
+                    continue
+                x1, y1, x2, y2 = (
+                    int(bm.group(1)), int(bm.group(2)),
+                    int(bm.group(3)), int(bm.group(4)))
+                if y1 < 300 or (y2 - y1) < 100:
+                    continue
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                try:
+                    d.click(cx, cy)
+                except Exception as e:
+                    log.debug("[opt-fp7] click 异常: %s", e)
+                    return False
+                log.info(
+                    "[opt-fp7] inbox-direct-tap hit recipient=%r "
+                    "scroll=%d row=[%d,%d][%d,%d] tap=(%d,%d)",
+                    recipient, scroll_idx, x1, y1, x2, y2, cx, cy)
+                return True
+            # 没找到 → swipe scroll inbox down
+            if scroll_idx < max_scrolls - 1:
+                try:
+                    w, h = d.window_size()
+                    d.swipe(w // 2, int(h * 0.7),
+                            w // 2, int(h * 0.3), 0.5)
+                    time.sleep(0.8)
+                except Exception as e:
+                    log.debug("[opt-fp7] swipe 异常: %s", e)
+        log.debug(
+            "[opt-fp7] inbox 中没找到 recipient=%r after %d scrolls",
+            recipient, max_scrolls)
+        return False
+
     def _verify_messenger_in_foreground(self, did: str) -> bool:
         """OPT-FP6 (2026-04-28): send_message return True 前最后一道防线 —
         dumpsys window 检查 com.facebook.orca 在前台.
@@ -2745,19 +2836,35 @@ class FacebookAutomation(BaseAutomation):
                         "[opt-fp6] dumpsys window retry=%d 失败 fail-safe",
                         retry_idx)
                     return True
-                if MESSENGER_PACKAGE in (out or ""):
+                out_str = out or ""
+                # OPT-FP6-v2 (2026-04-28): 接受 com.facebook.orca OR
+                # katana 内嵌 messaging activity (FB messaging-in-blue
+                # 整合 — Messenger UI 现在跑在 com.facebook.katana/com.
+                # facebook.messaging.* activity).
+                if MESSENGER_PACKAGE in out_str:
+                    return True
+                if "com.facebook.katana" in out_str and (
+                        "ThreadActivity" in out_str
+                        or "ThreadViewActivity" in out_str
+                        or "ThreadSettings" in out_str):
+                    # 仅接受真对话相关 Thread* activity (FB messaging-in-blue
+                    # 整合). 不接受 katana 内嵌 messaging 但非对话类 activity
+                    # (e.g. MibCloudBackupNuxActivity / LoginActivity 等).
+                    log.info(
+                        "[opt-fp6] orca 不在但 katana 内嵌 Thread* activity "
+                        "在前台 (FB messaging-in-blue), 接受")
                     return True
                 if retry_idx == 0:
                     time.sleep(1.0)
                     continue
                 # 2 次都 miss + dumpsys 成功 → 真不在前台
                 snippet = ""
-                for line in (out or "").splitlines():
+                for line in out_str.splitlines():
                     if "mCurrentFocus" in line or "mFocusedApp" in line:
                         snippet = line.strip()
                         break
                 log.warning(
-                    "[opt-fp6] send_message 末尾 orca 不在前台! "
+                    "[opt-fp6] send_message 末尾不在 messaging activity! "
                     "snippet=%r", snippet[:200])
                 return False
             except Exception as e:
