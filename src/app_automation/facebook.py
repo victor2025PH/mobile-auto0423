@@ -1674,7 +1674,8 @@ class FacebookAutomation(BaseAutomation):
 
     def attach_image(self, image_path: str, caption: str = "",
                      device_id: Optional[str] = None,
-                     raise_on_error: bool = False) -> bool:
+                     raise_on_error: bool = False,
+                     dry_run: bool = False) -> bool:
         """在当前 Messenger 对话页发送一张本地图片附件。
 
         前置: 当前 Messenger 必须已在某对话页 (典型用法 = 先调 send_message
@@ -1687,22 +1688,27 @@ class FacebookAutomation(BaseAutomation):
           4. tap "Open photo gallery."                  → gallery_button_missing
           5. dump XML 找第一张 "Photo taken DATE" → tap → picker_empty
                                                        / media_scan_timeout
-          6. (可选) tap composer + type caption
+          6. (可选) tap composer + type caption — dry_run=True 跳过
           7. tap Send (复用 _tap_messenger_send)        → send_failed
+                                                          dry_run=True 跳过 + back
 
         Args:
             image_path: 本地绝对路径 (.png / .jpg)
             caption: 可选附文; 空串则只发图
             device_id: 目标设备 (省略走 self._did)
             raise_on_error: True 抛 AttachImageError; False 静默 return False
+            dry_run: QA / 真机 selector 验证模式 — 走完前 5 步 (push/grant/
+                tap gallery/photo node 命中/tap select), 不发送 + 自动 press
+                back 退回对话页, 不真发任何消息。**用于 selector 真机回归**,
+                不应在生产路径调用。
 
         Returns:
-            True 成功; False (raise_on_error=False) 失败。
+            True 成功 (dry_run=True 时含义 = 前 5 步全过); False (raise_on_error=False) 失败。
         """
         did = self._did(device_id)
         d = self._u2(did)
         try:
-            return self._attach_image_impl(d, did, image_path, caption)
+            return self._attach_image_impl(d, did, image_path, caption, dry_run)
         except AttachImageError as e:
             if raise_on_error:
                 raise
@@ -1710,7 +1716,7 @@ class FacebookAutomation(BaseAutomation):
             return False
 
     def _attach_image_impl(self, d, did: str, image_path: str,
-                           caption: str) -> bool:
+                           caption: str, dry_run: bool = False) -> bool:
         """attach_image 内核 — 失败抛 :class:`AttachImageError` 不吞。"""
         with self.guarded("attach_image", device_id=did):
             # ── 1. push + grant + scan ────────────────────────────────────
@@ -1730,6 +1736,17 @@ class FacebookAutomation(BaseAutomation):
                           " broadcast 是否触发; 可能 Android 13+ 用 cmd "
                           "content insert MediaStore"))
             time.sleep(0.6)
+
+            # ── dry_run 早退: 不发送 + press back 退出 picker ─────────────
+            if dry_run:
+                log.info(
+                    "[attach_image] dry_run=True, 已完成 push/grant/picker 选图; "
+                    "press back 退出, 不发送")
+                try:
+                    d.press("back")
+                except Exception as e:
+                    log.debug("[attach_image] dry_run press back 异常: %s", e)
+                return True
 
             # ── 4. (可选) caption ─────────────────────────────────────────
             if caption:
@@ -1769,7 +1786,7 @@ class FacebookAutomation(BaseAutomation):
         had_any_success = False
         for cmd in cmds:
             try:
-                ok, out = self.dm.execute_adb_command(cmd, did, timeout=8)
+                ok, out = self.dm._run_adb(cmd, did, timeout=8)
                 if ok and "Unknown permission" not in (out or ""):
                     had_any_success = True
             except Exception as e:
@@ -1795,7 +1812,7 @@ class FacebookAutomation(BaseAutomation):
         ext = os.path.splitext(image_path)[1].lower() or ".png"
         remote = f"/sdcard/Pictures/openclaw_{ts}{ext}"
         try:
-            ok, out = self.dm.execute_adb_command(
+            ok, out = self.dm._run_adb(
                 ["push", image_path, remote], did, timeout=15)
         except Exception as e:
             raise AttachImageError(
@@ -1808,7 +1825,7 @@ class FacebookAutomation(BaseAutomation):
         # 触发媒体扫描 (Android 13 已 deprecated 但兼容); 即使失败也继续 —
         # 媒体扫描偶尔会异步处理, picker 内仍可能出图
         try:
-            self.dm.execute_adb_command(
+            self.dm._run_adb(
                 ["shell", "am", "broadcast",
                  "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
                  "-d", f"file://{remote}"], did, timeout=8)

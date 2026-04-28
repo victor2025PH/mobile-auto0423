@@ -54,7 +54,7 @@ def fb_env(tmp_path):
         if cmd[:2] == ["shell", "am"]:
             return knobs["scan_result"]
         return (True, "")
-    fb.dm.execute_adb_command = MagicMock(side_effect=_exec_adb)
+    fb.dm._run_adb = MagicMock(side_effect=_exec_adb)
 
     def _smart_tap(target, device_id=None, **kw):
         if "photo gallery" in target.lower():
@@ -261,7 +261,7 @@ class TestHelpers:
         fb, knobs, img = fb_env
         fb._grant_orca_media_permissions("D1")
         # READ_MEDIA_IMAGES + READ_EXTERNAL_STORAGE 都试一遍
-        cmds = [c.args[0] for c in fb.dm.execute_adb_command.call_args_list]
+        cmds = [c.args[0] for c in fb.dm._run_adb.call_args_list]
         joined = " ".join(" ".join(c) for c in cmds)
         assert "READ_MEDIA_IMAGES" in joined
         assert "READ_EXTERNAL_STORAGE" in joined
@@ -325,3 +325,59 @@ class TestCaptionPath:
         fb.attach_image(img, caption="", device_id="D1", raise_on_error=True)
         fb._focus_messenger_composer.assert_not_called()
         fb.hb.type_text.assert_not_called()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# dry_run 模式 — QA 真机回归用, 走前 5 步不发送
+# ════════════════════════════════════════════════════════════════════════
+
+class TestDryRun:
+    def test_dry_run_returns_true_on_picker_select_success(self, fb_env):
+        fb, knobs, img = fb_env
+        ok = fb.attach_image(img, device_id="D1", dry_run=True,
+                             raise_on_error=True)
+        assert ok is True
+
+    def test_dry_run_skips_send(self, fb_env):
+        fb, knobs, img = fb_env
+        fb.attach_image(img, device_id="D1", dry_run=True,
+                        raise_on_error=True)
+        fb._tap_messenger_send.assert_not_called()
+
+    def test_dry_run_skips_caption_even_when_provided(self, fb_env):
+        fb, knobs, img = fb_env
+        fb.attach_image(img, caption="ignored under dry_run",
+                        device_id="D1", dry_run=True, raise_on_error=True)
+        fb._focus_messenger_composer.assert_not_called()
+        fb.hb.type_text.assert_not_called()
+
+    def test_dry_run_presses_back_to_dismiss_picker(self, fb_env):
+        fb, knobs, img = fb_env
+        fake_u2 = fb._u2("D1")
+        fake_u2.press = MagicMock()
+        fb.attach_image(img, device_id="D1", dry_run=True,
+                        raise_on_error=True)
+        # press("back") 至少调 1 次 (退出 picker 防误触)
+        back_calls = [c for c in fake_u2.press.call_args_list
+                      if c.args == ("back",)]
+        assert len(back_calls) >= 1
+
+    def test_dry_run_still_propagates_push_failure(self, fb_env):
+        """dry_run 不应吞前 3 步的真错 — push 失败仍然是错。"""
+        fb, knobs, img = fb_env
+        from src.app_automation.facebook import AttachImageError
+        knobs["push_result"] = (False, "no space left on device")
+        with pytest.raises(AttachImageError) as exc:
+            fb.attach_image(img, device_id="D1", dry_run=True,
+                            raise_on_error=True)
+        assert exc.value.code == "push_failed"
+
+    def test_dry_run_still_propagates_picker_empty(self, fb_env):
+        """dry_run 也要验证 picker 选图阶段能正常归因 picker_empty。"""
+        fb, knobs, img = fb_env
+        from src.app_automation.facebook import AttachImageError
+        knobs["photo_obj_exists"] = False
+        with pytest.raises(AttachImageError) as exc:
+            fb.attach_image(img, device_id="D1", dry_run=True,
+                            raise_on_error=True)
+        assert exc.value.code == "picker_empty"
