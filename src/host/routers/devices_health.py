@@ -107,6 +107,43 @@ def device_fix(device_id: str, body: dict):
                             detail=f"Unknown action: {action}")
 
 
+# ── P1-A fix_action: rotate_ip ──
+
+@router.post("/devices/{device_id}/proxy/rotate")
+def device_proxy_rotate(device_id: str):
+    """前端「🔄 换 IP 重试」按钮端点 (fix_action=rotate_ip)。
+
+    通过 vpn_manager.reconnect_vpn_silent 重连 VPN/代理客户端 — 大多数 V2RayNG/911proxy
+    在重连后会换到下一个出口。同时使本机预检缓存失效，避免下一次派任务读到旧的失败缓存。
+
+    返回 {ok, device_id, vpn_reconnected, preflight_invalidated}
+    """
+    from ..api import _resolve_device_with_manager
+    did, _ = _resolve_device_with_manager(device_id)
+
+    vpn_ok = False
+    try:
+        from src.behavior.vpn_manager import reconnect_vpn_silent
+        vpn_ok = bool(reconnect_vpn_silent(did))
+    except Exception as e:
+        logger.warning("[proxy/rotate] %s reconnect_vpn_silent failed: %s", did[:8], e)
+
+    invalidated = False
+    try:
+        from src.host.preflight import invalidate_cache
+        invalidate_cache(did)
+        invalidated = True
+    except Exception as e:
+        logger.warning("[proxy/rotate] %s preflight invalidate_cache failed: %s", did[:8], e)
+
+    return {
+        "ok": vpn_ok,
+        "device_id": did,
+        "vpn_reconnected": vpn_ok,
+        "preflight_invalidated": invalidated,
+    }
+
+
 # ── Performance ──
 
 @router.get("/devices/{device_id}/performance")
