@@ -1895,6 +1895,66 @@ class FacebookAutomation(BaseAutomation):
                 time.sleep(1.5)  # 给媒体扫描更多时间
         return False
 
+    def _send_line_qr_after_text(self, decision: str, channel: str,
+                                 line_id: str, did: str,
+                                 peer_name: str) -> bool:
+        """D1-B 双轨集成 (2026-04-28) — wa_referral + LINE 渠道时, 在文字
+        已发出后追加 LINE QR 图片附件。
+
+        触发条件 (全满足才发图):
+          1. decision == "wa_referral"
+          2. channel.lower() == "line"     (whatsapp/telegram 不走双轨)
+          3. line_id.strip() 非空           (没 line_id 没法生成 QR)
+
+        降级策略 (任一失败 → 仅文字成功, decision 不退化):
+          - build_line_qr 返 None         → 直接跳, log.debug
+          - attach_image 返 False         → log.warning 记账
+          - 任意异常                      → log.debug 吞, 返 False
+
+        反 spam: 文字与图之间加 1.0~2.5s 随机延迟模拟人类行为, 避免 FB 把
+        "立刻双发" 识别成 bot。
+
+        Args:
+            decision: _ai_reply_and_send 当前轮的 decision (reply/wa_referral)
+            channel:  引流渠道 (line / whatsapp / telegram / messenger / instagram)
+            line_id:  LINE ID 或完整 line.me URL
+            did:      adb 设备 ID
+            peer_name:对方 Messenger 名 (仅作 log 标识)
+
+        Returns:
+            True QR 已成功附加; False 不满足触发条件 / 跳过 / 失败。
+            返回值会写入 wa_referral_sent 事件 meta.qr_sent 供漏斗分析。
+        """
+        if decision != "wa_referral" \
+                or (channel or "").lower() != "line" \
+                or not (line_id or "").strip():
+            return False
+        try:
+            from src.utils.qr_generator import build_line_qr
+            qr_path = build_line_qr(line_id)
+            if not qr_path:
+                log.debug(
+                    "[qr-dual] build_line_qr 返 None line_id=%s peer=%s 降级 "
+                    "text-only", line_id, peer_name)
+                return False
+            time.sleep(random.uniform(1.0, 2.5))
+            ok = self.attach_image(
+                qr_path, device_id=did, raise_on_error=False)
+            if ok:
+                log.info(
+                    "[qr-dual] LINE QR 双轨发送成功 line_id=%s peer=%s",
+                    line_id, peer_name)
+            else:
+                log.warning(
+                    "[qr-dual] LINE QR 附件发送失败 (文字已发达, 降级 text-"
+                    "only) line_id=%s peer=%s", line_id, peer_name)
+            return ok
+        except Exception as e:
+            log.debug(
+                "[qr-dual] 双轨异常 (文字已发达, 降级 text-only) line_id=%s "
+                "peer=%s err=%s", line_id, peer_name, e)
+            return False
+
     # ── Messenger UI multi-locale selectors (2026-04-24 实测真机新增) ──
     # `smart_tap(target_desc)` 走 AutoSelector engine (自学习式 UI 定位), 对
     # 2026 版 Messenger 中文化 UI 命中率低 ("Search in Messenger" 过时成了
@@ -7141,6 +7201,12 @@ class FacebookAutomation(BaseAutomation):
             log.debug("[ai_reply] 发送失败: %s", e)
             return None, "skip"
 
+        # ── D1-B 双轨集成 (2026-04-28): wa_referral + LINE 追加 QR 图 ──
+        # 文字已发出 — QR 失败不退化 decision (降级 text-only)。详见
+        # _send_line_qr_after_text docstring。
+        qr_attach_success = self._send_line_qr_after_text(
+            decision, _r_channel, _r_val, did, peer_name)
+
         try:
             from src.host.fb_store import record_inbox_message
             record_inbox_message(
@@ -7193,6 +7259,9 @@ class FacebookAutomation(BaseAutomation):
                     "channel": _r_channel or "unknown",
                     "peer_type": peer_type,
                     "intent": intent_tag,  # P4 意图信号
+                    # D1-B (2026-04-28): LINE QR 双轨附件是否成功; non-LINE
+                    # 渠道恒为 False (不影响漏斗解读)
+                    "qr_sent": qr_attach_success,
                 },
             )
             # L2 双写 — 引流话术发出 (不升级 status, 等真发起 handoff 才升)
