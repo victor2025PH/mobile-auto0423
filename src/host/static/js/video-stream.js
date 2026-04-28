@@ -318,6 +318,13 @@ async function startStreaming(){
             if(_streamHasControl){
               const s=document.getElementById('ctrl-status');
               if(s) s.textContent=_WEBCODECS_OK?'GPU硬解 + 低延迟控制':'低延迟控制';
+              _hideReadOnlyBanner();
+            }else{
+              // P0-3: control socket 未建立时，给用户明确提示而不是静默吞点击
+              console.warn('[stream] control socket NOT established — touchscreen will be read-only. Sidebar buttons (HOME/BACK) still work via adb input keyevent.');
+              _showReadOnlyBanner('🚫 投屏只读模式 — 屏幕点击无效（侧边栏按钮可用）。请重启实时流；若反复失败，重启 server.bat');
+              const s=document.getElementById('ctrl-status');
+              if(s) s.textContent='⚠️ video-only';
             }
             if(cfg.quality){
               const qs=document.getElementById('quality-sel');
@@ -414,6 +421,8 @@ function stopStreaming(keepFrame){
   if(!keepFrame) _saveLastFrame();
   _streamActive=false;
   _streamHasControl=false;
+  _hideReadOnlyBanner();
+  _readOnlyToastShown=false;
   _stopStatsPolling();
   _hideOfflineOverlay();
   if(_streamWs){try{_streamWs.close();}catch(e){}_streamWs=null;}
@@ -518,6 +527,7 @@ async function stopRecording(){
 }
 
 let _streamHasControl=false;
+let _readOnlyToastShown=false;
 let _statsTimer=null;
 
 function _startStatsPolling(){
@@ -765,7 +775,47 @@ function _hideOfflineOverlay(){
   if(ol) ol.style.display='none';
 }
 
+/* P0-3 + P1-C: 只读模式横幅 + 一键重启按钮 — control socket 未建立时显示 */
+function _showReadOnlyBanner(msg){
+  const wrap=document.getElementById('stream-wrap');
+  if(!wrap) return;
+  let bn=document.getElementById('stream-readonly-banner');
+  if(!bn){
+    bn=document.createElement('div');
+    bn.id='stream-readonly-banner';
+    bn.style.cssText='position:absolute;top:0;left:0;right:0;background:rgba(220,38,38,0.92);color:#fff;font-size:12px;font-weight:600;padding:6px 10px;text-align:center;z-index:9;border-radius:4px 4px 0 0;display:flex;justify-content:center;align-items:center;gap:8px';
+    wrap.appendChild(bn);
+  }
+  bn.style.display='flex';
+  // P1-C: 文案 + 一键重启按钮（重新协商 video+control socket，比关闭再开更直接）
+  const btnHtml=`<button id="readonly-reconnect-btn" style="background:#fff;color:#dc2626;border:none;padding:3px 10px;border-radius:3px;font-weight:600;font-size:11px;cursor:pointer">🔁 立即重启实时流</button>`;
+  bn.innerHTML=`<span>${msg||'投屏只读模式'}</span>${btnHtml}`;
+  const btn=document.getElementById('readonly-reconnect-btn');
+  if(btn){
+    btn.onclick=function(ev){
+      ev.preventDefault();ev.stopPropagation();
+      btn.disabled=true;
+      btn.textContent='重启中...';
+      try{
+        // 关闭旧 ws → 等 1s → 重启（让 scrcpy server 旧 socket 完全释放再尝试）
+        stopStreaming(true);
+        setTimeout(()=>{ if(typeof startStreaming==='function') startStreaming(); },1000);
+      }catch(e){
+        console.error('[readonly-reconnect]',e);
+        btn.disabled=false;
+        btn.textContent='🔁 立即重启实时流';
+      }
+    };
+  }
+}
+
+function _hideReadOnlyBanner(){
+  const bn=document.getElementById('stream-readonly-banner');
+  if(bn) bn.style.display='none';
+}
+
 function _attachVideoListeners(video){
+  let _touchSampleN=0;
   video.addEventListener('mousedown',function(e){
     e.preventDefault();
     // 离线浮层可见时阻断操控
@@ -778,7 +828,20 @@ function _attachVideoListeners(video){
     const dx=Math.round(rx*modalScreenSize.w), dy=Math.round(ry*modalScreenSize.h);
     _dragState={startX:dx,startY:dy,clientX:e.clientX,clientY:e.clientY,img:video,moved:false};
     _drawTouchIndicator(e.clientX,e.clientY,'down');
-    if(_streamHasControl) _sendCtrl({type:'touch',action:0,x:dx,y:dy});
+    // P0-3: 采样日志 — 每 10 次点击打 1 次，便于排查"点不动"是 has_control 还是坐标系
+    if(((++_touchSampleN)%10)===1){
+      console.log(`[stream] touch sample #${_touchSampleN}: device=(${dx},${dy}) screen=${modalScreenSize.w}x${modalScreenSize.h} hasControl=${_streamHasControl} renderRect=${Math.round(rect.width)}x${Math.round(rect.height)}`);
+    }
+    if(_streamHasControl){
+      _sendCtrl({type:'touch',action:0,x:dx,y:dy});
+    }else{
+      // 只读模式下用户点屏幕：toast 提醒一次（避免重复刷屏）
+      if(!_readOnlyToastShown){
+        _readOnlyToastShown=true;
+        showToast('🚫 投屏只读模式 — 屏幕点击无效（control socket 未建立）。请关掉再开实时流','warn',4000,'stream-status');
+        setTimeout(()=>{_readOnlyToastShown=false;},10000);
+      }
+    }
   });
   video.addEventListener('mousemove',function(e){
     const pt=_videoCoord(video,e);

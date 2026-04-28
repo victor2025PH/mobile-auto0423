@@ -46,40 +46,78 @@ from typing import Optional
 
 
 # 规则顺序: 最具体 → 最一般. 第一个匹配胜出.
-# 每条 (regex, layer, code, msg, tone, emoji)
-_RULES: list[tuple[re.Pattern, str, str, str, str, str]] = [
+# 每条 (regex, layer, code, msg, tone, emoji, fix_action)
+# fix_action: 前端 UI 据此渲染「一键修复」按钮，可选值见 _FIX_ACTIONS。
+_RULES: list[tuple[re.Pattern, str, str, str, str, str, str]] = [
     # ── quota / rate limit (最具体先) ──
     (re.compile(r"quota exceeded|in hourly window", re.I),
-     "quota", "rate_limited", "配额到 (等下个 window)", "amber", "⏰"),
+     "quota", "rate_limited", "配额到 (等下个 window)", "amber", "⏰", "wait_window"),
 
-    # ── infra ──
+    # ── infra: 代理 / 网络细分 ──
+    # P0-2: 拆 vpn_no_ip 为三态 — proxy_hijack / network_zero / network_timeout
+    # 顺序：具体的 hijack/zero/timeout 必须在通用 "无法访问外网" 之前
+    (re.compile(r"代理路径异常|代理.*被劫持|HTTP=.*'?(301|302|403|418|451)'?", re.I),
+     "infra", "proxy_hijack",
+     "代理 IP 被劫持/封禁 (建议换 IP)", "red", "🚫", "rotate_ip"),
+    (re.compile(r"完全无外网|三路全失败|HTTP/ICMP/IP", re.I),
+     "infra", "network_zero",
+     "彻底断网 (检查 SIM/Wi‑Fi/USB)", "red", "📡", "reconnect_usb"),
+    (re.compile(r"网络检查超时|USB 稳定性|adb.*timeout", re.I),
+     "infra", "adb_timeout",
+     "USB/adb 抖动 (重新插拔)", "red", "🔌", "reconnect_usb"),
+    # 兜底：旧版日志 + 业务方还在用 "无法访问外网" 的报错
     (re.compile(r"无法访问外网|\[gate\]\s*预检未通过.*network", re.I),
-     "infra", "vpn_no_ip", "VPN 不通 (修网络再派)", "red", "🔌"),
+     "infra", "vpn_no_ip", "VPN 不通 (修网络再派)", "red", "🔌", "rotate_ip"),
     (re.compile(r"adb\s+offline|device not found|adb.*not.*online", re.I),
-     "infra", "adb_offline", "设备 adb 离线", "red", "📵"),
+     "infra", "adb_offline", "设备 adb 离线", "red", "📵", "reconnect_usb"),
 
     # ── business (具体 vision/group 错误优先) ──
     (re.compile(r"已加入|already in group|already a member", re.I),
-     "business", "group_already_joined", "群已加入 (跳过)", "amber", "✅"),
+     "business", "group_already_joined", "群已加入 (跳过)", "amber", "✅", ""),
     (re.compile(r"群不存在|group not found|no such group", re.I),
-     "business", "group_not_found", "群不存在 / 已被封", "red", "🚫"),
+     "business", "group_not_found", "群不存在 / 已被封", "red", "🚫", ""),
     (re.compile(r"加入群组失败|join_group.*fail|无法找到.*Join", re.I),
      "business", "vision_join_button_miss",
-     "Vision 找不到 Join 按钮 (重试可能修复)", "red", "❌"),
+     "Vision 找不到 Join 按钮 (重试可能修复)", "red", "❌", "smart_retry"),
     (re.compile(r"找不到搜索框|search bar miss|search bar not found", re.I),
      "business", "vision_search_bar_miss",
-     "Vision 找不到搜索框 (FB 可能误入 Messenger)", "red", "🔎"),
+     "Vision 找不到搜索框 (FB 可能误入 Messenger)", "red", "🔎", "smart_retry"),
 
     # ── safety (熔断) ──
     (re.compile(r"circuit.*open|熔断", re.I),
-     "safety", "circuit_breaker", "熔断保护 (设备/路由器异常)", "amber", "🚧"),
+     "safety", "circuit_breaker", "熔断保护 (设备/路由器异常)", "amber", "🚧", "diagnose"),
 
     # ── timing (SLA 比 plain timeout 具体) ──
     (re.compile(r"SLA.*(timeout|abort)|30min.*无业务", re.I),
-     "timing", "sla_timeout", "SLA 超时 (30min 无业务事件)", "amber", "⏱️"),
+     "timing", "sla_timeout", "SLA 超时 (30min 无业务事件)", "amber", "⏱️", "smart_retry"),
     (re.compile(r"timeout|超时", re.I),
-     "timing", "task_timeout", "超时", "amber", "⏳"),
+     "timing", "task_timeout", "超时", "amber", "⏳", "smart_retry"),
 ]
+
+
+# fix_action 枚举（前端按钮渲染据此 + i18n）
+# 空字符串 = 不展示一键修复（如 group_already_joined / group_not_found 这类无意义重试）
+#
+# 端点契约（实装位置见 src/host/routers/）：
+# - rotate_ip       → routers/devices_health.py::device_proxy_rotate (POST, 调 vpn_manager.reconnect_vpn_silent)
+# - reconnect_usb   → routers/devices_core.py::reconnect_device     (POST, 已有: adb -s X reconnect)
+# - smart_retry     → routers/tasks.py::retry_task_endpoint         (POST, 新增: 拿原 task 复制重派 + invalidate cache)
+# - diagnose        → routers/devices_health.py::device_diagnose    (GET, 已有)
+# - wait_window     → routers/tasks.py::DELETE /tasks/{task_id}     (软删=移入回收站)
+_FIX_ACTIONS: dict = {
+    "rotate_ip":     {"label": "🔄 换 IP 重试",   "endpoint": "/devices/{device_id}/proxy/rotate", "method": "POST", "needs": ("device_id",)},
+    "reconnect_usb": {"label": "🔌 重连 USB",     "endpoint": "/devices/{device_id}/reconnect",     "method": "POST", "needs": ("device_id",)},
+    "smart_retry":   {"label": "🔁 智能重试",     "endpoint": "/tasks/{task_id}/retry",             "method": "POST", "needs": ("task_id",)},
+    "diagnose":      {"label": "🩺 诊断",         "endpoint": "/devices/{device_id}/diagnose",      "method": "GET",  "needs": ("device_id",)},
+    "wait_window":   {"label": "⏰ 移入回收站",   "endpoint": "/tasks/{task_id}",                   "method": "DELETE", "needs": ("task_id",)},
+}
+
+
+def get_fix_action(action_key: str) -> Optional[dict]:
+    """前端调用 / unit test 可用，返回 fix_action 元数据或 None。"""
+    if not action_key:
+        return None
+    return _FIX_ACTIONS.get(action_key)
 
 
 def classify_task_error(text: Optional[str]) -> Optional[dict]:
@@ -98,7 +136,7 @@ def classify_task_error(text: Optional[str]) -> Optional[dict]:
     if not text or not str(text).strip():
         return None
     t = str(text)
-    for pat, layer, code, msg, tone, emoji in _RULES:
+    for pat, layer, code, msg, tone, emoji, fix_action in _RULES:
         if pat.search(t):
             return {
                 "layer": layer,
@@ -106,6 +144,7 @@ def classify_task_error(text: Optional[str]) -> Optional[dict]:
                 "msg": msg,
                 "tone": tone,
                 "emoji": emoji,
+                "fix_action": fix_action,
             }
     return {
         "layer": "unknown",
@@ -113,4 +152,5 @@ def classify_task_error(text: Optional[str]) -> Optional[dict]:
         "msg": t[:60] + ("…" if len(t) > 60 else ""),
         "tone": "red",
         "emoji": "⚠️",
+        "fix_action": "diagnose",
     }
