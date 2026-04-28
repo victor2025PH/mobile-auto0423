@@ -317,14 +317,18 @@ def _check_network_ex(device_id: str) -> Tuple[bool, str, str]:
             if fb_code in ("200", "301", "302"):
                 return True, f"connected(fb_robots,{label},{fb_code})", NET_OK
 
-        for host in ("8.8.8.8", "1.1.1.1"):
+        # ICMP 辅证：8.8.8.8/1.1.1.1（通用）+ 31.13.66.35（FB 自身段）
+        # P2-⑤: FB 段独立 ICMP 是为了在 gstatic/Google 被运营商劫持时仍能确认"业务真实可达"。
+        # 即使 HTTP 全部 302/timeout，只要 FB ICMP 通就视作可工作（业务流量走 TCP 仍可能成功）。
+        for host in ("8.8.8.8", "1.1.1.1", "31.13.66.35"):
             r2 = _sp_run_text(
                 ["adb", "-s", device_id, "shell", f"ping -c 1 -W 3 {host}"],
                 capture_output=True,
                 timeout=8,
             )
             if r2.returncode == 0:
-                return True, f"connected(ping {host})", NET_OK
+                tag = "fb_icmp" if host.startswith("31.13.") else f"ping {host}"
+                return True, f"connected({tag})", NET_OK
 
         # ── 关键兜底：geo 路径独立验证 ──
         # 911proxy 等 Per-App SOCKS 代理只对申请代理的 App 生效，adb shell（uid=2000）

@@ -284,6 +284,50 @@ async function _executeFixAction(actionKey, taskId, deviceId, btnEl){
   }
 }
 
+/** P2-① 代理质量看板 modal — 拉 /proxy/quality 后用一张表展示分设备数据.
+ *  入口: chip-infra 或 chip-proxy-quality 点击触发.
+ *  关闭: 点击叉/外层背景. */
+async function showProxyQualityModal(){
+  document.getElementById('proxy-quality-modal')?.remove();
+  const modal=document.createElement('div');
+  modal.id='proxy-quality-modal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:9999;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)';
+  modal.innerHTML=`<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:20px;width:min(900px,95vw);max-height:84vh;overflow-y:auto"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div style="font-size:15px;font-weight:700">📊 代理质量看板 (24h)</div><button onclick="document.getElementById('proxy-quality-modal').remove()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:18px">✕</button></div><div id="pq-body" style="font-size:12px;color:var(--text-dim)">加载中...</div></div>`;
+  modal.onclick=(e)=>{if(e.target===modal) modal.remove();};
+  document.body.appendChild(modal);
+  try{
+    const data=await api('GET','/proxy/quality?hours=24');
+    const s=data.summary||{};
+    const layerMap=data.by_error_layer||{};
+    const rows=(data.per_device||[]).map(d=>{
+      const tone=d.infra_health_score>=90?'#22c55e':(d.infra_health_score>=70?'#f59e0b':'#ef4444');
+      const stTone={ok:'#22c55e',leak:'#ef4444',no_ip:'#ef4444',unverified:'#94a3b8',unknown:'#94a3b8'}[d.current_state]||'#94a3b8';
+      const aliasShort=(window.ALIAS&&window.ALIAS[d.device_id])||d.device_id?.substring(0,8)||'?';
+      return `<tr style="border-bottom:1px solid var(--border)"><td style="padding:6px;font-family:monospace">${aliasShort}</td><td style="padding:6px"><span style="color:${stTone}">${d.current_state}</span>${d.circuit_open?' 🚧':''}</td><td style="padding:6px;font-family:monospace;font-size:10px">${d.current_ip||'—'}</td><td style="padding:6px;text-align:right">${d.tasks_total}</td><td style="padding:6px;text-align:right;color:#ef4444">${d.tasks_failed}</td><td style="padding:6px;text-align:right;color:#f59e0b">${d.infra_failed}</td><td style="padding:6px;text-align:right;color:#a78bfa">${d.business_failed}</td><td style="padding:6px;text-align:right;font-weight:600;color:${tone}">${d.infra_health_score}</td><td style="padding:6px;font-size:10px;color:var(--text-muted)">${d.top_error_code||'—'}</td></tr>`;
+    }).join('');
+    document.getElementById('pq-body').innerHTML=`
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:14px;font-size:11px">
+        <div><b>设备</b> ${s.devices_total||0}</div>
+        <div><b>任务</b> ${s.tasks_total||0}</div>
+        <div style="color:#ef4444"><b>失败</b> ${s.tasks_failed||0}</div>
+        <div style="color:#f59e0b"><b>基建</b> ${s.infra_failed||0}</div>
+        <div style="color:#a78bfa"><b>业务</b> ${s.business_failed||0}</div>
+        <div style="color:#22c55e"><b>ok</b> ${s.ok||0}</div>
+        <div style="color:#ef4444"><b>leak</b> ${s.leak||0}</div>
+        <div style="color:#ef4444"><b>no_ip</b> ${s.no_ip||0}</div>
+        <div style="color:#94a3b8"><b>unverified</b> ${s.unverified||0}</div>
+        ${s.circuit_open?`<div style="color:#ef4444"><b>🚧 熔断</b> ${s.circuit_open}</div>`:''}
+      </div>
+      <div style="font-size:11px;margin-bottom:10px;color:var(--text-muted)">错误层级分布: infra=${layerMap.infra||0} · business=${layerMap.business||0} · timing=${layerMap.timing||0} · quota=${layerMap.quota||0} · unknown=${layerMap.unknown||0}</div>
+      <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="background:var(--bg-input);text-align:left"><th style="padding:6px">设备</th><th style="padding:6px">代理状态</th><th style="padding:6px">出口 IP</th><th style="padding:6px;text-align:right">任务</th><th style="padding:6px;text-align:right">败</th><th style="padding:6px;text-align:right">基建</th><th style="padding:6px;text-align:right">业务</th><th style="padding:6px;text-align:right">健康分</th><th style="padding:6px">主因</th></tr></thead>
+        <tbody>${rows||'<tr><td colspan="9" style="padding:20px;text-align:center;color:var(--text-muted)">最近 24h 没有任务记录</td></tr>'}</tbody>
+      </table>`;
+  }catch(e){
+    document.getElementById('pq-body').innerHTML=`<div style="color:#ef4444">加载失败: ${e.message||e}</div>`;
+  }
+}
+
 /** P1-B: 把后端 _classify_error 的 8 类映射到 error_classifier.py 的 layer.
  *  保持前后端口径一致，让 dashboard "基建 vs 业务" 跟 fix_action 联动. */
 const _CAT_TO_LAYER={
@@ -353,7 +397,21 @@ async function _refreshTaskHealthChips(){
         const infraTone=f===0?'gray':(score>=90?'green':score>=70?'amber':'red');
         infraEl.className=`task-health-chip ${infraTone}`;
         infraEl.innerHTML=`<span class="dot"></span>基建 ${score}/100`;
-        infraEl.title=`基建健康分 (代理/USB/网络挂掉的占比)：infra_failed=${infraFail} / dispatched=${f}. 越高越好.`;
+        infraEl.title=`基建健康分 (代理/USB/网络挂掉的占比)：infra_failed=${infraFail} / dispatched=${f}. 越高越好. 点开"📊 代理质量"看分设备明细.`;
+        infraEl.style.cursor='pointer';
+        infraEl.onclick=showProxyQualityModal;
+      }
+      // P2-① 代理质量明细按钮（chip-infra 旁挂一个 trigger，运营点开看 per-device 表）
+      let pqEl=document.getElementById('chip-proxy-quality');
+      if(!pqEl&&infraEl){
+        pqEl=document.createElement('span');
+        pqEl.id='chip-proxy-quality';
+        pqEl.className='task-health-chip gray';
+        pqEl.style.cssText='margin-left:8px;cursor:pointer';
+        pqEl.innerHTML=`<span class="dot"></span>📊 代理质量`;
+        pqEl.title='点击查看 24h 单设备代理 × 业务/基建失败分布';
+        pqEl.onclick=showProxyQualityModal;
+        infraEl.parentNode.insertBefore(pqEl,infraEl.nextSibling);
       }
     }
   }catch(e){console.warn('[health-chips] refresh failed',e);}
