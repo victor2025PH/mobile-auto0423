@@ -725,6 +725,91 @@ def cancel_task(task_id: str):
     return {"ok": True, "task_id": task_id, "message": "取消信号已发送"}
 
 
+# P1-A fix_action: smart_retry — 复制原 task params 重派 + 失效预检缓存
+@router.post("/tasks/{task_id}/retry", dependencies=_auth)
+def retry_task_endpoint(task_id: str):
+    """前端「🔁 智能重试」按钮端点 (fix_action=smart_retry)。
+
+    与「重派」语义不同：retry 是 **基于失败任务的快照** 复制一份新 task，
+    并主动失效该设备的预检缓存（让兜底逻辑重跑而不是读 90s 的 fail 缓存）。
+
+    跨集群：若 task_id 不在本地，按 cancel_task 的模式 proxy 到所属 worker。
+
+    返回 {ok, new_task_id, original_task_id, preflight_invalidated}
+    """
+    from ..api import task_store, _audit
+    from ..task_dispatcher import dispatch_after_create
+    import urllib.request as _ur, json as _jj, urllib.error as _ue
+
+    t = task_store.get_task(task_id, include_deleted=True)
+
+    if not t:
+        # 跨集群代理（同 cancel_task 模式）
+        try:
+            from ..multi_host import get_cluster_coordinator
+            coord = get_cluster_coordinator()
+            for h in coord._hosts.values():
+                if not h.online or not h.host_ip:
+                    continue
+                try:
+                    _req = _ur.Request(
+                        f"http://{h.host_ip}:{h.port}/tasks/{task_id}/retry",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    _resp = _ur.urlopen(_req, timeout=8)
+                    return {**_jj.loads(_resp.read().decode()), "_proxied_to": h.host_ip}
+                except _ue.HTTPError as _he:
+                    if _he.code == 404:
+                        continue
+                    raise
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="任务不存在（本地及所有节点均未找到）")
+
+    device_id = t.get("device_id")
+    task_type = t.get("type") or ""
+    params = dict(t.get("params") or {})
+    # 标记 retry 来源便于审计 + dashboard 区分原始/重试
+    params["_retry_of"] = task_id
+    params["_created_via"] = "smart_retry"
+
+    invalidated = False
+    if device_id:
+        try:
+            from src.host.preflight import invalidate_cache
+            invalidate_cache(device_id)
+            invalidated = True
+        except Exception as e:
+            logger.warning("[tasks/retry] %s preflight invalidate_cache failed: %s", str(device_id)[:8], e)
+
+    new_task_id = task_store.create_task(
+        task_type=task_type,
+        device_id=device_id,
+        params=params,
+        policy_id=t.get("policy_id"),
+        batch_id=t.get("batch_id") or "",
+        priority=t.get("priority", 50),
+    )
+    dispatch_after_create(
+        task_id=new_task_id,
+        device_id=device_id,
+        task_type=task_type,
+        params=params,
+        priority=t.get("priority", 50),
+    )
+    _audit("retry_task", str(device_id or ""), f"orig={task_id} new={new_task_id}")
+    return {
+        "ok": True,
+        "new_task_id": new_task_id,
+        "original_task_id": task_id,
+        "preflight_invalidated": invalidated,
+    }
+
+
 @router.post("/tasks/cancel-all", dependencies=_auth)
 def cancel_all_tasks():
     """Cancel all running and pending tasks (local + cluster workers)."""
