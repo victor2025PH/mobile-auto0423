@@ -1879,6 +1879,18 @@ class FacebookAutomation(BaseAutomation):
                     f"FB 拒绝发送 ({blocked_text[:80]})",
                     hint=(f"text_hash={text_hash}; A 可用更短/更自然的 "
                           f"greeting 重试, 或用此 hash 去重防重复触发"))
+            # OPT-FP3 (2026-04-28): post-send verify — FB 没主动拒发但
+            # 消息可能没真发 (网络 / 服务端 throttle / Send 按钮 tap 错位).
+            # dump 对话页历史验证 message 出现; 不出现抛 send_button_missing
+            # (复用既有 INTEGRATION_CONTRACT §7.6 code, 不引入新 code).
+            if not self._verify_message_actually_sent(d, rewritten):
+                raise MessengerError(
+                    "send_button_missing",
+                    f"send 按钮按了但对话页未找到刚发消息 "
+                    f"(前 30 chars: {rewritten[:30]!r})",
+                    hint=("post_send_verify_failed: 可能 send 按钮被点但消息 "
+                          "没真发 (网络问题 / FB 静默拒发 / tap 错对话页). "
+                          "上层应重试或换路径"))
             return True
         # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
@@ -2531,6 +2543,109 @@ class FacebookAutomation(BaseAutomation):
             hint=("smart_tap + XML + coordinate + VLM (Gemini/Ollama) 全 "
                   "miss; peer 未加好友/昵称变更/索引延迟/UI 大改版, A 可 "
                   "5-15s 后重试"))
+
+    def _launch_messenger_stable(self, did: str) -> None:
+        """OPT-FP2 (2026-04-28): 强制把 Messenger 拉前台 (smoke v6 真机
+        4/4 稳定方案), 替代 smart_tap("Messenger or chat icon") 旧路径.
+
+        smart_tap 实测命中 katana FB 主 app icon (而非 orca chat bubble),
+        heal 兜底死循环, send_message 第一步在错的 app 跑完造成 false
+        positive (4 真机截图证据). force-stop+am-start LAUNCHER intent
+        是 smoke v6 4/4 真机已稳定的 launch 方式.
+        """
+        try:
+            self.dm._run_adb(
+                ["shell", "cmd", "statusbar", "collapse"], did, timeout=4)
+        except Exception:
+            pass
+        time.sleep(0.4)
+        for _ in range(3):
+            try:
+                self.dm._run_adb(
+                    ["shell", "input", "keyevent", "KEYCODE_BACK"],
+                    did, timeout=4)
+                time.sleep(0.3)
+            except Exception:
+                pass
+        try:
+            self.dm._run_adb(
+                ["shell", "input", "keyevent", "KEYCODE_HOME"],
+                did, timeout=4)
+            time.sleep(0.6)
+        except Exception:
+            pass
+        try:
+            self.dm._run_adb(
+                ["shell", "am", "force-stop", MESSENGER_PACKAGE],
+                did, timeout=8)
+            time.sleep(1.0)
+        except Exception:
+            pass
+        try:
+            self.dm._run_adb(
+                ["shell", "am", "start",
+                 "-a", "android.intent.action.MAIN",
+                 "-c", "android.intent.category.LAUNCHER",
+                 f"{MESSENGER_PACKAGE}/.MainActivity"],
+                did, timeout=8)
+        except Exception as e:
+            raise MessengerError(
+                "messenger_unavailable",
+                f"am-start LAUNCHER 异常: {e}",
+                hint="launch_failed: orca apk 可能没装或被 disable")
+        time.sleep(5)
+        try:
+            ok, out = self.dm._run_adb(
+                ["shell", "dumpsys", "window"], did, timeout=8)
+        except Exception:
+            ok, out = False, ""
+        if MESSENGER_PACKAGE in (out or ""):
+            log.info(
+                "[opt-fp2] _launch_messenger_stable PASS: orca 在前台")
+            return
+        log.warning(
+            "[opt-fp2] am-start 后 orca 不在前台, 回退 monkey LAUNCHER")
+        try:
+            self.dm._run_adb(
+                ["shell", "monkey", "-p", MESSENGER_PACKAGE,
+                 "-c", "android.intent.category.LAUNCHER", "1"],
+                did, timeout=8)
+            time.sleep(4)
+            ok, out = self.dm._run_adb(
+                ["shell", "dumpsys", "window"], did, timeout=8)
+        except Exception:
+            ok, out = False, ""
+        if MESSENGER_PACKAGE not in (out or ""):
+            raise MessengerError(
+                "messenger_unavailable",
+                "force-stop + am-start LAUNCHER + monkey 都没把 orca 拉前台",
+                hint="launch_failed: 设备状态异常 / orca 安装损坏 / 锁屏中")
+
+    def _verify_message_actually_sent(self, d, message: str) -> bool:
+        """OPT-FP3 (2026-04-28): tap Send 之后 dump 对话页验证刚发 message
+        出现在历史消息列表. 防"按了 Send 但消息没真发"的二次 false positive.
+        fail-safe: dump 异常 / 返非 str → 放行 True.
+        """
+        if not message:
+            return True
+        try:
+            time.sleep(1.5)
+            xml = d.dump_hierarchy()
+            if not isinstance(xml, str) or not xml:
+                return True
+            msg_norm = message.strip()
+            if msg_norm and msg_norm in xml:
+                return True
+            if len(msg_norm) > 30 and msg_norm[:30] in xml:
+                return True
+            log.warning(
+                "[verify-sent] 对话页 dump 未找到 message=%r 前 30 chars — "
+                "可能 send 按钮按了但消息没发出", message[:60])
+            return False
+        except Exception as e:
+            log.debug(
+                "[verify-sent] 异常 fail-safe 放行: %s", e)
+            return True
 
     def _verify_recipient_in_conv_title(self, d, recipient: str) -> bool:
         """OPT-FP1 (2026-04-28): tap 第一个搜索结果后验证当前对话页 title bar
