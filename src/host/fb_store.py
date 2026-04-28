@@ -607,6 +607,10 @@ _RISK_KIND_RULES = [
     (("identity", "confirm it's you", "confirm it is you", "verify"), "identity_verify"),
     (("captcha", "robot", "are you a human"), "captcha"),
     (("checkpoint", "temporarily blocked", "temporarily restricted"), "checkpoint"),
+    # OPT-4 (2026-04-28): N 天 restriction 独立 kind, 必须先于 account_review
+    # 规则 (后者会 catch "account has been"). restriction 期内可收不可发,
+    # OPT-6 调度器应避开 (kind=account_restricted 是触发器)
+    (("account has been restricted", "restricted for"), "account_restricted"),
     (("disabled", "account is locked", "account has been"), "account_review"),
     (("suspicious", "unusual login"), "identity_verify"),
     (("can't use this feature", "cannot use this feature"), "policy_warning"),

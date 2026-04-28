@@ -97,6 +97,13 @@ _FB_RISK_KEYWORDS = [
     "Please verify your account",
     "Your account has been disabled",
     "account is locked",
+    # OPT-4 (2026-04-28, SWZL 真机摸底产物): Community Standards 违规
+    # 后的 N 天 restriction 页面 — 跟 disabled 不同, restriction 期内仍可
+    # 收消息但不能 reply/start chat。文案: "Your account has been
+    # restricted for X days"。该页面只有 OK 按钮 (不在 _FB_RISK_BUTTONS),
+    # 因此 _detect_risk_dialog 走独立路径跳过 button 校验。
+    "Your account has been restricted",
+    "account has been restricted",  # 容错: 大小写或前缀缺失
 ]
 
 _FB_RISK_BUTTONS = [
@@ -107,6 +114,41 @@ _FB_RISK_BUTTONS = [
 
 _RISK_DETECT_VERIFY_DELAY = 1.6
 _RISK_DETECT_PROBE_TIMEOUT = 0.25
+
+
+# OPT-4 (2026-04-28): "Your account has been restricted for X days" 文案
+# 解析天数. 用 finditer 取第一个 X 数字 (Messenger 文案有 2 处: 标题"for 6
+# days" + 详情"for 6 days"; 取第一个即可)。返回 0 = 未匹配 (调用方应降级
+# 走默认 cooldown 时长)。
+import re as _opt4_re
+_OPT4_RESTRICTION_DAYS_RE = _opt4_re.compile(
+    r"restricted\s+for\s+(\d+)\s+day", _opt4_re.IGNORECASE)
+
+
+def _parse_restriction_days(text: str) -> int:
+    """从 FB restriction 文案抽取限制天数。
+
+    匹配 "restricted for 6 days" / "restricted for 1 day" 等模式。
+    返回 0 表示未匹配 (调用方应降级走默认 cooldown 时长 + log warning)。
+
+    >>> _parse_restriction_days("Your account has been restricted for 6 days")
+    6
+    >>> _parse_restriction_days("restricted FOR 1 day because of bullying")
+    1
+    >>> _parse_restriction_days("restricted")
+    0
+    >>> _parse_restriction_days("")
+    0
+    """
+    if not text:
+        return 0
+    m = _OPT4_RESTRICTION_DAYS_RE.search(text)
+    if m:
+        try:
+            return max(0, int(m.group(1)))
+        except (TypeError, ValueError):
+            return 0
+    return 0
 
 
 # ─── P0-1: browse_feed 真人节奏常量（2026-04-21 重写）─────────────────────
@@ -1114,6 +1156,25 @@ class FacebookAutomation(BaseAutomation):
         if not hit_kw:
             return False, ""
 
+        # OPT-4 (2026-04-28, SWZL 真机摸底产物): "account has been restricted
+        # for X days" 是强持续 risk signal — 该页面**只有 OK 按钮**, OK 太
+        # 通用不能进 _FB_RISK_BUTTONS, 也**不会** 1.6s 内消失 (会持续到用户
+        # 主动 OK)。两条通用校验都会误判, 给独立路径。
+        # 同时抽取完整文案 (含 "for X days") 供 _classify_risk_kind 命中
+        # account_restricted kind, 并 log 解析出的天数供 OPT-6 调度器使用。
+        kw_lower = hit_kw.lower()
+        if "restricted" in kw_lower and "account" in kw_lower:
+            full_msg = self._extract_restriction_full_text(d) or hit_kw
+            days = _parse_restriction_days(full_msg)
+            did_hint = (getattr(d, "serial", "")
+                        or getattr(d, "_serial", "") or "")
+            log.warning(
+                "[risk-restricted] account restriction detected device=%s "
+                "days=%d full_msg=%r",
+                did_hint[:12] if did_hint else "?", days, full_msg[:200])
+            self._report_risk(full_msg, device_id_hint=did_hint)
+            return True, full_msg
+
         try:
             has_button = False
             for btn in _FB_RISK_BUTTONS:
@@ -1136,6 +1197,34 @@ class FacebookAutomation(BaseAutomation):
 
         self._report_risk(hit_kw, device_id_hint=getattr(d, "serial", "") or getattr(d, "_serial", ""))
         return True, hit_kw
+
+    def _extract_restriction_full_text(self, d) -> str:
+        """OPT-4 (2026-04-28): 从当前 hierarchy 抓出 restriction 完整文案
+        (含 "for X days"), 用于 _parse_restriction_days + 入库 raw_message。
+
+        优先策略: 找 textContains="restricted for" 的 EditText/TextView 节点;
+        失败回退到 textContains="account has been restricted" (没天数也比
+        没文案好)。两路都失败返空 — 调用方应降级用 hit_kw。
+        """
+        for needle in ("restricted for", "account has been restricted"):
+            try:
+                obj = d(textContains=needle)
+                if obj.exists(timeout=_RISK_DETECT_PROBE_TIMEOUT):
+                    txt = ""
+                    try:
+                        txt = (obj.get_text() or "").strip()
+                    except Exception:
+                        # u2 老版本无 get_text, 走 info dict
+                        try:
+                            info = obj.info or {}
+                            txt = (info.get("text") or "").strip()
+                        except Exception:
+                            pass
+                    if txt:
+                        return txt
+            except Exception:
+                continue
+        return ""
 
     def _report_risk(self, message: str, device_id_hint: str = ""):
         """上报风控事件 + 标记设备状态。
