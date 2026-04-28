@@ -570,27 +570,85 @@ class ScrcpySession:
 
     def _connect_control(self):
         """Connect socket #2 — control channel (after video socket).
-        Retries up to 5 times with 0.3s delay between attempts.
+
+        P2-③ 二阶段重连防 race: scrcpy server 启动后 control receiver 内部 attach
+        慢一点会让 TCP 三次握手成功但 server 还没读 control packet → has_control=True
+        但实际丢事件. 用两阶段重试 (1.5s 短轮询 + 5s 等待 + 3s 长轮询) 提高稳定性.
+
+        阶段一: 5 × 0.3s = 1.5s (常规快速 attach)
+        阶段二: 等 5s 让 server 充分 init, 再 3 × 1s = 3s 兜底
+        总耗时上限: ~10s (失败时)
         """
-        for attempt in range(5):
+        if self._connect_control_once(attempts=5, delay=0.3, label="phase1"):
+            return
+        log.warning("[scrcpy] Control phase1 failed for %s, waiting 5s then phase2",
+                    self.device_id[:8])
+        time.sleep(5.0)
+        if self._connect_control_once(attempts=3, delay=1.0, label="phase2"):
+            return
+        log.warning("[scrcpy] Control failed both phases for %s — falling back to "
+                    "video-only. UI will display read-only banner; user can click "
+                    "'reconnect control' button to retry without rebuilding video.",
+                    self.device_id[:8])
+        self.has_control = False
+
+    def _connect_control_once(self, attempts: int, delay: float, label: str) -> bool:
+        """单阶段 attempt 重连. 成功返 True, 全部失败返 False (不抛异常).
+
+        P2-③ 在 connect 成功后立刻做 socket sanity probe (写 0 字节 noop), 检测
+        '看似 connected 实际坏掉' 的极端情况 (server crash 但 forward 还在).
+        """
+        for attempt in range(attempts):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
                 sock.connect(("127.0.0.1", self.port))
                 sock.settimeout(2)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Sanity probe: 立刻 send 0 字节 检测 socket health
+                # (broken socket 在写时立刻 EPIPE/ECONNRESET, 让我们及时降级)
+                try:
+                    sock.send(b"")
+                except OSError as probe_err:
+                    log.debug("[scrcpy] %s probe failed for %s attempt %d: %s",
+                              label, self.device_id[:8], attempt + 1, probe_err)
+                    sock.close()
+                    raise
                 self._control_socket = sock
                 self.has_control = True
-                log.info("[scrcpy] Control channel connected: %s (attempt %d)",
-                         self.device_id[:8], attempt + 1)
-                return
+                log.info("[scrcpy] Control %s connected: %s (attempt %d)",
+                         label, self.device_id[:8], attempt + 1)
+                return True
             except Exception as e:
-                if attempt < 4:
-                    time.sleep(0.3)
+                if attempt < attempts - 1:
+                    time.sleep(delay)
                 else:
-                    log.warning("[scrcpy] Control channel failed after %d attempts (video-only): %s",
-                                attempt + 1, e)
-                    self.has_control = False
+                    log.debug("[scrcpy] Control %s exhausted (%d attempts): %s",
+                              label, attempts, e)
+        return False
+
+    def reconnect_control(self) -> bool:
+        """P2-③ 重连 control 通道但保持 video stream.
+
+        用户场景: 投屏视频流正常但屏幕点击没响应(has_control=False). 不必关掉视频
+        流再开 (重启 scrcpy server 要 ~5-10s, 浪费), 直接重连 control socket.
+
+        返回 True = 成功并 has_control=True, False = 仍 video-only.
+        """
+        with self._ctrl_lock:
+            # 关闭旧 control socket (如果有)
+            if self._control_socket:
+                try:
+                    self._control_socket.close()
+                except Exception:
+                    pass
+                self._control_socket = None
+            self.has_control = False
+            # 不杀 server, 不动 video — 仅重新建 control socket
+            log.info("[scrcpy] Reconnecting control for %s (keep video alive)",
+                     self.device_id[:8])
+            self._connect_control()
+            return self.has_control
 
 
 class ScrcpyManager:
