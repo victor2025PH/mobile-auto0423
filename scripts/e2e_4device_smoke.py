@@ -60,11 +60,27 @@ def adb(device, *args, timeout=15):
         return False, f"exception: {e}"
 
 
-def dump_xml(device, label="dump"):
-    """dump 当前 UI XML 到本地 + 返路径。"""
+def dump_xml(device, label="dump", d=None):
+    """dump 当前 UI XML 到本地 + 返路径。
+
+    优先用 d.dump_hierarchy() (跟 fb_dialog_dismisser 共用 u2 server,
+    避免 adb shell uiautomator 跟 u2 server 冲突). d=None 时回退 adb。
+    """
     ts = int(time.time())
-    remote = f"/sdcard/_smoke_{label}_{ts}.xml"
     local = os.path.join(OUT_DIR, f"smoke_{device}_{label}_{ts}.xml")
+
+    if d is not None:
+        try:
+            xml = d.dump_hierarchy()
+            if xml:
+                with open(local, "w", encoding="utf-8") as f:
+                    f.write(xml)
+                return local
+        except Exception as e:
+            print(f"  WARN: d.dump_hierarchy() 失败 ({e}), 回退 adb")
+
+    # adb 兜底 (d=None 或 d.dump 失败)
+    remote = f"/sdcard/_smoke_{label}_{ts}.xml"
     adb(device, "shell", "uiautomator", "dump", remote)
     adb(device, "pull", remote, local)
     return local if os.path.isfile(local) else ""
@@ -222,6 +238,7 @@ def run_one_device(device, skip_attach=False):
         "state": "unknown",
         "marker": "",
         "dismissed": [],
+        "cleared_dialogs": [],
         "attach_dry_run": None,
         "attach_error": "",
     }
@@ -233,9 +250,28 @@ def run_one_device(device, skip_attach=False):
         "-c", "android.intent.category.LAUNCHER", "1")
     time.sleep(5)
 
+    # OPT-5 v3 集成 (2026-04-28): 用 fb_dialog_dismisser 通用模块清场,
+    # 处理 Q4N7 "Previews are on" / 中文区不支持 / 通知请求等 startup dialog.
+    # 同时拿 d 共用给 dump_xml (避免 u2 server 跟 adb shell uiautomator 冲突).
+    d_for_dump = None
+    try:
+        from src.app_automation.fb_dialog_dismisser import (
+            dismiss_known_dialogs,
+        )
+        from src.device_control.device_manager import get_device_manager
+        dm = get_device_manager()
+        d_for_dump = dm.get_u2(device)
+        if d_for_dump:
+            cleared = dismiss_known_dialogs(d_for_dump)
+            result["cleared_dialogs"] = cleared
+            if cleared:
+                time.sleep(1.5)  # 给 UI 稳定时间
+    except Exception as e:
+        result["dismisser_error"] = str(e)
+
     # 2. dump + classify (最多 2 次 — 第一次可能有 dialog 挡)
     for round_idx in range(2):
-        xml_path = dump_xml(device, label=f"home_r{round_idx}")
+        xml_path = dump_xml(device, label=f"home_r{round_idx}", d=d_for_dump)
         state, marker = classify_state(xml_path)
         result["state"] = state
         result["marker"] = marker
