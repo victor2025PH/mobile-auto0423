@@ -270,6 +270,12 @@ def launch_messenger_stable(device):
 
     Returns: bool 启动成功 (orca 在前台)
     """
+    # smoke v6 (2026-04-28): 先 collapse 通知栏 (KEYCODE_BACK 对通知栏
+    # 无效, IJ8H 实测 launcher 下拉通知栏时 BACK x3 + HOME + am-start
+    # 都进不了 Messenger → state=unknown). cmd statusbar collapse 是
+    # Android 系统命令, 直接通知栏收起.
+    adb(device, "shell", "cmd", "statusbar", "collapse")
+    time.sleep(0.5)
     # 1. 清覆盖窗口
     for _ in range(3):
         adb(device, "shell", "input", "keyevent", "KEYCODE_BACK")
