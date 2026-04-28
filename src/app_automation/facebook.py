@@ -246,6 +246,34 @@ class MessengerError(Exception):
         return f"MessengerError(code={self.code!r})"
 
 
+class AttachImageError(Exception):
+    """attach_image 结构化错误 (D1-A 2026-04-28, B worker 内部专用)。
+
+    与 MessengerError 命名空间隔离 — attach_image 仅在 wa_referral 双轨发送
+    路径里被调用 (B 独占), A worker 的 A2 降级链不 catch 本异常, 因此 codes
+    无须登记到 INTEGRATION_CONTRACT §7.6。
+
+    Codes:
+      - push_failed:            image 文件 push 到设备 /sdcard/Pictures 失败
+      - permission_failed:      READ_MEDIA_IMAGES grant 系统调用失败
+      - media_scan_timeout:     MEDIA_SCANNER_SCAN_FILE 后图片在 picker 仍不可见
+      - gallery_button_missing: "Open photo gallery." 多语言 selector 全 miss
+      - picker_empty:           picker 出现但 dump 不到任何 "Photo taken X" 节点
+      - send_failed:            照片选中后 send 阶段失败 (复用 _tap_messenger_send)
+
+    调用方按 code 决定: push_failed / permission_failed → 重试; gallery_button_
+    missing → 重读 selector 再发版; picker_empty → 检查 push 路径与媒体扫描。
+    """
+
+    def __init__(self, code: str, message: str = "", hint: str = ""):
+        super().__init__(message or code)
+        self.code = code
+        self.hint = hint or ""
+
+    def __repr__(self) -> str:
+        return f"AttachImageError(code={self.code!r})"
+
+
 def _emit_contact_event_safe(device_id: str, peer_name: str,
                              event_type: str, **kwargs) -> None:
     """P7 (INTEGRATION_CONTRACT §7.1 B 机回写契约) fb_contact_events 写入
@@ -1606,6 +1634,249 @@ class FacebookAutomation(BaseAutomation):
         # guarded 上下文正常退出走上面的 return; 走到这里说明 guarded 抛了
         # QuotaExceeded 一类 (guarded 不吞),让 caller 看到原错
         return False  # pragma: no cover
+
+    # ════════════════════════════════════════════════════════════════════
+    # attach_image (D1-A, 2026-04-28) — 在 Messenger 当前对话页发送本地图片
+    # 用途: B worker 在 wa_referral 双轨发送时, 紧接 send_message 调本方法
+    #       发 LINE QR 图; A worker 不消费本方法的错误码 (AttachImageError
+    #       与 MessengerError 命名空间隔离)。
+    #
+    # 真机摸底 (IJ8H Redmi 13C / Android 13 / orca 556.0.0.60.64, 2026-04-28):
+    #   - 对话页底部 "Open photo gallery." button content-desc 稳定
+    #   - photo picker 内每张图 content-desc = "Photo taken DD MMM YYYY"
+    #   - resource-id 全被 ProGuard 混淆为 "(name removed)" → 只能用 desc/text
+    #   - 首次使用需 grant READ_MEDIA_IMAGES (Android 13+) 或
+    #     READ_EXTERNAL_STORAGE (Android 12-)
+    # ════════════════════════════════════════════════════════════════════
+
+    _MESSENGER_ATTACH_GALLERY_SELECTORS = (
+        # uiautomator2 d(**kwargs).exists() — 按优先级 try, 第一个 hit 返回
+        {"description": "Open photo gallery."},     # en (实测 IJ8H)
+        {"description": "打开图库"},                  # zh-CN 推测
+        {"description": "打開相簿"},                  # zh-TW 推测
+        {"description": "ギャラリーを開く"},           # ja 推测
+        {"description": "갤러리 열기"},                # ko 推测
+        {"descriptionContains": "photo gallery"},   # en 容错
+        {"descriptionContains": "图库"},              # zh 简容错
+        {"descriptionContains": "相簿"},              # zh 繁容错
+        {"descriptionContains": "ギャラリー"},         # ja 容错
+        {"descriptionContains": "갤러리"},             # ko 容错
+    )
+
+    _MESSENGER_PHOTO_NODE_SELECTORS = (
+        # 从 picker 半屏 RecyclerView 里选第一张图; "Photo taken DD MMM YYYY"
+        # 是 Android Photo Picker 标准 desc 模式 (Messenger 直接复用)
+        {"descriptionMatches": r"Photo taken \d+ \w+ \d{4}"},  # en
+        {"descriptionContains": "Photo taken"},     # en 容错
+        {"descriptionContains": "拍摄于"},           # zh 推测
+        {"descriptionContains": "撮影"},             # ja 推测
+    )
+
+    def attach_image(self, image_path: str, caption: str = "",
+                     device_id: Optional[str] = None,
+                     raise_on_error: bool = False) -> bool:
+        """在当前 Messenger 对话页发送一张本地图片附件。
+
+        前置: 当前 Messenger 必须已在某对话页 (典型用法 = 先调 send_message
+        进入对话页, 再调本方法发图片)。本方法不负责打开对话页。
+
+        流程分段, 失败抛对应 :class:`AttachImageError` code:
+          1. push image_path 到 /sdcard/Pictures/openclaw_<ts>.png → push_failed
+          2. grant READ_MEDIA_IMAGES (幂等)              → permission_failed
+          3. 触发 MEDIA_SCANNER_SCAN_FILE broadcast
+          4. tap "Open photo gallery."                  → gallery_button_missing
+          5. dump XML 找第一张 "Photo taken DATE" → tap → picker_empty
+                                                       / media_scan_timeout
+          6. (可选) tap composer + type caption
+          7. tap Send (复用 _tap_messenger_send)        → send_failed
+
+        Args:
+            image_path: 本地绝对路径 (.png / .jpg)
+            caption: 可选附文; 空串则只发图
+            device_id: 目标设备 (省略走 self._did)
+            raise_on_error: True 抛 AttachImageError; False 静默 return False
+
+        Returns:
+            True 成功; False (raise_on_error=False) 失败。
+        """
+        did = self._did(device_id)
+        d = self._u2(did)
+        try:
+            return self._attach_image_impl(d, did, image_path, caption)
+        except AttachImageError as e:
+            if raise_on_error:
+                raise
+            log.warning("[attach_image] 失败 code=%s msg=%s", e.code, str(e))
+            return False
+
+    def _attach_image_impl(self, d, did: str, image_path: str,
+                           caption: str) -> bool:
+        """attach_image 内核 — 失败抛 :class:`AttachImageError` 不吞。"""
+        with self.guarded("attach_image", device_id=did):
+            # ── 1. push + grant + scan ────────────────────────────────────
+            self._grant_orca_media_permissions(did)
+            self._push_image_to_orca_gallery(image_path, did)
+
+            # ── 2. tap "Open photo gallery." ──────────────────────────────
+            self._open_messenger_photo_gallery(d, did)
+            time.sleep(1.2)
+
+            # ── 3. select first photo from picker ─────────────────────────
+            if not self._select_first_messenger_photo(d, did):
+                raise AttachImageError(
+                    "picker_empty",
+                    "photo picker 出现但 dump 不到 Photo taken X 节点",
+                    hint=("检查 /sdcard/Pictures 是否成功收到图 + 媒体扫描"
+                          " broadcast 是否触发; 可能 Android 13+ 用 cmd "
+                          "content insert MediaStore"))
+            time.sleep(0.6)
+
+            # ── 4. (可选) caption ─────────────────────────────────────────
+            if caption:
+                rewritten = self.rewrite_message(
+                    caption, {"platform": "facebook",
+                              "context": "attach_image_caption"})
+                self._focus_messenger_composer(d)
+                self.hb.type_text(d, rewritten)
+                self.hb.wait_think(0.4)
+
+            # ── 5. send ────────────────────────────────────────────────────
+            try:
+                self._tap_messenger_send(d, did)
+            except MessengerError as e:
+                # 复用现有 send_button_missing 4 级 fallback; 包成
+                # AttachImageError(send_failed) 让上层按 attach 域分流
+                raise AttachImageError(
+                    "send_failed",
+                    f"附件 send 阶段失败 ({e.code}): {e}",
+                    hint=e.hint or "")
+            return True
+        return False  # pragma: no cover
+
+    def _grant_orca_media_permissions(self, did: str) -> None:
+        """幂等给 com.facebook.orca 授读取媒体权限 (首次使用 picker 必需)。
+
+        Android 13+ (SDK 33) 用 READ_MEDIA_IMAGES; Android 12 及更早走
+        READ_EXTERNAL_STORAGE。两条都试, 失败的那条静默忽略 (SDK 不存在
+        会返 "Unknown permission")。pm grant 是幂等操作, 已 grant 也 OK。
+        """
+        cmds = [
+            ["shell", "pm", "grant", MESSENGER_PACKAGE,
+             "android.permission.READ_MEDIA_IMAGES"],
+            ["shell", "pm", "grant", MESSENGER_PACKAGE,
+             "android.permission.READ_EXTERNAL_STORAGE"],
+        ]
+        had_any_success = False
+        for cmd in cmds:
+            try:
+                ok, out = self.dm.execute_adb_command(cmd, did, timeout=8)
+                if ok and "Unknown permission" not in (out or ""):
+                    had_any_success = True
+            except Exception as e:
+                log.debug("[attach_image] pm grant 异常 (%s): %s", cmd[-1], e)
+        if not had_any_success:
+            # 不抛 — 已授权过的设备 pm grant 也会"成功但无 effect", 进入下
+            # 一步看 picker 实际能否出图; picker_empty 时再归因到 permission
+            log.debug("[attach_image] pm grant 两条都没成功, 也许已授权")
+
+    def _push_image_to_orca_gallery(self, image_path: str, did: str) -> str:
+        """push 本地图到 /sdcard/Pictures/openclaw_<ts>.png + 触发媒体扫描。
+
+        Returns:
+            设备上的图片路径 (供调试/日志)
+        """
+        import os
+        if not os.path.isfile(image_path):
+            raise AttachImageError(
+                "push_failed",
+                f"本地图片不存在: {image_path}",
+                hint="检查 qr_generator 是否真生成了文件")
+        ts = int(time.time() * 1000)
+        ext = os.path.splitext(image_path)[1].lower() or ".png"
+        remote = f"/sdcard/Pictures/openclaw_{ts}{ext}"
+        try:
+            ok, out = self.dm.execute_adb_command(
+                ["push", image_path, remote], did, timeout=15)
+        except Exception as e:
+            raise AttachImageError(
+                "push_failed", f"adb push 异常: {e}",
+                hint="检查设备连接 / 磁盘空间")
+        if not ok:
+            raise AttachImageError(
+                "push_failed", f"adb push 返回失败: {out}",
+                hint="可能 /sdcard/Pictures 不可写 (设备未解锁?)")
+        # 触发媒体扫描 (Android 13 已 deprecated 但兼容); 即使失败也继续 —
+        # 媒体扫描偶尔会异步处理, picker 内仍可能出图
+        try:
+            self.dm.execute_adb_command(
+                ["shell", "am", "broadcast",
+                 "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                 "-d", f"file://{remote}"], did, timeout=8)
+        except Exception as e:
+            log.debug("[attach_image] MEDIA_SCANNER_SCAN_FILE 失败 (continuing): %s", e)
+        return remote
+
+    def _open_messenger_photo_gallery(self, d, did: str) -> None:
+        """点 "Open photo gallery." — smart_tap → multi-locale → coordinate
+        三级 fallback (本节点不上 VLM, picker 后续仍可被 picker_empty 兜底)。
+
+        失败抛 :class:`AttachImageError(code='gallery_button_missing')`。
+        """
+        # L1: smart_tap (AutoSelector 学习库)
+        if self.smart_tap("Open photo gallery", device_id=did):
+            return
+        # L2: multi-locale selector
+        obj = self._find_messenger_ui_fallback(
+            d, self._MESSENGER_ATTACH_GALLERY_SELECTORS)
+        if obj is not None:
+            try:
+                obj.click()
+                return
+            except Exception as e:
+                log.debug(
+                    "[_open_messenger_photo_gallery] L2 click 失败: %s", e)
+        # L3: coordinate fallback (gallery 在 composer toolbar 第 3 个 icon,
+        # 720x1438 实测 ≈ (200, 1412); 按比例缩放)
+        try:
+            w, h = d.window_size()
+            d.click(int(w * 0.278), int(h * 0.982))
+            time.sleep(0.6)
+            return
+        except Exception as e:
+            log.debug(
+                "[_open_messenger_photo_gallery] L3 coordinate 失败: %s", e)
+        raise AttachImageError(
+            "gallery_button_missing",
+            "Open photo gallery 按钮 3 级 fallback 都失败",
+            hint=("smart_tap + multi-locale selector + coordinate 全 miss; "
+                  "Messenger UI 大改或 composer 没 focus"))
+
+    def _select_first_messenger_photo(self, d, did: str) -> bool:
+        """从 photo picker 里选第一张图 — XML dump → 找首个匹配 selector
+        的 photo node → tap 其中心。返回 True 命中, False 没找到。
+
+        photo node = `Photo taken DD MMM YYYY` content-desc (Android Photo
+        Picker 标准模式, Messenger 直接复用)。
+        """
+        time.sleep(0.8)  # 等 picker 渲染
+        # 多次尝试 (媒体扫描可能异步)
+        for retry in range(3):
+            for kwargs in self._MESSENGER_PHOTO_NODE_SELECTORS:
+                try:
+                    obj = d(**kwargs)
+                    if obj.exists(timeout=1.5):
+                        obj.click()
+                        log.info(
+                            "[attach_image] photo node hit (selector=%s)",
+                            kwargs)
+                        return True
+                except Exception as e:
+                    log.debug(
+                        "[_select_first_messenger_photo] selector %s 异常: %s",
+                        kwargs, e)
+            if retry < 2:
+                time.sleep(1.5)  # 给媒体扫描更多时间
+        return False
 
     # ── Messenger UI multi-locale selectors (2026-04-24 实测真机新增) ──
     # `smart_tap(target_desc)` 走 AutoSelector engine (自学习式 UI 定位), 对
