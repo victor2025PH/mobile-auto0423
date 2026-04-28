@@ -1818,18 +1818,26 @@ class FacebookAutomation(BaseAutomation):
             if blocked_text:
                 # OPT-4-v2 (2026-04-28): blocked_text 含 restriction hint
                 # ("restricted" / "violated Community Standards" 等) →
-                # 补登记 device_state 让 OPT-6 调度器避开. days=7 默认猜测
-                # (FB send 失败文案不含具体天数, 保守 = 比观察到的 6 天长
-                # 1 天). 覆盖 OPT-4 _detect_risk_dialog 自动路径在 restriction
-                # page 用户已 OK 后的盲区. 不退化 send_blocked_by_content
-                # 现有 raise 路径 (双信号: 既记 risk_event 又 mark state).
+                # 补登记 device_state 让 OPT-6 调度器避开. 覆盖 OPT-4
+                # _detect_risk_dialog 自动路径在 restriction page 用户已
+                # OK 后的盲区. 不退化 send_blocked_by_content 现有 raise
+                # 路径 (双信号: 既记 risk_event 又 mark state).
+                #
+                # OPT-4-v3 (2026-04-28): 先尝试从 blocked_text 解析具体天数
+                # (FB 真机如果推送 "...for 6 days" 等文案), 解析失败回退
+                # 7 天默认猜测 (保守上限).
                 if self._detect_restriction_hint(blocked_text):
+                    parsed_days = _parse_restriction_days(blocked_text)
+                    days = parsed_days if parsed_days > 0 else 7
+                    src_tag = ("parsed" if parsed_days > 0
+                               else "default-7d")
                     log.warning(
-                        "[opt4-v2] send 失败含 restriction hint, 补登记 7 "
-                        "天 device=%s text=%r",
+                        "[opt4-v2/v3] send 失败含 restriction hint, 补登记 "
+                        "%d 天 (%s) device=%s text=%r",
+                        days, src_tag,
                         did[:12] if did else "?", blocked_text[:100])
                     self._mark_account_restricted_state(
-                        did, blocked_text, days=7)
+                        did, blocked_text, days=days)
 
                 try:
                     from src.host.fb_store import record_risk_event

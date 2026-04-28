@@ -137,7 +137,7 @@ class TestSendImplRestrictionHintIntegration:
 
     def test_real_fb_text_triggers_mark_path(self):
         """模拟真实 FB 文案: '...currently restricted...' 触发 hint 命中,
-        调用方应走 _mark_account_restricted_state(days=7) 路径。"""
+        调用方应走 _mark_account_restricted_state 路径。"""
         fb = _make_fb()
         real_text = (
             "Your message can't be sent because your account is currently "
@@ -152,3 +152,59 @@ class TestSendImplRestrictionHintIntegration:
         fb = _make_fb()
         pure_text = "Message can't be sent. Please try again."
         assert fb._detect_restriction_hint(pure_text) is False
+
+
+# ════════════════════════════════════════════════════════════════════════
+# OPT-4-v3: 复用 _parse_restriction_days 解析 send 失败文案天数
+# ════════════════════════════════════════════════════════════════════════
+
+class TestOpt4v3DaysParsing:
+    """OPT-4-v3 (2026-04-28): send_message_impl 命中 hint 时, 先尝试
+    _parse_restriction_days(blocked_text) 解析具体天数, 解析失败回退 7 天."""
+
+    @pytest.mark.parametrize("text,expected_days", [
+        # FB 真机如果在 send 失败时推送含天数文案 (理论上可能)
+        ("Your account is currently restricted for 6 days. Try again "
+         "after Tuesday.", 6),
+        ("You've been restricted for 1 day", 1),
+        ("Your account has been restricted for 30 days due to violation",
+         30),
+        # OPT-4 实测的 SWZL 真机原文
+        ("Your account has been restricted for 6 days because a message "
+         "you sent didn't follow our Community Standards on bullying and "
+         "harassment.", 6),
+    ])
+    def test_parses_days_from_send_failure_text(self, text, expected_days):
+        """复用 _parse_restriction_days 顶级工具, 该函数 OPT-4 已实现."""
+        from src.app_automation.facebook import _parse_restriction_days
+        assert _parse_restriction_days(text) == expected_days
+
+    @pytest.mark.parametrize("text", [
+        # send 失败常见文案 — 不含天数, 应该回退默认 7 天
+        ("Your message can't be sent because your account is currently "
+         "restricted."),
+        ("You can't reply because you've violated our Community Standards."),
+        ("Account limitato per violazione degli Standard della community"),
+        # 边界: 空 / 无 restricted 关键词
+        "",
+        "Random unrelated text",
+    ])
+    def test_no_days_in_text_returns_zero_for_v3_fallback(self, text):
+        """这些文案 _parse_restriction_days 应返 0, 调用方 (OPT-4-v3) 用 0
+        判断回退到 7 天默认值."""
+        from src.app_automation.facebook import _parse_restriction_days
+        assert _parse_restriction_days(text) == 0
+
+    def test_v3_fallback_logic_chooses_parsed_when_positive(self):
+        """OPT-4-v3 调用方逻辑: parsed_days > 0 用 parsed, 否则 7."""
+        from src.app_automation.facebook import _parse_restriction_days
+        # 真机推送的明确天数文案
+        text_with_days = "restricted for 14 days"
+        parsed = _parse_restriction_days(text_with_days)
+        days = parsed if parsed > 0 else 7
+        assert days == 14
+        # 不含天数 → 7
+        text_without_days = "Your account is currently restricted."
+        parsed = _parse_restriction_days(text_without_days)
+        days = parsed if parsed > 0 else 7
+        assert days == 7

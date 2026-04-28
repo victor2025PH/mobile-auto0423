@@ -231,6 +231,48 @@ def run_attach_dry_run(device):
         return False, f"{type(e).__name__}: {e}"
 
 
+def launch_messenger_stable(device):
+    """smoke v4 (2026-04-28): 强制把 Messenger 拉到前台, 替代 monkey 不可靠。
+
+    monkey 在覆盖窗口存在时 (锁屏/通知栏下拉/前台是别的 app/MIUI 安全弹窗)
+    可能成功调度 intent 但 UI 不切换. v4 修复:
+      1. 多次 KEYCODE_BACK 清覆盖窗口 (3 次足够, 大部分弹窗 1-2 次能关)
+      2. KEYCODE_HOME 回 launcher
+      3. force-stop com.facebook.orca 干净启动 (避免 resume 上次 view)
+      4. am start -n com.facebook.orca/.MainActivity 显式 entry
+      5. 等 5s UI 渲染
+      6. verify dumpsys window 含 com.facebook.orca
+
+    Returns: bool 启动成功 (orca 在前台)
+    """
+    # 1. 清覆盖窗口
+    for _ in range(3):
+        adb(device, "shell", "input", "keyevent", "KEYCODE_BACK")
+        time.sleep(0.3)
+    # 2. 回 launcher
+    adb(device, "shell", "input", "keyevent", "KEYCODE_HOME")
+    time.sleep(0.6)
+    # 3. force-stop 干净启动
+    adb(device, "shell", "am", "force-stop", "com.facebook.orca")
+    time.sleep(1.0)
+    # 4. am start LAUNCHER intent (比 -n 显式 activity 更可靠 —
+    # Android 自动找包名对应的入口 activity)
+    adb(device, "shell", "am", "start", "-a", "android.intent.action.MAIN",
+        "-c", "android.intent.category.LAUNCHER", "com.facebook.orca/.MainActivity")
+    # 5. 等 UI 渲染
+    time.sleep(5)
+    # 6. verify
+    ok, out = adb(device, "shell", "dumpsys", "window")
+    if "com.facebook.orca" in (out or ""):
+        return True
+    # 7. 最后兜底: monkey LAUNCHER (force-stop 之后 monkey 也比裸 monkey 稳)
+    adb(device, "shell", "monkey", "-p", "com.facebook.orca",
+        "-c", "android.intent.category.LAUNCHER", "1")
+    time.sleep(4)
+    ok, out = adb(device, "shell", "dumpsys", "window")
+    return "com.facebook.orca" in (out or "")
+
+
 def run_one_device(device, skip_attach=False):
     """对一台真机跑完整 smoke test。返回结果 dict。"""
     result = {
@@ -239,16 +281,20 @@ def run_one_device(device, skip_attach=False):
         "marker": "",
         "dismissed": [],
         "cleared_dialogs": [],
+        "launched_via": "",
         "attach_dry_run": None,
         "attach_error": "",
     }
 
-    # 1. 启动 Messenger
-    adb(device, "shell", "input", "keyevent", "KEYCODE_HOME")
-    time.sleep(0.6)
-    adb(device, "shell", "monkey", "-p", "com.facebook.orca",
-        "-c", "android.intent.category.LAUNCHER", "1")
-    time.sleep(5)
+    # 1. 启动 Messenger (smoke v4 — 稳定 launch)
+    launch_ok = launch_messenger_stable(device)
+    result["launched_via"] = "force-stop+am-start" if launch_ok else "FAIL"
+    if not launch_ok:
+        # 兜底回退 monkey (老路径, 兼容某些 ROM force-stop 受限)
+        adb(device, "shell", "monkey", "-p", "com.facebook.orca",
+            "-c", "android.intent.category.LAUNCHER", "1")
+        time.sleep(5)
+        result["launched_via"] = "monkey-fallback"
 
     # OPT-5 v3 集成 (2026-04-28): 用 fb_dialog_dismisser 通用模块清场,
     # 处理 Q4N7 "Previews are on" / 中文区不支持 / 通知请求等 startup dialog.
