@@ -1106,6 +1106,20 @@ class FacebookAutomation(BaseAutomation):
                 "[opt5v2] _dismiss_dialogs no-op: 在 account restriction "
                 "page, 保留 OPT-4 检测路径")
             return
+        # OPT-5 v3-v2 (2026-04-28): 通用 startup dialog 模块前置 — 处理
+        # Previews are on / 中文区不支持 / 通知/通讯录权限请求 / e2e 介绍.
+        # restriction_page 在 KNOWN_DIALOGS 是 skip 类, 不会被 dismiss
+        # (双重保护 OPT-4 检测路径). FB 主 app caller (例如 6465 行的
+        # check_friend_requests) 跑时 marker 全 miss → no-op, 副作用 0.
+        try:
+            from .fb_dialog_dismisser import dismiss_known_dialogs
+            cleared = dismiss_known_dialogs(d, max_rounds=3)
+            if cleared:
+                log.info(
+                    "[opt5v3-v2] _dismiss_dialogs prefix cleared: %s",
+                    cleared)
+        except Exception as e:
+            log.debug("[opt5v3-v2] dismiss_known_dialogs 异常: %s", e)
         for _ in range(max_attempts):
             dismissed = False
             # 优先:MIUI XSpace/双开对话框 — 一旦出现业务流程都会卡死
@@ -1802,11 +1816,30 @@ class FacebookAutomation(BaseAutomation):
             # A 的 A2 降级可按 text_hash 去重并用更短 greeting 重试
             blocked_text = self._detect_send_blocked(d)
             if blocked_text:
+                # OPT-4-v2 (2026-04-28): blocked_text 含 restriction hint
+                # ("restricted" / "violated Community Standards" 等) →
+                # 补登记 device_state 让 OPT-6 调度器避开. days=7 默认猜测
+                # (FB send 失败文案不含具体天数, 保守 = 比观察到的 6 天长
+                # 1 天). 覆盖 OPT-4 _detect_risk_dialog 自动路径在 restriction
+                # page 用户已 OK 后的盲区. 不退化 send_blocked_by_content
+                # 现有 raise 路径 (双信号: 既记 risk_event 又 mark state).
+                if self._detect_restriction_hint(blocked_text):
+                    log.warning(
+                        "[opt4-v2] send 失败含 restriction hint, 补登记 7 "
+                        "天 device=%s text=%r",
+                        did[:12] if did else "?", blocked_text[:100])
+                    self._mark_account_restricted_state(
+                        did, blocked_text, days=7)
+
                 try:
                     from src.host.fb_store import record_risk_event
                     # record_risk_event 用 raw_message 文本经 _RISK_KIND_RULES
                     # 自动分类到 'content_blocked' (该规则由 F4-support
-                    # commit 在 follow-up PR 里扩展)
+                    # commit 在 follow-up PR 里扩展)。OPT-4-v2 命中 restriction
+                    # hint 时 blocked_text 通常仍含"can't be sent"等 send
+                    # 失败短语 → 仍分到 content_blocked, **kind 分类不影响
+                    # OPT-6 拦截** (后者读 device_state.restriction_lifted_at,
+                    # 已由上面 _mark_account_restricted_state 写入).
                     record_risk_event(did, blocked_text,
                                       task_id=f"send_message:{recipient[:20]}")
                 except Exception as e:
@@ -2485,6 +2518,40 @@ class FacebookAutomation(BaseAutomation):
                 "[_focus_messenger_composer] click 失败 (继续走 type_text): %s", e)
             return False
 
+    # OPT-4-v2 (2026-04-28): send 失败文案含 restriction 暗示关键词时,
+    # 补登记 _mark_account_restricted_state(days=7 默认猜测), 覆盖 OPT-4
+    # 自动路径在 user-acked restriction page 后的盲区. FB send 失败文案
+    # 通常不含具体天数 ("Your message can't be sent because your account
+    # is currently restricted." / "violated Community Standards" 等),
+    # days=7 是保守上限 (比观察到的 6 天长 1 天, 防提早恢复).
+    _FB_RESTRICTION_HINT_KEYWORDS = (
+        # en
+        "restricted",
+        "Community Standards",
+        "violated",
+        "can't reply",
+        "cannot reply",
+        "account is currently",
+        "limits on sending",
+        # zh-CN
+        "已限制",
+        "已被限制",
+        "违反社区准则",
+        # zh-TW
+        "已被限制",
+        "違反社群守則",
+        "違反 Facebook 社群守則",
+        # ja
+        "コミュニティ規定",
+        "制限されました",
+        # it
+        "limitato",
+        "Standard della community",
+        # es
+        "restringido",
+        "Normas de la Comunidad",
+    )
+
     # F4 关键字: 多语言 Messenger"内容不能发送"弹窗文案 (en/zh/ja/it/es 对齐
     # persona)。要改请同步改 src/host/fb_store.py::_RISK_KIND_RULES 的
     # content_blocked 分类规则,否则 record_risk_event 会错分类。
@@ -2524,6 +2591,33 @@ class FacebookAutomation(BaseAutomation):
             if time.time() >= deadline:
                 return ""
             time.sleep(poll_interval_s)
+
+    def _detect_restriction_hint(self, text: str) -> bool:
+        """OPT-4-v2 (2026-04-28): 检查 send 失败的 blocked_text 是否含
+        restriction 暗示关键词.
+
+        用途: 补登记 OPT-4 自动路径错过的 restriction 状态. restriction
+        page 用户已 OK 后服务端账号属性仍 restricted, send 真发时 FB 返
+        snackbar 含 "restricted" / "violated Community Standards" / 等
+        关键词. 命中时调用方应:
+          1. _mark_account_restricted_state(did, text, days=7)  # 默认猜测
+          2. 不退化 raise MessengerError(send_blocked_by_content) 路径
+
+        Args:
+            text: _detect_send_blocked 返回的 blocked snippet (≤ 200 chars)
+
+        Returns:
+            True 含至少 1 个 restriction hint 关键词 (en/zh-CN/zh-TW/ja/
+                  it/es 多语言).
+            False 普通内容违禁 (走现有 content_blocked 路径).
+        """
+        if not text:
+            return False
+        low = text.lower()
+        for kw in self._FB_RESTRICTION_HINT_KEYWORDS:
+            if kw.lower() in low:
+                return True
+        return False
 
     def _xspace_select_sheet_visible(self, d) -> bool:
         """快速探测 MIUI 'Select app' 浅色底 sheet 是否仍在屏(P2 辅助)。"""
