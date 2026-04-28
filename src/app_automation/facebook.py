@@ -1076,13 +1076,36 @@ class FacebookAutomation(BaseAutomation):
             log.warning("[xspace] 兜底失败: %s", e)
             return False
 
+    def _in_restriction_page(self, d) -> bool:
+        """OPT-5 v2 (2026-04-28): 检测当前是否在 account restriction page。
+
+        给 _dismiss_dialogs 等清场动作做 short-circuit — restriction page
+        只有 OK 按钮, 而 _FB_DISMISS_TEXTS 含 "OK", 误点会让 OPT-4
+        _detect_risk_dialog 后续命中不到 restriction (full_msg 已被关掉)。
+        """
+        try:
+            return d(textContains="Your account has been restricted").exists(
+                timeout=0.3)
+        except Exception:
+            return False
+
     def _dismiss_dialogs(self, d, max_attempts: int = 5, device_id: str = ""):
         """Dismiss common Facebook popups (permissions, notifications, etc.).
 
         Sprint 3 P3 真机加固: 任务执行过程中随时可能弹 MIUI "Select app"
         sheet(双开时点 Messenger 触发),必须先处理再跑通用 dismiss。
+
+        OPT-5 v2 (2026-04-28): 在 account restriction page 时一律 no-op,
+        否则 _FB_DISMISS_TEXTS 里的 "OK" 会被点掉, OPT-4 _detect_risk_dialog
+        后续命中不到 restriction 文案。restriction page 应让 _detect_risk_
+        dialog 抛 MessengerError(risk_detected) + OPT-6 写状态后由调度器处理。
         """
         did = device_id or getattr(self, "_current_device", "")
+        if self._in_restriction_page(d):
+            log.debug(
+                "[opt5v2] _dismiss_dialogs no-op: 在 account restriction "
+                "page, 保留 OPT-4 检测路径")
+            return
         for _ in range(max_attempts):
             dismissed = False
             # 优先:MIUI XSpace/双开对话框 — 一旦出现业务流程都会卡死
