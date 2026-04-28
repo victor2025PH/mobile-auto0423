@@ -1184,6 +1184,8 @@ class FacebookAutomation(BaseAutomation):
                 "[risk-restricted] account restriction detected device=%s "
                 "days=%d full_msg=%r",
                 did_hint[:12] if did_hint else "?", days, full_msg[:200])
+            # OPT-6 (2026-04-28): 写 device_state 让调度器自动避开
+            self._mark_account_restricted_state(did_hint, full_msg, days)
             self._report_risk(full_msg, device_id_hint=did_hint)
             return True, full_msg
 
@@ -1209,6 +1211,70 @@ class FacebookAutomation(BaseAutomation):
 
         self._report_risk(hit_kw, device_id_hint=getattr(d, "serial", "") or getattr(d, "_serial", ""))
         return True, hit_kw
+
+    def _is_account_restricted(self, did: str) -> tuple:
+        """OPT-6 (2026-04-28): 检查 device 是否在 account restriction 期内
+        (读 OPT-4 写入的 device_state)。
+
+        本方法**纯读 + 0 副作用**, 同时给 _ai_reply_and_send 入口 guard 和
+        executor._opt6_check_restriction 调度器拦截使用。fail-open: 数据库
+        异常返 (False, 0.0) 让任务继续 (不能因为状态读不到就阻断生产)。
+
+        Returns:
+            (is_restricted, lifted_at_ts)
+              is_restricted=True  → did 在 restriction 期内, 不应主动发
+              is_restricted=False → 已过期 / 没记录 / 异常, 可正常发
+              lifted_at_ts        → 解封 epoch ts (0.0 表示无记录)
+        """
+        if not did:
+            return False, 0.0
+        try:
+            from src.host.device_state import DeviceStateStore
+            ds = DeviceStateStore(platform="facebook")
+            lifted_at = ds.get_float(did, "restriction_lifted_at", 0.0)
+            if lifted_at > time.time():
+                return True, lifted_at
+            return False, lifted_at
+        except Exception as e:
+            log.debug(
+                "[opt6] _is_account_restricted 异常 device=%s: %s",
+                did[:12] if did else "", e)
+            return False, 0.0
+
+    def _mark_account_restricted_state(self, did: str, full_msg: str,
+                                       days: int) -> None:
+        """OPT-6 (2026-04-28): N 天 restriction 状态写入 device_state, 让
+        调度器 (executor._opt6_check_restriction) + _ai_reply_and_send 入口
+        guard 自动避开该设备直到 restriction_lifted_at。
+
+        Fields written (platform='facebook'):
+          restriction_lifted_at   — float epoch ts; 调度器比较 now < lifted_at
+          restriction_full_msg    — 原始风控文案 (≤ 500 chars 截断)
+          restriction_days        — 解析出的限制天数 (int str)
+          restriction_detected_at — 检测到时的 epoch ts
+
+        days <= 0 (解析失败) 或 did 为空时 no-op (避免脏数据进 device_state)。
+        TTL 自然过期 — 调度器/guard 比较 now 即可, 不需主动清理 (省一个清理
+        task 的复杂度)。
+        """
+        if not did or days <= 0:
+            return
+        try:
+            from src.host.device_state import DeviceStateStore
+            ds = DeviceStateStore(platform="facebook")
+            now_ts = time.time()
+            lifted_at = now_ts + days * 86400
+            ds.set(did, "restriction_lifted_at", str(lifted_at))
+            ds.set(did, "restriction_full_msg", (full_msg or "")[:500])
+            ds.set(did, "restriction_days", str(days))
+            ds.set(did, "restriction_detected_at", str(now_ts))
+            log.warning(
+                "[opt6] device=%s restriction marked: lifted_at=%.0f "
+                "(still %d days, msg=%r)",
+                did[:12], lifted_at, days, (full_msg or "")[:60])
+        except Exception as e:
+            log.debug("[opt6] mark restriction state 失败 device=%s: %s",
+                      did[:12] if did else "", e)
 
     def _extract_restriction_full_text(self, d) -> str:
         """OPT-4 (2026-04-28): 从当前 hierarchy 抓出 restriction 完整文案
@@ -6963,6 +7029,18 @@ class FacebookAutomation(BaseAutomation):
                 return None, "human_takeover"
         except Exception:
             pass
+        # OPT-6 (2026-04-28): account restriction 期内不主动回复 — restriction
+        # 限制 reply/start chat, 但 inbox 仍可读, check_inbox 仍可跑;
+        # 把守在 _ai_reply_and_send 入口, 让 check_inbox 触发的 reply 也避开。
+        is_restricted, lifted_at = self._is_account_restricted(did)
+        if is_restricted:
+            remaining_days = (lifted_at - time.time()) / 86400
+            log.info(
+                "[opt6] peer=%s device=%s 在 restriction 期内 (剩 %.1f 天),"
+                " AI 不自动回",
+                peer_name, did, remaining_days,
+            )
+            return None, "account_restricted"
         target_lang = ""
         ab_style_hint = ""
         # P0 2026-04-23: incoming 侧语言检测,用于:
