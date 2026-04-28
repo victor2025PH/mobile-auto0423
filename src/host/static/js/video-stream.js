@@ -787,23 +787,43 @@ function _showReadOnlyBanner(msg){
     wrap.appendChild(bn);
   }
   bn.style.display='flex';
-  // P1-C: 文案 + 一键重启按钮（重新协商 video+control socket，比关闭再开更直接）
-  const btnHtml=`<button id="readonly-reconnect-btn" style="background:#fff;color:#dc2626;border:none;padding:3px 10px;border-radius:3px;font-weight:600;font-size:11px;cursor:pointer">🔁 立即重启实时流</button>`;
+  // P2-③: 优先调 reconnect-control 端点 (仅重连 control 通道, 不重建视频流, 快 5-10s);
+  // 失败再 fallback 到 stop+start.
+  const btnHtml=`<button id="readonly-reconnect-btn" style="background:#fff;color:#dc2626;border:none;padding:3px 10px;border-radius:3px;font-weight:600;font-size:11px;cursor:pointer">🔁 重连 control 通道</button>`;
   bn.innerHTML=`<span>${msg||'投屏只读模式'}</span>${btnHtml}`;
   const btn=document.getElementById('readonly-reconnect-btn');
   if(btn){
-    btn.onclick=function(ev){
+    btn.onclick=async function(ev){
       ev.preventDefault();ev.stopPropagation();
       btn.disabled=true;
-      btn.textContent='重启中...';
+      btn.textContent='重连中...';
+      const did=modalDeviceId;
+      if(!did){btn.disabled=false; btn.textContent='🔁 重连 control 通道'; return;}
       try{
-        // 关闭旧 ws → 等 1s → 重启（让 scrcpy server 旧 socket 完全释放再尝试）
-        stopStreaming(true);
-        setTimeout(()=>{ if(typeof startStreaming==='function') startStreaming(); },1000);
+        // P2-③ 先尝试 reconnect-control (轻量, 不动视频)
+        const r=await api('POST',`/devices/${encodeURIComponent(did)}/stream/reconnect-control`,{});
+        if(r&&r.has_control){
+          _streamHasControl=true;
+          _hideReadOnlyBanner();
+          _readOnlyToastShown=false;
+          showToast('✅ control 通道已重连, 屏幕点击恢复','success',3000,'stream-status');
+          const s=document.getElementById('ctrl-status');
+          if(s) s.textContent=_WEBCODECS_OK?'GPU硬解 + 低延迟控制':'低延迟控制';
+          return;
+        }
+        // server 报 still video-only → 升级到完整重启
+        showToast('control 仍未建立, 改成重启完整实时流','warn',2500,'stream-status');
+        throw new Error('still video-only');
       }catch(e){
-        console.error('[readonly-reconnect]',e);
+        console.warn('[readonly-reconnect] reconnect-control failed, fallback to stop+start:',e);
+        try{
+          stopStreaming(true);
+          setTimeout(()=>{ if(typeof startStreaming==='function') startStreaming(); },1000);
+        }catch(e2){
+          console.error('[readonly-reconnect] fallback failed',e2);
+        }
         btn.disabled=false;
-        btn.textContent='🔁 立即重启实时流';
+        btn.textContent='🔁 重连 control 通道';
       }
     };
   }
