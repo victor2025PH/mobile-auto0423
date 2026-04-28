@@ -76,12 +76,22 @@ Claude 崩溃后重入本 repo：
 
 | 工具 | 时机 | 抓什么 |
 |------|------|------|
-| `repo_health.bat` | 任何时候 | branch + dirty + behind local main |
+| `repo_health.bat` | 任何时候 | branch + dirty + behind local main + **\[7/7\] sibling collision** |
 | `repo_health.bat -Fetch` | commit/push 前 | + behind origin/main（实时） |
 | `sync_with_main.bat` | sibling 协同期间 | fetch + ahead/behind 报告 |
 | `sync_with_main.bat -Rebase` | feat-* 落后 origin/main 时 | fetch + rebase + 冲突提示 |
 | `branch_create.bat` | 开新工作前 | 一键建 feat-ops-* 分支 |
+| `safe_commit.bat "<msg>"` | **commit 时（替代 git commit -a）** | branch + staged 清单 + 跨模块风险 + 二次确认 |
+| `install_hooks.bat` | 仓库初始化时一次 | 把 `pre_commit.ps1` 装到 `.git/hooks/pre-commit` |
 | `start.ps1` | 启动服务前（自动） | main+dirty 警告 |
+
+### P2-⑥ sibling commit 防护（2026-04-28 升级）
+
+事故根因：PR #142 期间 sibling Claude 用 `git commit -a` 把我 staged 的 5 个 P2 文件**打包进它的 OPT-FP1 messenger commit 6f80638**。CLAUDE.md 文字警告"共享 worktree"靠人 review 不可靠，工具兜底:
+
+- **`safe_commit.bat`** 强制不用 `-a`，commit 前显示 branch + staged + 跨模块风险 + 二次确认
+- **`pre_commit.ps1`** 加 4 个新检查（warning 不 block）：跨 src/ 模块 staged / `feat-ops-*` 分支 staged facebook.py / stash > 5 / untracked > 8
+- **`repo_health.bat \[7/7\]`** 章节：stash count / 跨模块 dirty / 1h 内 sibling commit / branch vs dirty 不匹配，输出 collision risk score
 
 ### 崩溃恢复扩展
 
