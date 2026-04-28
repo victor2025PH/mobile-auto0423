@@ -106,6 +106,7 @@ def git_branches_with_prefix(prefix: str) -> List[str]:
         r = subprocess.run(
             ["git", "branch", "-r", "--list", f"origin/{prefix}*"],
             capture_output=True, text=True, check=True, timeout=15,
+            encoding="utf-8", errors="replace",
         )
         lines = [l.strip().replace("origin/", "") for l in r.stdout.splitlines()]
         return [l for l in lines if l and "HEAD" not in l]
@@ -130,6 +131,7 @@ def git_recent_commits_on_branch(branch: str, hours: int,
              f"--since={since_iso}",
              "--pretty=format:%H|%an|%ar|%s"],
             capture_output=True, text=True, check=True, timeout=15,
+            encoding="utf-8", errors="replace",
         )
     except Exception:
         return []
@@ -167,6 +169,7 @@ def git_file_changed_recently(path: str, hours: int,
              "--pretty=format:%H|%P|%ar|%s",
              "--", path],
             capture_output=True, text=True, check=True, timeout=15,
+            encoding="utf-8", errors="replace",
         )
     except Exception:
         return []
@@ -195,6 +198,7 @@ def get_token() -> Optional[str]:
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\n\n",
             capture_output=True, text=True, timeout=10, check=True,
+            encoding="utf-8", errors="replace",
         )
     except Exception:
         return None
@@ -524,6 +528,7 @@ def check_main_has_file(path: str) -> bool:
         r = subprocess.run(
             ["git", "cat-file", "-e", f"origin/main:{path}"],
             capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
         )
         return r.returncode == 0
     except Exception:
