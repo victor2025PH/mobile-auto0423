@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 def _gather_metrics(device_id: Optional[str] = None,
                     hours: int = 24) -> Dict[str, Any]:
     """汇总过去 N 小时的所有数据。"""
-    since = (_dt.datetime.utcnow() - _dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = (_dt.datetime.now(_dt.UTC) - _dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     from src.host import fb_store
     funnel = fb_store.get_funnel_metrics(device_id=device_id, since_iso=since)
@@ -142,7 +142,7 @@ def generate_brief(device_id: Optional[str] = None,
         md_text = _fallback_brief(metrics)
 
     brief = {
-        "generated_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "scope_device": metrics["scope_device"],
         "window_hours": hours,
         "markdown": md_text.strip(),
