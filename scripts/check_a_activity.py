@@ -105,7 +105,7 @@ def git_branches_with_prefix(prefix: str) -> List[str]:
     try:
         r = subprocess.run(
             ["git", "branch", "-r", "--list", f"origin/{prefix}*"],
-            capture_output=True, text=True, check=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=15,
         )
         lines = [l.strip().replace("origin/", "") for l in r.stdout.splitlines()]
         return [l for l in lines if l and "HEAD" not in l]
@@ -129,7 +129,7 @@ def git_recent_commits_on_branch(branch: str, hours: int,
             ["git", "log", f"{main_ref}..origin/{branch}",
              f"--since={since_iso}",
              "--pretty=format:%H|%an|%ar|%s"],
-            capture_output=True, text=True, check=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=15,
         )
     except Exception:
         return []
@@ -166,7 +166,7 @@ def git_file_changed_recently(path: str, hours: int,
              # %P parent SHAs (空 = initial commit)
              "--pretty=format:%H|%P|%ar|%s",
              "--", path],
-            capture_output=True, text=True, check=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=True, timeout=15,
         )
     except Exception:
         return []
@@ -194,7 +194,7 @@ def get_token() -> Optional[str]:
         r = subprocess.run(
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\n\n",
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=True,
         )
     except Exception:
         return None
@@ -523,7 +523,7 @@ def check_main_has_file(path: str) -> bool:
     try:
         r = subprocess.run(
             ["git", "cat-file", "-e", f"origin/main:{path}"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         return r.returncode == 0
     except Exception:

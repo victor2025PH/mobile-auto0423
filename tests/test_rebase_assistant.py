@@ -6,12 +6,16 @@ do_rebase / apply_rebase 不测 — 会动真分支, 由手动 --apply 验证。
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# P2-⑫: spawn 子 Python 进程时强制 UTF-8 防 Windows cp936 emoji 解码挂.
+_UTF8_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -24,7 +28,7 @@ class TestCliArgs:
     def test_push_requires_apply(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--push", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 2
         assert "--push" in (r.stderr + r.stdout)
@@ -32,7 +36,7 @@ class TestCliArgs:
     def test_test_requires_apply(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--test", "--no-color"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 2
 

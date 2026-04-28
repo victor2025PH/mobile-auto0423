@@ -5,12 +5,16 @@
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# P2-⑫: spawn 子 Python 进程时强制 UTF-8 防 Windows cp936 emoji 解码挂.
+_UTF8_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -24,7 +28,7 @@ class TestCli:
         """--help 不打网络, 秒退, 能打印 description。"""
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "--help"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=30,
         )
         assert r.returncode == 0
         assert "自动合并" in r.stdout or "auto" in r.stdout.lower()
