@@ -173,10 +173,19 @@ def dismiss_restriction_ok(device, xml_path):
 
 
 def find_first_thread_y(xml_path):
-    """从 inbox XML 找第一条会话的中心 y 坐标。
+    """从 inbox XML 找第一条会话的中心 y 坐标 (smoke v5 修).
 
-    会话列表里第一个 <node> SimpleTextThreadSnippet 或 类似结构。
-    简化策略: 找第一个 Button bounds 在 y > 300 (跳过 active-now stories)。
+    v4 用 `content-desc="...SimpleTextThreadSnippet..."[^>]*bounds=...`
+    单 regex 因 `[^>]*` 贪婪匹配跨过 bounds → 0 命中. v5 改两步法:
+      1. 先找含 SimpleTextThreadSnippet 的 content-desc 起始位置
+      2. 从该位置 +400 chars 内找 bounds (一个 node 一般 < 400 chars)
+
+    同时拓展 thread node identifier (除 SimpleTextThreadSnippet 外):
+      - `X.2Xl@` (Messenger 反编译节点 obfuscation 标识)
+      - `class="android.widget.Button"` 高度 100-200 + y > 500 兜底
+
+    Returns:
+        中心 y 坐标 int / None 没找到
     """
     if not xml_path or not os.path.isfile(xml_path):
         return None
@@ -185,21 +194,37 @@ def find_first_thread_y(xml_path):
             xml = f.read()
     except Exception:
         return None
-    # SimpleTextThreadSnippet 是 IJ8H 实测的会话节点 desc pattern
-    for m in re.finditer(
-            r'content-desc="[^"]*SimpleTextThreadSnippet[^"]*"[^>]*'
-            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml):
-        y1, y2 = int(m.group(2)), int(m.group(4))
-        if y1 > 300:
-            return (y1 + y2) // 2
-    # 备用: 找第一个 Button 节点 bounds y > 500（跳 stories + search）
-    for m in re.finditer(
-            r'<node[^>]*class="android\.widget\.Button"[^>]*'
-            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml):
+
+    # === Pass 1: SimpleTextThreadSnippet 模式 (主路径) ===
+    bounds_re = re.compile(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+    for m in re.finditer(r'SimpleTextThreadSnippet', xml):
+        # 从该位置 +400 chars 内找 bounds
+        chunk = xml[m.start():m.start() + 400]
+        bm = bounds_re.search(chunk)
+        if bm:
+            y1, y2 = int(bm.group(2)), int(bm.group(4))
+            if y1 > 300:  # 跳 stories + search bar
+                return (y1 + y2) // 2
+
+    # === Pass 2: X.2Xl@ obfuscation 标识 (Messenger 反编译节点) ===
+    for m in re.finditer(r'X\.2Xl@', xml):
+        chunk = xml[m.start():m.start() + 400]
+        bm = bounds_re.search(chunk)
+        if bm:
+            y1, y2 = int(bm.group(2)), int(bm.group(4))
+            if y1 > 300:
+                return (y1 + y2) // 2
+
+    # === Pass 3: 兜底 — Button 节点高度 100-200 + y > 500 ===
+    button_re = re.compile(
+        r'<node[^>]*class="android\.widget\.Button"[^>]*?'
+        r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"')
+    for m in button_re.finditer(xml):
         y1, y2 = int(m.group(2)), int(m.group(4))
         height = y2 - y1
         if y1 > 500 and 100 <= height <= 200:
             return (y1 + y2) // 2
+
     return None
 
 
@@ -345,24 +370,47 @@ def run_one_device(device, skip_attach=False):
         result["attach_dry_run"] = "PASS" if ok else "FAIL"
         result["attach_error"] = err
     elif not skip_attach and result["state"] == "inbox":
-        # tap 进第一个对话
+        # smoke v5 (2026-04-28): thread tap + retry verify + 备用 y 兜底
         thread_y = find_first_thread_y(xml_path)
-        if thread_y is None:
-            thread_y = 753  # IJ8H 实测中位数兜底
-        adb(device, "shell", "input", "tap", "360", str(thread_y))
-        time.sleep(3)
+        result["thread_y_parsed"] = thread_y
 
-        # verify 进了对话页 (composer present)
-        verify_xml = dump_xml(device, label="conv")
-        try:
-            with open(verify_xml, encoding="utf-8", errors="replace") as f:
-                vx = f.read()
-        except Exception:
-            vx = ""
-        composer_ok = ("Type a message" in vx
-                       or "输入消息" in vx
-                       or "Message" in vx)
+        # 主尝试 + 3 个备用 y 坐标 (覆盖不同 inbox 布局)
+        candidate_ys = []
+        if thread_y is not None:
+            candidate_ys.append(thread_y)
+        for fallback_y in (609, 753, 897):  # IJ8H 实测前 3 thread 中心
+            if fallback_y not in candidate_ys:
+                candidate_ys.append(fallback_y)
+
+        composer_ok = False
+        tried_ys = []
+        for tap_y in candidate_ys:
+            adb(device, "shell", "input", "tap", "360", str(tap_y))
+            tried_ys.append(tap_y)
+            # retry verify 3 次, 每次 sleep 2s = 最多 6s 等 UI 稳定
+            for retry_idx in range(3):
+                time.sleep(2.0)
+                verify_xml = dump_xml(device, label=f"conv_y{tap_y}_r{retry_idx}",
+                                      d=d_for_dump)
+                try:
+                    with open(verify_xml, encoding="utf-8",
+                              errors="replace") as f:
+                        vx = f.read()
+                except Exception:
+                    vx = ""
+                if ("Type a message" in vx
+                        or "输入消息" in vx
+                        or "メッセージを入力" in vx):
+                    composer_ok = True
+                    break
+            if composer_ok:
+                break
+            # 没进 conversation, BACK 一次准备下一个 y
+            adb(device, "shell", "input", "keyevent", "KEYCODE_BACK")
+            time.sleep(1.0)
+
         result["composer_visible"] = composer_ok
+        result["tried_ys"] = tried_ys
 
         if composer_ok:
             ok, err = run_attach_dry_run(device)
@@ -370,7 +418,8 @@ def run_one_device(device, skip_attach=False):
             result["attach_error"] = err
         else:
             result["attach_dry_run"] = "SKIP"
-            result["attach_error"] = "no composer in conversation page"
+            result["attach_error"] = (
+                f"no composer in conversation page after trying y={tried_ys}")
 
     # 4. cleanup home
     adb(device, "shell", "input", "keyevent", "KEYCODE_HOME")
