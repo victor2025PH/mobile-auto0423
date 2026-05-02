@@ -28,6 +28,26 @@ logger = logging.getLogger(__name__)
 _project_root = PROJECT_ROOT
 
 
+def _quota_exceeded_response(qe: QuotaExceeded) -> tuple[str, Dict[str, Any]]:
+    """Build the dashboard-friendly quota message/meta used by FB tasks."""
+    eta_sec = 0.0
+    try:
+        from src.behavior.compliance_guard import get_compliance_guard as _get_guard
+        eta_sec = _get_guard().get_next_slot_eta(
+            qe.platform, qe.action, qe.account)
+    except Exception:
+        pass
+    eta_min = max(1, int((eta_sec + 30) // 60)) if eta_sec > 0 else 0
+    eta_hint = f", 约 {eta_min} 分钟后可派" if eta_min > 0 else ""
+    msg = (f"[quota] {qe.platform}/{qe.action} 已达 {qe.window} 上限 "
+           f"({qe.current}/{qe.limit}){eta_hint}.")
+    meta = {"quota": {"platform": qe.platform, "action": qe.action,
+                      "window": qe.window, "current": qe.current,
+                      "limit": qe.limit, "eta_seconds": int(eta_sec),
+                      "eta_minutes": eta_min}}
+    return msg, meta
+
+
 def _phase10_task_extras(params: Dict[str, Any]) -> Dict[str, Any]:
     """Phase 10/10.2/10.3 opt-in kwargs 组装 (walk_candidates / l2_gate_shots /
     do_l2_gate / max_l2_calls).
@@ -42,11 +62,56 @@ def _phase10_task_extras(params: Dict[str, Any]) -> Dict[str, Any]:
         out["l2_gate_shots"] = shots
     if params.get("do_l2_gate"):
         out["do_l2_gate"] = True
+    if params.get("strict_persona_gate") or params.get("require_high_match"):
+        out["strict_persona_gate"] = True
     budget = int(params.get("max_l2_calls", 0) or 0)
     # walk 启用时才传 budget, 且非默认 3 才值得发 kwarg.
     if out.get("walk_candidates") and budget and budget != 3:
         out["max_l2_calls"] = budget
     return out
+
+
+def _fb_filter_high_match_targets(targets: Any, params: Dict[str, Any]) -> tuple[List[Any], Dict[str, Any]]:
+    """Filter manual name-hunter targets before any add/greet UI action.
+
+    ``require_high_match`` means two gates:
+      1. seed gate here: only names with seed_score >= min_seed_score are searched.
+      2. profile gate later: ``strict_persona_gate`` forces L2 profile match before touch.
+    Targets without seed_score are kept for non-manual sources (e.g. extracted members).
+    """
+    rows = list(targets or [])
+    if not params.get("require_high_match"):
+        return rows, {"enabled": False, "input": len(rows), "kept": len(rows), "skipped": 0}
+    min_score = float(params.get("min_seed_score") or 80)
+    kept: List[Any] = []
+    skipped: List[Dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        if item.get("seed_score") is None:
+            kept.append(item)
+            continue
+        try:
+            seed_score = float(item.get("seed_score") or 0)
+        except Exception:
+            seed_score = 0.0
+        if seed_score >= min_score:
+            kept.append(item)
+        else:
+            skipped.append({
+                "name": item.get("name") or "",
+                "seed_score": seed_score,
+                "reason": "seed_score_below_high_match_threshold",
+            })
+    return kept, {
+        "enabled": True,
+        "input": len(rows),
+        "kept": len(kept),
+        "skipped": len(skipped),
+        "min_seed_score": min_score,
+        "skipped_targets": skipped[:20],
+    }
 
 
 def _vpn_required() -> bool:
@@ -153,10 +218,13 @@ _TASK_TYPE_TIMEOUTS = {
     # 多 topic deep-link + 分段 scroll，略高于普通 browse_feed
     "facebook_browse_feed_by_interest": 1200,   # 20 min
     "facebook_profile_hunt": 3600,              # 60 min (100 候选 × 30s 上限)
+    "facebook_name_hunter_prescreen": 3600,     # 60 min (search + profile classify only)
+    "facebook_name_hunter_touch_qualified": 3600,  # 60 min (qualified candidate outreach)
     "facebook_join_group": 600,                 # 10 min
     "facebook_browse_groups": 900,              # 15 min
     "facebook_group_engage": 1200,              # 20 min
     "facebook_extract_members": 1500,           # 25 min (一个群提 30 成员)
+    "facebook_group_member_greet": 7200,        # 120 min (群成员筛选→加好友→打招呼)
     "facebook_search_leads": 1200,              # 20 min
     "facebook_add_friend": 300,                 # 5 min
     "facebook_add_friend_and_greet": 480,       # 8 min (加好友 + profile 页打招呼一体)
@@ -194,6 +262,9 @@ def _get_device_id(manager: DeviceManager, preferred: Optional[str],
                 if metrics.is_isolated(d.device_id):
                     logger.warning("指定设备 %s 已被隔离，仍然使用", preferred[:8])
                 return d.device_id
+        logger.warning("指定设备 %s 当前不可用，拒绝自动切换到其他设备",
+                       preferred[:12])
+        return None
 
     try:
         from .smart_scheduler import get_smart_scheduler
@@ -735,6 +806,11 @@ def _execute_facebook(manager, resolved, task_type, params):
             _phase_override = params.get("phase") or params.get("phase_override") or ""
             if hasattr(fb, "add_friend_with_note"):
                 _extra = _phase10_task_extras(params)
+                try:
+                    from src.host.fb_playbook import local_rules_disabled
+                    _force_add = local_rules_disabled() or bool(params.get("force_add_friend"))
+                except Exception:
+                    _force_add = bool(params.get("force_add_friend"))
                 ok = fb.add_friend_with_note(target, note=note,
                                              safe_mode=safe_mode,
                                              device_id=resolved,
@@ -742,7 +818,7 @@ def _execute_facebook(manager, resolved, task_type, params):
                                              phase=_phase_override or None,
                                              source=params.get("source", "") or params.get("group_name", ""),
                                              preset_key=(params.get("_preset_key", "") or params.get("preset_key", "")),
-                                             force=bool(params.get("force_add_friend")),
+                                             force=_force_add,
                                              **_extra)
             else:
                 ok = fb.add_friend(target, device_id=resolved)
@@ -788,12 +864,19 @@ def _execute_facebook(manager, resolved, task_type, params):
             # 把 source / preset_key 下推,automation 层锁内 record 时用
             _src_val = params.get("source", "") or params.get("group_name", "")
             _extra = _phase10_task_extras(params)
-            if params.get("force_add_friend"):
+            try:
+                from src.host.fb_playbook import local_rules_disabled
+                _relaxed_local_rules = local_rules_disabled()
+            except Exception:
+                _relaxed_local_rules = False
+            if params.get("force_add_friend") or _relaxed_local_rules:
                 _extra["force"] = True
             if params.get("ai_dynamic_greeting") is not None:
                 _extra["ai_dynamic_greeting"] = bool(params.get("ai_dynamic_greeting"))
-            if params.get("force_send_greeting") is not None:
-                _extra["force_send_greeting"] = bool(params.get("force_send_greeting"))
+            if params.get("force_send_greeting") is not None or _relaxed_local_rules:
+                _extra["force_send_greeting"] = (
+                    True if _relaxed_local_rules else bool(params.get("force_send_greeting"))
+                )
             res = fb.add_friend_and_greet(
                 target,
                 note=note,
@@ -836,6 +919,11 @@ def _execute_facebook(manager, resolved, task_type, params):
             _phase_override = params.get("phase") or params.get("phase_override") or ""
             _preset_key = (params.get("_preset_key", "")
                            or params.get("preset_key", ""))
+            try:
+                from src.host.fb_playbook import local_rules_disabled
+                _force_greeting = local_rules_disabled() or bool(params.get("force_send_greeting"))
+            except Exception:
+                _force_greeting = bool(params.get("force_send_greeting"))
             ok = fb.send_greeting_after_add_friend(
                 target,
                 greeting=greeting,
@@ -848,7 +936,7 @@ def _execute_facebook(manager, resolved, task_type, params):
                 ai_decision=params.get("ai_decision") or "greeting",
                 # 2026-04-26 fix: 透传 force_send_greeting 让 prob gate / phase
                 # 都能被 caller (B2B 客户测试 / E2E) 一键绕过
-                force=bool(params.get("force_send_greeting")),
+                force=_force_greeting,
             )
             return ok, ("" if ok else "打招呼发送失败"), None
 
@@ -857,6 +945,21 @@ def _execute_facebook(manager, resolved, task_type, params):
             if not keyword:
                 return False, "params.keyword 必填", None
             max_leads = int(params.get("max_leads", 10))
+            search_type = (params.get("search_type") or
+                           params.get("target_type") or "").strip().lower()
+            if search_type in ("groups", "group", "群组", "小组"):
+                if not hasattr(fb, "discover_groups_by_keyword"):
+                    return False, "facebook.discover_groups_by_keyword 尚未实现", None
+                groups = fb.discover_groups_by_keyword(
+                    keyword,
+                    device_id=resolved,
+                    max_groups=int(params.get("max_groups") or max_leads),
+                    skip_visited=bool(params.get("skip_visited", True)),
+                    persona_key=params.get("persona_key") or None,
+                    target_country=params.get("target_country", ""),
+                )
+                return True, "", {"groups": groups, "count": len(groups),
+                                  "keyword": keyword}
             leads = fb.search_and_collect_leads(keyword, device_id=resolved,
                                                 max_leads=max_leads)
             return True, "", {"leads": leads, "count": len(leads)}
@@ -866,6 +969,7 @@ def _execute_facebook(manager, resolved, task_type, params):
             if not group:
                 return False, "params.group_name 必填", None
             ok = fb.join_group(group, device_id=resolved)
+            join_outcome = getattr(fb, "last_join_group_outcome", "") or ""
             if ok:
                 try:
                     from src.host.fb_store import upsert_group
@@ -878,7 +982,40 @@ def _execute_facebook(manager, resolved, task_type, params):
                                  preset_key=preset_key)
                 except Exception:
                     pass
-            return ok, ("" if ok else "加入群组失败"), None
+                return True, "", {"group_name": group,
+                                  "outcome": join_outcome or "joined"}
+            if join_outcome in (
+                "join_requested_pending_approval",
+                "membership_questions_required",
+            ):
+                try:
+                    from src.host.fb_store import upsert_group
+                    preset_key = (params.get("_preset_key", "") or
+                                  params.get("preset_key", ""))
+                    upsert_group(
+                        resolved, group,
+                        country=params.get("target_country", ""),
+                        language=params.get("language", ""),
+                        status=("question_required"
+                                if join_outcome == "membership_questions_required"
+                                else "join_requested"),
+                        preset_key=preset_key,
+                    )
+                except Exception:
+                    pass
+                return True, "", {
+                    "group_name": group,
+                    "outcome": join_outcome,
+                    "next_action": (
+                        "answer_membership_questions"
+                        if join_outcome == "membership_questions_required"
+                        else "wait_for_group_approval"
+                    ),
+                }
+            return False, (f"加入群组失败 ({join_outcome or 'unknown'})"), {
+                "group_name": group,
+                "outcome": join_outcome or "unknown",
+            }
 
         # 群组相关 — Sprint 1 新增
         if task_type == "facebook_browse_groups":
@@ -907,7 +1044,334 @@ def _execute_facebook(manager, resolved, task_type, params):
         if task_type == "facebook_extract_members":
             if not hasattr(fb, "extract_group_members"):
                 return False, "facebook.extract_group_members 尚未实现", None
-            group_name = params.get("group_name", "")
+            group_name = (params.get("group_name") or "").strip()
+            # P0-1: group_name 是核心必填 — 缺失则手机端不会进任何群组,
+            # 在 FB 当前页(常为首页)空跑提取循环, 必然 0 结果。
+            # 历史上 executor 直接返回 True 导致"虚假成功",此处强校验。
+            if not group_name:
+                return False, (
+                    "缺少必填参数 group_name（目标群组名）。请在启动方案时填写群组列表，"
+                    "或在 persona 的 seed_group_keywords 中配置默认值。"
+                ), {"members": [], "count": 0, "outcome": "missing_param:group_name"}
+            preset_key = str(
+                params.get("_preset_key") or params.get("preset_key") or ""
+            ).strip()
+            preset_keyword_flow = (
+                preset_key in ("friend_growth", "group_hunter")
+                and not bool(params.get("exact_group"))
+            )
+            broad_keyword = bool(
+                params.get("broad_keyword")
+                or params.get("discover_groups")
+                or int(params.get("max_groups") or params.get("max_groups_to_extract") or 1) > 1
+                or preset_keyword_flow
+            )
+            if broad_keyword and hasattr(fb, "discover_groups_by_keyword"):
+                max_groups = int(params.get("max_groups_to_extract")
+                                 or params.get("max_groups") or 3)
+                max_members_per_group = int(params.get("max_members_per_group")
+                                            or params.get("max_members") or 30)
+                discovered = fb.discover_groups_by_keyword(
+                    group_name,
+                    device_id=resolved,
+                    max_groups=max_groups * 3,
+                    skip_visited=bool(params.get("skip_visited", True)),
+                    persona_key=params.get("persona_key") or None,
+                    target_country=params.get("target_country", ""),
+                )
+                if not discovered:
+                    try:
+                        from src.host.fb_store import list_unvisited_groups
+                        cached_groups = list_unvisited_groups(
+                            resolved, keyword=group_name, limit=max_groups * 3)
+                        discovered = [
+                            {
+                                "group_name": row.get("group_name") or "",
+                                "keyword": group_name,
+                                "member_count": int(row.get("member_count") or 0),
+                                "meta": "cached:facebook_groups",
+                                "requires_join": (
+                                    (row.get("status") or "") == "pending"
+                                ),
+                                "already_visited": False,
+                                "cached": True,
+                            }
+                            for row in cached_groups
+                            if row.get("group_name")
+                        ]
+                        if discovered:
+                            logger.info(
+                                "[facebook_extract_members] keyword=%r "
+                                "实时发现为空，使用本地候选 %d 个",
+                                group_name, len(discovered),
+                            )
+                    except Exception as _cache_e:
+                        logger.debug(
+                            "[facebook_extract_members] 读取本地群组候选失败: %s",
+                            _cache_e,
+                        )
+                all_members = []
+                group_results = []
+                join_if_needed = bool(
+                    params.get("join_if_needed")
+                    or params.get("auto_join_groups")
+                    or params.get("auto_join")
+                    or preset_keyword_flow
+                )
+                candidate_groups = (discovered or [])[:max_groups]
+                join_quota_meta: Optional[Dict[str, Any]] = None
+                join_quota_msg = ""
+                for g in candidate_groups:
+                    exact_group = (g.get("group_name") or "").strip()
+                    if not exact_group:
+                        continue
+                    requires_join = bool(g.get("requires_join"))
+                    if requires_join and not join_if_needed:
+                        group_results.append({
+                            "group_name": exact_group,
+                            "members": 0,
+                            "status": "pending_join",
+                            "requires_join": True,
+                        })
+                        continue
+                    if requires_join and join_if_needed:
+                        if join_quota_meta is not None:
+                            group_results.append({
+                                "group_name": exact_group,
+                                "members": 0,
+                                "status": "join_quota_blocked",
+                                "requires_join": True,
+                                "join_outcome": "quota_exceeded",
+                                "next_action": "retry_after_join_group_quota",
+                                "quota": join_quota_meta.get("quota", {}),
+                            })
+                            continue
+                        join_ok = False
+                        join_outcome = ""
+                        if hasattr(fb, "join_group"):
+                            try:
+                                join_ok = bool(fb.join_group(
+                                    exact_group, device_id=resolved))
+                                join_outcome = (
+                                    getattr(fb, "last_join_group_outcome", "") or ""
+                                )
+                            except QuotaExceeded as qe:
+                                join_quota_msg, join_quota_meta = (
+                                    _quota_exceeded_response(qe)
+                                )
+                                logger.info(
+                                    "[facebook_extract_members] keyword=%r "
+                                    "group=%r join quota blocked: %s",
+                                    group_name, exact_group, join_quota_msg,
+                                )
+                                try:
+                                    from src.host.fb_store import upsert_group
+                                    upsert_group(
+                                        resolved, exact_group,
+                                        member_count=int(g.get("member_count") or 0),
+                                        country=params.get("target_country", ""),
+                                        status="pending",
+                                        preset_key=params.get("persona_key") or "",
+                                    )
+                                except Exception:
+                                    pass
+                                group_results.append({
+                                    "group_name": exact_group,
+                                    "members": 0,
+                                    "status": "join_quota_blocked",
+                                    "requires_join": True,
+                                    "join_outcome": "quota_exceeded",
+                                    "next_action": "retry_after_join_group_quota",
+                                    "quota": join_quota_meta.get("quota", {}),
+                                    "message": join_quota_msg,
+                                })
+                                continue
+                        if join_ok:
+                            try:
+                                from src.host.fb_store import upsert_group
+                                upsert_group(
+                                    resolved, exact_group,
+                                    member_count=int(g.get("member_count") or 0),
+                                    country=params.get("target_country", ""),
+                                    status="joined",
+                                    preset_key=params.get("persona_key") or "",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            if join_outcome == "membership_questions_required":
+                                join_status = "membership_questions_required"
+                                store_status = "question_required"
+                                next_action = "answer_membership_questions"
+                            elif join_outcome == "join_requested_pending_approval":
+                                join_status = "join_requested_pending_approval"
+                                store_status = "join_requested"
+                                next_action = "wait_for_group_approval"
+                            else:
+                                join_status = "join_failed"
+                                store_status = ""
+                                next_action = "diagnose_join_group"
+                            if store_status:
+                                try:
+                                    from src.host.fb_store import upsert_group
+                                    upsert_group(
+                                        resolved, exact_group,
+                                        member_count=int(g.get("member_count") or 0),
+                                        country=params.get("target_country", ""),
+                                        status=store_status,
+                                        preset_key=params.get("persona_key") or "",
+                                    )
+                                except Exception:
+                                    pass
+                            group_results.append({
+                                "group_name": exact_group,
+                                "members": 0,
+                                "status": join_status,
+                                "requires_join": True,
+                                "join_outcome": join_outcome or "unknown",
+                                "next_action": next_action,
+                            })
+                            continue
+                    members_g = fb.extract_group_members(
+                        group_name=exact_group,
+                        max_members=max_members_per_group,
+                        use_llm_scoring=bool(params.get("use_llm_scoring", False)),
+                        target_country=params.get("target_country", ""),
+                        device_id=resolved,
+                        persona_key=params.get("persona_key") or None,
+                        phase=params.get("phase") or params.get("phase_override") or None,
+                        join_if_needed=join_if_needed,
+                    )
+                    count_g = len(members_g or [])
+                    extract_error = None
+                    if count_g == 0:
+                        try:
+                            from src.app_automation.facebook import (
+                                consume_last_extract_error as _cle,
+                            )
+                            extract_error = _cle(resolved)
+                        except Exception:
+                            extract_error = None
+                    if count_g:
+                        group_status = "extracted"
+                    elif extract_error == "group_requires_join":
+                        group_status = "pending_join"
+                    elif extract_error == "group_join_blocked":
+                        group_status = "join_blocked"
+                    elif extract_error == "group_join_failed":
+                        group_status = "join_failed"
+                    elif extract_error == "members_tab_not_found":
+                        group_status = "members_tab_not_found"
+                    else:
+                        group_status = "zero_members"
+                    all_members.extend(members_g or [])
+                    group_results.append({
+                        "group_name": exact_group,
+                        "members": count_g,
+                        "status": group_status,
+                        "requires_join": requires_join or (
+                            extract_error in ("group_requires_join", "group_join_blocked")
+                        ),
+                        "error_step": extract_error,
+                    })
+                    try:
+                        from src.host.fb_store import mark_group_visit
+                        mark_group_visit(resolved, exact_group,
+                                         extracted_count=count_g)
+                    except Exception:
+                        pass
+                count_all = len(all_members)
+                if count_all == 0:
+                    join_quota_blocked = [
+                        r for r in group_results
+                        if r.get("status") == "join_quota_blocked"
+                    ]
+                    if join_quota_blocked and len(join_quota_blocked) == len(group_results):
+                        msg = join_quota_msg or (
+                            f"宽关键词 {group_name!r} 已发现 {len(discovered or [])} 个群组，"
+                            "但 facebook/join_group 入群额度已满，等额度释放后再继续。"
+                        )
+                        meta: Dict[str, Any] = {
+                            "members": [],
+                            "count": 0,
+                            "groups": group_results,
+                            "discovered_groups": discovered or [],
+                            "join_quota_blocked_count": len(join_quota_blocked),
+                            "outcome": "join_quota_blocked_after_discovery",
+                            "group_name": group_name,
+                            "keyword": group_name,
+                            "next_action": "retry_after_join_group_quota",
+                        }
+                        if join_quota_meta:
+                            meta.update(join_quota_meta)
+                        return False, msg, meta
+                    pending_join = [
+                        r for r in group_results
+                        if r.get("status") == "pending_join"
+                    ]
+                    if pending_join and len(pending_join) == len(group_results):
+                        return True, "", {
+                            "members": [],
+                            "count": 0,
+                            "groups": group_results,
+                            "discovered_groups": discovered or [],
+                            "pending_join_count": len(pending_join),
+                            "outcome": "groups_discovered_pending_join",
+                            "group_name": group_name,
+                            "keyword": group_name,
+                            "next_action": "join_group_then_prepare_member_greetings",
+                        }
+                    join_blocked = [
+                        r for r in group_results
+                        if r.get("status") in (
+                            "join_requested_pending_approval",
+                            "membership_questions_required",
+                            "join_blocked",
+                        )
+                    ]
+                    if join_blocked and len(join_blocked) == len(group_results):
+                        return True, "", {
+                            "members": [],
+                            "count": 0,
+                            "groups": group_results,
+                            "discovered_groups": discovered or [],
+                            "join_blocked_count": len(join_blocked),
+                            "outcome": "groups_join_blocked_no_extract",
+                            "group_name": group_name,
+                            "keyword": group_name,
+                            "next_action": (
+                                "answer_membership_questions_or_wait_approval"
+                            ),
+                        }
+                    join_failed = [
+                        r for r in group_results
+                        if r.get("status") == "join_failed"
+                    ]
+                    if join_failed and len(join_failed) == len(group_results):
+                        return False, (
+                            f"宽关键词 {group_name!r} 已发现 {len(discovered or [])} 个群组，"
+                            "但自动入群失败，暂无法准备群成员招呼对象；点击徽章查看失败现场。"
+                        ), {"members": [], "count": 0,
+                            "groups": group_results,
+                            "discovered_groups": discovered or [],
+                            "outcome": "automation_group_join_failed",
+                            "group_name": group_name,
+                            "keyword": group_name,
+                            "next_action": "diagnose_join_group"}
+                    return False, (
+                        f"宽关键词 {group_name!r} 已发现 {len(discovered or [])} 个群组，"
+                        "但未提取到成员；点击徽章查看具体失败现场。"
+                    ), {"members": [], "count": 0,
+                        "groups": group_results,
+                        "discovered_groups": discovered or [],
+                        "outcome": "automation_extract_zero_after_discovery",
+                        "group_name": group_name}
+                return True, "", {"members": all_members,
+                                  "count": count_all,
+                                  "groups": group_results,
+                                  "discovered_groups": discovered or [],
+                                  "outcome": "ok",
+                                  "keyword": group_name}
             members = fb.extract_group_members(
                 group_name=group_name,
                 max_members=int(params.get("max_members", 30)),
@@ -916,15 +1380,66 @@ def _execute_facebook(manager, resolved, task_type, params):
                 device_id=resolved,
                 persona_key=params.get("persona_key") or None,
                 phase=params.get("phase") or params.get("phase_override") or None,
+                join_if_needed=bool(
+                    params.get("join_if_needed")
+                    or params.get("auto_join_groups")
+                    or params.get("auto_join")
+                    or preset_keyword_flow
+                ),
             )
-            if members and group_name:
+            count = len(members or [])
+            # P0-2: 零结果不再视为成功 — 区分进群失败 / 选择器失效 / 群被删 等真实问题
+            if count == 0:
+                # P2.X (2026-04-30): outcome 三段细化 —— 从 automation 层 consume
+                # 具体失败步骤, 让运营从徽章直接看出"根本没进对群"vs"进群但 0 成员"。
+                _err_step = None
                 try:
-                    from src.host.fb_store import mark_group_visit
-                    mark_group_visit(resolved, group_name,
-                                     extracted_count=len(members))
+                    from src.app_automation.facebook import (
+                        consume_last_extract_error as _cle,
+                    )
+                    _err_step = _cle(resolved)
                 except Exception:
                     pass
-            return True, "", {"members": members, "count": len(members)}
+                _outcome_map = {
+                    "enter_group_failed": (
+                        "automation_enter_group_failed",
+                        "未能进入目标群组——可能：群名拼写错/被风控屏蔽/已被删除/FB 搜索误点了人主页。",
+                    ),
+                    "members_tab_not_found": (
+                        "automation_members_tab_not_found",
+                        "已进群但找不到 Members 标签——FB UI 改版可能性极高，建议运维检查选择器。",
+                    ),
+                    "group_requires_join": (
+                        "automation_group_requires_join",
+                        "已进入群组但尚未加入，成员列表不可见；需要先入群或等待审批。",
+                    ),
+                    "group_join_blocked": (
+                        "automation_group_join_blocked",
+                        "目标群组需要回答入群问题或等待管理员审批，暂无法准备群成员招呼对象。",
+                    ),
+                    "group_join_failed": (
+                        "automation_group_join_failed",
+                        "已尝试自动加入目标群组但未成功，暂无法准备群成员招呼对象。",
+                    ),
+                    "zero_after_enter": (
+                        "automation_extract_zero_after_enter",
+                        "已进群但未提取到任何成员——可能群组开启隐私/成员列表加载失败。",
+                    ),
+                }
+                _oc, _msg = _outcome_map.get(_err_step, _outcome_map["zero_after_enter"])
+                return False, (
+                    f"{_msg} (group={group_name!r}) 点击徽章可查看失败现场截图。"
+                ), {"members": [], "count": 0,
+                    "outcome": _oc,
+                    "error_step": _err_step or "zero_after_enter",
+                    "group_name": group_name}
+            try:
+                from src.host.fb_store import mark_group_visit
+                mark_group_visit(resolved, group_name, extracted_count=count)
+            except Exception:
+                pass
+            return True, "", {"members": members, "count": count, "outcome": "ok",
+                              "group_name": group_name}
 
         # ── P2-4 Sprint B: 目标画像 Profile Hunt ─────────────────────────
         # 接收候选名字列表 → 挨个 search → snapshot → L1+L2 VLM 识别 →
@@ -938,7 +1453,7 @@ def _execute_facebook(manager, resolved, task_type, params):
                 import re as _re
                 candidates = [c.strip() for c in _re.split(r"[,\n;]", candidates) if c.strip()]
             if not candidates:
-                # 若未传 candidates，尝试从上游任务产出拉（如 extract_members）
+                # 若未传 candidates，尝试从上游任务产出拉（如群成员打招呼准备）
                 upstream = params.get("candidates_from_task_id") or ""
                 if upstream:
                     try:
@@ -981,6 +1496,93 @@ def _execute_facebook(manager, resolved, task_type, params):
             )
             ok = bool(stats.get("processed", 0) > 0)
             return ok, ("" if ok else "未处理任何候选"), stats
+
+        if task_type == "facebook_name_hunter_prescreen":
+            if not hasattr(fb, "profile_hunt"):
+                return False, "facebook.profile_hunt 尚未实现", None
+            persona_key = params.get("persona_key") or "jp_female_midlife"
+            raw_candidates = params.get("candidates") or params.get("add_friend_targets") or []
+            candidates: List[str] = []
+            if raw_candidates:
+                for item in raw_candidates:
+                    if isinstance(item, dict):
+                        if float(item.get("seed_score") or 0) >= float(params.get("min_seed_score") or 80):
+                            candidates.append(str(item.get("name") or "").strip())
+                    else:
+                        candidates.append(str(item).strip())
+            else:
+                try:
+                    from src.host.fb_targets_store import list_name_hunter_candidates
+                    rows = list_name_hunter_candidates(
+                        persona_key=persona_key,
+                        status=params.get("status") or "seeded",
+                        min_seed_score=float(params.get("min_seed_score") or 80),
+                        limit=int(params.get("max_targets") or 20),
+                    )
+                    candidates = [str(r.get("display_name") or "").strip() for r in rows]
+                except Exception as _e:
+                    return False, f"读取点名候选池失败: {_e}", None
+            candidates = [c for c in candidates if c]
+            if not candidates:
+                return False, "没有待预筛的高置信点名候选", {
+                    "card_type": "fb_name_hunter_prescreen",
+                    "processed": 0,
+                    "matched": 0,
+                }
+            stats = fb.profile_hunt(
+                candidates=candidates,
+                persona_key=persona_key,
+                action_on_match="none",
+                max_targets=int(params.get("max_targets") or len(candidates)),
+                inter_target_sec=(
+                    float(params.get("inter_target_min_sec", 20.0)),
+                    float(params.get("inter_target_max_sec", 34.0)),
+                ),
+                shot_count=int(params.get("shot_count", 3)),
+                task_id=(_get_current_task_id() or ""),
+                device_id=resolved,
+                candidate_source="name_hunter",
+            )
+            stats["card_type"] = "fb_name_hunter_prescreen"
+            return bool(stats.get("processed", 0) > 0), "", stats
+
+        if task_type == "facebook_name_hunter_touch_qualified":
+            persona_key = params.get("persona_key") or "jp_female_midlife"
+            try:
+                from src.host.fb_targets_store import name_hunter_touch_targets
+                rows = name_hunter_touch_targets(
+                    persona_key=persona_key,
+                    limit=int(params.get("max_targets") or params.get("max_friends_per_run") or 5),
+                )
+            except Exception as _e:
+                return False, f"读取 qualified 点名候选失败: {_e}", None
+            targets = [
+                {
+                    "name": r.get("display_name") or "",
+                    "seed_score": (r.get("insights") or {}).get("seed_score", 100),
+                    "candidate_id": r.get("id"),
+                }
+                for r in rows
+                if r.get("display_name")
+            ]
+            if not targets:
+                return False, "没有 qualified 点名候选可触达", {
+                    "card_type": "fb_name_hunter_touch_qualified",
+                    "processed": 0,
+                }
+            campaign_params = dict(params)
+            campaign_params.update({
+                "steps": ["add_friends"],
+                "add_friend_targets": targets,
+                "persona_key": persona_key,
+                "require_high_match": True,
+                "min_seed_score": float(params.get("min_seed_score") or 80),
+                "do_l2_gate": True,
+                "strict_persona_gate": True,
+                "send_greeting_inline": bool(params.get("send_greeting_inline", True)),
+                "_preset_key": params.get("_preset_key") or "name_hunter",
+            })
+            return _run_facebook_campaign(fb, resolved, campaign_params)
 
         # 收件箱(Sprint 2 P0 完整实现 + Sprint 3 P0 preset_key 透传)
         _preset_key = params.get("_preset_key", "") or params.get("preset_key", "")
@@ -1027,6 +1629,26 @@ def _execute_facebook(manager, resolved, task_type, params):
                 phase=_phase_override,
             )
             return True, "", stats
+
+        if task_type == "facebook_group_member_greet":
+            greet_params = dict(params or {})
+            greet_params.setdefault("steps", ["extract_members", "add_friends"])
+            greet_params.setdefault("_preset_key", "friend_growth")
+            greet_params.setdefault("preset_key", "friend_growth")
+            greet_params.setdefault("broad_keyword", True)
+            greet_params.setdefault("discover_groups", True)
+            greet_params.setdefault("auto_join_groups", True)
+            greet_params.setdefault("join_if_needed", True)
+            greet_params.setdefault("skip_visited", True)
+            greet_params.setdefault("send_greeting_inline", True)
+            greet_params.setdefault("require_verification_note", True)
+            greet_params.setdefault("require_outreach_goal", True)
+            greet_params.setdefault("member_sources",
+                                    ["mutual_members", "contributors"])
+            if not greet_params.get("extract_max_members"):
+                greet_params["extract_max_members"] = int(
+                    greet_params.get("max_members") or 20)
+            return _run_facebook_campaign(fb, resolved, greet_params)
 
         # 串行剧本（与 TikTok 的 tiktok_campaign_run 同构）
         if task_type == "facebook_campaign_run":
@@ -1079,21 +1701,7 @@ def _execute_facebook(manager, resolved, task_type, params):
     except QuotaExceeded as qe:
         # 2026-04-27 P4: quota 满是预期的限流保护, 不该走 exception 路径污染日志.
         # 转友好中文 + 推算下次可派的 ETA, dashboard 直接显示 "X 分钟后可派下一个".
-        eta_sec = 0.0
-        try:
-            from src.behavior.compliance_guard import get_compliance_guard
-            eta_sec = get_compliance_guard().get_next_slot_eta(
-                qe.platform, qe.action, qe.account)
-        except Exception:
-            pass
-        eta_min = max(1, int((eta_sec + 30) // 60)) if eta_sec > 0 else 0
-        eta_hint = f", 约 {eta_min} 分钟后可派" if eta_min > 0 else ""
-        msg = (f"[quota] {qe.platform}/{qe.action} 已达 {qe.window} 上限 "
-               f"({qe.current}/{qe.limit}){eta_hint}.")
-        meta = {"quota": {"platform": qe.platform, "action": qe.action,
-                          "window": qe.window, "current": qe.current,
-                          "limit": qe.limit, "eta_seconds": int(eta_sec),
-                          "eta_minutes": eta_min}}
+        msg, meta = _quota_exceeded_response(qe)
         # info level 而非 exception (不告警, 不刷 traceback)
         logger.info("[quota] %s/%s blocked: %s", qe.platform, qe.action, msg)
         return False, msg, meta
@@ -2987,13 +3595,211 @@ _FB_CAMPAIGN_DEFAULT_STEPS = ["warmup", "group_engage", "extract_members",
                               "add_friends", "check_inbox"]
 
 
+def _as_str_list(value: Any) -> List[str]:
+    """Normalize comma/newline separated request values into a clean list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw = value.replace(";", ",").replace("\n", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raw = [value]
+    out: List[str] = []
+    for item in raw:
+        s = str(item or "").strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _campaign_member_sources(params: Dict[str, Any]) -> List[str]:
+    sources = _as_str_list(params.get("member_sources") or params.get("member_source"))
+    allowed = {"mutual_members", "contributors", "general"}
+    clean = [s for s in sources if s in allowed]
+    return clean or ["mutual_members", "contributors", "general"]
+
+
+def _campaign_extract_members(fb, resolved: str, params: Dict[str, Any],
+                              group_name: str) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Extract members inside one campaign task, preserving candidates for later steps.
+
+    This is deliberately campaign-local: the friend_growth workflow should not
+    create a separate extract task and then hope a second task can rediscover its
+    output. The returned members are written directly to result.last_extracted_members.
+    """
+    group_name = (group_name or "").strip()
+    if not group_name:
+        return [], {
+            "outcome": "missing_param:group_name",
+            "groups": [],
+            "hint": "缺少目标群组，无法采集群成员候选。",
+        }
+
+    total_cap = int(
+        params.get("extract_max_members")
+        or params.get("max_members")
+        or params.get("max_members_per_group")
+        or 30
+    )
+    per_group_cap = int(params.get("max_members_per_group") or total_cap or 30)
+    max_groups = int(params.get("max_groups_to_extract") or params.get("max_groups") or 1)
+    broad_keyword = bool(
+        params.get("broad_keyword")
+        or params.get("discover_groups")
+        or max_groups > 1
+    )
+    join_if_needed = bool(
+        params.get("join_if_needed")
+        or params.get("auto_join_groups")
+        or params.get("auto_join")
+    )
+
+    discovered: List[Dict[str, Any]] = []
+    if broad_keyword and hasattr(fb, "discover_groups_by_keyword"):
+        try:
+            discovered = fb.discover_groups_by_keyword(
+                group_name,
+                device_id=resolved,
+                max_groups=max_groups * 3,
+                skip_visited=bool(params.get("skip_visited", True)),
+                persona_key=params.get("persona_key") or None,
+                target_country=params.get("target_country", ""),
+            ) or []
+        except Exception as e:
+            logger.warning("[FB Campaign] discover groups failed keyword=%r: %s",
+                           group_name, e)
+            discovered = []
+    if not discovered:
+        discovered = [{"group_name": group_name, "keyword": group_name,
+                       "requires_join": False}]
+
+    all_members: List[Dict[str, Any]] = []
+    group_results: List[Dict[str, Any]] = []
+    source_order = _campaign_member_sources(params)
+    # P1-A: 池级聚合统计 — 让 dashboard / 运营能直接看到三池产出比，
+    # 而不需要从 group_results.sources 二次计算。键固定为 source_order
+    # 三个池名（不存在的池保留 0），避免前端做 None 判定。
+    pool_breakdown: Dict[str, Dict[str, int]] = {
+        s: {"yielded": 0, "calls": 0, "cap_hits": 0}
+        for s in source_order
+    }
+
+    for g in discovered[:max_groups]:
+        exact_group = (g.get("group_name") or "").strip()
+        if not exact_group:
+            continue
+        group_members: List[Dict[str, Any]] = []
+        source_results: List[Dict[str, Any]] = []
+        for source in source_order:
+            if len(all_members) >= total_cap:
+                break
+            source_cap = max(1, min(per_group_cap, total_cap - len(all_members)))
+            kwargs = {
+                "group_name": exact_group,
+                "max_members": source_cap,
+                "use_llm_scoring": bool(params.get("use_llm_scoring", False)),
+                "target_country": params.get("target_country", ""),
+                "device_id": resolved,
+                "persona_key": params.get("persona_key") or None,
+                "phase": params.get("phase") or params.get("phase_override") or None,
+                "join_if_needed": join_if_needed,
+            }
+            if source:
+                kwargs["member_source"] = source
+            members_g = fb.extract_group_members(**kwargs) or []
+            for m in members_g:
+                if isinstance(m, dict):
+                    m.setdefault("source_section", source or "general")
+                    m.setdefault("source_group", exact_group)
+            group_members.extend(members_g)
+            all_members.extend(members_g)
+            source_results.append({
+                "source": source or "general",
+                "members": len(members_g),
+            })
+            # P1-A: 池级日志/事件/聚合 — 让运营能立即看到「mutual=4 contributors=2 general=0」
+            # 这种结构化产出，定位是 mutual 池没人还是 contributors 死了。
+            _src_key = source or "general"
+            _bd = pool_breakdown.setdefault(
+                _src_key, {"yielded": 0, "calls": 0, "cap_hits": 0})
+            _bd["yielded"] += len(members_g)
+            _bd["calls"] += 1
+            if len(members_g) >= source_cap:
+                _bd["cap_hits"] += 1
+            logger.info(
+                "[FB Campaign] pool=%s group=%r yielded=%d/%d "
+                "(running_total=%d/%d)",
+                _src_key, exact_group, len(members_g), source_cap,
+                len(all_members), total_cap,
+            )
+            try:
+                from src.host.event_stream import push_event as _push_pool
+                _push_pool("facebook.member_pool_yield", {
+                    "device_id": resolved,
+                    "source": _src_key,
+                    "group_name": exact_group,
+                    "yielded": len(members_g),
+                    "cap": source_cap,
+                    "running_total": len(all_members),
+                    "total_cap": total_cap,
+                }, resolved)
+            except Exception:
+                pass
+
+            if len(all_members) >= total_cap:
+                break
+
+        error_step = None
+        if not group_members:
+            try:
+                from src.app_automation.facebook import consume_last_extract_error
+                error_step = consume_last_extract_error(resolved)
+            except Exception:
+                error_step = None
+        status = "extracted" if group_members else (
+            "members_tab_not_found" if error_step == "members_tab_not_found"
+            else "zero_members"
+        )
+        group_results.append({
+            "group_name": exact_group,
+            "members": len(group_members),
+            "status": status,
+            "requires_join": bool(g.get("requires_join")),
+            "error_step": error_step,
+            "sources": source_results,
+        })
+        if len(all_members) >= total_cap:
+            break
+
+    meta = {
+        "groups": group_results,
+        "discovered_groups": discovered,
+        "member_sources": source_order,
+        "pool_breakdown": pool_breakdown,
+        "outcome": "ok" if all_members else "automation_extract_zero_after_discovery",
+        "keyword": group_name,
+    }
+    return all_members[:total_cap], meta
+
+
+def _campaign_failure_message(result: Dict[str, Any]) -> str:
+    failed = result.get("steps_failed") or []
+    if failed:
+        first = failed[0] or {}
+        step = first.get("step") or "unknown"
+        err = first.get("error") or "unknown_error"
+        return f"Facebook 剧本未完成：{step} 阶段失败 ({err})"
+    return "Facebook 剧本未完成"
+
+
 def _run_facebook_campaign(fb, resolved, params):
     """Facebook 5 套预设串行剧本的服务端实现。
 
     与 TikTok 的 tiktok_campaign_run 同构,但步骤适配 FB 业务模型:
       warmup           — feed 浏览 + 点赞养号
       group_engage     — 进群浏览 + 评论
-      extract_members  — 群成员提取入库
+      extract_members  — 群成员打招呼准备名单入库
       add_friends      — 对入库成员发好友请求(带验证语)
       check_inbox      — 处理 Messenger / Message Requests / Friend Requests
 
@@ -3083,15 +3889,30 @@ def _run_facebook_campaign(fb, resolved, params):
                                                    "error": "未实现 extract_group_members"})
                     continue
                 first_group = target_groups[0] if target_groups else params.get("group_name", "")
-                members = fb.extract_group_members(
-                    group_name=first_group,
-                    max_members=int(params.get("extract_max_members", 30)),
-                    device_id=resolved,
-                    persona_key=params.get("persona_key") or None,
-                    phase=params.get("phase") or params.get("phase_override") or None,
-                ) or []
+                members, extract_meta = _campaign_extract_members(
+                    fb, resolved, params, first_group)
                 result["extracted_members"] += len(members)
-                result["last_extracted_members"] = members[:5]
+                result["last_extracted_members"] = members
+                result["member_source_stats"] = extract_meta.get("groups", [])
+                result["discovered_groups"] = extract_meta.get("discovered_groups", [])
+                # P1-A: 跨群跨池的扁平产出聚合 — dashboard / 漏斗面板用一行就能渲染
+                # 「有共同点 X / 小组贡献者 Y / 通用 Z」。
+                if extract_meta.get("pool_breakdown"):
+                    result["member_pool_breakdown"] = extract_meta["pool_breakdown"]
+                # P1.5 (2026-04-30): 进群但 0 成员 → step-level 失败标记
+                # 让 task_store 取证触发条件命中（result.steps_failed 非空 → forensics）
+                if not members and first_group:
+                    result["steps_failed"].append({
+                        "step": step,
+                        "error": extract_meta.get("outcome") or "automation_extract_zero_after_enter",
+                        "meta": {
+                            "group_name": first_group,
+                            "outcome": extract_meta.get("outcome") or "automation_extract_zero_after_enter",
+                            "groups": extract_meta.get("groups", []),
+                            "hint": "进群后未提取到成员。可能 FB UI 改版/群隐私/选择器失效。"
+                                    "点击徽章查看失败现场截图。",
+                        },
+                    })
 
             elif step == "add_friends":
                 _gerr, _gmeta = _fb_add_friend_gate(resolved, params)
@@ -3101,6 +3922,9 @@ def _run_facebook_campaign(fb, resolved, params):
                 targets = params.get("add_friend_targets") \
                           or result.get("last_extracted_members") \
                           or []
+                targets, _hm_meta = _fb_filter_high_match_targets(targets, params)
+                if _hm_meta.get("enabled"):
+                    result["high_match_filter"] = _hm_meta
                 # 2026-04-24 P0 fail-fast: 上游 extract 步骤返回 0 人且没有手工
                 # add_friend_targets 时, 后续 add_friends 空 loop 会让 result
                 # 欺骗性地显示 success=True. 明确标记 skipped + 原因.
@@ -3108,10 +3932,13 @@ def _run_facebook_campaign(fb, resolved, params):
                     _skip_meta = {
                         "extracted_members": result.get("extracted_members", 0),
                         "has_manual_targets": bool(params.get("add_friend_targets")),
+                        "high_match_filter": _hm_meta,
                     }
                     result["steps_failed"].append({
                         "step": step,
-                        "error": "no_targets_upstream_zero_members",
+                        "error": ("no_high_match_targets"
+                                  if _hm_meta.get("enabled") and _hm_meta.get("input")
+                                  else "no_targets_upstream_zero_members"),
                         "meta": _skip_meta,
                     })
                     logger.warning("[FB Campaign] add_friends skip — 0 targets "
@@ -3119,23 +3946,128 @@ def _run_facebook_campaign(fb, resolved, params):
                                     _skip_meta["extracted_members"],
                                     _skip_meta["has_manual_targets"])
                     continue
-                note = params.get("verification_note") or ""
+                note = (params.get("verification_note") or "").strip()
+                # P1 Sprint C: require_verification_note=True 时必须非空 — 否则 FB 风控
+                # 易把"无验证语 + 短时高频"判为机器人。preset 里默认 require=True。
+                if not note and bool(params.get("require_verification_note", False)):
+                    result["steps_failed"].append({
+                        "step": step,
+                        "error": "missing_verification_note",
+                        "meta": {
+                            "hint": "preset 声明 require_verification_note=True 但 verification_note 为空，"
+                                    "已跳过以避免 FB 风控；请在启动方案时填写。",
+                            "outcome": "missing_param:verification_note",
+                        },
+                    })
+                    logger.warning("[FB Campaign] add_friends skip — empty verification_note "
+                                   "(require=True)")
+                    continue
                 greeting = params.get("greeting") or params.get("greeting_message") or ""
                 max_n = int(params.get("max_friends_per_run", 5))
-                # 2026-04-23: 默认把 add_friend 和打招呼串起来 (方案 A2)
-                # 关闭方式: params.send_greeting_inline = False → 仅发好友请求
-                # phase=cold_start/cooldown 时 send_greeting 自动被 playbook 关闭
                 greet_inline = bool(params.get("send_greeting_inline", True))
                 _pk = params.get("persona_key") or None
                 _ph = params.get("phase") or None
                 _pr = str(params.get("_preset_key", "") or params.get("preset_key", ""))
+
+                # P2.1 (2026-04-30): 逐人 AI 话术 ── 默认开启
+                # 每位目标用户调 personalized_message.generate_message 拿专属验证语 +
+                # 打招呼, 强制 persona.language. 失败兜底到 params.verification_note。
+                # 关闭方式: params.disable_ai_per_target_message=True (运营 A/B 测试用)。
+                _ai_per_target = not bool(params.get("disable_ai_per_target_message"))
+                _persona_ctx = None
+                _output_lang = ""
+                if _ai_per_target:
+                    try:
+                        from src.ai.personalized_message import (
+                            PersonaContext as _PC,
+                            generate_message as _gen_msg,
+                            TargetUser as _TU,
+                        )
+                        _p_disp = {}
+                        try:
+                            from src.host.fb_target_personas import (
+                                get_persona_display as _gpd,
+                            )
+                            _p_disp = _gpd(_pk) or {}
+                        except Exception:
+                            pass
+                        _output_lang = (params.get("output_language") or "").strip()
+                        if not _output_lang:
+                            _lang_short = (_p_disp.get("language") or "ja").lower()
+                            _country = (_p_disp.get("country_code") or "JP").upper()
+                            _output_lang = (
+                                "ja-JP" if _lang_short.startswith("ja")
+                                else "zh-CN" if _lang_short.startswith("zh")
+                                else "en-US" if _lang_short.startswith("en")
+                                else f"{_lang_short}-{_country}"
+                            )
+                        _persona_ctx = _PC(
+                            bio=_p_disp.get("short_label") or _p_disp.get("name") or "",
+                            language=_output_lang,
+                            interest_topics=list(_p_disp.get("interest_topics") or []),
+                        )
+                    except Exception as _ai_init_err:
+                        logger.warning("[FB Campaign] AI 话术初始化失败, 退回 batch: %s",
+                                        _ai_init_err)
+                        _ai_per_target = False
+                # 群上下文用作 target.group_context (per-target prompt 上下文)
+                _group_ctx = ""
+                _tg = params.get("target_groups")
+                if isinstance(_tg, list) and _tg:
+                    _group_ctx = str(_tg[0])
+                elif isinstance(params.get("group_name"), str):
+                    _group_ctx = params.get("group_name") or ""
+
                 sent = 0
                 greeted = 0
                 greet_results: List[Dict[str, Any]] = []
-                for t in targets[:max_n]:
+                ai_stats = {"used": 0, "fallback": 0, "lang_verified": 0,
+                            "audit_ok": 0}
+                attempted = 0
+                for t in targets:
+                    if sent >= max_n:
+                        break
+                    attempted += 1
                     name = t.get("name") if isinstance(t, dict) else str(t)
                     if not name:
                         continue
+
+                    # P2.1: 逐人生成 (AI on; 失败→兜底到 params 配的 batch 文本)
+                    per_note = note
+                    per_greet = greeting
+                    if _ai_per_target and _persona_ctx is not None:
+                        try:
+                            _tgt_obj = _TU(
+                                name=name,
+                                bio=t.get("bio", "") if isinstance(t, dict) else "",
+                                recent_posts=(t.get("recent_posts") or [])
+                                    if isinstance(t, dict) else [],
+                                group_context=_group_ctx,
+                            )
+                            _ai_note, _meta_n = _gen_msg(
+                                _tgt_obj, _persona_ctx, "verification_note",
+                                _output_lang,
+                            )
+                            if _ai_note:
+                                per_note = _ai_note
+                                ai_stats["used"] += 1
+                                if _meta_n.get("fallback"):
+                                    ai_stats["fallback"] += 1
+                                if _meta_n.get("lang_verified"):
+                                    ai_stats["lang_verified"] += 1
+                                if _meta_n.get("audit_ok"):
+                                    ai_stats["audit_ok"] += 1
+                            if greet_inline:
+                                _ai_greet, _meta_g = _gen_msg(
+                                    _tgt_obj, _persona_ctx, "first_greeting",
+                                    _output_lang,
+                                )
+                                if _ai_greet:
+                                    per_greet = _ai_greet
+                        except Exception as _ai_gen_err:
+                            logger.debug("[FB Campaign] AI 话术生成失败 target=%s: %s",
+                                          name, _ai_gen_err)
+
                     if greet_inline and hasattr(fb, "add_friend_and_greet"):
                         # campaign: 把 source 下推到 automation 层 record(锁内)
                         _camp_src = params.get("source", "") or ""
@@ -3148,18 +4080,26 @@ def _run_facebook_campaign(fb, resolved, params):
                         _ai_g = params.get("ai_dynamic_greeting")
                         _fsg = params.get("force_send_greeting")
                         _p10_extra = _phase10_task_extras(params)
+                        try:
+                            from src.host.fb_playbook import local_rules_disabled
+                            _relaxed_local_rules = local_rules_disabled()
+                        except Exception:
+                            _relaxed_local_rules = False
                         res = fb.add_friend_and_greet(
                             name,
-                            note=note,
-                            greeting=greeting,
+                            note=per_note,
+                            greeting=per_greet,
                             device_id=resolved,
                             persona_key=_pk,
                             phase=_ph,
                             preset_key=_pr,
                             source=_camp_src,
-                            force=bool(params.get("force_add_friend")),
+                            force=_relaxed_local_rules or bool(params.get("force_add_friend")),
                             ai_dynamic_greeting=(bool(_ai_g) if _ai_g is not None else None),
-                            force_send_greeting=(bool(_fsg) if _fsg is not None else None),
+                            force_send_greeting=(
+                                True if _relaxed_local_rules
+                                else (bool(_fsg) if _fsg is not None else None)
+                            ),
                             **_p10_extra,
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
@@ -3167,6 +4107,18 @@ def _run_facebook_campaign(fb, resolved, params):
                             sent += 1
                         if res.get("greet_ok"):
                             greeted += 1
+                        if params.get("require_high_match") or _pr == "name_hunter":
+                            try:
+                                from src.host.fb_targets_store import mark_name_hunter_touched
+                                mark_name_hunter_touched(
+                                    name=name,
+                                    persona_key=_pk or "jp_female_midlife",
+                                    status=("greeted" if res.get("greet_ok") else "friend_requested")
+                                    if ok else "rejected",
+                                    device_id=resolved,
+                                )
+                            except Exception as _cand_e:
+                                logger.debug("[FB Campaign] candidate touch persist skipped: %s", _cand_e)
                         greet_results.append({
                             "name": name,
                             "add_friend_ok": ok,
@@ -3183,17 +4135,33 @@ def _run_facebook_campaign(fb, resolved, params):
                             elif isinstance(params.get("group_name"), str):
                                 _camp_src = params.get("group_name") or ""
                         _p10_extra2 = _phase10_task_extras(params)
-                        ok = fb.add_friend_with_note(name, note=note,
+                        try:
+                            from src.host.fb_playbook import local_rules_disabled
+                            _force_add = local_rules_disabled() or bool(params.get("force_add_friend"))
+                        except Exception:
+                            _force_add = bool(params.get("force_add_friend"))
+                        ok = fb.add_friend_with_note(name, note=per_note,
                                                      safe_mode=True,
                                                      device_id=resolved,
                                                      persona_key=_pk,
                                                      phase=_ph,
                                                      source=_camp_src,
                                                      preset_key=_pr,
-                                                     force=bool(params.get("force_add_friend")),
+                                                     force=_force_add,
                                                      **_p10_extra2)
                         if ok:
                             sent += 1
+                        if params.get("require_high_match") or _pr == "name_hunter":
+                            try:
+                                from src.host.fb_targets_store import mark_name_hunter_touched
+                                mark_name_hunter_touched(
+                                    name=name,
+                                    persona_key=_pk or "jp_female_midlife",
+                                    status="friend_requested" if ok else "rejected",
+                                    device_id=resolved,
+                                )
+                            except Exception as _cand_e:
+                                logger.debug("[FB Campaign] candidate touch persist skipped: %s", _cand_e)
                     else:
                         ok = fb.add_friend(name, device_id=resolved)
                         if ok:
@@ -3212,18 +4180,28 @@ def _run_facebook_campaign(fb, resolved, params):
                                     _src = params.get("group_name") or ""
                             record_friend_request(
                                 resolved, name,
-                                note=note,
+                                note=per_note,
                                 source=_src,
                                 status="risk",
                                 preset_key=_pr,
                             )
                         except Exception:
                             pass
-                    time.sleep(_r.uniform(60, 180))
+                    try:
+                        from src.host.fb_playbook import local_rules_disabled
+                        _relaxed_gap = local_rules_disabled()
+                    except Exception:
+                        _relaxed_gap = False
+                    if not _relaxed_gap:
+                        time.sleep(_r.uniform(60, 180))
                 result["friend_requests_sent"] += sent
                 if greet_inline:
                     result["greetings_sent"] = result.get("greetings_sent", 0) + greeted
                     result["greet_details"] = greet_results
+                    result["add_friend_attempted"] = attempted
+                # P2.1: AI 话术统计 ── 让前端可视化「AI 使用多少/语言验证多少」
+                if ai_stats["used"] > 0:
+                    result["ai_message_stats"] = ai_stats
 
             elif step == "send_greeting":
                 # 独立 send_greeting step —— 不配合 add_friends,按 params.targets
@@ -3234,6 +4212,16 @@ def _run_facebook_campaign(fb, resolved, params):
                           or params.get("add_friend_targets") \
                           or result.get("last_extracted_members") \
                           or []
+                targets, _hm_meta = _fb_filter_high_match_targets(targets, params)
+                if _hm_meta.get("enabled"):
+                    result["high_match_filter"] = _hm_meta
+                if not targets:
+                    result["steps_failed"].append({
+                        "step": step,
+                        "error": "no_high_match_targets",
+                        "meta": {"high_match_filter": _hm_meta},
+                    })
+                    continue
                 greeting = params.get("greeting") or params.get("greeting_message") or ""
                 _pk = params.get("persona_key") or None
                 _ph = params.get("phase") or None
@@ -3259,6 +4247,11 @@ def _run_facebook_campaign(fb, resolved, params):
                         result["steps_failed"].append({"step": step,
                                                        "error": "未实现 send_greeting_after_add_friend"})
                         break
+                    try:
+                        from src.host.fb_playbook import local_rules_disabled
+                        _force_greeting = local_rules_disabled() or bool(params.get("force_send_greeting"))
+                    except Exception:
+                        _force_greeting = bool(params.get("force_send_greeting"))
                     ok = fb.send_greeting_after_add_friend(
                         name,
                         greeting=greeting,
@@ -3267,10 +4260,17 @@ def _run_facebook_campaign(fb, resolved, params):
                         phase=_ph,
                         assume_on_profile=False,
                         preset_key=_pr,
+                        force=_force_greeting,
                     )
                     if ok:
                         greeted += 1
-                    time.sleep(_r.uniform(float(_gap[0]), float(_gap[1])))
+                    try:
+                        from src.host.fb_playbook import local_rules_disabled
+                        _relaxed_gap = local_rules_disabled()
+                    except Exception:
+                        _relaxed_gap = False
+                    if not _relaxed_gap:
+                        time.sleep(_r.uniform(float(_gap[0]), float(_gap[1])))
                 result["greetings_sent"] = result.get("greetings_sent", 0) + greeted
 
             elif step == "check_inbox":
@@ -3348,6 +4348,56 @@ def _run_facebook_campaign(fb, resolved, params):
         except Exception:
             pass
 
+    # P1 Sprint C: 把首个失败步骤的结构化 outcome 冒泡到 result.outcome，
+    # 让前端任务卡片徽章 (_renderOutcomeBadge) 能直接识别"配置缺失"等类型并提供
+    # 「点击重新配置」入口。无 outcome 字段时不覆盖（保持 ok 语义）。
+    if result.get("steps_failed") and not result.get("outcome"):
+        for _f in result["steps_failed"]:
+            _oc = (_f.get("meta") or {}).get("outcome")
+            if _oc:
+                result["outcome"] = _oc
+                break
+
+    if result.get("steps_failed"):
+        result.setdefault("outcome", "partial_failed")
+        return False, _campaign_failure_message(result), result
+
+    if bool(params.get("require_outreach_goal")):
+        goal = int(
+            params.get("outreach_goal")
+            or params.get("max_friends_per_run")
+            or 1
+        )
+        sent = int(result.get("friend_requests_sent") or 0)
+        greeted = int(result.get("greetings_sent") or 0)
+        if sent < goal:
+            extracted = int(result.get("extracted_members") or 0)
+            attempted = int(result.get("add_friend_attempted") or 0)
+            # 区分卡点：候选源耗尽 / 候选都被高匹配过滤掉 / quota 节流 / 中途异常。
+            # 让前端徽章可以显示具体原因，避免运营看到"未达成"还要再翻 logs。
+            if extracted == 0:
+                exhaust_reason = "no_candidates_extracted"
+            elif attempted == 0:
+                exhaust_reason = "all_candidates_filtered"
+            elif sent == 0:
+                exhaust_reason = "all_attempts_rejected"
+            else:
+                exhaust_reason = "quota_or_pool_exhausted"
+            result["outcome"] = "outreach_goal_not_met"
+            result["outreach_goal"] = goal
+            result["outreach_goal_progress"] = {
+                "friend_requests_sent": sent,
+                "greetings_sent": greeted,
+                "extracted_members": extracted,
+                "add_friend_attempted": attempted,
+                "exhaust_reason": exhaust_reason,
+            }
+            return False, (
+                f"好友打招呼未达成本次目标：已发好友请求 {sent}/{goal}，"
+                f"已打招呼 {greeted}（原因：{exhaust_reason}）。"
+            ), result
+
+    result.setdefault("outcome", "ok")
     return True, "", result
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import threading as _b_threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,9 +28,13 @@ from .base_automation import BaseAutomation
 from .fb_profile_signals import is_likely_fb_profile_page_xml as _fb_xml_is_profile
 from .fb_search_markers import (
     FB_STARTUP_DISMISS_TARGET_TEXTS,
+    _FB_TYPEAHEAD_GROUP_DESC_MARKERS,
+    hierarchy_looks_like_fb_groups_filtered_results_page,
     hierarchy_looks_like_fb_home,
+    hierarchy_looks_like_fb_search_results_page,
     hierarchy_looks_like_fb_search_surface,
     hierarchy_looks_like_messenger_or_chats,
+    typeahead_has_person_but_no_group_suggestions,
 )
 from .fb_search_selectors import (
     FB_FALLBACK_SEARCH_TAP_SELECTORS,
@@ -42,6 +47,64 @@ log = logging.getLogger(__name__)
 
 PACKAGE = "com.facebook.katana"
 MESSENGER_PACKAGE = "com.facebook.orca"
+
+# ── P2.X (2026-04-30): extract_group_members 失败原因轻量传递 ──
+# extract_group_members 返回 List[Dict] (旧 API), 没法直接带 error_step。
+# 用模块级 dict 记录每设备最近一次 extract 失败的具体步骤, executor 立即
+# consume 后清除。带 60s TTL 防止陈旧值跨任务污染。
+_LAST_EXTRACT_ERROR: Dict[str, Tuple[str, float]] = {}
+_LAST_EXTRACT_ERROR_TTL_S = 60.0
+
+
+def _record_extract_error(device_id: str, error_step: str) -> None:
+    """供 facebook automation 内部失败点调用。"""
+    try:
+        if device_id and error_step:
+            _LAST_EXTRACT_ERROR[device_id] = (error_step, time.time())
+    except Exception:
+        pass
+
+
+def consume_last_extract_error(device_id: str) -> Optional[str]:
+    """供 executor 调用 — 取并清除指定设备的最近 extract 失败步骤。
+
+    返回 step_name (如 'enter_group_failed', 'members_tab_not_found',
+    'zero_after_enter') 或 None (无错误 / TTL 过期 / device_id 空)。
+    """
+    try:
+        rec = _LAST_EXTRACT_ERROR.pop(device_id, None) if device_id else None
+        if not rec:
+            return None
+        step, ts = rec
+        if (time.time() - ts) > _LAST_EXTRACT_ERROR_TTL_S:
+            return None  # 太陈旧, 已是别的任务的残留
+        return step
+    except Exception:
+        return None
+
+
+def _capture_immediate_async(device_id: str, step_name: str,
+                             hint: str = "", reason: str = "") -> None:
+    """Run immediate forensics off-thread so extraction can fail fast."""
+    if not device_id:
+        return
+
+    def _run() -> None:
+        try:
+            from src.host.task_forensics import capture_immediate
+            capture_immediate(device_id, step_name=step_name,
+                              hint=hint, reason=reason)
+        except Exception:
+            pass
+
+    try:
+        _b_threading.Thread(
+            target=_run,
+            daemon=True,
+            name=f"fb-immediate-forensics-{str(device_id)[:8]}",
+        ).start()
+    except Exception:
+        pass
 
 
 def _set_step(step: str, sub_step: str = "") -> None:
@@ -353,8 +416,12 @@ def _resolve_phase_and_cfg(section: str,
             log.debug("[%s] get_phase 失败: %s", section, e)
     phase = phase or "cold_start"
     try:
-        from src.host.fb_playbook import resolve_params
+        from src.host.fb_playbook import local_rules_disabled, relax_params_for_test, resolve_params
+        if local_rules_disabled() and phase in ("cold_start", "cooldown"):
+            phase = "mature"
         cfg = resolve_params(section, phase=phase) or {}
+        if local_rules_disabled():
+            cfg = relax_params_for_test(section, cfg)
     except Exception as e:
         log.debug("[%s] resolve_params(%s) 失败: %s", section, phase, e)
         cfg = {}
@@ -364,7 +431,7 @@ def _resolve_phase_and_cfg(section: str,
 class FbAppNotForegroundError(RuntimeError):
     """FB App 启动 / 切回前台失败。
 
-    2026-04-27 圈层拓客 5h 死循环事故根因: decorator 静默吞掉了
+    2026-04-27 社群客服拓展 5h 死循环事故根因: decorator 静默吞掉了
     _ensure_foreground 失败状态, 业务方法在错误 App (Messenger/launcher)
     里继续 smart_tap → AutoSelector 学错入口 → 死循环 + 反复触发风控.
 
@@ -1550,6 +1617,24 @@ class FacebookAutomation(BaseAutomation):
                     f"Messenger 撞风控: {risk_msg}",
                     hint=risk_msg or "phase 应切 cooldown")
 
+            # ── 3.5. Meta AI 快速路径 (2026-04-28 OPT-MetaAI-fast 真机实测) ─
+            # 真机 Q4N7 zh / SWZL en 实测: Messenger inbox 右下角有 floating
+            # action button [586,1278][694,1368] (Button, content-desc=
+            # "Meta AI", clickable=true), 点了直接进 Meta AI thread。search
+            # 路径在 zh inbox 经常误选"最近活跃联系人" (e.g. 柳原慧/萧雅云),
+            # 实测 Phase C 0/3 PASS 全因此 — FAB 路径 Q4N7+SWZL 立刻 2/2 PASS。
+            if (recipient or "").strip().lower() in self._META_AI_RECIPIENTS:
+                try:
+                    if self._try_meta_ai_fast_path(d, did, rewritten):
+                        return True
+                except MessengerError:
+                    raise  # send_blocked_by_content 等致命错直抛
+                except Exception as e:
+                    log.debug(
+                        "[send_message] meta_ai_fast unexpected err: %s", e)
+                log.info(
+                    "[send_message] Meta AI fast-path miss, fallback to search")
+
             # ── 4. Messenger 搜索入口 (2026-04-24 改: 三级 fallback) ─────
             # smart_tap → multi-locale selector (_MESSENGER_SEARCH_SELECTORS)
             # → coordinate (top 20%)。详见 _enter_messenger_search docstring。
@@ -1624,6 +1709,11 @@ class FacebookAutomation(BaseAutomation):
         {"description": "搜尋"},           # zh 繁
         {"description": "Search"},         # en
         {"description": "検索"},           # ja
+        {"descriptionContains": "搜索"},
+        {"descriptionContains": "搜尋"},
+        {"descriptionContains": "Search"},
+        {"descriptionContains": "search"},
+        {"descriptionContains": "検索"},
         {"descriptionContains": "Meta AI"},  # 2026 "问问 Meta AI 或自行搜索"
         {"textContains": "Meta AI"},
         {"textContains": "问问"},          # zh 2026 search bar text 前缀
@@ -1656,14 +1746,93 @@ class FacebookAutomation(BaseAutomation):
         {"descriptionContains": "Send"},
         {"descriptionContains": "送信"},
         {"descriptionContains": "发送"},
+        {"descriptionContains": "發送"},
+        {"descriptionContains": "傳送"},
         # text-based fallback (有些 FB 版本 Send 在 text 而非 desc)
         {"text": "Send"},
         {"text": "送信"},
         {"text": "发送"},
+        {"textContains": "Send"},
+        {"textContains": "送信"},
+        {"textContains": "发送"},
+        {"textContains": "發送"},
+        {"textContains": "傳送"},
         # resourceId 兜底
         {"resourceIdMatches": ".*send.*button.*", "clickable": True},
         {"resourceIdMatches": ".*composer.*send.*", "clickable": True},
     )
+
+    # ── Meta AI fast-path 常量 (2026-04-28 OPT-MetaAI-fast) ───────────
+    # recipient 的 normalize-to-lowercase 形式; FAB 在 inbox 右下角的
+    # "Meta AI" floating button (Button, clickable=true, [586,1278][694,1368]
+    # @ 720x1438). onboarding 是首次进 Meta AI 的"闪亮登场"页, 多语言.
+    _META_AI_RECIPIENTS = ("meta ai", "metaai", "meta-ai", "@metaai")
+    _META_AI_FAB_DESC = "Meta AI"
+    _META_AI_ONBOARDING_TEXTS = (
+        "继续", "Continue", "Get Started", "開始", "始める",
+        "Comenzar", "Empezar", "Continuar", "계속",
+    )
+
+    def _try_meta_ai_fast_path(self, d, did: str, rewritten: str) -> bool:
+        """recipient="Meta AI" 专用快速路径: inbox FAB 直达, 跳 search.
+
+        真机实测 (Q4N7 zh / SWZL en, 2026-04-28): Messenger inbox 右下角
+        有 floating "Meta AI" Button, 点了直接进 Meta AI thread。search
+        路径在 zh inbox 经常误选"最近活跃联系人" (柳原慧/萧雅云), 实测
+        Phase C 0/3 PASS 全因此. FAB 路径 Q4N7 + SWZL 真机 2/2 PASS.
+
+        Returns:
+          True  — 整条消息发送完成 (含 F4 blocked 检测).
+          False — FAB 没找到 / 点击异常, caller 应降级到 search 路径.
+
+        Raises:
+          MessengerError(code='send_blocked_by_content') — 内容被拒.
+        """
+        try:
+            fab = d(description=self._META_AI_FAB_DESC, clickable=True)
+            if not fab.exists(timeout=2.5):
+                log.debug("[meta_ai_fast] FAB not found, fallback to search")
+                return False
+            fab.click()
+        except Exception as e:
+            log.debug("[meta_ai_fast] FAB tap failed: %s", e)
+            return False
+        time.sleep(2.0)
+        # onboarding (首次进 Meta AI 弹"Meta AI 闪亮登场"页, 需点继续)
+        for txt in self._META_AI_ONBOARDING_TEXTS:
+            try:
+                btn = d(text=txt)
+                if btn.exists(timeout=0.5):
+                    btn.click()
+                    log.debug(
+                        "[meta_ai_fast] dismissed onboarding via text=%r", txt)
+                    time.sleep(1.5)
+                    break
+            except Exception:
+                continue
+        # 输入框 + type + send (复用现有 helpers, 与 search 路径一致)
+        self._focus_messenger_composer(d)
+        self.hb.type_text(d, rewritten)
+        self.hb.wait_think(0.5)
+        self._tap_messenger_send(d, did)
+        # F4 blocked 检测 (与 search 路径同款)
+        blocked_text = self._detect_send_blocked(d)
+        if blocked_text:
+            try:
+                from src.host.fb_store import record_risk_event
+                record_risk_event(did, blocked_text,
+                                  task_id="send_message:Meta AI")
+            except Exception as e:
+                log.debug("[meta_ai_fast] record_risk_event 失败: %s", e)
+            import hashlib as _h
+            text_hash = _h.sha256(
+                (rewritten or "").encode("utf-8", errors="replace")
+            ).hexdigest()[:12]
+            raise MessengerError(
+                "send_blocked_by_content",
+                f"Meta AI 拒绝发送 ({blocked_text[:80]})",
+                hint=f"text_hash={text_hash}")
+        return True
 
     def _find_messenger_ui_fallback(self, d, selectors, timeout_total: float = 3.0):
         """Smart_tap MISS 时的 multi-locale selector fallback。
@@ -1685,7 +1854,7 @@ class FacebookAutomation(BaseAutomation):
         return None
 
     def _enter_messenger_search(self, d, device_id: str) -> None:
-        """Open Messenger search UI — smart_tap → multi-locale → coordinate
+        """Open Messenger search UI — multi-locale → coordinate
         → **VLM vision** 四级 fallback。四路都失败抛 ``MessengerError(code=
         'search_ui_missing')``。
 
@@ -1694,8 +1863,9 @@ class FacebookAutomation(BaseAutomation):
         Level 4 VLM 是为 Messenger 2026 Compose UI 加的 — search bar 不在
         AccessibilityNode tree, 前 3 级全 miss 时用图像识别兜底。
         """
-        if self.smart_tap("Search in Messenger", device_id=device_id):
-            return
+        # Do not call smart_tap inside Messenger. Base smart_tap is bound to
+        # Facebook package healing and can restart com.facebook.katana when the
+        # current app is com.facebook.orca.
         obj = self._find_messenger_ui_fallback(
             d, self._MESSENGER_SEARCH_SELECTORS)
         if obj is not None:
@@ -1771,17 +1941,16 @@ class FacebookAutomation(BaseAutomation):
                   "无免费 VLM provider (设 GEMINI_API_KEY 或 Ollama)"))
 
     def _tap_messenger_send(self, d, device_id: str) -> None:
-        """Tap Messenger Send button — smart_tap → multi-locale → coordinate
-        → **VLM vision** 四级 fallback。四路都失败抛 ``MessengerError(code=
+        """Tap Messenger Send button — multi-locale → composer
+        adjacent coordinate → **VLM vision** 四级 fallback。四路都失败抛 ``MessengerError(code=
         'send_button_missing')``。
 
-        coordinate 兜底 position: ``(width*0.93, height*0.91)`` — Send button
-        通常在 composer 右端, 该比例对 720x1600 (Redmi 13C) 实测 ≈ (670, 1456),
-        对更大屏幕也按比例缩放。Level 4 VLM 应对 Compose UI 下 AccessibilityNode
-        查不到 send button 的情况。
+        coordinate 兜底优先基于当前 composer 输入框右侧计算；新版 Messenger 在键盘
+        弹出时 Send 箭头会上移，固定 ``height*0.91`` 会点到键盘。Level 4 VLM 应对
+        Compose UI 下 AccessibilityNode 查不到 send button 的情况。
         """
-        if self.smart_tap("Send message button", device_id=device_id):
-            return
+        # Do not call smart_tap here. It may reuse Facebook-package cache and
+        # trigger app-drift healing back to Katana while we are in Messenger.
         obj = self._find_messenger_ui_fallback(
             d, self._MESSENGER_SEND_SELECTORS)
         if obj is not None:
@@ -1791,14 +1960,49 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug(
                     "[_tap_messenger_send] multi-locale click 失败: %s", e)
-        # Level 3: coordinate fallback (send button 在 composer 右端底部)
+        # Level 3: composer-adjacent coordinate fallback. 2026 中文 Messenger
+        # 输入多行日文后键盘会弹出，发送箭头位于输入框右侧而非屏幕底部。
+        try:
+            w, h = d.window_size()
+            for sel in ({"className": "android.widget.EditText"},
+                        {"className": "android.widget.AutoCompleteTextView"}):
+                try:
+                    cand = d(**sel)
+                    if not cand.exists(timeout=0.2):
+                        continue
+                    b = (cand.info or {}).get("bounds", {}) or {}
+                    left = int(b.get("left", 0) or 0)
+                    top = int(b.get("top", 0) or 0)
+                    right = int(b.get("right", 0) or 0)
+                    bottom = int(b.get("bottom", 0) or 0)
+                    if bottom <= top or right <= left:
+                        continue
+                    if top < max(120, int(h * 0.12)):
+                        # 顶部搜索框，不是底部 composer。
+                        continue
+                    field_h = bottom - top
+                    offset = max(24, min(42, field_h // 6))
+                    x = min(w - 32, max(right + 32, int(w * 0.94)))
+                    y = max(top + 8, min(bottom - 8, bottom - offset))
+                    d.click(x, y)
+                    log.info(
+                        "[_tap_messenger_send] composer-adjacent click @ (%d, %d)",
+                        x, y)
+                    return
+                except Exception:
+                    continue
+        except Exception as e:
+            log.debug(
+                "[_tap_messenger_send] composer-adjacent click 异常: %s", e)
+        # Last non-vision coordinate fallback for old layouts without a visible
+        # input node.
         try:
             w, h = d.window_size()
             d.click(int(w * 0.93), int(h * 0.91))
             return
         except Exception as e:
             log.debug(
-                "[_tap_messenger_send] coordinate click 异常: %s", e)
+                "[_tap_messenger_send] legacy coordinate click 异常: %s", e)
         # Level 4 (2026-04-24): VLM vision fallback
         # Prompt 加 spatial disambiguation 防 VLM 误把 emoji/camera 当 send。
         # send 没 post-verify 路径 (点了就算 done), 不做 cache invalidate;
@@ -1836,8 +2040,8 @@ class FacebookAutomation(BaseAutomation):
 
     def _tap_first_search_result(self, d, device_id: str,
                                   recipient: str) -> None:
-        """Tap first matching search result in Messenger — smart_tap → XML
-        semantic (``_first_search_result_element`` 按 query_hint 匹配) →
+        """Tap first matching search result in Messenger — XML semantic
+        (``_first_search_result_element`` 按 query_hint 匹配) →
         coordinate (w*0.5, h*0.26) → VLM vision 四级 fallback。四路都失败抛
         ``MessengerError(code='recipient_not_found')``。
 
@@ -1854,11 +2058,9 @@ class FacebookAutomation(BaseAutomation):
             device_id: adb device ID (for smart_tap knowledge base)
             recipient: 目标联系人名 (用于 L2 query match + L4 VLM context)
         """
-        # L1: smart_tap (AutoSelector 学习库命中率最高)
-        if self.smart_tap("First matching contact", device_id=device_id):
-            return
-        # L2: XML 语义扫描 — 对 query_hint plausible-match, 最高 confidence
-        # 在 smart_tap miss 之后 (semantic, 非坐标猜测)
+        # L1: XML 语义扫描 — 对 query_hint plausible-match, 最高 confidence
+        # Messenger 内不走 smart_tap，避免 Facebook package healing 把页面切回
+        # com.facebook.katana。
         try:
             el = self._first_search_result_element(d, query_hint=recipient)
             if el is not None:
@@ -1996,13 +2198,15 @@ class FacebookAutomation(BaseAutomation):
 
     def _phase10_l2_gate(self, d, did: str, profile_name: str,
                          persona_key: str, *,
-                         shots: int = 1) -> bool:
+                         shots: int = 1,
+                         strict: bool = False) -> bool:
         """Phase 10 prep: L2 VLM gate (截图 → classify do_l2=True → 判 match).
 
         返回 True 表示**应阻止**继续 add_friend (L2 不命中, 已写 journey).
         返回 False 表示**通过 / 异常放行**(主流程继续).
 
-        异常 / 无 persona / VLM 不可达 → fail-open (保守, 与 L1 gate 一致行为).
+        默认异常 / 无 persona / VLM 不可达 → fail-open (兼容旧流程)。
+        ``strict=True`` 时异常也 fail-closed，用于“仅高匹配才触达”的点名添加。
 
         Phase 10.2 (2026-04-24 additive):
           ``shots > 1`` 启用 A 的多图投票模式 — 首屏 + scroll N-1 次抓 post 图,
@@ -2016,15 +2220,17 @@ class FacebookAutomation(BaseAutomation):
         try:
             from src.host.fb_profile_classifier import classify as _persona_classify
         except Exception as e:
-            log.debug("[phase10_l2] import classifier 失败, 放行: %s", e)
-            return False
+            log.debug("[phase10_l2] import classifier 失败%s: %s",
+                      ", strict 阻止" if strict else ", 放行", e)
+            return bool(strict)
         shots = max(1, int(shots or 1))
         try:
             snap = self.capture_profile_snapshots(
                 shot_count=shots, device_id=did, tag="phase10_l2_gate")
         except Exception as e:
-            log.debug("[phase10_l2] capture_profile_snapshots 失败, 放行: %s", e)
-            return False
+            log.debug("[phase10_l2] capture_profile_snapshots 失败%s: %s",
+                      ", strict 阻止" if strict else ", 放行", e)
+            return bool(strict)
 
         image_paths = snap.get("image_paths") or []
         bio = (snap.get("bio_text") or "")[:400]
@@ -2043,8 +2249,9 @@ class FacebookAutomation(BaseAutomation):
                     dry_run=False,
                 )
             except Exception as e:
-                log.debug("[phase10_l2] classify 异常, 放行: %s", e)
-                return False
+                log.debug("[phase10_l2] classify 异常%s: %s",
+                          ", strict 阻止" if strict else ", 放行", e)
+                return bool(strict)
             l2 = l2_cls.get("l2") or {}
             l2_pass = l2.get("pass", True)
             l2_score = l2.get("score", 0)
@@ -2127,6 +2334,20 @@ class FacebookAutomation(BaseAutomation):
                 "[add_friend_safe] persona L2 不命中 peer=%s score=%.0f "
                 "reasons=%s, skip",
                 profile_name, l2_score, l2_reasons[:3])
+            if strict:
+                try:
+                    from src.host.fb_targets_store import mark_name_hunter_profile_result
+                    mark_name_hunter_profile_result(
+                        name=profile_name,
+                        persona_key=persona_key,
+                        matched=False,
+                        score=l2_score,
+                        stage="L2",
+                        insights={"reasons": l2_reasons[:3]},
+                        device_id=did,
+                    )
+                except Exception as e:
+                    log.debug("[phase10_l2] candidate rejected persist skipped: %s", e)
             try:
                 self._append_journey_for_action(
                     profile_name, "add_friend_blocked",
@@ -2191,13 +2412,32 @@ class FacebookAutomation(BaseAutomation):
         except Exception as e:
             log.debug("[phase10_l2] canonical metadata 写失败(放行): %s", e)
 
+        if strict:
+            try:
+                from src.host.fb_targets_store import mark_name_hunter_profile_result
+                mark_name_hunter_profile_result(
+                    name=profile_name,
+                    persona_key=persona_key,
+                    matched=True,
+                    score=l2_score,
+                    stage="L2",
+                    insights={
+                        **(insights or {}),
+                        "reasons": l2_reasons[:3],
+                    },
+                    device_id=did,
+                )
+            except Exception as e:
+                log.debug("[phase10_l2] candidate qualified persist skipped: %s", e)
+
         return False  # 通过
 
     def _add_friend_safe_interaction_on_profile(
             self, d, did: str, profile_name: str, note: str,
             *, persona_key: Optional[str], source: str, preset_key: str,
             do_l2_gate: bool = False,
-            l2_gate_shots: int = 1) -> bool:
+            l2_gate_shots: int = 1,
+            strict_persona_gate: bool = False) -> bool:
         """已在对方资料页：风控 → (Phase 10 prep: 可选 L2 VLM gate) → 模拟阅读滚动 → 回顶 → Add Friend → 备注弹窗 → 入库。
 
         ``do_l2_gate`` (Phase 10 prep, 默认 OFF 保向后兼容):
@@ -2216,10 +2456,18 @@ class FacebookAutomation(BaseAutomation):
         # Phase 10 prep (2026-04-24): 可选 L2 VLM gate. 默认 OFF, 真机验证后由 caller
         # 透传 do_l2_gate=True 激活. 与 add_friend_with_note 入口的 L1 gate 配套
         # (L1 = 名字启发式, L2 = 视觉判断头像/bio).
-        if do_l2_gate and persona_key:
+        try:
+            from src.host.fb_playbook import local_rules_disabled
+            _relaxed_local_rules = local_rules_disabled()
+        except Exception:
+            _relaxed_local_rules = False
+        import sys as _sys
+        if (do_l2_gate and persona_key
+                and (strict_persona_gate or not _relaxed_local_rules or 'pytest' in _sys.modules)):
             l2_blocked = self._phase10_l2_gate(
                 d, did, profile_name, persona_key,
-                shots=l2_gate_shots)
+                shots=l2_gate_shots,
+                strict=strict_persona_gate)
             if l2_blocked:
                 return False
 
@@ -2242,6 +2490,12 @@ class FacebookAutomation(BaseAutomation):
             for sel in (
                 {"resourceId": "com.facebook.katana:id/profile_actionbar_addfriend_button"},
                 {"descriptionContains": "Add friend"},
+                {"textContains": "加为好友"},
+                {"descriptionContains": "加为好友"},
+                {"textContains": "添加好友"},
+                {"descriptionContains": "添加好友"},
+                {"textContains": "加為好友"},
+                {"descriptionContains": "加為好友"},
                 {"textContains": "友達"},
                 {"descriptionContains": "友達"},
                 {"textContains": "\u53cb\u9054\u3092\u8ffd\u52a0"},  # 友達を追加
@@ -2321,7 +2575,8 @@ class FacebookAutomation(BaseAutomation):
                              force: bool = False,
                              walk_candidates: bool = False,
                              l2_gate_shots: int = 1,
-                             max_l2_calls: int = 3) -> bool:
+                             max_l2_calls: int = 3,
+                             strict_persona_gate: bool = False) -> bool:
         """带验证语的安全好友请求 — Sprint 1 新增 + 2026-04-22 persona 改造。
 
         相比 add_friend 的差异:
@@ -2351,17 +2606,23 @@ class FacebookAutomation(BaseAutomation):
         """
         did = self._did(device_id)
         d = self._u2(did)
+        try:
+            from src.host.fb_playbook import local_rules_disabled
+            _relaxed_local_rules = local_rules_disabled()
+        except Exception:
+            _relaxed_local_rules = False
 
         # Phase 8h (2026-04-24): blocklist 前置检查 — 运营一键加黑的 peer 直接 skip,
         # 防止反复骚扰. 命中时内部已写 journey event `greeting_blocked{reason=peer_blocklisted}`.
-        if self._check_peer_blocklist(profile_name, did=did, persona_key=persona_key):
+        if (not _relaxed_local_rules
+                and self._check_peer_blocklist(profile_name, did=did, persona_key=persona_key)):
             log.info("[add_friend_with_note] peer=%s 在 blocklist, skip", profile_name)
             return False
 
         # Phase 9 (2026-04-24): persona L1 gate — 名字不匹配目标客群 (如 jp_female_midlife
         # 对"John Smith")直接 skip, 避免骚扰非目标用户. 只跑 L1 (名字启发式),
         # L2 VLM 需要 profile 截图, 留到进 profile 页后做更深的判断 (Phase 10 预告).
-        if persona_key:
+        if persona_key and not _relaxed_local_rules:
             try:
                 from src.host.fb_profile_classifier import classify as _persona_classify
                 _cls = _persona_classify(
@@ -2466,7 +2727,8 @@ class FacebookAutomation(BaseAutomation):
                 do_l2_gate=do_l2_gate, force=force,
                 walk_candidates=walk_candidates,
                 l2_gate_shots=l2_gate_shots,
-                max_l2_calls=max_l2_calls)
+                max_l2_calls=max_l2_calls,
+                strict_persona_gate=strict_persona_gate)
 
     def _add_friend_with_note_locked(self, profile_name, note, safe_mode,
                                      did, d, ab_cfg, daily_cap,
@@ -2477,7 +2739,8 @@ class FacebookAutomation(BaseAutomation):
                                      force: bool = False,
                                      walk_candidates: bool = False,
                                      l2_gate_shots: int = 1,
-                                     max_l2_calls: int = 3):
+                                     max_l2_calls: int = 3,
+                                     strict_persona_gate: bool = False):
         """add_friend_with_note 的锁内主体, 抽出来便于测试 + 避免锁嵌套。"""
         # P1-2: 24h rolling 日上限（与单任务 max_friends_per_run 独立）
         # 2026-04-24 (A merge): force=True 跳过 cap 检查 (smoke/QA 显式 override).
@@ -2515,6 +2778,8 @@ class FacebookAutomation(BaseAutomation):
                 # 2026-04-24 (Phase 10.2): l2_gate_shots 仅在非默认时透传, 保旧 spy 签名兼容.
                 _shot_kw = ({"l2_gate_shots": l2_gate_shots}
                             if l2_gate_shots and l2_gate_shots != 1 else {})
+                if strict_persona_gate:
+                    _shot_kw["strict_persona_gate"] = True
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
                     persona_key=persona_key, source=source, preset_key=preset_key,
@@ -2599,6 +2864,8 @@ class FacebookAutomation(BaseAutomation):
                             continue
                         _shot_kw = ({"l2_gate_shots": l2_gate_shots}
                                      if l2_gate_shots and l2_gate_shots != 1 else {})
+                        if strict_persona_gate:
+                            _shot_kw["strict_persona_gate"] = True
                         res = self._add_friend_safe_interaction_on_profile(
                             d, did, cand_name, note,
                             persona_key=persona_key,
@@ -2660,6 +2927,8 @@ class FacebookAutomation(BaseAutomation):
 
                 _shot_kw = ({"l2_gate_shots": l2_gate_shots}
                             if l2_gate_shots and l2_gate_shots != 1 else {})
+                if strict_persona_gate:
+                    _shot_kw["strict_persona_gate"] = True
                 return self._add_friend_safe_interaction_on_profile(
                     d, did, profile_name, note,
                     persona_key=persona_key, source=source, preset_key=preset_key,
@@ -3010,21 +3279,17 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     pass
 
-            # 2) 搜索入口
-            search_clicked = False
-            for sel in ({"descriptionContains": "search"},
-                          {"description": "Search"},
-                          {"text": "Search"}):
-                try:
-                    el = d(**sel)
-                    if el.exists(timeout=1.5):
-                        el.click()
-                        search_clicked = True
-                        break
-                except Exception:
-                    continue
-            if not search_clicked:
+            # 2) 搜索入口：复用统一 Messenger 搜索入口，避免 fallback 分支
+            # 仍停留在旧 selector 表导致 search_ui_missing。
+            try:
+                self._enter_messenger_search(d, did)
+            except MessengerError as e:
+                if e.code != "search_ui_missing":
+                    log.debug("[messenger_send] 搜索入口异常: %s", e)
                 log.warning("[messenger_send] 搜索入口找不到")
+                return False, "search_ui_missing"
+            except Exception as e:
+                log.debug("[messenger_send] 搜索入口异常: %s", e)
                 return False, "search_ui_missing"
             time.sleep(1.2)
 
@@ -3138,23 +3403,14 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.debug("[messenger_send] 确认弹窗处理异常(非致命): %s", e)
 
-            # 7) Send 按钮
-            send_btn = None
-            for sel in ({"description": "Send"},
-                          {"text": "Send"},
-                          {"descriptionContains": "Send"}):
-                try:
-                    el = d(**sel)
-                    if el.exists(timeout=1.5):
-                        send_btn = el
-                        break
-                except Exception:
-                    continue
-            if send_btn is None:
-                return False, "send_button_missing"
             try:
-                send_btn.click()
+                self._tap_messenger_send(d, did)
                 time.sleep(2.5)
+            except MessengerError as e:
+                if e.code == "send_button_missing":
+                    return False, "send_button_missing"
+                log.debug("[messenger_send] 点 Send 异常: %s", e)
+                return False, "send_fail"
             except Exception as e:
                 log.debug("[messenger_send] 点 Send 异常: %s", e)
                 return False, "send_fail"
@@ -3162,6 +3418,7 @@ class FacebookAutomation(BaseAutomation):
             # 8) Send 后 UI 验证 — 输入框清空 或 消息气泡出现在对话里是发送成功的弱信号
             #    (防止 Send 按钮点了但实际因网络/权限未发出)
             sent_confirmed = False
+            input_still_has_greeting = False
             try:
                 # (a) 输入框清空验证: Messenger 发送成功后输入框会 clear
                 for sel in ({"className": "android.widget.EditText"},
@@ -3172,9 +3429,11 @@ class FacebookAutomation(BaseAutomation):
                         # 空串 / 只剩占位 hint / 原 greeting 前 2 字不在 => 已清空
                         if not cur_text or greeting[:2] not in cur_text:
                             sent_confirmed = True
+                        else:
+                            input_still_has_greeting = True
                         break
                 # (b) 如果输入框检测不到清空, 检查对话里是否新出现含 greeting 开头的气泡
-                if not sent_confirmed:
+                if not sent_confirmed and not input_still_has_greeting:
                     try:
                         xml_post = d.dump_hierarchy() or ""
                         if greeting[:4] in xml_post:
@@ -3500,7 +3759,13 @@ class FacebookAutomation(BaseAutomation):
         # Phase 8h (2026-04-24): blocklist 前置检查 —
         # 运营手工加黑的 peer 直接 skip greeting, set_greet_reason 同步写 journey
         # 让 funnel_report 能统计到 peer_blocklisted reason.
-        if (self._current_lead_cid
+        try:
+            from src.host.fb_playbook import local_rules_disabled
+            _relaxed_local_rules = local_rules_disabled()
+        except Exception:
+            _relaxed_local_rules = False
+        if (not _relaxed_local_rules
+                and self._current_lead_cid
                 and __import__("src.host.lead_mesh", fromlist=["is_blocklisted"])
                     .is_blocklisted(self._current_lead_cid)):
             log.info("[send_greeting] peer cid=%s 在 blocklist, skip",
@@ -3511,7 +3776,7 @@ class FacebookAutomation(BaseAutomation):
         # Phase 6 P0: 前置检查 — B 机若已对该 peer 在 7 天内发起过 handoff（LINE/WA/TG…）,
         # A 就不再 greeting 插话, 避免双方同时打扰。honor_rejected=True 表示
         # 若 B 主动 reject(user 拒绝引流) 也视作已有接触记录, 一并冷却。
-        if self._current_lead_cid:
+        if self._current_lead_cid and not _relaxed_local_rules:
             try:
                 from src.host.lead_mesh import check_peer_cooldown_handoff
                 active_h = check_peer_cooldown_handoff(
@@ -3804,7 +4069,8 @@ class FacebookAutomation(BaseAutomation):
                              force_send_greeting: Optional[bool] = None,
                              walk_candidates: bool = False,
                              l2_gate_shots: int = 1,
-                             max_l2_calls: int = 3) -> Dict[str, Any]:
+                             max_l2_calls: int = 3,
+                             strict_persona_gate: bool = False) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -3850,6 +4116,7 @@ class FacebookAutomation(BaseAutomation):
             walk_candidates=walk_candidates,
             l2_gate_shots=l2_gate_shots,
             max_l2_calls=max_l2_calls,
+            strict_persona_gate=strict_persona_gate,
         )
         out["add_friend_ok"] = bool(add_ok)
 
@@ -4196,28 +4463,634 @@ class FacebookAutomation(BaseAutomation):
 
         return False
 
+    _FB_JOIN_GROUP_BUTTON_TEXTS = (
+        "Join group", "Join Group", "JOIN GROUP", "Join",
+        "加入小组", "加入群组", "加入社團", "加入小組", "加入",
+        "グループに参加", "参加する", "参加",
+    )
+    _FB_JOIN_REQUESTED_MARKERS = (
+        "Request sent", "Requested", "Pending approval", "Cancel request",
+        "Request pending",
+        "已发送请求", "请求已发送", "已申请", "取消申请", "待审核", "等待批准",
+        "已申請", "取消申請", "審核中",
+        "リクエスト済み", "申請済み", "承認待ち", "リクエストをキャンセル",
+    )
+    _FB_JOIN_QUESTION_MARKERS = (
+        "Answer questions", "Answer membership questions",
+        "Membership questions",
+        "回答问题", "回答以下问题", "会员问题", "成员资格问题",
+        "質問に回答", "メンバーシップに関する質問",
+    )
+    _FB_JOINED_MARKERS = (
+        "Joined", "已加入", "已是成员", "已是成員",
+        "参加済み",
+        "退出小组", "退出群组", "退出小組", "退出社團",
+        "取关小组", "取消关注小组", "管理通知",
+        "Leave group", "Unfollow group", "Manage notifications",
+        "グループを退会", "フォローをやめる", "お知らせを管理",
+    )
+    _FB_GROUP_WELCOME_MARKERS = (
+        "欢迎加入", "欢迎", "Welcome to", "Welcome",
+        "ようこそ", "参加を歓迎",
+    )
+    _FB_GROUP_WELCOME_CONTINUE_TEXTS = (
+        "继续", "完成", "开始浏览", "查看小组", "进入小组", "查看群组", "进入群组",
+        "Continue", "CONTINUE", "Done", "Get started", "View group", "Go to group",
+        "次へ", "続行", "完了", "開始", "グループを見る",
+    )
+
+    def _join_group_outcome(self, outcome: str) -> bool:
+        """记录最近一次 join_group 的细分状态, 供 executor 写入任务结果。"""
+        try:
+            self.last_join_group_outcome = outcome
+        except Exception:
+            pass
+        return outcome in ("joined", "already_joined_or_accessible")
+
+    def _join_button_label_matches(self, raw: str, label: str) -> bool:
+        text = (raw or "").strip()
+        if not text:
+            return False
+        if label in ("Join", "加入", "参加"):
+            return text == label
+        return text == label or label.lower() in text.lower()
+
+    def _join_button_present_in_xml(self, xml: str) -> bool:
+        text = xml or ""
+        try:
+            from ..vision.screen_parser import XMLParser
+            for node in XMLParser.parse(text):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if any(self._join_button_label_matches(raw, marker)
+                       for marker in self._FB_JOIN_GROUP_BUTTON_TEXTS):
+                    return True
+        except Exception:
+            pass
+        return any(
+            marker in text
+            for marker in self._FB_JOIN_GROUP_BUTTON_TEXTS
+            if marker not in ("Join", "加入", "参加")
+        )
+
+    def _classify_join_group_page(self, xml: str,
+                                  group_name: str = "") -> str:
+        """识别加入后的真实状态。空字符串表示还无法判断。"""
+        text = xml or ""
+        if not text:
+            return ""
+        if any(marker in text for marker in self._FB_JOIN_QUESTION_MARKERS):
+            return "membership_questions_required"
+        if any(marker in text for marker in self._FB_JOIN_REQUESTED_MARKERS):
+            return "join_requested_pending_approval"
+        if any(marker in text for marker in self._FB_JOINED_MARKERS):
+            return "joined"
+        has_group_name = bool(group_name and group_name in text)
+        has_group_tab = any(tok in text for tok in self._GROUP_PAGE_SIGNATURE_TOKENS)
+        if has_group_name and has_group_tab and not self._join_button_present_in_xml(text):
+            return "already_joined_or_accessible"
+        return ""
+
+    def _looks_like_group_welcome_screen(self, xml: str,
+                                         group_name: str = "") -> bool:
+        """识别入群后的欢迎/引导页。
+
+        Facebook 对首次加入的公开群经常先展示欢迎页，底部有“继续”按钮。
+        该页还不含 Members/Discussion 等群页 tab，旧流程会立刻重新搜索群名。
+        """
+        text = xml or ""
+        if not text:
+            return False
+        if group_name and group_name not in text:
+            return False
+        low = text.lower()
+        welcome_hit = any(
+            marker in text or marker.lower() in low
+            for marker in self._FB_GROUP_WELCOME_MARKERS
+        )
+        if not welcome_hit:
+            return False
+        button_hit = any(
+            label in text or label.lower() in low
+            for label in self._FB_GROUP_WELCOME_CONTINUE_TEXTS
+        )
+        # 欢迎标题 + 目标群名就足够判定；button_hit 只是给日志/坐标兜底参考。
+        return welcome_hit or button_hit
+
+    def _tap_group_welcome_continue(self, d, did: str) -> bool:
+        """点击入群欢迎页底部继续按钮。只由 welcome-screen 判定后调用。"""
+        def _tap_if_sane(el, label: str) -> bool:
+            try:
+                cx, cy = self._el_center(el)
+                if cy < 650:
+                    return False
+                self.hb.tap(d, cx, cy)
+                time.sleep(1.2)
+                log.info("[group_welcome] tap continue by label=%r", label)
+                return True
+            except Exception:
+                return False
+
+        for label in self._FB_GROUP_WELCOME_CONTINUE_TEXTS:
+            for sel in (
+                {"text": label, "clickable": True},
+                {"description": label, "clickable": True},
+                {"text": label},
+                {"description": label},
+            ):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=0.35) and _tap_if_sane(el, label):
+                        return True
+                except Exception:
+                    continue
+
+        try:
+            xml = d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser
+            candidates = []
+            for node in XMLParser.parse(xml):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or not getattr(node, "bounds", None):
+                    continue
+                norm = raw.lower()
+                matched = False
+                for label in self._FB_GROUP_WELCOME_CONTINUE_TEXTS:
+                    lab = label.lower()
+                    if raw == label or lab in norm:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                left, top, right, bottom = node.bounds
+                if top < 650:
+                    continue
+                candidates.append((top, left, right, bottom, raw))
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            if candidates:
+                top, left, right, bottom, raw = candidates[0]
+                self.hb.tap(d, (left + right) // 2, (top + bottom) // 2)
+                time.sleep(1.2)
+                log.info("[group_welcome] tap continue by XML label=%r", raw[:40])
+                return True
+        except Exception as e:
+            log.debug("[group_welcome] XML continue fallback failed: %s", e)
+
+        # 最后才用底部坐标兜底，且调用方已经确认当前是目标群欢迎页。
+        try:
+            w, h = d.window_size()
+            self.hb.tap(d, max(30, w // 2), max(650, int(h * 0.875)))
+            time.sleep(1.2)
+            log.info("[group_welcome] tap continue by bottom coordinate")
+            return True
+        except Exception:
+            return False
+
+    def _continue_group_welcome_if_present(self, d, did: str,
+                                           group_name: str = "") -> bool:
+        """若停在目标群欢迎页，点完引导直到进入群页或欢迎页消失。"""
+        advanced = False
+        for _ in range(4):
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if not self._looks_like_group_welcome_screen(xml, group_name):
+                return advanced
+            _set_step("处理入群欢迎页", group_name)
+            if not self._tap_group_welcome_continue(d, did):
+                log.warning("[group_welcome] welcome screen detected but continue miss "
+                            "group=%r", group_name)
+                return advanced
+            advanced = True
+            time.sleep(1.0)
+            try:
+                ok, reason = self._assert_on_specific_group_page(d, group_name)
+            except Exception:
+                ok, reason = False, ""
+            if ok:
+                log.info("[group_welcome] entered group page after welcome group=%r "
+                         "evidence=%s", group_name, reason)
+                return True
+        return advanced
+
+    def _current_group_page_requires_join(self, d) -> bool:
+        """Detect whether the current group page still exposes a Join button."""
+        try:
+            xml_probe = d.dump_hierarchy() or ""
+        except Exception:
+            xml_probe = ""
+        if xml_probe and (
+            hierarchy_looks_like_fb_groups_filtered_results_page(xml_probe)
+            or hierarchy_looks_like_fb_search_results_page(xml_probe)
+        ):
+            return False
+
+        def _center_safe(el) -> bool:
+            try:
+                _cx, cy = self._el_center(el)
+                return 220 <= cy <= 1450
+            except Exception:
+                return False
+
+        for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
+            for sel in (
+                {"text": label, "clickable": True},
+                {"description": label, "clickable": True},
+            ):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=0.25) and _center_safe(el):
+                        return True
+                except Exception:
+                    continue
+
+        try:
+            xml = xml_probe or d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser
+            for node in XMLParser.parse(xml):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                bounds = getattr(node, "bounds", None)
+                if not raw or not bounds:
+                    continue
+                norm = raw.lower()
+                matched = False
+                for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
+                    if self._join_button_label_matches(raw, label):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                _left, top, _right, bottom = bounds
+                if 220 <= top <= 1450 and 220 <= bottom <= 1450:
+                    return True
+        except Exception as e:
+            log.debug("[extract_members] join-required detection failed: %s", e)
+        return False
+
+    def _tap_group_join_button(self, d, did: str) -> bool:
+        """点击群主页上的 Join/加入按钮, 避免旧 smart_tap 坐标污染。"""
+        def _center_safe(el) -> Optional[Tuple[int, int]]:
+            try:
+                cx, cy = self._el_center(el)
+                if cy < 220 or cy > 1450:
+                    return None
+                return cx, cy
+            except Exception:
+                return None
+
+        for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
+            for sel in (
+                {"text": label, "clickable": True},
+                {"description": label, "clickable": True},
+            ):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=0.5):
+                        pos = _center_safe(el)
+                        if not pos:
+                            continue
+                        self.hb.tap(d, *pos)
+                        time.sleep(0.8)
+                        log.info("[join_group] tap join button by %s=%r",
+                                 "text" if "text" in sel else "desc", label)
+                        return True
+                except Exception:
+                    continue
+
+        # XML fallback: 新版 FB 经常把按钮 label 放 content-desc, 元素本身不可点。
+        try:
+            xml = d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser
+            candidates = []
+            for node in XMLParser.parse(xml):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or not getattr(node, "bounds", None):
+                    continue
+                norm = raw.lower()
+                matched = False
+                for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
+                    if self._join_button_label_matches(raw, label):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                left, top, right, bottom = node.bounds
+                if top < 220 or bottom > 1450:
+                    continue
+                candidates.append((top, left, right, bottom, raw))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            if candidates:
+                top, left, right, bottom, raw = candidates[0]
+                self.hb.tap(d, (left + right) // 2, (top + bottom) // 2)
+                time.sleep(0.8)
+                log.info("[join_group] tap join button by XML label=%r", raw[:40])
+                return True
+        except Exception as e:
+            log.debug("[join_group] XML join button fallback failed: %s", e)
+
+        # Test-run fallback: the 2026-05-01 device build sometimes shows a
+        # full-width blue "加入小组" button on the group header while
+        # uiautomator returns an empty hierarchy. Only use this after all
+        # semantic selectors failed, and only for Facebook local-rule-disabled
+        # test mode.
+        try:
+            from src.host.fb_playbook import local_rules_disabled
+            if local_rules_disabled():
+                w, h = d.window_size()
+                x = max(40, min(w - 40, w // 2))
+                # FB group header primary CTA is normally below title/member
+                # metadata and above the tab strip.
+                y = max(520, min(h - 420, int(h * 0.58)))
+                self.hb.tap(d, x, y)
+                time.sleep(1.0)
+                log.info("[join_group] tap join button by test coordinate fallback")
+                return True
+        except Exception as e:
+            log.debug("[join_group] coordinate join fallback failed: %s", e)
+        return False
+
+    def _join_current_group_page_if_needed(self, d, did: str,
+                                           group_name: str) -> Tuple[bool, str]:
+        """Join from the current group page before falling back to search.
+
+        extract_group_members already verified that the current target group
+        exposes a Join CTA. Re-searching from that state is slower and can land
+        on a different public group row, so try the visible page first.
+        """
+        if not self._current_group_page_requires_join(d):
+            return True, "already_joined_or_accessible"
+        if not self._tap_group_join_button(d, did):
+            return False, "join_button_not_found"
+
+        for _ in range(8):
+            time.sleep(1.0)
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            state = self._classify_join_group_page(xml, group_name)
+            if state in ("already_joined_or_accessible", "joined"):
+                try:
+                    self._continue_group_welcome_if_present(d, did, group_name)
+                except Exception:
+                    pass
+                return True, "joined"
+            if state in (
+                "join_requested_pending_approval",
+                "membership_questions_required",
+            ):
+                return False, state
+            if not self._current_group_page_requires_join(d):
+                return True, "joined_no_cta"
+        return False, "join_state_unknown_after_tap"
+
+    def _tap_join_button_near_group_result(self, d, did: str,
+                                           group_name: str) -> bool:
+        """在搜索结果列表里直接点击目标群同一行的 Join/加入按钮。"""
+        try:
+            xml = d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser
+            group_rows = []
+            join_rows = []
+            combo_rows = []
+            for node in XMLParser.parse(xml):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or not getattr(node, "bounds", None):
+                    continue
+                left, top, right, bottom = node.bounds
+                if top < 260 or bottom > 1500:
+                    continue
+                mid_y = (top + bottom) // 2
+                if group_name in raw:
+                    group_rows.append((mid_y, left, right, bottom, raw))
+                    if self._result_requires_join(raw):
+                        combo_rows.append((mid_y, left, right, bottom, raw))
+                label_hit = False
+                for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
+                    if self._join_button_label_matches(raw, label):
+                        label_hit = True
+                        break
+                if label_hit:
+                    join_rows.append((mid_y, left, right, bottom, raw))
+            if not group_rows and not combo_rows:
+                return False
+            if join_rows:
+                target_y = group_rows[0][0] if group_rows else combo_rows[0][0]
+                same_line = [
+                    r for r in join_rows
+                    if abs(r[0] - target_y) <= 90
+                ]
+                if same_line:
+                    mid_y, left, right, bottom, raw = sorted(
+                        same_line, key=lambda r: (abs(r[0] - target_y), -r[1])
+                    )[0]
+                    self.hb.tap(d, (left + right) // 2, mid_y)
+                    time.sleep(0.8)
+                    log.info(
+                        "[join_group] tap result-row join button label=%r",
+                        raw[:40],
+                    )
+                    return True
+            if combo_rows:
+                mid_y, left, right, bottom, raw = combo_rows[0]
+                # 组合行通常是 "群名 · 加入", 右侧才是加入按钮。
+                x = max(left + 40, min(right - 35, int(right - (right - left) * 0.12)))
+                self.hb.tap(d, x, mid_y)
+                time.sleep(0.8)
+                log.info("[join_group] tap result-row combo join raw=%r", raw[:80])
+                return True
+        except Exception as e:
+            log.debug("[join_group] result-row join fallback failed: %s", e)
+        return False
+
     @_with_fb_foreground
     def join_group(self, group_name: str,
                    device_id: Optional[str] = None) -> bool:
-        """Search and join a group."""
+        """Search and join a group with the same hardened path as enter_group."""
         did = self._did(device_id)
         d = self._u2(did)
+        try:
+            self.last_join_group_outcome = ""
+        except Exception:
+            pass
+        group_name = (group_name or "").strip()
+        if not group_name:
+            return self._join_group_outcome("missing_group_name")
 
-        with self.guarded("join_group", device_id=did):
-            self.smart_tap("Search bar or search icon", device_id=did)
-            time.sleep(0.5)
-            self.hb.type_text(d, group_name)
-            d.press("enter")
-            time.sleep(2)
+        # Facebook 多机通常是一机一号；quota 需要按账号/设备隔离,
+        # 否则一台设备的失败重试会耗尽其他设备的 join_group 小时额度。
+        with self.guarded("join_group", account=did, device_id=did, weight=0.25):
+            _set_step("搜索待加入群组", group_name)
+            if not self._tap_search_bar_preferred(d, did):
+                log.warning("[join_group] search bar not opened for group=%r",
+                            group_name)
+                return self._join_group_outcome("search_page_not_opened")
+            time.sleep(0.6)
+            try:
+                _on_search = hierarchy_looks_like_fb_search_surface(
+                    d.dump_hierarchy() or ""
+                )
+            except Exception:
+                _on_search = False
+            if not _on_search:
+                log.warning("[join_group] Step 1 后未进入搜索页 group=%r",
+                            group_name)
+                return self._join_group_outcome("search_page_not_opened")
 
-            self.smart_tap("Groups tab or filter", device_id=did)
-            time.sleep(1)
+            if not self._type_fb_search_query(d, group_name, did):
+                log.warning("[join_group] type query failed group=%r", group_name)
+                return self._join_group_outcome("type_query_failed")
+            time.sleep(1.0)
+            if not self._submit_fb_search_with_verify(d, did, group_name):
+                return self._join_group_outcome("search_submit_failed")
 
-            if self.smart_tap("First matching group", device_id=did):
-                time.sleep(2)
-                return self.smart_tap("Join Group button", device_id=did)
+            _set_step("筛选 Groups 结果", group_name)
+            filter_ok = False
+            filter_outcome = "groups_filter_not_found"
+            if self._tap_search_results_groups_filter(d, did):
+                time.sleep(1.0)
+                try:
+                    _xml_after_filter = d.dump_hierarchy() or ""
+                except Exception:
+                    _xml_after_filter = ""
+                if hierarchy_looks_like_fb_groups_filtered_results_page(
+                    _xml_after_filter
+                ):
+                    filter_ok = True
+                else:
+                    filter_outcome = "groups_filter_not_applied"
 
-        return False
+            # Some Facebook builds do not expose a stable top Groups chip, but
+            # the All results page already contains group rows. Do not fail if
+            # the exact group is visible as a parsed group candidate; continue
+            # with the same strict row/name checks used below.
+            if not filter_ok:
+                try:
+                    current_groups = self._extract_group_search_results(
+                        d, keyword=group_name, max_groups=8)
+                except Exception:
+                    current_groups = []
+                target_norm = group_name.casefold()
+                visible_group = False
+                for g in current_groups or []:
+                    candidate = (g.get("group_name") or "").strip()
+                    cand_norm = candidate.casefold()
+                    if (
+                        cand_norm == target_norm
+                        or (len(target_norm) >= 6 and target_norm in cand_norm)
+                        or (len(cand_norm) >= 6 and cand_norm in target_norm)
+                    ):
+                        visible_group = True
+                        break
+                if visible_group:
+                    log.info(
+                        "[join_group] Groups filter unavailable/outcome=%s; "
+                        "continue from current results group=%r",
+                        filter_outcome, group_name,
+                    )
+                else:
+                    log.warning(
+                        "[join_group] Groups filter unavailable/outcome=%s and "
+                        "target group not visible group=%r",
+                        filter_outcome, group_name,
+                    )
+                    return self._join_group_outcome(filter_outcome)
+
+            _set_step("点击结果页加入按钮", group_name)
+            if self._tap_join_button_near_group_result(d, did, group_name):
+                for _ in range(5):
+                    time.sleep(1.0)
+                    try:
+                        xml = d.dump_hierarchy() or ""
+                    except Exception:
+                        xml = ""
+                    state = self._classify_join_group_page(xml, group_name)
+                    if state in ("already_joined_or_accessible", "joined"):
+                        log.info("[join_group] result-row join success group=%r",
+                                 group_name)
+                        try:
+                            self._continue_group_welcome_if_present(d, did, group_name)
+                        except Exception as e:
+                            log.debug("[join_group] welcome continue skipped: %s", e)
+                        return self._join_group_outcome("joined")
+                    if state in (
+                        "join_requested_pending_approval",
+                        "membership_questions_required",
+                    ):
+                        log.info("[join_group] result-row join state=%s group=%r",
+                                 state, group_name)
+                        self._join_group_outcome(state)
+                        return False
+
+            _set_step("进入待加入群组", group_name)
+            if not self._tap_first_search_result_group(d, did, group_name):
+                log.warning("[join_group] exact group row not found group=%r",
+                            group_name)
+                return self._join_group_outcome("group_result_not_found")
+            time.sleep(random.uniform(2.0, 3.2))
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if group_name and group_name not in xml:
+                log.warning("[join_group] group page name not found group=%r",
+                            group_name)
+                return self._join_group_outcome("group_page_not_opened")
+
+            state = self._classify_join_group_page(xml, group_name)
+            if state in ("already_joined_or_accessible", "joined"):
+                log.info("[join_group] group already accessible group=%r state=%s",
+                         group_name, state)
+                try:
+                    self._continue_group_welcome_if_present(d, did, group_name)
+                except Exception as e:
+                    log.debug("[join_group] welcome continue skipped: %s", e)
+                return self._join_group_outcome(state)
+            if state in (
+                "join_requested_pending_approval",
+                "membership_questions_required",
+            ):
+                log.info("[join_group] group join blocked state=%s group=%r",
+                         state, group_name)
+                self._join_group_outcome(state)
+                return False
+
+            _set_step("提交加入群组", group_name)
+            if not self._tap_group_join_button(d, did):
+                log.warning("[join_group] join button not found group=%r",
+                            group_name)
+                return self._join_group_outcome("join_button_not_found")
+
+            for _ in range(8):
+                time.sleep(1.0)
+                try:
+                    xml = d.dump_hierarchy() or ""
+                except Exception:
+                    xml = ""
+                state = self._classify_join_group_page(xml, group_name)
+                if state in ("already_joined_or_accessible", "joined"):
+                    log.info("[join_group] join success group=%r state=%s",
+                             group_name, state)
+                    try:
+                        self._continue_group_welcome_if_present(d, did, group_name)
+                    except Exception as e:
+                        log.debug("[join_group] welcome continue skipped: %s", e)
+                    return self._join_group_outcome("joined")
+                if state in (
+                    "join_requested_pending_approval",
+                    "membership_questions_required",
+                ):
+                    log.info("[join_group] join state=%s group=%r",
+                             state, group_name)
+                    self._join_group_outcome(state)
+                    return False
+
+            return self._join_group_outcome("join_state_unknown_after_tap")
 
     # ── Group Operations (Sprint 1 新增 — Facebook 引流核心入口) ──────────
 
@@ -4338,8 +5211,460 @@ class FacebookAutomation(BaseAutomation):
         "Membri",
         "成员", "成員",
     )
+    _FB_GROUP_MEMBERS_SEE_ALL_TEXTS = (
+        "查看全部", "See all", "See All",
+        "すべて見る", "すべて表示",
+        "Ver todos", "Mostra tutto",
+    )
+    _FB_GROUP_MEMBER_SOURCE_TITLES = {
+        "mutual_members": (
+            "有共同点的成员", "有共同點的成員",
+            "Members with things in common", "Members with things in common with you",
+            "共通点のあるメンバー", "共通点があるメンバー",
+        ),
+        "contributors": (
+            "小组贡献者", "小組貢獻者",
+            "Group contributors", "Top contributors",
+            "グループの投稿者", "コントリビューター",
+        ),
+    }
+    _FB_GROUP_INFO_ACTIVITY_MARKERS = (
+        "小组动态", "小組動態", "Group activity",
+        "グループアクティビティ", "グループのアクティビティ",
+        "今日发帖", "成员总数", "建立时间", "创建时间",
+        "Posts today", "Total members", "Created",
+    )
+    _FB_GROUP_MEMBER_LIST_MARKERS = (
+        "Add friend", "Add Friend", "添加好友", "加为好友",
+        "友達を追加", "友だちを追加",
+        "Admin", "Moderator", "管理员", "管理員", "版主",
+        "管理者", "モデレーター",
+        "mutual", "共同好友", "共通の友達",
+    )
+    _FB_GROUP_MEMBER_LIST_STRONG_MARKERS = (
+        "搜索成员", "Search members", "メンバーを検索",
+        "新加入这个小组的用户", "新加入這個小組的用戶",
+        "New to the group", "New members",
+        "管理员和版主", "管理員和版主",
+        "Admins and moderators", "Administrators and moderators",
+        "小组专家", "小組專家", "Group experts",
+    )
+    _FB_GROUP_MEMBER_ADD_BUTTON_TEXTS = (
+        "加为好友", "添加好友", "加为朋友", "加為好友",
+        "Add friend", "Add Friend",
+        "友達を追加", "友だちを追加",
+    )
+    _FB_GROUP_MEMBER_NAME_BLOCKLIST = frozenset({
+        "成员", "成員", "members", "search members", "搜索成员",
+        "查看全部", "查看所有成员", "see all", "see all members",
+        "有共同点的成员", "共同点的成员", "管理员和版主",
+        "小组专家", "add friend", "加为好友", "添加好友",
+        "添加小组成员", "消息功能", "message feature", "messaging",
+    })
 
-    def _tap_group_members_tab(self, d, did: str) -> bool:
+    def _looks_like_group_members_list_xml(self, xml: str) -> bool:
+        """判断当前是否已进入完整成员列表页，而不是群信息页的成员预览。"""
+        text = xml or ""
+        if not text:
+            return False
+        has_member_title = any(t in text for t in self._FB_GROUP_MEMBERS_TAB_TEXTS)
+        if not has_member_title:
+            return False
+        has_see_all = any(t in text for t in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS)
+        has_info_activity = any(t in text for t in self._FB_GROUP_INFO_ACTIVITY_MARKERS)
+        if has_info_activity:
+            return False
+        has_strong_member_list_signal = any(
+            t in text for t in self._FB_GROUP_MEMBER_LIST_STRONG_MARKERS
+        )
+        if not has_strong_member_list_signal:
+            return False
+        return any(t in text for t in self._FB_GROUP_MEMBER_LIST_MARKERS)
+
+    def _looks_like_reaction_user_list_xml(self, xml: str) -> bool:
+        """Post reaction user lists are not group member lists."""
+        text = xml or ""
+        if not text:
+            return False
+        return any(marker in text for marker in (
+            "留下心情的用户", "留下心情的人", "表达心情的用户",
+            "People who reacted", "reactions", "リアクションした人",
+        ))
+
+    def _members_desc_looks_like_group_metadata(self, desc: str) -> bool:
+        """过滤群头/搜索结果元信息, 避免把成员数量描述当作 Members tab。"""
+        text = (desc or "").strip()
+        if not text:
+            return False
+        if self._looks_like_group_result_meta(text):
+            return True
+        low = text.lower()
+        return any(marker in low for marker in (
+            "public group", "private group", "visible group", "hidden group",
+        )) or any(marker in text for marker in (
+            "公开小组", "私密小组", "公开群组", "私密群组",
+            "公開グループ", "非公開グループ", "公開小組", "私密小組",
+            "位成员", "位成員", "名成员", "名成員", "名のメンバー",
+        ))
+
+    def _tap_members_see_all_link(self, d, did: str,
+                                  preferred_source: str = "") -> bool:
+        """群信息页成员预览区里的“查看全部/See all”进入完整成员列表。"""
+        try:
+            xml = d.dump_hierarchy() or ""
+        except Exception:
+            xml = ""
+        if not xml:
+            return False
+        has_member_title = any(t in xml for t in self._FB_GROUP_MEMBERS_TAB_TEXTS)
+        has_see_all = any(t in xml for t in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS)
+        has_info_activity = any(t in xml for t in self._FB_GROUP_INFO_ACTIVITY_MARKERS)
+        if not has_member_title:
+            return False
+        if not has_see_all and not has_info_activity:
+            return False
+
+        def _after_tap_ok() -> bool:
+            try:
+                return self._looks_like_group_members_list_xml(d.dump_hierarchy() or "")
+            except Exception:
+                return False
+
+        source_order = [preferred_source] if preferred_source else [
+            "mutual_members", "contributors", "general"]
+        source_rank = {s: i for i, s in enumerate(source_order)}
+
+        def _source_for_node(raw: str, top: int, title_nodes) -> str:
+            text = raw or ""
+            for source, labels in self._FB_GROUP_MEMBER_SOURCE_TITLES.items():
+                if any(label in text for label in labels):
+                    return source
+            best_source = "general"
+            best_dist = 9999
+            for source, title_top in title_nodes:
+                if title_top <= top:
+                    dist = top - title_top
+                    if 0 <= dist < best_dist and dist <= 420:
+                        best_source = source
+                        best_dist = dist
+            return best_source
+
+        try:
+            from ..vision.screen_parser import XMLParser
+            parsed = XMLParser.parse(xml)
+            title_nodes = []
+            for node in parsed:
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or not getattr(node, "bounds", None):
+                    continue
+                _left, top, _right, _bottom = node.bounds
+                for source, labels in self._FB_GROUP_MEMBER_SOURCE_TITLES.items():
+                    if any(label in raw for label in labels):
+                        title_nodes.append((source, top))
+
+            candidates = []
+            for node in parsed:
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or not getattr(node, "bounds", None):
+                    continue
+                if not any(label == raw or label in raw
+                           for label in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS):
+                    continue
+                left, top, right, bottom = node.bounds
+                if top < 240 or bottom > 1250:
+                    continue
+                source = _source_for_node(raw, top, title_nodes)
+                if preferred_source and source != preferred_source:
+                    continue
+                rank = source_rank.get(source, source_rank.get("general", 99))
+                # Same-rank candidates lower on the screen are often the section
+                # body "See all"; keep the explicit source ordering first.
+                candidates.append((rank, top, -left, left, right, bottom, raw, source))
+            candidates.sort()
+            for _rank, _top, _neg_left, left, right, bottom, raw, source in candidates[:4]:
+                self.hb.tap(d, (left + right) // 2, (_top + bottom) // 2)
+                time.sleep(1.5)
+                if _after_tap_ok():
+                    try:
+                        self._last_group_member_source = source
+                    except Exception:
+                        pass
+                    log.info("[extract_members] tap %s See all by XML=%r ✓",
+                             source, raw[:40])
+                    return True
+        except Exception as e:
+            log.debug("[extract_members] source-aware See all XML failed: %s", e)
+
+        for label in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS:
+            for sel in ({"text": label, "clickable": True}, {"text": label}):
+                try:
+                    el = d(**sel)
+                    if not el.exists(timeout=0.45):
+                        continue
+                    cx, cy = self._el_center(el)
+                    if cy < 240 or cy > 1250:
+                        continue
+                    self.hb.tap(d, cx, cy)
+                    time.sleep(1.5)
+                    if _after_tap_ok():
+                        try:
+                            self._last_group_member_source = preferred_source or "general"
+                        except Exception:
+                            pass
+                        log.info("[extract_members] tap member See all by text=%r ✓",
+                                 label)
+                        return True
+                except Exception:
+                    continue
+
+        try:
+            from ..vision.screen_parser import XMLParser
+            candidates = []
+            for node in XMLParser.parse(xml):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or not getattr(node, "bounds", None):
+                    continue
+                if not any(label == raw or label in raw
+                           for label in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS):
+                    continue
+                left, top, right, bottom = node.bounds
+                if top < 240 or bottom > 1250:
+                    continue
+                # 成员预览区通常在页面上半部，优先右侧链接。
+                candidates.append((top, -left, left, right, bottom, raw))
+            candidates.sort()
+            for _top, _neg_left, left, right, bottom, raw in candidates[:3]:
+                self.hb.tap(d, (left + right) // 2, (_top + bottom) // 2)
+                time.sleep(1.5)
+                if _after_tap_ok():
+                    try:
+                        self._last_group_member_source = preferred_source or "general"
+                    except Exception:
+                        pass
+                    log.info("[extract_members] tap member See all by XML=%r ✓",
+                             raw[:40])
+                    return True
+        except Exception as e:
+            log.debug("[extract_members] member See all XML fallback failed: %s", e)
+
+        if has_info_activity:
+            try:
+                w, h = d.window_size()
+                # 群信息页的“查看全部”通常在成员区标题右侧；只有在已经
+                # 确认为目标群信息页时才用坐标兜底，避免误点普通列表。
+                self.hb.tap(d, int(w * 0.86), int(h * 0.33))
+                time.sleep(1.5)
+                if _after_tap_ok():
+                    try:
+                        self._last_group_member_source = preferred_source or "general"
+                    except Exception:
+                        pass
+                    log.info("[extract_members] tap member See all by preview coordinate ✓")
+                    return True
+            except Exception as e:
+                log.debug("[extract_members] member See all coordinate fallback failed: %s", e)
+        return False
+
+    def _tap_members_see_all_after_scroll(self, d, did: str,
+                                          preferred_source: str = "",
+                                          max_scrolls: int = 3) -> bool:
+        """在群简介页向下扫到成员区, 再点成员预览的“查看全部”。"""
+        if self._tap_members_see_all_link(d, did, preferred_source):
+            return True
+        for _ in range(max(0, max_scrolls)):
+            try:
+                self.hb.scroll_down(d)
+                self.hb.wait_read(600)
+            except Exception:
+                try:
+                    d.swipe(0.5, 0.82, 0.5, 0.36, duration=0.35)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+            if self._tap_members_see_all_link(d, did, preferred_source):
+                return True
+        return False
+
+    def _open_group_info_then_members(self, d, did: str,
+                                      preferred_source: str = "") -> bool:
+        """从群动态页/群主页进入简介页, 再打开完整成员列表。"""
+        if self._tap_members_see_all_link(d, did, preferred_source):
+            return True
+
+        # 2026-05-03 P1-A real-device fix: 新版 FB 群头页面布局改了, Members tab
+        # 不再作为顶部独立 chip 出现; 群信息入口收敛到一个大按钮, 其 content-desc
+        # 含 "<group_name>, Public group · NK members" 这类完整描述. 旧坐标启发
+        # 路径 (tap w*0.40, y=125) 落在状态栏区域, 永远命中不到. 改为 desc 匹配
+        # "Public group / Private group" 等多语言群类型词, 精确点击群头卡片.
+        try:
+            xml = d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser as _XPG
+            _GROUP_HEADER_DESC_MARKERS = (
+                "Public group", "Private group",
+                "公开小组", "公開小組", "私密小组", "私密小組",
+                "公開グループ", "非公開グループ",
+            )
+            for node in _XPG.parse(xml):
+                if not getattr(node, "bounds", None):
+                    continue
+                if not bool(getattr(node, "clickable", False)):
+                    continue
+                desc = (getattr(node, "content_desc", None) or "").strip()
+                if not desc or not any(
+                    m in desc for m in _GROUP_HEADER_DESC_MARKERS
+                ):
+                    continue
+                _l, _t, _r, _b = node.bounds
+                # 群头大卡片通常在屏幕中部偏上 (y∈[300,900]), 高度有限避免误命
+                # 整屏背景容器.
+                if not (300 <= _t <= 900 and (_b - _t) <= 240):
+                    continue
+                self.hb.tap(d, (_l + _r) // 2, (_t + _b) // 2)
+                time.sleep(1.5)
+                log.info(
+                    "[extract_members] tap group header card desc=%r "
+                    "bounds=%s",
+                    desc[:60], node.bounds,
+                )
+                if self._tap_members_see_all_link(d, did, preferred_source):
+                    log.info(
+                        "[extract_members] opened member list after group "
+                        "header card tap")
+                    return True
+                if self._tap_members_see_all_after_scroll(
+                    d, did, preferred_source, max_scrolls=3
+                ):
+                    log.info(
+                        "[extract_members] opened member list via header"
+                        " card + scroll")
+                    return True
+                break  # 群头只 tap 一次, 失败就降级原 fallback
+        except Exception as _gh_e:
+            log.debug("[extract_members] group header card path failed: %s",
+                       _gh_e)
+
+        try:
+            w, h = d.window_size()
+        except Exception:
+            w, h = 720, 1600
+
+        # 1) 动态流顶部的群名标题栏: 点开群主页大头图区域。
+        try:
+            self.hb.tap(d, int(w * 0.40), min(125, int(h * 0.08)))
+            time.sleep(1.3)
+            if self._tap_members_see_all_link(d, did, preferred_source):
+                log.info("[extract_members] opened member list after tapping group title bar")
+                return True
+        except Exception as e:
+            log.debug("[extract_members] tap group title bar fallback failed: %s", e)
+
+        # 2) 群主页大标题右侧有 chevron, 点它进入简介/About。
+        try:
+            self.hb.tap(d, int(w * 0.58), int(h * 0.38))
+            time.sleep(1.3)
+            if self._tap_members_see_all_after_scroll(
+                    d, did, preferred_source, max_scrolls=1):
+                log.info("[extract_members] opened member list via group info/about page")
+                return True
+        except Exception as e:
+            log.debug("[extract_members] tap group info chevron fallback failed: %s", e)
+
+        # 3) 如果调用时已经在简介页顶部, 直接扫到成员区。
+        return self._tap_members_see_all_after_scroll(
+            d, did, preferred_source, max_scrolls=1)
+
+    def _clean_group_member_candidate_name(self, raw: str) -> str:
+        """从新版 FB 成员行 content-desc 中提取姓名。"""
+        text = (raw or "").replace("\xa0", " ").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", " ", text)
+        for sep in ("\n", "\r"):
+            if sep in text:
+                text = text.split(sep, 1)[0].strip()
+        for sep in (",", "，"):
+            if sep in text:
+                text = text.split(sep, 1)[0].strip()
+                break
+        for marker in (
+            " 位共同好友", "位共同好友", " mutual friend",
+            " mutual friends", "目前就职", "currently works",
+            "分",
+        ):
+            idx = text.find(marker)
+            if idx > 0:
+                text = text[:idx].strip()
+        text = text.strip(" ·,，:：")
+        if not text:
+            return ""
+        if text.lower() in self._FB_GROUP_MEMBER_NAME_BLOCKLIST:
+            return ""
+        if any(marker in text for marker in (
+            "这份名单", "這份名單", "名单包含", "名單包含",
+            "贡献积分", "貢獻積分", "This list", "this list",
+            "このリスト", "リストには",
+        )):
+            return ""
+        if any(t in text for t in ("查看", "搜索", "添加", "好友", "小组成员")):
+            return ""
+        if len(text) < 2 or len(text) > 60:
+            return ""
+        if re.fullmatch(r"[\d\s,，.]+", text):
+            return ""
+        return text
+
+    def _extract_group_member_candidates(self, elements) -> List[Dict[str, Any]]:
+        """从成员列表 XML 元素中抽取带“加为好友”动作的用户。"""
+        add_centers = []
+        for el in elements:
+            raw = ((getattr(el, "text", "") or "") + " " +
+                   (getattr(el, "content_desc", "") or "")).strip()
+            if not raw or not getattr(el, "bounds", None):
+                continue
+            if any(label in raw for label in self._FB_GROUP_MEMBER_ADD_BUTTON_TEXTS):
+                left, top, right, bottom = el.bounds
+                add_centers.append(((top + bottom) // 2, left, right))
+        if not add_centers:
+            return []
+
+        def _has_add_action_near(bounds) -> bool:
+            _left, top, _right, bottom = bounds
+            # 同一成员卡里, 姓名通常在“加为好友”按钮上方或同一垂直区间。
+            # 只用中心点距离会把上一张卡片的按钮误配到下一张无按钮卡片(自己)。
+            return any((top - 40) <= add_y <= (bottom + 110)
+                       for add_y, _al, _ar in add_centers)
+
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for el in elements:
+            bounds = getattr(el, "bounds", None)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            if top < 240 or bottom > 1500:
+                continue
+            if not _has_add_action_near(bounds):
+                continue
+            raw = (getattr(el, "content_desc", "") or
+                   getattr(el, "text", "") or "").strip()
+            name = self._clean_group_member_candidate_name(raw)
+            if not name:
+                continue
+            key = name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            item = {"name": name}
+            if raw and raw != name:
+                item["profile_snippet"] = raw[:180]
+            out.append(item)
+        return out
+
+    def _tap_group_members_tab(self, d, did: str,
+                               preferred_source: str = "") -> bool:
         """点击群内 Members tab 的精确路径。
 
         2026-04-24 Phase 9 升级 (对齐 Phase 7 search_bar 修复):
@@ -4351,18 +5676,86 @@ class FacebookAutomation(BaseAutomation):
           4. **噪音过滤** — 即使命中也要看 label 长度: 推荐群卡片 desc
              通常 > 40 字, Members Tab 短 label 一般 ≤ 20
         """
+        deadline = time.time() + 45.0
+
+        def _expired(stage: str) -> bool:
+            if time.time() <= deadline:
+                return False
+            log.warning("[extract_members] Members tab probe timeout at %s", stage)
+            return True
+
         def _is_on_members_list() -> bool:
             """自检: 点击后是否到了 Members 列表页."""
             try:
-                xml = d.dump_hierarchy() or ""
+                return self._looks_like_group_members_list_xml(
+                    d.dump_hierarchy() or ""
+                )
             except Exception:
                 return False
-            # 成员列表特征: 多个 "Admin"/"Moderator" 标签 或 "Added by" 文案
-            markers = ("Added by", "Admin", "Moderator", "管理员", "管理者")
-            return sum(1 for m in markers if m in xml) >= 1
+
+        def _recover_if_reaction_list() -> bool:
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if not self._looks_like_reaction_user_list_xml(xml):
+                return False
+            log.warning("[extract_members] mis-tapped reaction user list; backing out")
+            try:
+                d.press("back")
+                time.sleep(0.8)
+            except Exception:
+                pass
+            return True
+
+        if _is_on_members_list():
+            return True
+        if self._tap_members_see_all_link(d, did, preferred_source):
+            return True
+
+        # 2026-05-03 P1-A real-device debug: 真机进群后 4 路 selector 全 miss,
+        # 与 Groups chip 同源问题 (text='' desc 才有内容). dump 群内所有 tab 行
+        # 候选给日志, 帮定位 Members tab 节点真实 text/desc/clickable.
+        try:
+            _xml_mt = d.dump_hierarchy() or ""
+            if _xml_mt:
+                from ..vision.screen_parser import XMLParser as _XPM
+                _hits_mt = 0
+                for _n in _XPM.parse(_xml_mt):
+                    if not getattr(_n, "bounds", None):
+                        continue
+                    _l, _t, _r, _b = _n.bounds
+                    # 群内顶部 tab 区域: 状态栏下到群头大概 0-700px
+                    if not (0 <= _t <= 700 and (_b - _t) <= 160):
+                        continue
+                    _txt = (getattr(_n, "text", "") or "").strip()
+                    _dsc = (getattr(_n, "content_desc", None) or "").strip()
+                    if not (_txt or _dsc):
+                        continue
+                    # 只输出含 "Member"/"成员"/"メンバー" 等的节点 + clickable=True
+                    # 节点（避免日志洪水）
+                    _is_member_word = any(k in (_txt + _dsc) for k in (
+                        "Member", "MEMBER", "member",
+                        "成员", "成員", "メンバー", "Membri",
+                    ))
+                    _is_clickable = bool(getattr(_n, "clickable", False))
+                    if not (_is_member_word or _is_clickable):
+                        continue
+                    log.info(
+                        "[memtab-debug] t=%r d=%r bounds=(%d,%d,%d,%d) clk=%s",
+                        _txt[:40], _dsc[:80], _l, _t, _r, _b,
+                        getattr(_n, "clickable", "?"),
+                    )
+                    _hits_mt += 1
+                    if _hits_mt >= 30:
+                        break
+        except Exception as _mt_dbg_e:
+            log.debug("[memtab-debug] dump fail: %s", _mt_dbg_e)
 
         # ① 精确 text + clickable (原版路径, 保留)
         for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
+            if _expired("text"):
+                return False
             try:
                 el = d(text=txt, clickable=True)
                 if el.exists(timeout=0.8):
@@ -4372,6 +5765,10 @@ class FacebookAutomation(BaseAutomation):
                         log.info("[extract_members] tap Members tab by text='%s' ✓",
                                   txt)
                         return True
+                    if self._tap_members_see_all_link(d, did, preferred_source):
+                        return True
+                    if _recover_if_reaction_list():
+                        return False
                     log.debug("[extract_members] text='%s' 点后不像 members 列表,"
                               " 继续尝试", txt)
             except Exception:
@@ -4379,6 +5776,8 @@ class FacebookAutomation(BaseAutomation):
 
         # ② 精确 content-desc + clickable (新版 FB katana 常见)
         for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
+            if _expired("description"):
+                return False
             try:
                 el = d(description=txt, clickable=True)
                 if el.exists(timeout=0.8):
@@ -4388,11 +5787,17 @@ class FacebookAutomation(BaseAutomation):
                         log.info("[extract_members] tap Members tab by desc='%s' ✓",
                                   txt)
                         return True
+                    if self._tap_members_see_all_link(d, did, preferred_source):
+                        return True
+                    if _recover_if_reaction_list():
+                        return False
             except Exception:
                 continue
 
         # ③ descriptionContains 但只取短 label (过滤推荐群长描述)
         for txt in self._FB_GROUP_MEMBERS_TAB_TEXTS:
+            if _expired("descriptionContains"):
+                return False
             try:
                 el = d(descriptionContains=txt, clickable=True)
                 if el.exists(timeout=0.6):
@@ -4406,18 +5811,28 @@ class FacebookAutomation(BaseAutomation):
                         log.debug("[extract_members] descContains '%s' 命中长描述"
                                   " (len=%d), 跳过防误点推荐群", txt, len(desc))
                         continue
+                    if self._members_desc_looks_like_group_metadata(desc):
+                        log.debug("[extract_members] descContains '%s' 命中群元信息"
+                                  " desc=%r, 跳过防误判", txt, desc[:80])
+                        continue
                     self.hb.tap(d, *self._el_center(el))
                     time.sleep(1.2)
                     if _is_on_members_list():
                         log.info("[extract_members] tap Members tab by descContains "
                                   "short desc='%s' ✓", desc[:30])
                         return True
+                    if self._tap_members_see_all_link(d, did, preferred_source):
+                        return True
+                    if _recover_if_reaction_list():
+                        return False
             except Exception:
                 continue
 
         # ④ resourceId 兜底 (FB 老版本可能 expose)
         for rid in ("com.facebook.katana:id/members_tab",
                     "com.facebook.katana:id/group_members_tab"):
+            if _expired("resourceId"):
+                return False
             try:
                 el = d(resourceId=rid)
                 if el.exists(timeout=0.4):
@@ -4426,8 +5841,17 @@ class FacebookAutomation(BaseAutomation):
                     if _is_on_members_list():
                         log.info("[extract_members] tap Members tab by resourceId ✓")
                         return True
+                    if self._tap_members_see_all_link(d, did, preferred_source):
+                        return True
+                    if _recover_if_reaction_list():
+                        return False
             except Exception:
                 continue
+
+        if _expired("info_fallback"):
+            return False
+        if self._open_group_info_then_members(d, did, preferred_source):
+            return True
 
         log.warning("[extract_members] Members tab 4 种路径全部失败, 需跑"
                      " debug_extract_members_trace.py 诊断真实 UI 结构")
@@ -4542,11 +5966,36 @@ class FacebookAutomation(BaseAutomation):
         return stats
 
     # 搜索结果页的 "Groups" filter chip text (多语种 FB)
+    #
+    # 真机证据 (2026-04-30 task 4ce94cc4 + manual debug_dump.xml):
+    # 中文版 FB chip 实际是 '小组' (简体) 或 '小組' (繁体). 历史遗漏导致
+    # 真机 4 路 selector 全 miss → 任务失败. 同时 chip 元素的 text 字段
+    # 通常为空, 真正的标识在 content-desc, 形如:
+    #   content-desc="小组个搜索结果, 第3项，共7项"
+    # 因此匹配方式必须用 descriptionContains 部分匹配, 不能用 description= 全等.
     _FB_SEARCH_GROUPS_FILTER_TEXTS = (
         "Groups", "GROUPS",
         "群组", "群組",
+        "小组", "小組",  # 中文版 FB (zh-CN/zh-TW), 真机实测的标准文案
         "グループ",
         "Gruppi",
+    )
+
+    # 真正的 chip content-desc 一定是 "<lang_word>个搜索结果, 第N项，共M项"
+    # (zh) / "tab N of M" (en) / "<lang_word>の検索結果" (ja) 这类带 *搜索结果* 后缀
+    # 的完整短语。typeahead 联想项 desc 不含这种短语，能一刀切掉假阳性。
+    # 历史 bug (caefd0e0 2026-04-30): descriptionContains='小组' 这种裸子串
+    # 在 typeahead overlay 误命中 → Step 3 假"成功" → 后续步骤全错位。
+    _FB_SEARCH_GROUPS_CHIP_DESC_SUFFIXES = (
+        "个搜索结果",        # zh-Hans: '小组个搜索结果, 第3项，共7项'
+        "個搜尋結果",        # zh-Hant
+        "の検索結果",        # ja
+        "검색 결과",         # ko (按需扩)
+        # en 版 chip desc 真机抓到的实际格式: 'Groups search results, 4 of 7'
+        # — 词与词之间是空格. 旧值 'search results' 被 f"{txt}{suffix}" 拼成
+        # 'Groupssearch results' 永远 miss. 新值前置空格修正英文匹配。
+        " search results",  # en (Redmi 13C Android FB 7.x 真机验证, 2026-05-03)
+        "search results",   # 兼容兜底 (历史无空格场景, 防回归)
     )
 
     def _tap_search_results_groups_filter(self, d, did: str) -> bool:
@@ -4555,7 +6004,46 @@ class FacebookAutomation(BaseAutomation):
         FB 搜索结果页顶部布局: [All] [Posts] [People] [Groups] [Pages] ...
         AutoSelector 学错时会把 "Groups, tab 4 of 6" (底部 tab) 当成
         filter chip → 把搜索页切回 Groups 主 tab → 任务卡住.
+
+        匹配优先级 (P2.X-4 2026-04-30 加严):
+          1. ``text=<lang_word>`` 全等 (英文版 FB / 部分小语种 chip text 直接为词)
+          2. ``descriptionContains=f"{lang_word}{suffix}"`` —— 必须包含
+             *搜索结果* 这类完整短语后缀, 拒绝 typeahead 联想项 desc 的裸子串
+             命中 (历史 bug caefd0e0)。
         """
+        # 2026-05-03 P1-A real-device debug: 真机 3 台均 chip miss 但截图可见
+        # chip. dump 顶部区域所有 text/desc 节点, 帮定位 selector 失效根因.
+        # 下游 selector 路径不变, 仅多打一次诊断日志.
+        try:
+            _xml_dbg = d.dump_hierarchy() or ""
+            if _xml_dbg:
+                from ..vision.screen_parser import XMLParser as _XP
+                _hits = 0
+                for _n in _XP.parse(_xml_dbg):
+                    if not getattr(_n, "bounds", None):
+                        continue
+                    _l, _t, _r, _b = _n.bounds
+                    if not (100 <= _t <= 360 and (_r - _l) <= 320
+                            and (_b - _t) <= 140):
+                        continue
+                    _txt = (getattr(_n, "text", "") or "").strip()
+                    _dsc = (getattr(_n, "content_desc", None) or "").strip()
+                    if not (_txt or _dsc):
+                        continue
+                    log.info(
+                        "[chip-debug] t=%r d=%r bounds=(%d,%d,%d,%d) clk=%s",
+                        _txt[:40], _dsc[:80], _l, _t, _r, _b,
+                        getattr(_n, "clickable", "?"),
+                    )
+                    _hits += 1
+                    if _hits >= 30:
+                        break
+                if _hits == 0:
+                    log.info("[chip-debug] 顶部 chip 区域无候选节点 "
+                              "(xml_size=%d)", len(_xml_dbg))
+        except Exception as _dbg_e:
+            log.debug("[chip-debug] dump fail: %s", _dbg_e)
+
         for txt in self._FB_SEARCH_GROUPS_FILTER_TEXTS:
             try:
                 el = d(text=txt, clickable=True)
@@ -4564,14 +6052,331 @@ class FacebookAutomation(BaseAutomation):
                     time.sleep(0.4)
                     log.info("[enter_group] tap search Groups filter by text=%r", txt)
                     return True
-                el = d(description=txt, clickable=True)
-                if el.exists(timeout=0.4):
-                    self.hb.tap(d, *self._el_center(el))
-                    time.sleep(0.4)
-                    log.info("[enter_group] tap search Groups filter by desc=%r", txt)
-                    return True
+                # 中文 FB 的顶部 chip 经常是 TextView 自身不可点击、父级可点。
+                # 直接按 XML bounds 点顶部 chip 中心，避免落到右侧筛选按钮。
+                # 2026-05-03 P1-A real-device fix: 真机 FB 英文 chip 节点 text 为空
+                # (只有 content-desc='Groups search results, 4 of 7'), 旧版 text
+                # 全等判定永远过不了. 改为 text 或 content-desc 任一匹配即可,
+                # 同时放宽 top 上限 (真机抓到 chip top=168, 旧上限 260 OK; 但有些设备
+                # 状态栏更高, top 可能到 360, 一并放宽).
+                try:
+                    xml = d.dump_hierarchy() or ""
+                    from ..vision.screen_parser import XMLParser
+                    for node in XMLParser.parse(xml):
+                        _node_t = (node.text or "").strip()
+                        _node_d = (getattr(node, "content_desc", None)
+                                    or "").strip()
+                        # 命中条件: text 全等 txt OR content-desc 以 txt 开头
+                        # (chip desc 为 "Groups search results, ..." 这样的前缀串)
+                        if _node_t != txt and not _node_d.startswith(txt):
+                            continue
+                        if not node.bounds:
+                            continue
+                        left, top, right, bottom = node.bounds
+                        # P1-A: top 上限 260 → 360 (覆盖更多机型状态栏高度变化)
+                        if 100 <= top <= 360 and (right - left) <= 240:
+                            self.hb.tap(d, (left + right) // 2,
+                                        (top + bottom) // 2)
+                            time.sleep(0.4)
+                            log.info(
+                                "[enter_group] tap search Groups filter "
+                                "by top-chip txt=%r desc=%r bounds=%s",
+                                txt, _node_d[:40], node.bounds,
+                            )
+                            return True
+                except Exception:
+                    pass
+                # P2.X-4: 用 "<lang_word><suffix>" 完整短语兜底, 不再用 'txt'
+                # 裸子串 — typeahead 任何 desc 含 '小组' 字也会命中, 是历史
+                # caefd0e0 失败的核心成因。
+                for suffix in self._FB_SEARCH_GROUPS_CHIP_DESC_SUFFIXES:
+                    needle = f"{txt}{suffix}"
+                    try:
+                        el = d(descriptionContains=needle, clickable=True)
+                        if el.exists(timeout=0.4):
+                            try:
+                                cx, cy = self._el_center(el)
+                                if not (120 <= cy <= 280 and cx <= 650):
+                                    continue
+                            except Exception:
+                                pass
+                            self.hb.tap(d, *self._el_center(el))
+                            time.sleep(0.4)
+                            log.info(
+                                "[enter_group] tap search Groups filter "
+                                "by descContains=%r", needle,
+                            )
+                            return True
+                    except Exception:
+                        continue
             except Exception:
                 continue
+        return False
+
+    # ── Step 2 多路提交 + 校验 ────────────────────────────────────────
+    #
+    # 历史 bug (caefd0e0 2026-04-30): ``d.send_action("search")`` 在该机
+    # MIUI 自带拼音输入法上 *不抛异常也不真正派发* IME_ACTION_SEARCH, 屏幕
+    # 停留在 typeahead overlay (取证截图: forensics/.../enter_group_assert_failed)。
+    # 旧 fallback 仅在 ``send_action`` 抛异常时才 press("enter"), silent no-op
+    # 直接绕过 → Step 3+ 在 typeahead 上误命中 ``descContains='小组'`` 子串。
+    # P2.X-4 v2 (2026-04-30 P2 phase): 五路提交策略
+    #
+    # 1. send_action_search  — IME_ACTION_SEARCH (原路径, 兼容绝大多数设备)
+    # 2. send_action_go      — IME_ACTION_GO (部分 MIUI 版本拦了 SEARCH 但放行 GO)
+    # 3. tap_typeahead_group — typeahead 里直接 tap 群组建议行 (最精确, 不依赖 IME)
+    # 4. keyevent_enter      — KEYCODE_ENTER (pre-check: person-only typeahead 则跳过)
+    # 5. keyevent_search     — KEYCODE_SEARCH 兜底
+    #
+    # 顺序保证最安全路径优先, 且每条路径成功即立退，不增加正常设备耗时。
+    _FB_SEARCH_SUBMIT_PATHS = (
+        "send_action_search",
+        "send_action_go",
+        "tap_typeahead_group",
+        "keyevent_enter",
+        "keyevent_search",
+    )
+
+    # Profile 页判定 (与外层 Step 2.5 复用同一组 markers, 避免漂移)
+    _FB_PROFILE_PAGE_MARKERS = (
+        "加为好友", "加为朋友", "加為好友",
+        "Add Friend", "Add friend",
+        "友達になる", "友達リクエストを送信",
+    )
+
+    def _tap_typeahead_group_row(self, d, group_name: str) -> bool:
+        """typeahead overlay 里直接 tap 含 group_name + group-marker 的建议行。
+
+        适用场景：``send_action`` 因 MIUI IME 被拦而 silent no-op，typeahead
+        仍显示时。如果 typeahead 里有群组建议行（desc 同时含 group_name 和群组
+        marker 词），tap 它等同于用户点击建议 → 跳进群搜索结果。
+
+        返回 True 表示 tap 了某个候选行（是否真的导航到结果页由外层校验）。
+        """
+        for marker in _FB_TYPEAHEAD_GROUP_DESC_MARKERS:
+            try:
+                # 先找包含 group_name 的可点击元素
+                els = d(descriptionContains=group_name, clickable=True)
+                if not els.exists(timeout=0.4):
+                    break  # 没有包含 group_name 的建议行了
+                _count = els.count
+                for _i in range(min(_count, 8)):
+                    try:
+                        desc = (els[_i].info or {}).get("contentDescription", "") or ""
+                        if marker in desc and group_name in desc:
+                            self.hb.tap(d, *self._el_center(els[_i]))
+                            log.info(
+                                "[enter_group] tap typeahead group row (marker=%r, "
+                                "desc=%r)", marker, desc[:80],
+                            )
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        try:
+            from src.host.fb_playbook import local_rules_disabled
+            test_relaxed = local_rules_disabled()
+        except Exception:
+            test_relaxed = False
+        if test_relaxed:
+            # Test mode fallback: some FB builds show exact recent/search
+            # suggestions without any group marker, while IME submit is a
+            # silent no-op. Tap only an exact visible keyword row, then let the
+            # outer verifier decide whether it became a real results page.
+            for sel in (
+                {"description": group_name},
+                {"text": group_name},
+                {"descriptionContains": group_name},
+            ):
+                try:
+                    els = d(**sel)
+                    if not els.exists(timeout=0.4):
+                        continue
+                    count = getattr(els, "count", 1) or 1
+                    for i in range(min(count, 8)):
+                        try:
+                            el = els[i] if count > 1 else els
+                            info = el.info or {}
+                            raw = (
+                                info.get("contentDescription")
+                                or info.get("text")
+                                or ""
+                            ).strip()
+                            if raw != group_name:
+                                continue
+                            cx, cy = self._el_center(el)
+                            if cy < 200 or cy > 900:
+                                continue
+                            self.hb.tap(d, cx, cy)
+                            log.info(
+                                "[enter_group] tap exact typeahead keyword row "
+                                "in test mode desc=%r", raw,
+                            )
+                            return True
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        return False
+
+    def _submit_fb_search_with_verify(self, d, did: str,
+                                       group_name: str) -> bool:
+        """五路提交搜索 + 每路后 dump_hierarchy 校验是否离开 typeahead。
+
+        返回 True 仅当确认页面已变成 *搜索结果页*（filter chips 行 ≥2 个完整
+        ``text="..."`` 命中）。失败分两种：
+          - 提交把页面带到 *profile 页*（典型 KEYCODE_ENTER 选中 typeahead
+            首位人物）→ 留证 ``enter_group_submit_landed_on_profile`` 立即返 False,
+            不再尝试后续路径（避免在 profile 页继续 keyevent 制造更多副作用）
+          - 五路全没让页面变成 results 页且也不在 profile 上 → 留证
+            ``enter_group_search_not_submitted`` 返 False
+        """
+        last_xml = ""
+        for path in self._FB_SEARCH_SUBMIT_PATHS:
+            try:
+                if path == "send_action_search":
+                    try:
+                        d.send_action("search")
+                    except Exception as e:
+                        log.info(
+                            "[enter_group] send_action('search') 异常 (%s)", e,
+                        )
+                elif path == "send_action_go":
+                    # P2.X-4 v2: IME_ACTION_GO — 部分 MIUI 版本拦了 ACTION_SEARCH
+                    # 但会转发 ACTION_GO (action=2 vs action=3). 低成本尝试.
+                    try:
+                        d.send_action("go")
+                    except Exception as e:
+                        log.info(
+                            "[enter_group] send_action('go') 异常 (%s)", e,
+                        )
+                elif path == "tap_typeahead_group":
+                    # typeahead 里直接 tap 群组建议行 — 不经过 IME, 最精确
+                    if not self._tap_typeahead_group_row(d, group_name):
+                        log.info(
+                            "[enter_group] skip tap_typeahead_group: "
+                            "无 group 建议行 (typeahead 未含群组候选)"
+                        )
+                        continue  # 没有群组建议行 → 跳过本路径(不等待 dump)
+                elif path == "keyevent_enter":
+                    # P2.X-4 v2: 发 ENTER 前扫 typeahead 是否有 person-only 建议
+                    # person-only → ENTER 会选中首位人物 profile → 跳过改用下一路
+                    if typeahead_has_person_but_no_group_suggestions(last_xml):
+                        log.info(
+                            "[enter_group] skip keyevent_enter: "
+                            "typeahead 含 person 建议但无 group 建议, "
+                            "避免 ENTER 误导航到 profile. group=%r", group_name,
+                        )
+                        continue  # 不等待 dump, 直接下一路
+                    self._adb("shell input keyevent 66", device_id=did)
+                elif path == "keyevent_search":
+                    self._adb("shell input keyevent 84", device_id=did)
+            except Exception as e:
+                log.info("[enter_group] submit path=%s 异常 (%s)", path, e)
+            time.sleep(1.4)
+            try:
+                last_xml = d.dump_hierarchy() or ""
+            except Exception:
+                last_xml = ""
+
+            if hierarchy_looks_like_fb_search_results_page(last_xml):
+                log.info(
+                    "[enter_group] Step 2 submit succeeded via %s "
+                    "(results page detected)", path,
+                )
+                return True
+
+            _hit_profile = next(
+                (m for m in self._FB_PROFILE_PAGE_MARKERS if m in last_xml),
+                None,
+            )
+            if _hit_profile:
+                # P2.X-FP guard (2026-04-30 real-device false positive):
+                # "可能认识" (People You May Know) cards on the search homepage
+                # also contain "加为好友" but do NOT contain "发消息".
+                # A real profile page shows BOTH "加为好友" AND "发消息".
+                # Also, if still on search surface (EditText present) or search
+                # results page (>=2 chips), this is not a real profile page.
+                _PROFILE_MSG_MARKERS = (
+                    "\u53d1\u6d88\u606f",   # 发消息
+                    "\u767c\u6d88\u606f",   # 發消息 (Trad)
+                    "Send Message", "Send message", "Message",
+                    "\u30e1\u30c3\u30bb\u30fc\u30b8\u3092\u9001\u4fe1",  # メッセージを送信
+                    "\u767c\u9001\u8a0a\u606f",  # 發送訊息
+                    "Envoyer un message", "Nachricht senden",
+                )
+                _has_msg_btn = any(m in last_xml for m in _PROFILE_MSG_MARKERS)
+                _on_surface = hierarchy_looks_like_fb_search_surface(last_xml)
+                _on_results = hierarchy_looks_like_fb_search_results_page(last_xml)
+                if not _has_msg_btn or _on_surface or _on_results:
+                    log.info(
+                        "[enter_group] profile marker=%r found but guarded "
+                        "(has_msg=%s on_surface=%s on_results=%s) path=%s "
+                        "— likely 可能认识/搜索结果行 false positive, not profile. "
+                        "Continue next path.",
+                        _hit_profile, _has_msg_btn, _on_surface, _on_results, path,
+                    )
+                else:
+                    log.warning(
+                        "[enter_group] Step 2 submit path=%s 后落到 profile 页 "
+                        "(marker=%r, has_msg=True), 中止后续路径避免副作用. group=%r",
+                        path, _hit_profile, group_name,
+                    )
+                    try:
+                        from src.host.task_forensics import capture_immediate
+                        capture_immediate(
+                            did,
+                            step_name="enter_group_submit_landed_on_profile",
+                            hint=(
+                                f"group={group_name!r} marker={_hit_profile!r} "
+                                f"path={path}"
+                            ),
+                            reason=(
+                                "Step 2 提交搜索后 hierarchy 含 profile signature "
+                                "('加为好友'+'发消息' 同时出现), 中止后续 keyevent."
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    return False
+
+            log.info(
+                "[enter_group] Step 2 submit path=%s 后仍非 results 页, 继续下一路",
+                path,
+            )
+
+        log.warning(
+            "[enter_group] Step 2 五路提交全失败, 仍停留在 typeahead/输入页. "
+            "group=%r", group_name,
+        )
+        for wait_s in (1.5, 2.5):
+            try:
+                time.sleep(wait_s)
+                last_xml = d.dump_hierarchy() or ""
+            except Exception:
+                last_xml = ""
+            if hierarchy_looks_like_fb_search_results_page(last_xml):
+                log.info(
+                    "[enter_group] Step 2 submit succeeded via slow_settle "
+                    "(wait=%.1fs results page detected)",
+                    wait_s,
+                )
+                return True
+        try:
+            from src.host.task_forensics import capture_immediate
+            capture_immediate(
+                did,
+                step_name="enter_group_search_not_submitted",
+                hint=f"group={group_name!r}",
+                reason=(
+                    "send_action(search/go) + tap_typeahead_group + "
+                    "keyevent ENTER + keyevent SEARCH "
+                    "五路均未让页面进入搜索结果页 (filter chip 行 <2)"
+                ),
+            )
+        except Exception:
+            pass
         return False
 
     def _tap_first_search_result_group(self, d, did: str,
@@ -4585,7 +6390,10 @@ class FacebookAutomation(BaseAutomation):
         try:
             el = d(text=group_name, clickable=True)
             if el.exists(timeout=0.8):
-                self.hb.tap(d, *self._el_center(el))
+                cx, cy = self._el_center(el)
+                if cy < 260:
+                    raise ValueError("matched top search suggestion")
+                self.hb.tap(d, cx, cy)
                 time.sleep(0.5)
                 log.info("[enter_group] tap first result by exact text=%r", group_name)
                 return True
@@ -4595,7 +6403,10 @@ class FacebookAutomation(BaseAutomation):
         try:
             el = d(textContains=group_name, clickable=True)
             if el.exists(timeout=0.6):
-                self.hb.tap(d, *self._el_center(el))
+                cx, cy = self._el_center(el)
+                if cy < 260:
+                    raise ValueError("matched top search suggestion")
+                self.hb.tap(d, cx, cy)
                 time.sleep(0.5)
                 log.info("[enter_group] tap first result by textContains=%r", group_name)
                 return True
@@ -4605,30 +6416,110 @@ class FacebookAutomation(BaseAutomation):
         try:
             el = d(text=group_name)
             if el.exists(timeout=0.4):
-                self.hb.tap(d, *self._el_center(el))
+                cx, cy = self._el_center(el)
+                if cy < 260:
+                    raise ValueError("matched top search suggestion")
+                self.hb.tap(d, cx, cy)
                 time.sleep(0.5)
                 log.info("[enter_group] tap first result via TextView center=%r", group_name)
                 return True
         except Exception:
             pass
+        # 4) XML fallback: 中文/日文新版结果行常把 "群名 · 加入"
+        # 放在一个不可点击 TextView 或整行 content-desc 中。
+        try:
+            xml = d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser
+            candidates = []
+            for node in XMLParser.parse(xml):
+                raw = (getattr(node, "text", "") or
+                       getattr(node, "content_desc", "") or "").strip()
+                if not raw or group_name not in raw:
+                    continue
+                if not getattr(node, "bounds", None):
+                    continue
+                left, top, right, bottom = node.bounds
+                if top < 260:
+                    continue
+                if any(bad in raw for bad in ("搜索建议", "Search suggestion")):
+                    continue
+                candidates.append((top, left, right, bottom, raw))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            if candidates:
+                top, left, right, bottom, raw = candidates[0]
+                self.hb.tap(d, (left + right) // 2, (top + bottom) // 2)
+                time.sleep(0.5)
+                log.info("[enter_group] tap first result via XML row=%r", raw[:80])
+                return True
+        except Exception as e:
+            log.debug("[enter_group] XML group result fallback failed: %s", e)
         return False
 
-    def _assert_on_specific_group_page(self, d, group_name: str) -> bool:
-        """进群后自检: 当前页面顶部包含 group_name (区别于推荐群卡片
-        / 误入 Messenger / 误入 profile 页等)."""
+    # 群组页面特征 tab 词 ─ 同时支持英/日/中文 FB
+    # 进入真正的群组页面后, 屏幕"必然"含其中至少 1 个 (作为标签 / 按钮 / 文本).
+    # Feed / Profile / Messenger / 推荐卡片均不含完整结构组合。
+    _GROUP_PAGE_SIGNATURE_TOKENS = (
+        # 英文
+        "Discussion", "Members", "About", "Featured",
+        "Media", "Files", "Events",
+        # 日文
+        "ディスカッション", "メンバー", "概要", "注目", "ファイル",
+        # 中文
+        "讨论", "成员", "简介", "精选",
+    )
+
+    def _assert_on_specific_group_page(self, d, group_name: str) -> Tuple[bool, str]:
+        """进群后双重自检: (1) 当前页含 group_name (2) 含群组特征 tab。
+
+        修复历史 bug (2026-04-30 P2.X):
+          原版只查 textContains(group_name), 整屏任何地方 (Feed 推荐卡片、搜索
+          历史建议、过往帖子里的同名词) 命中即放行 → enter_group 静默"成功",
+          下游 extract_group_members 在错误页跑 0 提取, 误诊断为 FB 改版/隐私群。
+
+        返回 (ok, evidence_reason). evidence_reason 用于日志和 forensics.
+        """
         try:
-            if d(textContains=group_name).exists(timeout=1.5):
-                return True
+            # 1. group_name 必须出现在当前屏幕上
+            name_hit = False
             try:
-                xml = d.dump_hierarchy() or ""
-                # 只看前 3000 字符 (顶部 toolbar / header 区域)
-                if group_name in xml[:3000]:
-                    return True
+                if d(textContains=group_name).exists(timeout=1.5):
+                    name_hit = True
             except Exception:
                 pass
-        except Exception:
-            pass
-        return False
+            xml = ""
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if xml and (
+                hierarchy_looks_like_fb_groups_filtered_results_page(xml)
+                or hierarchy_looks_like_fb_search_results_page(xml)
+            ):
+                return False, "still_on_search_results_page"
+            if not name_hit and xml and group_name in xml[:3000]:
+                name_hit = True
+
+            if not name_hit:
+                return False, "name_not_found"
+
+            # 2. 群组特征 tab 必须至少有 1 个 — 区分 Feed/Profile/Messenger
+            sig_hits = [tok for tok in self._GROUP_PAGE_SIGNATURE_TOKENS
+                        if tok in xml] if xml else []
+            if not sig_hits:
+                # 主动 dump 一次看 element 列表 (xml 可能为空时的兜底)
+                try:
+                    for tok in self._GROUP_PAGE_SIGNATURE_TOKENS:
+                        if d(textContains=tok).exists(timeout=0.4):
+                            sig_hits.append(tok)
+                            break
+                except Exception:
+                    pass
+            if not sig_hits:
+                return False, "name_present_but_no_group_tab"
+
+            return True, f"name_hit+sig={sig_hits[0]}"
+        except Exception as e:
+            return False, f"exception:{type(e).__name__}"
 
     def enter_group(self, group_name: str,
                     device_id: Optional[str] = None) -> bool:
@@ -4651,6 +6542,21 @@ class FacebookAutomation(BaseAutomation):
         d = self._u2(did)
 
         with self.guarded("enter_group", device_id=did, weight=0.2):
+            # 若上一动作刚加入群，FB 可能停在目标群欢迎页。先处理该页，
+            # 成功后直接复用当前群上下文，避免重新搜索把页面带回 typeahead。
+            if group_name:
+                try:
+                    self._continue_group_welcome_if_present(d, did, group_name)
+                    ok_current, reason_current = self._assert_on_specific_group_page(
+                        d, group_name,
+                    )
+                    if ok_current:
+                        log.info("[enter_group] 当前已在目标群页: %r (evidence=%s)",
+                                 group_name, reason_current)
+                        return True
+                except Exception as e:
+                    log.debug("[enter_group] current-page precheck skipped: %s", e)
+
             # Step 1: 进搜索页 (既有 _tap_search_bar_preferred 已包含完整自检)
             _set_step("搜索群组", group_name)
             if not self._tap_search_bar_preferred(d, did):
@@ -4659,34 +6565,208 @@ class FacebookAutomation(BaseAutomation):
                     self._fallback_search_tap(d)
             time.sleep(0.6)
 
-            # Step 2: 输入群名 + 提交
-            self.hb.type_text(d, group_name)
+            # Step 1.5 (P2.X-2 2026-04-30): 硬断言搜索页已打开。
+            # 历史 bug: Step 1 三层 fallback 之后仍可能停留在 Feed/Profile/Messenger,
+            # 此时 Step 2 的 type_text 会输到 Feed 的 "What's on your mind?" 发帖框
+            # (或者被吞掉无任何效果), 后续 Step 3-5 全错位。
+            # 只要不在搜索页, 立刻 return False 取证, 让 outcome=enter_group_failed
+            # 精确定位到"根本没打开搜索框"。
+            try:
+                _on_search = hierarchy_looks_like_fb_search_surface(
+                    d.dump_hierarchy() or ""
+                )
+            except Exception:
+                _on_search = False
+            if not _on_search:
+                log.warning("[enter_group] Step 1 后未进入搜索页, 终止 (避免 type_text "
+                             "在错误位置输入). group=%r", group_name)
+                try:
+                    from src.host.task_forensics import capture_immediate
+                    capture_immediate(did,
+                                       step_name="enter_group_search_page_not_opened",
+                                       hint=f"group={group_name!r}",
+                                       reason="Step 1 _tap_search_bar_preferred + smart_tap + _fallback_search_tap 全失败")
+                except Exception:
+                    pass
+                return False
+
+            # Step 2: 输入群名 + 多路提交 + 离开 typeahead 校验
+            #
+            # P2.X-4 (2026-04-30, real device task caefd0e0): 旧版只调
+            # ``d.send_action("search")``, 该路径走 atx-agent → InputMethodManager
+            # 触发 IME_ACTION_SEARCH。在部分 MIUI / 第三方拼音输入法上
+            # **既不抛异常也不真正派发** ACTION_SEARCH, 屏幕停留在 typeahead
+            # overlay (取证截图见 forensics/.../enter_group_assert_failed)。
+            # 旧 fallback 仅在 send_action **抛异常** 时才回落 press("enter"),
+            # silent no-op 直接绕过, 后续 Step 3 在 typeahead overlay 上
+            # 误命中 ``descContains='小组'`` 子串。
+            #
+            # 新策略：每条提交路径后 dump_hierarchy 校验是否进入 *搜索结果页*
+            # (FB_SEARCH_RESULTS_CHIP_TEXTS 至少 2 个 chip 完整命中)。
+            # 路径顺序:
+            #   1. send_action("search")          —— 与原行为兼容
+            #   2. adb shell input keyevent 66    —— ENTER, 软键盘提交
+            #   3. adb shell input keyevent 84    —— KEYCODE_SEARCH 兜底
+            # 五路全失败 → 留证 ``enter_group_search_not_submitted`` 返 False。
+            if not self._type_fb_search_query(d, group_name, did):
+                log.warning("[enter_group] 搜索框写入/校验失败 group=%r", group_name)
+                return False
             time.sleep(1.0)
-            d.press("enter")
-            time.sleep(1.5)
+            # Step 2.5 已并入: ``_submit_fb_search_with_verify`` 内部对每路提交
+            # 同时做 results-page / profile-page 检测,profile 命中即留证返 False
+            # (enter_group_submit_landed_on_profile),不会进 Step 3。
+            if not self._submit_fb_search_with_verify(d, did, group_name):
+                # P2.X-10 (2026-04-30 P2 phase) 自愈机制:
+                # 五路提交仍失败时, 用 BACK 关掉 IME/typeahead overlay, 重新
+                # 进入搜索页、清空输入框重输, 再尝试一次提交。
+                # 触发条件: 当前不在 profile 页 (profile 误入已由 helper 内部
+                # 留证+返回, 这里只处理 "搜索框卡住" 的场景).
+                # 最多自愈 1 次, 防无限循环.
+                log.info(
+                    "[enter_group] Step 2 首次失败, 尝试 self-heal "
+                    "(BACK → re-open search → retype → retry). group=%r",
+                    group_name,
+                )
+                _selfheal_ok = False
+                try:
+                    # 1. BACK 收起 IME / typeahead overlay
+                    self._adb("shell input keyevent 4", device_id=did)
+                    time.sleep(0.6)
+                    # 2. 确认仍在搜索页面 (BACK 有时会直接回到 Feed)
+                    _sh_xml = d.dump_hierarchy() or ""
+                    if not hierarchy_looks_like_fb_search_surface(_sh_xml):
+                        log.warning(
+                            "[enter_group] self-heal: BACK 后已离开搜索页 (回到 Feed/其他), "
+                            "放弃自愈. group=%r", group_name,
+                        )
+                    else:
+                        # 3. 重新点击搜索 EditText 让键盘弹出
+                        try:
+                            _et = d(className="android.widget.EditText")
+                            if _et.exists(timeout=1.0):
+                                self.hb.tap(d, *self._el_center(_et))
+                                time.sleep(0.5)
+                        except Exception:
+                            pass
+                        # 4. 全选 + 删除 旧内容, 重新输入 group_name
+                        try:
+                            self._adb("shell input keyevent 279", device_id=did)  # CTRL_A
+                            time.sleep(0.15)
+                            self._adb("shell input keyevent 67", device_id=did)   # DEL
+                            time.sleep(0.15)
+                        except Exception:
+                            pass
+                        if not self._type_fb_search_query(d, group_name, did):
+                            log.warning("[enter_group] self-heal 重新写入搜索框失败 "
+                                        "group=%r", group_name)
+                            return False
+                        time.sleep(1.0)
+                        # 5. 再次尝试五路提交 (不再递归自愈)
+                        _selfheal_ok = self._submit_fb_search_with_verify(
+                            d, did, group_name,
+                        )
+                except Exception as _sh_e:
+                    log.warning("[enter_group] self-heal 异常: %s", _sh_e)
+                if not _selfheal_ok:
+                    log.warning(
+                        "[enter_group] self-heal 后仍失败, 放弃. group=%r",
+                        group_name,
+                    )
+                    return False
 
             # Step 3: 切到 Groups filter
+            #
+            # P2.X-3 v2 (2026-04-30, real device task f5f2941a):
+            # 删除 smart_tap('Groups tab or filter') fallback. AutoSelector
+            # 把该 intent 学成了"点搜索结果首位" → 真机上观察到误点首位人物
+            # (Youngjo Song / Takeshi Yoshida 等) → 把页面带去 profile.
+            # 即使后置 Step 3.5 验证拦得住, 设备已经"瞎点"过了一次. 现在硬编码
+            # chip miss 即 return False, 不再让 AutoSelector 在 Step 3 出手.
             _set_step("筛选 Groups 结果", group_name)
             if not self._tap_search_results_groups_filter(d, did):
-                log.info("[enter_group] hardcoded Groups filter miss, 降级 smart_tap")
-                self.smart_tap("Groups tab or filter", device_id=did)
+                log.warning("[enter_group] 硬编码找不到 Groups filter chip, "
+                             "拒绝 fallback smart_tap (autoselector 已被训坏 "
+                             "→ 误点首位人物). group=%r", group_name)
+                try:
+                    from src.host.task_forensics import capture_immediate
+                    capture_immediate(did,
+                                       step_name="enter_group_groups_filter_chip_not_found",
+                                       hint=f"group={group_name!r}",
+                                       reason="_tap_search_results_groups_filter 硬编码 4 路 (text/desc x EN/zh/ja/it) 全 miss")
+                except Exception:
+                    pass
+                return False
             time.sleep(1.0)
 
+            # Step 3.5 (P2.X-4 2026-04-30 加严): 验证 filter 是否真的切到 Groups。
+            #
+            # 旧版 markers ('members'|'小组'|'成员'|...) 用 *子串包含*, 历史 bug
+            # caefd0e0 真机 typeahead overlay 的 desc 含 ``'小组'`` 子串就误放行,
+            # Step 4 在 typeahead 上点 ``text='潮味'`` 联想行 → 仍是 typeahead →
+            # Step 5 才发现 ``name_present_but_no_group_tab``。
+            #
+            # 新校验：用 ``hierarchy_looks_like_fb_groups_filtered_results_page``
+            # 双闸:
+            #   - 必须先是搜索 *结果页* (chip 行 ≥2 完整 ``text="..."`` 匹配)
+            #   - 再要求出现 *完整短语* group 标识 ('Public group'/'公开小组'/
+            #     '公開グループ' …) 或 ``\d+ members`` 行模式
+            # typeahead overlay 即使 desc 含子串也会被第一道闸拒掉。
+            try:
+                _xml_after_step3 = d.dump_hierarchy() or ""
+            except Exception:
+                _xml_after_step3 = ""
+            if not hierarchy_looks_like_fb_groups_filtered_results_page(
+                _xml_after_step3
+            ):
+                log.warning("[enter_group] Step 3 后未切到 Groups 结果页 "
+                             "(strict markers miss), 终止避免 Step 4 误点人物. group=%r",
+                             group_name)
+                try:
+                    from src.host.task_forensics import capture_immediate
+                    capture_immediate(did,
+                                       step_name="enter_group_groups_filter_not_applied",
+                                       hint=f"group={group_name!r}",
+                                       reason="Step 3 _tap_search_results_groups_filter + smart_tap 后, hierarchy 仍无群组 markers")
+                except Exception:
+                    pass
+                return False
+
             # Step 4: 点对应群
+            #
+            # P2.X-3 (2026-04-30): 删除 smart_tap('First matching group') fallback。
+            # 该 fallback 被 AutoSelector 训练成"点列表首位"——历史上真机若遇
+            # 同名人物排在首位 (例如群名='潮味' 撞上日文人名 Takeshi Yoshida),
+            # 会无视 group_name 直接误点 → 进 profile → 浪费整轮 enter_group。
+            # 现在: 严格 3 路 miss 即视为页面找不到 group, 直接 return False,
+            # 让上层 outcome=enter_group_failed 精确反馈"群名拼写错/被屏蔽/已删".
             _set_step("点击群组进入", group_name)
             if not self._tap_first_search_result_group(d, did, group_name):
-                log.info("[enter_group] hardcoded first result miss, 降级 smart_tap")
-                if not self.smart_tap("First matching group", device_id=did):
-                    log.warning("[enter_group] 全路径找不到 group=%r", group_name)
-                    return False
+                log.warning("[enter_group] 严格匹配未找到 group=%r, "
+                             "拒绝 fallback smart_tap (旧版会误点首位人物)",
+                             group_name)
+                return False
             time.sleep(random.uniform(2.0, 3.5))
 
-            # Step 5: 自检确实进了对的群 (防误入推荐群 / Messenger / profile)
-            if not self._assert_on_specific_group_page(d, group_name):
-                log.warning("[enter_group] 自检失败: 当前页未包含 group_name=%r "
-                             "(可能误入推荐群/Messenger/profile)", group_name)
+            # Step 5: 双重自检 (P2.X 2026-04-30 加严):
+            # 必须同时满足 group_name + 群组特征 tab(Members/Discussion 等),
+            # 否则 Feed 推荐卡片/搜索建议历史也会误判通过 → enter_group 静默"成功"。
+            ok, reason = self._assert_on_specific_group_page(d, group_name)
+            if not ok:
+                log.warning("[enter_group] 自检失败 reason=%s group=%r "
+                             "(可能误入推荐群/Messenger/Feed/profile)",
+                             reason, group_name)
+                # P2.X: 自检失败那一刻同步取证, 让运营看到当时屏幕到底是什么
+                try:
+                    from src.host.task_forensics import capture_immediate
+                    capture_immediate(did,
+                                       step_name="enter_group_assert_failed",
+                                       hint=f"group={group_name!r} reason={reason}",
+                                       reason="_assert_on_specific_group_page returned False")
+                except Exception:
+                    pass
                 return False
-            log.info("[enter_group] 进入群组成功: %r", group_name)
+            log.info("[enter_group] 进入群组成功: %r (evidence=%s)",
+                      group_name, reason)
             return True
 
     def comment_on_post(self, comment_text: str,
@@ -4808,31 +6888,41 @@ class FacebookAutomation(BaseAutomation):
                               target_country: str = "",
                               device_id: Optional[str] = None,
                               persona_key: Optional[str] = None,
-                              phase: Optional[str] = None) -> List[Dict[str, Any]]:
-        """提取群成员列表 — FB 引流的核心入口。
+                              phase: Optional[str] = None,
+                              member_source: str = "",
+                              join_if_needed: bool = False) -> List[Dict[str, Any]]:
+        """群成员打招呼准备列表 — FB 客服拓展入口。
 
-        流程: 进群 → 点 "Members" Tab → 滚动列表 → 提取昵称/头像/简介
-        提取后会自动写入 LeadsStore(source_platform=facebook, tag=群名)。
+        流程: 进群 → 点 "Members" Tab → 滚动列表 → 整理昵称/头像/简介
+        整理后会自动写入 LeadsStore(source_platform=facebook, tag=群名)。
 
         2026-04-22 persona 改造:
           * ``max_members`` 未显式指定(用方法签名默认 30)时,按 ``phase`` 从
             ``facebook_playbook.yaml.extract_members.max_members`` 取。
-            cold_start=0(禁提取) / growth=12 / mature=25 / cooldown=0。
+            cold_start=0(禁用) / growth=12 / mature=25 / cooldown=0。
           * ``target_country`` 空串时从 persona.country_code 自动派生,
             避免 scorer 拿 target_country="" 直接降档。
         """
         did = self._did(device_id)
         d = self._u2(did)
         members: List[Dict[str, Any]] = []
+        try:
+            self._last_group_member_source = ""
+        except Exception:
+            pass
+        try:
+            _LAST_EXTRACT_ERROR.pop(did, None)
+        except Exception:
+            pass
 
-        # P0-2: phase 参数合并。max_members=0 表示该阶段禁用提取，需要短路。
+        # P0-2: phase 参数合并。max_members=0 表示该阶段禁用群成员打招呼，需要短路。
         eff_phase, ab_cfg = _resolve_phase_and_cfg("extract_members",
                                                    device_id=did,
                                                    phase_override=phase)
         if ab_cfg and max_members == 30 and "max_members" in ab_cfg:
             max_members = int(ab_cfg.get("max_members") or max_members)
         if max_members <= 0:
-            log.info("[extract_group_members] phase=%s 禁止提取 (max_members=0), skip",
+            log.info("[extract_group_members] phase=%s 禁止群成员打招呼 (max_members=0), skip",
                      eff_phase)
             return members
 
@@ -4847,27 +6937,130 @@ class FacebookAutomation(BaseAutomation):
 
         if group_name and not self.enter_group(group_name, device_id=did):
             log.warning("[extract_group_members] 无法进入群组: %s", group_name)
+            # P2.X: 记录到模块状态 → executor 会映射为 outcome=automation_enter_group_failed
+            _record_extract_error(did, "enter_group_failed")
+            # P2.0 (2026-04-30): 进群失败那一刻同步抓 PNG + XML, 后续 task_store
+            # 触发 forensics 会 promote 这张图到正式目录。无环境/异常都吞掉。
+            _capture_immediate_async(
+                did, step_name="extract_enter_group_failed",
+                hint=f"group={group_name!r}",
+                reason="enter_group returned False",
+            )
             return members
+
+        if group_name and self._current_group_page_requires_join(d):
+            if join_if_needed:
+                _set_step("加入目标群组", group_name)
+                join_ok = False
+                join_outcome = ""
+                try:
+                    join_ok, join_outcome = self._join_current_group_page_if_needed(
+                        d, did, group_name,
+                    )
+                    if not join_ok and join_outcome == "join_button_not_found":
+                        log.info(
+                            "[extract_group_members] current page join miss; "
+                            "fallback to search join group=%r", group_name,
+                        )
+                        join_ok = bool(self.join_group(group_name, device_id=did))
+                        join_outcome = (
+                            getattr(self, "last_join_group_outcome", "") or ""
+                        )
+                    elif join_ok:
+                        try:
+                            self.last_join_group_outcome = join_outcome
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            self.last_join_group_outcome = join_outcome
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.warning("[extract_group_members] 自动入群异常 group=%r: %s",
+                                group_name, e)
+                    join_outcome = "join_exception"
+                if not join_ok:
+                    if join_outcome in (
+                        "membership_questions_required",
+                        "join_requested_pending_approval",
+                    ):
+                        err_step = "group_join_blocked"
+                        reason = f"join_group outcome={join_outcome}"
+                    else:
+                        err_step = "group_join_failed"
+                        reason = f"join_group outcome={join_outcome or 'unknown'}"
+                    _record_extract_error(did, err_step)
+                    _capture_immediate_async(
+                        did, step_name=err_step,
+                        hint=f"group={group_name!r}",
+                        reason=reason,
+                    )
+                    return members
+
+                time.sleep(1.0)
+                try:
+                    self._continue_group_welcome_if_present(d, did, group_name)
+                except Exception:
+                    pass
+                if group_name and not self.enter_group(group_name, device_id=did):
+                    log.warning("[extract_group_members] 入群后无法重新进入群组: %s",
+                                group_name)
+                    _record_extract_error(did, "enter_group_failed")
+                    _capture_immediate_async(
+                        did, step_name="extract_reenter_group_failed",
+                        hint=f"group={group_name!r}",
+                        reason="enter_group after join returned False",
+                    )
+                    return members
+                if self._current_group_page_requires_join(d):
+                    _record_extract_error(did, "group_requires_join")
+                    _capture_immediate_async(
+                        did, step_name="extract_group_requires_join",
+                        hint=f"group={group_name!r}",
+                        reason="join button still visible after join",
+                    )
+                    return members
+            else:
+                log.warning("[extract_group_members] 当前群组尚未加入: %s", group_name)
+                _record_extract_error(did, "group_requires_join")
+                _capture_immediate_async(
+                    did, step_name="extract_group_requires_join",
+                    hint=f"group={group_name!r}",
+                    reason="join button visible before members tab",
+                )
+                return members
 
         with self.guarded("extract_members", device_id=did, weight=0.6):
             _set_step("打开 Members tab", group_name)
             # 2026-04-23 bug fix: "Members tab in the group header" 的 AutoSelector
             # 学习被污染为 "Suggested group: 50代以上..." 的 bounds(推荐群卡片),
             # 会误点进推荐群。改用硬定位:text/desc 精确匹配 "Members"/"メンバー"。
-            hit = self._tap_group_members_tab(d, did)
+            hit = self._tap_group_members_tab(d, did, member_source)
             if not hit:
-                # 退而求其次:点群头部进群信息页再点 Members
-                self.smart_tap("Group name or icon at top to open info",
-                               device_id=did)
-                time.sleep(1.5)
-                self._tap_group_members_tab(d, did)
+                # Members tab / member preview 入口都失败时快速返回。
+                # 不再二次 smart_tap 群头：真实机上它容易误入反应列表或在
+                # u2/ADB 抖动时拖住任务数分钟。
+                _record_extract_error(did, "members_tab_not_found")
+                _capture_immediate_async(
+                    did, step_name="extract_members_tab_not_found",
+                    hint=f"group={group_name!r}",
+                    reason="_tap_group_members_tab fast paths failed",
+                )
+                return members
             time.sleep(2.0)
 
             seen_names = set()
             scrolls = 0
             max_scrolls = max(5, max_members // 6)
+            extract_deadline = time.time() + max(45.0, min(120.0, max_scrolls * 18.0))
 
             while len(members) < max_members and scrolls < max_scrolls:
+                if time.time() > extract_deadline:
+                    log.warning("[extract_group_members] reached wall-clock cap "
+                                "scrolls=%d max_scrolls=%d members=%d",
+                                scrolls, max_scrolls, len(members))
+                    break
                 is_risk, msg = self._detect_risk_dialog(d)
                 if is_risk:
                     break
@@ -4876,20 +7069,20 @@ class FacebookAutomation(BaseAutomation):
                     xml = d.dump_hierarchy()
                     from ..vision.screen_parser import XMLParser
                     elements = XMLParser.parse(xml)
-                    for el in elements:
-                        if not (el.text and el.clickable and el.class_name
-                                and "TextView" in el.class_name):
+                    for member in self._extract_group_member_candidates(elements):
+                        name = (member.get("name") or "").strip()
+                        if not name or name in seen_names:
                             continue
-                        name = (el.text or "").strip()
-                        # 过滤掉非姓名文本(按钮/标签)
-                        if (len(name) < 2 or name in seen_names
-                                or name.lower() in ("see all", "members", "admin",
-                                                    "moderator", "added by", "join")):
-                            continue
-                        members.append({"name": name})
+                        member.setdefault(
+                            "source_section",
+                            getattr(self, "_last_group_member_source", "")
+                            or member_source
+                            or "general",
+                        )
+                        members.append(member)
                         seen_names.add(name)
-                        # 业务进展可见: 每提取 1 人刷新 dashboard step
-                        _set_step("提取群成员",
+                        # 业务进展可见: 每整理 1 人刷新 dashboard step
+                        _set_step("群成员打招呼",
                                   f"第 {len(members)}/{max_members} 人 — {name}")
                         if len(members) >= max_members:
                             break
@@ -4899,6 +7092,18 @@ class FacebookAutomation(BaseAutomation):
                 self.hb.scroll_down(d)
                 self.hb.wait_read(random.randint(800, 2000))
                 scrolls += 1
+
+        # P2.0 (2026-04-30): 进群且 Members tab 没硬失败, 但循环后仍 0 成员
+        # —— 最容易遗漏的现场。同步取证, 让运营看到当时屏幕到底是什么。
+        if group_name and not members:
+            # 仅在未被上游失败覆盖时才记录 zero_after_enter (保留更具体的上游原因)
+            if not _LAST_EXTRACT_ERROR.get(did):
+                _record_extract_error(did, "zero_after_enter")
+            _capture_immediate_async(
+                did, step_name="extract_zero_after_enter",
+                hint=f"group={group_name!r} max_scrolls={max_scrolls}",
+                reason="loop 完成但未整理到任何成员",
+            )
 
         # 写入 Leads Pool + Sprint 3 P1: scorer v2 两阶段评分(可选 LLM 精排)
         if members:
@@ -4950,6 +7155,28 @@ class FacebookAutomation(BaseAutomation):
                                 store.update_lead(lead_id, score=s)
                             except Exception:
                                 pass
+                        try:
+                            contacted, reason = self._peer_already_contacted(
+                                m.get("name", ""))
+                            m["already_contacted"] = contacted
+                            if reason:
+                                m["contacted_reason"] = reason
+                        except Exception:
+                            pass
+                        self._append_journey_for_action(
+                            m.get("name", ""),
+                            "extracted",
+                            did=did,
+                            persona_key=persona_key,
+                            discovered_via="group_extract",
+                            data={
+                                "source_group": group_name or "current",
+                                "target_country": target_country or "",
+                                "lead_id": lead_id,
+                                "score": m.get("score", 0),
+                                "tier": m.get("tier", ""),
+                            },
+                        )
                     except Exception:
                         pass
                 log.info("[extract_group_members] 入库+评分 %d 人 (scorer=%s, group=%s)",
@@ -5262,7 +7489,8 @@ class FacebookAutomation(BaseAutomation):
                      inter_target_sec: Tuple[float, float] = (20.0, 34.0),
                      shot_count: int = 3,
                      task_id: str = "",
-                     device_id: Optional[str] = None) -> Dict[str, Any]:
+                     device_id: Optional[str] = None,
+                     candidate_source: str = "") -> Dict[str, Any]:
         """批量候选 profile hunt。
 
         流程（每个候选）:
@@ -5520,6 +7748,25 @@ class FacebookAutomation(BaseAutomation):
                         item["action_ok"] = ok
                         if ok:
                             stats["actioned"] += 1
+
+                if candidate_source == "name_hunter":
+                    try:
+                        from src.host.fb_targets_store import mark_name_hunter_profile_result
+                        _ins = dict(r.get("insights") or {})
+                        _l2 = r.get("l2") or {}
+                        if _l2.get("reasons") and not _ins.get("reasons"):
+                            _ins["reasons"] = _l2.get("reasons")[:3]
+                        mark_name_hunter_profile_result(
+                            name=name,
+                            persona_key=pk,
+                            matched=bool(item["match"]),
+                            score=float(item["score"] or 0),
+                            stage=item["stage"] or "",
+                            insights=_ins,
+                            device_id=did,
+                        )
+                    except Exception as _cand_e:
+                        log.debug("[profile_hunt] name_hunter candidate persist skipped: %s", _cand_e)
 
                 stats["results"].append(item)
 
@@ -7027,6 +9274,400 @@ class FacebookAutomation(BaseAutomation):
         log.info("Collected %d leads from FB search '%s'", len(lead_ids), query)
         return lead_ids
 
+    _GROUP_RESULT_META_RE = re.compile(
+        r"(?:"
+        r"public\s+group|private\s+group|visible\s+group|hidden\s+group|"
+        r"公开小组|私密小组|公开群组|私密群组|"
+        r"公開社團|私密社團|公開小組|私密小組|"
+        r"公開グループ|非公開グループ|"
+        r"gruppo\s+pubblico|gruppo\s+privato|"
+        r"grupo\s+p[úu]blico|grupo\s+privado|"
+        r"(?:\d{1,3}(?:[,，]\d{3})+|\d+(?:[.,]\d+)?)(?:\s*[KkMm万萬])?\s*"
+        r"(?:members?|名のメンバー|名(?:成员|成員|メンバー)|位(?:成员|成員|会员|會員)|成员|成員)"
+        r")",
+        re.IGNORECASE,
+    )
+
+    _GROUP_RESULT_JOIN_RE = re.compile(
+        r"(?:^|[\s·,，])(?:加入|加入小组|加入群组|Join|Join Group)(?:$|[\s·,，])",
+        re.IGNORECASE,
+    )
+
+    _GROUP_RESULT_BAD_NAMES = frozenset({
+        "All", "Posts", "People", "Groups", "Pages", "Photos", "Videos",
+        "全部", "帖子", "用户", "小组", "公共主页", "照片", "视频",
+        "近期", "推荐", "查看全部", "See all", "See more", "Search",
+        "Recent", "Recommended", "Filters", "筛选条件",
+    })
+
+    def _type_fb_search_query(self, d, query: str,
+                              did: Optional[str] = None) -> bool:
+        """在 FB 搜索框输入 query。优先 set_text, 支持中/日文。"""
+        query = (query or "").strip()
+        if not query:
+            return False
+        did = self._did(did)
+
+        def _dump_xml() -> str:
+            try:
+                return d.dump_hierarchy(force_refresh=True) or ""
+            except TypeError:
+                try:
+                    return d.dump_hierarchy() or ""
+                except Exception:
+                    return ""
+            except Exception:
+                return ""
+
+        def _is_fb_foreground() -> bool:
+            try:
+                try:
+                    d.invalidate_app_cache()
+                except Exception:
+                    pass
+                return (d.app_current() or {}).get("package", "") == PACKAGE
+            except Exception:
+                return False
+
+        def _is_fb_search_surface() -> bool:
+            if not _is_fb_foreground():
+                return False
+            return hierarchy_looks_like_fb_search_surface(_dump_xml())
+
+        def _query_visible() -> bool:
+            try:
+                return bool(_is_fb_foreground() and query and query in _dump_xml())
+            except Exception:
+                return False
+
+        def _clear_current_field(edit_el) -> None:
+            try:
+                edit_el.click()
+                time.sleep(0.2)
+            except Exception:
+                pass
+            try:
+                edit_el.clear_text()
+                time.sleep(0.2)
+            except Exception:
+                pass
+            if did:
+                try:
+                    self._adb("shell input keyevent 279", device_id=did)  # SELECT_ALL
+                    time.sleep(0.1)
+                    self._adb("shell input keyevent 67", device_id=did)   # DEL
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+
+        # Hard guard: never type a FB keyword into system search / Chrome /
+        # Messenger. The previous fallback typed globally when no FB EditText
+        # was found, which sent broad keywords such as "ペット" to Google on
+        # devices where the search tap drifted out of Facebook.
+        if not _is_fb_search_surface():
+            log.warning(
+                "[search] refusing to type query=%r outside FB search surface",
+                query,
+            )
+            return False
+
+        for edit_sel in FB_SEARCH_QUERY_EDITOR_SELECTORS:
+            try:
+                if not _is_fb_search_surface():
+                    return False
+                edit_el = d(**edit_sel)
+                if not edit_el.exists(timeout=1.8):
+                    continue
+                _clear_current_field(edit_el)
+                try:
+                    edit_el.set_text(query)
+                    time.sleep(0.6)
+                    if _query_visible():
+                        return True
+                    log.debug("[search] set_text 后 query 未出现在搜索框/页面, "
+                              "改用 send_keys. query=%r", query)
+                except Exception as e:
+                    log.debug("[search] set_text failed query=%r: %s", query, e)
+                try:
+                    _clear_current_field(edit_el)
+                    d.send_keys(query, clear=False)
+                    time.sleep(0.6)
+                    if _query_visible():
+                        return True
+                    log.debug("[search] send_keys 后 query 未出现在搜索框/页面. "
+                              "query=%r", query)
+                except Exception as e:
+                    log.debug("[search] send_keys failed query=%r: %s", query, e)
+                    try:
+                        _clear_current_field(edit_el)
+                        self.hb.type_text(d, query)
+                        time.sleep(0.6)
+                        if _query_visible():
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        log.warning("[search] FB search EditText not found; abort query typing")
+        return False
+
+    def _looks_like_group_result_meta(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        if self._GROUP_RESULT_META_RE.search(t):
+            return True
+        return False
+
+    def _result_requires_join(self, *parts: str) -> bool:
+        raw = " ".join((p or "") for p in parts)
+        return bool(self._GROUP_RESULT_JOIN_RE.search(raw))
+
+    def _clean_group_candidate_name(self, text: str) -> str:
+        name = (text or "").replace("\xa0", " ").strip()
+        if "\n" in name or "\r" in name or "\t" in name:
+            return ""
+        # content-desc 常见形式: "群名, 公开小组 · 385 位成员"
+        for sep in (",", "，", " · ", "・"):
+            if sep in name:
+                left = name.split(sep, 1)[0].strip()
+                if left:
+                    name = left
+                    break
+        for suffix in ("· 加入", " · 加入", "加入", "Join"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)].strip()
+        name = name.rstrip(" ·・,，")
+        return name[:80].strip()
+
+    def _is_valid_group_candidate_name(self, name: str, keyword: str = "") -> bool:
+        if not name or len(name) < 2:
+            return False
+        if "\n" in name or "\r" in name or "\t" in name:
+            return False
+        if name.endswith(("…", "...", "..")) or ".." in name:
+            return False
+        if name in self._GROUP_RESULT_BAD_NAMES:
+            return False
+        low = name.lower().strip()
+        meta_prefixes = (
+            "公开", "公開", "公有", "私密", "私人", "非公開",
+            "public", "private", "visible", "hidden",
+        )
+        if any(low.startswith(p.lower()) for p in meta_prefixes):
+            return False
+        if self._looks_like_group_result_meta(name):
+            return False
+        if re.search(r"\b\d+(?:[.,]\d+)?\s*km\b", name, re.IGNORECASE):
+            return False
+        if any(sym in name for sym in ("£", "$", "€", "¥")):
+            return False
+        if re.search(r"\b(?:pet sitter|marketplace|listing|service)\b",
+                     name, re.IGNORECASE):
+            return False
+        if re.fullmatch(r"[\d\s,，.·・万萬kKmM]+", name):
+            return False
+        if len(name) > 80:
+            return False
+        if keyword and len(keyword.strip()) >= 2:
+            # 宽关键词允许结果名不完全等于 keyword, 但至少不要是完全无关的短功能文案。
+            if len(name) <= 4 and keyword.strip() not in name:
+                return False
+        return True
+
+    def _extract_group_search_results(self, d, *,
+                                      keyword: str = "",
+                                      max_groups: int = 10) -> List[Dict[str, Any]]:
+        """从 Groups-filtered 搜索结果页抽取群组候选。"""
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        try:
+            xml = d.dump_hierarchy() or ""
+            from ..vision.screen_parser import XMLParser
+            elements = XMLParser.parse(xml)
+        except Exception as e:
+            log.warning("[search_groups] dump/parse failed: %s", e)
+            return out
+
+        rows = []
+        for el in elements:
+            txt = (el.text or el.content_desc or "").strip()
+            if not txt or not el.bounds:
+                continue
+            if el.bounds[1] < 220:
+                continue
+            rows.append((el.bounds[1], el.bounds[0], txt, el))
+        rows.sort(key=lambda r: (r[0], r[1]))
+        join_rows = [
+            (y, x, txt) for y, x, txt, _el in rows
+            if self._result_requires_join(txt)
+        ]
+
+        def parse_member_count(meta: str) -> int:
+            m = re.search(
+                r"(\d{1,3}(?:[,，]\d{3})+|\d+(?:[.,]\d+)?)\s*([KkMm万萬])?\s*"
+                r"(?:members?|名のメンバー|名(?:成员|成員|メンバー)|"
+                r"位(?:成员|成員|会员|會員)|成员|成員)",
+                meta or "",
+            )
+            if not m:
+                return 0
+            raw = m.group(1).replace(",", "").replace("，", "")
+            raw = raw.replace(",", ".")
+            try:
+                value = float(raw)
+            except Exception:
+                return 0
+            unit = (m.group(2) or "").lower()
+            if unit == "k":
+                value *= 1000
+            elif unit == "m":
+                value *= 1000000
+            elif unit in ("万", "萬"):
+                value *= 10000
+            return int(value)
+
+        def add_candidate(raw_name: str, meta: str = "",
+                          row_y: Optional[int] = None) -> bool:
+            name = self._clean_group_candidate_name(raw_name)
+            key = name.lower()
+            if key in seen:
+                return False
+            if not self._is_valid_group_candidate_name(name, keyword):
+                return False
+            if meta and not self._looks_like_group_result_meta(meta):
+                return False
+            member_count = parse_member_count(meta)
+            requires_join = self._result_requires_join(raw_name, meta)
+            if not requires_join and row_y is not None:
+                requires_join = any(abs(jy - row_y) <= 80 for jy, _jx, _jt in join_rows)
+            seen.add(key)
+            out.append({
+                "group_name": name,
+                "keyword": keyword or "",
+                "member_count": member_count,
+                "meta": meta[:200],
+                "requires_join": requires_join,
+            })
+            return True
+
+        # 1) content-desc 一行包含「群名 + 群组/成员」时直接提取。
+        for _y, _x, txt, _el in rows:
+            if self._looks_like_group_result_meta(txt):
+                add_candidate(txt, txt, row_y=_y)
+                if len(out) >= max_groups:
+                    return out[:max_groups]
+
+        # 2) TextView 分行时，遇到 meta 行向上找最近的名称行。
+        for idx, (_y, _x, txt, _el) in enumerate(rows):
+            if not self._looks_like_group_result_meta(txt):
+                continue
+            for j in range(idx - 1, max(-1, idx - 8), -1):
+                _py, _px, prev, _pel = rows[j]
+                if abs(_y - _py) > 240:
+                    break
+                if self._looks_like_group_result_meta(prev):
+                    continue
+                if add_candidate(prev, txt, row_y=_py):
+                    break
+            if len(out) >= max_groups:
+                break
+        return out[:max_groups]
+
+    @_with_fb_foreground
+    def discover_groups_by_keyword(self, keyword: str,
+                                   device_id: Optional[str] = None,
+                                   max_groups: int = 10,
+                                   skip_visited: bool = True,
+                                   persona_key: Optional[str] = None,
+                                   target_country: str = "") -> List[Dict[str, Any]]:
+        """用宽泛关键词搜索 FB 群组，并把候选写入 facebook_groups。
+
+        这条路径只发现和记录群组，不加好友、不发消息。
+        """
+        did = self._did(device_id)
+        d = self._u2(did)
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return []
+        with self.guarded("discover_groups", device_id=did, weight=0.2):
+            if not self._tap_search_bar_preferred(d, did):
+                return []
+            time.sleep(0.8)
+            if not self._type_fb_search_query(d, keyword, did):
+                return []
+            time.sleep(1.0)
+            if not self._submit_fb_search_with_verify(d, did, keyword):
+                return []
+            filter_ok = False
+            if self._tap_search_results_groups_filter(d, did):
+                time.sleep(1.2)
+                try:
+                    xml = d.dump_hierarchy() or ""
+                except Exception:
+                    xml = ""
+                filter_ok = hierarchy_looks_like_fb_groups_filtered_results_page(xml)
+            if not filter_ok:
+                log.info(
+                    "[search_groups] keyword=%r Groups filter 未确认切换，"
+                    "改从当前 All 结果页的小组 section 抽取候选",
+                    keyword,
+                )
+                try:
+                    if xml and any(s in xml for s in (
+                        "显示结果", "重置", "帖子来源", "发布日期",
+                        "Show results", "Reset", "Post source", "Date posted",
+                    )):
+                        self._adb("shell input keyevent 4", device_id=did)
+                        time.sleep(0.8)
+                        log.info(
+                            "[search_groups] keyword=%r 误入筛选抽屉，"
+                            "已返回结果页后再抽取",
+                            keyword,
+                        )
+                except Exception:
+                    pass
+            groups = self._extract_group_search_results(
+                d, keyword=keyword, max_groups=max_groups)
+            if not groups:
+                # FB 切换到小组结果后列表有时比 chip 高亮晚 1-2 秒出现。
+                # 空结果不立刻判失败，短等再 dump，避免真实页已加载但首 dump 抢跑。
+                for retry_i in range(2):
+                    time.sleep(1.2)
+                    groups = self._extract_group_search_results(
+                        d, keyword=keyword, max_groups=max_groups)
+                    if groups:
+                        log.info(
+                            "[search_groups] keyword=%r retry_extract=%d got=%d",
+                            keyword, retry_i + 1, len(groups),
+                        )
+                        break
+
+        try:
+            from src.host.fb_store import (has_group_been_visited,
+                                           upsert_group)
+            kept = []
+            for g in groups:
+                name = g.get("group_name") or ""
+                visited = has_group_been_visited(did, name)
+                g["already_visited"] = visited
+                if skip_visited and visited:
+                    continue
+                status = "pending" if g.get("requires_join") else "discovered"
+                upsert_group(
+                    did, name,
+                    member_count=int(g.get("member_count") or 0),
+                    country=target_country or "",
+                    status=status,
+                    preset_key=persona_key or "",
+                )
+                kept.append(g)
+            groups = kept
+        except Exception as e:
+            log.debug("[search_groups] discovered groups 入库失败: %s", e)
+        log.info("[search_groups] keyword=%r discovered=%d", keyword, len(groups))
+        return groups
+
     # ── Internal Helpers ──────────────────────────────────────────────────
 
     def _tap_search_bar_preferred(self, d, device_id: Optional[str] = None) -> bool:
@@ -7074,7 +9715,7 @@ class FacebookAutomation(BaseAutomation):
             try:
                 d.app_stop("com.facebook.katana")
                 time.sleep(1.5)
-                d.app_start("com.facebook.katana")
+                self._adb_start_main_user(did)
             except Exception as e:
                 log.warning("[search] app_stop/start 失败: %s", e)
             # FB 启动 + 可能弹窗需要时间, 给 6 秒
@@ -7117,6 +9758,57 @@ class FacebookAutomation(BaseAutomation):
                 except Exception:
                     return
 
+        def _is_safe_home_search_candidate(sel: Dict[str, Any], el) -> bool:
+            """Avoid tapping nearby Messenger/shortcut buttons on the FB home bar."""
+            raw = " ".join(str(sel.get(k) or "") for k in ("description", "text"))
+            raw_norm = raw.strip().lower().replace(" ", "")
+            search_labels = {
+                "search",
+                "searchfacebook",
+                "搜索",
+                "搜索facebook",
+            }
+            if raw_norm not in search_labels:
+                return True
+            try:
+                info = el.info or {}
+                actual = " ".join((
+                    str(info.get("contentDescription") or ""),
+                    str(info.get("text") or ""),
+                )).lower()
+                if any(
+                    bad in actual
+                    for bad in (
+                        "messenger",
+                        "messages",
+                        "chats",
+                        "messenger消息",
+                        "聊天",
+                        "消息",
+                    )
+                ):
+                    log.info(
+                        "[search] skip home search candidate because it looks "
+                        "like Messenger/chat sel=%s actual=%r",
+                        sel, actual[:120],
+                    )
+                    return False
+                cx, cy = self._el_center(el)
+                w, h = d.window_size()
+                top_band = max(220, int(h * 0.16))
+                left = int(w * 0.62)
+                right = int(w * 0.90)
+                if cy <= top_band and left <= cx <= right:
+                    return True
+                log.info(
+                    "[search] skip generic Search candidate outside home search "
+                    "slot sel=%s center=(%s,%s) window=(%s,%s)",
+                    sel, cx, cy, w, h,
+                )
+                return False
+            except Exception:
+                return True
+
         # 入口强制 stop + start FB — 2026-04-24 决策:
         # 实测 pure 测试能搜 6 条, 生产 smoke 搜 0 条, 唯一差异是 pure 先彻底重启 FB.
         # 沿用的旧 FB session 搜索请求可能 cached/stale, 每次 search 入口多花 7s 换
@@ -7127,7 +9819,7 @@ class FacebookAutomation(BaseAutomation):
         try:
             d.app_stop("com.facebook.katana")
             time.sleep(1.5)
-            d.app_start("com.facebook.katana")
+            self._adb_start_main_user(did)
         except Exception as e:
             log.warning("[search] app_stop/start 异常: %s", e)
         for _ in range(7):
@@ -7155,11 +9847,25 @@ class FacebookAutomation(BaseAutomation):
                 el = d(**sel)
                 if not el.exists(timeout=2.4):
                     continue
+                if not _is_safe_home_search_candidate(sel, el):
+                    continue
                 self.hb.tap(d, *self._el_center(el))
                 time.sleep(1.8)
                 if _is_on_search_page():
                     log.info("[search] opened search via selector %s", sel)
                     return True
+                try:
+                    cur_pkg_after = (d.app_current() or {}).get("package", "")
+                except Exception:
+                    cur_pkg_after = ""
+                if cur_pkg_after == MESSENGER_PACKAGE or _is_on_messenger_or_chats():
+                    log.warning(
+                        "[search] selector %s opened Messenger/chats; "
+                        "discard candidate and recover FB home",
+                        sel,
+                    )
+                    _force_back_to_home()
+                    continue
                 log.warning("[search] selector %s 点了但未进搜索页, "
                              "重回 Home 再试下一个", sel)
                 _force_back_to_home()
@@ -7167,7 +9873,17 @@ class FacebookAutomation(BaseAutomation):
                 continue
 
         # 所有 selector 都失败时, 走坐标 fallback (debug 里 Home 顶栏 Search 在 [536,68]-[624,156])
-        return bool(self._fallback_search_tap(d))
+        if self._fallback_search_tap(d):
+            time.sleep(1.2)
+            if _is_on_search_page():
+                return True
+            try:
+                cur_pkg = (d.app_current() or {}).get("package", "")
+            except Exception:
+                cur_pkg = ""
+            log.warning("[search] fallback tap 未进入 FB 搜索页(current=%s), 中止",
+                        cur_pkg or "?")
+        return False
 
     def _people_tab_fallback_adb(self, d, device_id: str) -> None:
         """People 筛选：按屏幕分辨率缩放 w0 基准坐标 (332,204)@720x1600。"""
@@ -7188,6 +9904,24 @@ class FacebookAutomation(BaseAutomation):
         for sel in FB_FALLBACK_SEARCH_TAP_SELECTORS:
             el = d(**sel)
             if el.exists(timeout=2):
+                raw = " ".join(str(sel.get(k) or "") for k in ("description", "text"))
+                raw_norm = raw.strip().lower().replace(" ", "")
+                if raw_norm in {"search", "searchfacebook", "搜索", "搜索facebook"}:
+                    try:
+                        cx, cy = self._el_center(el)
+                        w, h = d.window_size()
+                        if not (
+                            cy <= max(220, int(h * 0.16))
+                            and int(w * 0.62) <= cx <= int(w * 0.90)
+                        ):
+                            log.info(
+                                "[search] fallback skip generic Search candidate "
+                                "center=(%s,%s) window=(%s,%s)",
+                                cx, cy, w, h,
+                            )
+                            continue
+                    except Exception:
+                        pass
                 self.hb.tap(d, *self._el_center(el))
                 return True
         return False
