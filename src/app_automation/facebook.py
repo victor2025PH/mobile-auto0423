@@ -2792,11 +2792,16 @@ class FacebookAutomation(BaseAutomation):
 
             time.sleep(1)
 
-            if safe_mode and walk_candidates:
+            if (safe_mode and walk_candidates
+                    and hasattr(self, "_list_top_search_result_cards")):
                 # Phase 10.2 additive (2026-04-24): walk top 5 候选, 快速跳过明显男性/已联系,
                 # L2 VLM 精筛. 姓搜(如 '田中')会返回混合性别候选; 默认单结果路径常撞
                 # 男性/已联系候选浪费 quota. 男性名启发式 → 跳; peer_already_contacted → 跳;
                 # L2 REJECT 后 BACK 返搜索页 → 下一个; L2 PASS 继续. 若 walk 空 → 回退单结果.
+                # 2026-05-03 真机第九轮 fix: 此 helper 在 master 缺失定义 (引用悬空),
+                # 加 hasattr 守卫退化到单结果路径, 避免 AttributeError 让整个
+                # add_friends step 异常退出. helper 实现待 P1-B 视觉/AI 候选筛选时
+                # 一并补回.
                 cands = self._list_top_search_result_cards(
                     d, query_hint=profile_name, max_n=5)
                 if cands:
@@ -5396,6 +5401,169 @@ class FacebookAutomation(BaseAutomation):
                     return True
         except Exception as e:
             log.debug("[extract_members] source-aware See all XML failed: %s", e)
+
+        # 2026-05-03 P1-B selector helper: anchor-aware See all 探测.
+        # 真机第 5 轮 (task 613f3af9) 显示新版 FB 群信息页有多个 section 各自含
+        # See all (About / Photos / Files / Members / Featured), 旧路径找到第
+        # 一个 text='See all' 就 tap, 跳到非成员页面 → _looks_like_group_members
+        # _list_xml 校验失败. 解法: 收集所有 See all 节点 + 邻近 200px 内必须
+        # 有 Members/成员/メンバー anchor, 才视为成员区入口; 失败的 candidate
+        # back 一次回群信息页再试下一个.
+        _MEMBER_SECTION_ANCHORS = (
+            "Members", "MEMBERS",
+            "メンバー",
+            "Membri",
+            "成员", "成員",
+        )
+        # P1-B v2 (2026-05-03 真机第六轮反馈): 上版本 anchor 距离判定 200px 太宽,
+        # 群信息页所有 4 个 See all (Photos/Files/Members/Featured) 都被关联到
+        # 同一个 'Members' anchor → 3 次误 tap. 收严策略:
+        #   1. 扩展 anchor 类型: 加 "数字 + members/成员/メンバー" 模式 (FB 群信息页
+        #      Members section 标题就是 "7.3K members" 这种), 比纯 "Members" 文字
+        #      候选多, 锚点更密.
+        #   2. 距离判定收严到 80px 同一行 + anchor 必须在 See all 左侧 (FB 标准布局
+        #      "标题在左 See all 在右"); 取消纵向 200px 模糊匹配.
+        #   3. 加 [seeall-dbg] 高粒度日志: 列出所有 See all 节点和 Anchor 节点的
+        #      真实 bounds, 让下一轮真机 dump 一次到位 (避免再迭代).
+        import re as _re_anchor
+        _NUM_MEMBERS_PATTERN = _re_anchor.compile(
+            r"\d[\d.,]*\s*[KkMm万]?\s*(?:members?|成员|成員|メンバー)",
+            _re_anchor.IGNORECASE,
+        )
+        try:
+            from ..vision.screen_parser import XMLParser as _XPSA
+            parsed_sa = list(_XPSA.parse(xml))
+            # 高粒度调试 dump: See all 节点 + Member anchor 节点
+            for _n in parsed_sa:
+                if not getattr(_n, "bounds", None):
+                    continue
+                _t = (getattr(_n, "text", "") or "").strip()
+                _d_ = (getattr(_n, "content_desc", None) or "").strip()
+                _is_seeall_dbg = any(
+                    _sa in (_t + " " + _d_)
+                    for _sa in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS
+                )
+                _is_anchor_dbg = (
+                    _t in _MEMBER_SECTION_ANCHORS
+                    or _d_ in _MEMBER_SECTION_ANCHORS
+                    or bool(_NUM_MEMBERS_PATTERN.search(_t))
+                    or bool(_NUM_MEMBERS_PATTERN.search(_d_))
+                )
+                if _is_seeall_dbg:
+                    log.info(
+                        "[seeall-dbg] SeeAll t=%r d=%r bounds=%s clk=%s",
+                        _t[:30], _d_[:60], _n.bounds,
+                        getattr(_n, "clickable", "?"),
+                    )
+                if _is_anchor_dbg:
+                    log.info(
+                        "[seeall-dbg] Anchor t=%r d=%r bounds=%s clk=%s",
+                        _t[:50], _d_[:80], _n.bounds,
+                        getattr(_n, "clickable", "?"),
+                    )
+            anchor_bounds: list = []
+            for _n in parsed_sa:
+                if not getattr(_n, "bounds", None):
+                    continue
+                _t = (getattr(_n, "text", "") or "").strip()
+                _d_ = (getattr(_n, "content_desc", None) or "").strip()
+                _matched_label = None
+                # 1) 全等 / 起始的传统 anchor
+                for _lbl in _MEMBER_SECTION_ANCHORS:
+                    if (_t == _lbl or _d_ == _lbl
+                        or _d_.startswith(_lbl + " ")
+                        or _d_.startswith(_lbl + ",")):
+                        _matched_label = _lbl
+                        break
+                # 2) "7.3K members" 等数字+成员模式 (可能在 text 或 desc 任一)
+                if not _matched_label:
+                    if _NUM_MEMBERS_PATTERN.search(_t):
+                        _matched_label = f"NUM:{_t[:30]}"
+                    elif _NUM_MEMBERS_PATTERN.search(_d_):
+                        _matched_label = f"NUM:{_d_[:30]}"
+                if _matched_label:
+                    anchor_bounds.append((_matched_label, _n.bounds))
+            see_all_candidates: list = []
+            for _n in parsed_sa:
+                if not getattr(_n, "bounds", None):
+                    continue
+                _t = (getattr(_n, "text", "") or "").strip()
+                _d_ = (getattr(_n, "content_desc", None) or "").strip()
+                _hit = False
+                for _sa in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS:
+                    if _t == _sa or _d_ == _sa or _sa in _d_:
+                        _hit = True
+                        break
+                if not _hit:
+                    continue
+                _l, _t2, _r, _b = _n.bounds
+                # P1-B v3 (2026-05-03 真机第七轮反馈): 上版本 `_b > 1400` 把
+                # 群信息页 Members 段 See all (y=1462-1506) 全部误杀. 真机日志
+                # 显示真正 clickable=True 的整行 See all 在 y∈[1462,1506],
+                # 这台 Redmi 13C 屏幕高 1600, See all 在 ~91% 位置完全合理.
+                # 取消 _b 上限, 改用 _t2 ≥ 240 过滤状态栏即可; clickable 节点
+                # 优先 (代码下方 sort 时纳入).
+                if _t2 < 240:
+                    continue
+                _sa_cx = (_l + _r) // 2
+                _sa_cy = (_t2 + _b) // 2
+                _best_anchor = None
+                _best_dist = 9999
+                for _alabel, (_al, _at, _ar, _ab) in anchor_bounds:
+                    _a_cx = (_al + _ar) // 2
+                    _a_cy = (_at + _ab) // 2
+                    # 严格: 必须同一行 (y 差 < 80) + anchor 在 See all 左侧
+                    # 容忍向下 80px 偏差 (覆盖 "标题在第一行, 整行可点 See all
+                    # 在第二行" 这种 FB 新 UI 模式)
+                    _y_diff = _sa_cy - _a_cy   # +: see-all 在 anchor 下方
+                    if not (-30 <= _y_diff <= 100):
+                        continue
+                    if _a_cx >= _sa_cx:
+                        continue
+                    _dist = _sa_cx - _a_cx
+                    # clickable 节点优先 (减小其 sort 距离, 优先被 tap)
+                    if bool(getattr(_n, "clickable", False)):
+                        _dist = max(0, _dist - 1000)
+                    if _dist < _best_dist:
+                        _best_dist = _dist
+                        _best_anchor = _alabel
+                if _best_anchor:
+                    see_all_candidates.append(
+                        (_best_dist, _t2, _l, _r, _b, _best_anchor)
+                    )
+            see_all_candidates.sort()
+            log.info(
+                "[extract_members] anchor-aware See all candidates: %d "
+                "(anchors found: %d, strict-row mode)",
+                len(see_all_candidates), len(anchor_bounds),
+            )
+            for _dist, _top, _l, _r, _b, _alabel in see_all_candidates[:3]:
+                self.hb.tap(d, (_l + _r) // 2, (_top + _b) // 2)
+                time.sleep(1.5)
+                if _after_tap_ok():
+                    try:
+                        self._last_group_member_source = (
+                            preferred_source or "general"
+                        )
+                    except Exception:
+                        pass
+                    log.info(
+                        "[extract_members] tap See all (anchor=%r dist=%d) ✓",
+                        _alabel, _dist,
+                    )
+                    return True
+                log.info(
+                    "[extract_members] anchor See all (anchor=%r) tap 后非"
+                    " 成员列表, back + 试下一个", _alabel,
+                )
+                try:
+                    d.press("back")
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+        except Exception as _ane:
+            log.debug("[extract_members] anchor-aware See all path failed: %s",
+                       _ane)
 
         for label in self._FB_GROUP_MEMBERS_SEE_ALL_TEXTS:
             for sel in ({"text": label, "clickable": True}, {"text": label}):

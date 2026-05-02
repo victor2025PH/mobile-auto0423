@@ -1156,8 +1156,14 @@ def fb_device_launch(device_id: str, body: dict = Body(default={})):
                 "facebook_campaign_run",
                 "facebook_group_member_greet",
         ):
-            s_params.setdefault("verification_note", verification_note)
-            s_params.setdefault("note", verification_note)
+            # 2026-05-03 真机第八轮 bug fix: 与 add_friend_targets / greeting 同
+            # 源问题. friend_growth 预设里预填 "verification_note": "" 占位,
+            # setdefault 因 key 已存在不写入 → body 传入的话术被吞掉, add_friends
+            # step skip empty verification_note. 改为 "if not get" 才覆盖.
+            if not (s_params.get("verification_note") or "").strip():
+                s_params["verification_note"] = verification_note
+            if not (s_params.get("note") or "").strip():
+                s_params["note"] = verification_note
 
         # 2026-04-23: name_hunter 预设 — 注入名字列表 + 覆盖打招呼文案
         # 注意: 不能用 setdefault, 因为 name_hunter 预设里预填了 add_friend_targets=[],
