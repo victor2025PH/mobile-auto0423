@@ -4715,13 +4715,27 @@ class FacebookAutomation(BaseAutomation):
                 return False
 
         for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
-            for sel in (
+            sels: List[Dict[str, Any]] = [
                 {"text": label, "clickable": True},
                 {"description": label, "clickable": True},
-            ):
+            ]
+            # 2026-05-03 v8: 短词 'Join'/'加入'/'参加' 加 startsWith 兼容 FB 新版
+            # 按钮 "Join {群名} group" 形式. 旧 d(text='Join') 全等 selector
+            # 永远 miss; XML 兜底也未输出 [join_group] log 说明 raw 提取或缩进
+            # 有问题. 直接加 u2 startsWith 路径最直接.
+            if label in ("Join", "加入", "参加"):
+                sels.extend([
+                    {"textStartsWith": label + " ", "clickable": True},
+                    {"descriptionStartsWith": label + " ", "clickable": True},
+                ])
+            for sel in sels:
                 try:
                     el = d(**sel)
                     if el.exists(timeout=0.25) and _center_safe(el):
+                        log.info(
+                            "[extract_members] join required (sel=%s)",
+                            list(sel.keys())[0],
+                        )
                         return True
                 except Exception:
                     continue
@@ -4745,6 +4759,10 @@ class FacebookAutomation(BaseAutomation):
                     continue
                 _left, top, _right, bottom = bounds
                 if 220 <= top <= 1450 and 220 <= bottom <= 1450:
+                    log.info(
+                        "[extract_members] join required (XML raw=%r)",
+                        raw[:40],
+                    )
                     return True
         except Exception as e:
             log.debug("[extract_members] join-required detection failed: %s", e)
@@ -4762,10 +4780,17 @@ class FacebookAutomation(BaseAutomation):
                 return None
 
         for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
-            for sel in (
+            sels: List[Dict[str, Any]] = [
                 {"text": label, "clickable": True},
                 {"description": label, "clickable": True},
-            ):
+            ]
+            # v8: 短词加 startsWith 兼容 "Join {群名} group" 真按钮
+            if label in ("Join", "加入", "参加"):
+                sels.extend([
+                    {"textStartsWith": label + " ", "clickable": True},
+                    {"descriptionStartsWith": label + " ", "clickable": True},
+                ])
+            for sel in sels:
                 try:
                     el = d(**sel)
                     if el.exists(timeout=0.5):
@@ -4774,8 +4799,9 @@ class FacebookAutomation(BaseAutomation):
                             continue
                         self.hb.tap(d, *pos)
                         time.sleep(0.8)
+                        _kind = next(iter(sel.keys()))
                         log.info("[join_group] tap join button by %s=%r",
-                                 "text" if "text" in sel else "desc", label)
+                                 _kind, label)
                         return True
                 except Exception:
                     continue
