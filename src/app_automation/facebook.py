@@ -4517,7 +4517,22 @@ class FacebookAutomation(BaseAutomation):
         if not text:
             return False
         if label in ("Join", "加入", "参加"):
-            return text == label
+            # 2026-05-03 v7: FB 新版 Join button 是 "Join {group_name} group"
+            # 形式 (e.g. "Join ペットの時間 group"). 旧代码要求短词全等, 永远
+            # miss → auto_join 没生效. 放宽: text 以 "Join "/"加入 " 开头视为
+            # 命中. 仍排除 "Joined"/"加入了" 等已加入状态 (用 endswith 排除).
+            if text == label:
+                return True
+            _prefix = label + " "
+            if text.startswith(_prefix):
+                # 排除 "Joined" 这类前缀被空格补全的边缘情况
+                _low = text.lower()
+                if any(_low.startswith(_neg) for _neg in (
+                    "joined", "join request",
+                )):
+                    return False
+                return True
+            return False
         return text == label or label.lower() in text.lower()
 
     def _join_button_present_in_xml(self, xml: str) -> bool:
@@ -5669,6 +5684,61 @@ class FacebookAutomation(BaseAutomation):
         """从群动态页/群主页进入简介页, 再打开完整成员列表。"""
         if self._tap_members_see_all_link(d, did, preferred_source):
             return True
+
+        # 2026-05-03 P1-A v6 (真机第十二轮 dump 反馈): 真机 dump 显示进群后落在
+        # "群预览页" (非成员模式), 含 cover/群头/Join button/子 tab/帖子流, 但
+        # **顶部没有 Members anchor**. 第 11 轮 mutual=4 成功的根因是滚屏到底部
+        # 看到 "成员预览" section (anchor y=1499). 第 1 次 see_all_link 失败应
+        # 先滚屏多次找底部成员预览, 而不是直接 tap 群头 (会跳到 cover 页破坏状态).
+        if self._tap_members_see_all_after_scroll(
+            d, did, preferred_source, max_scrolls=5,
+        ):
+            log.info(
+                "[extract_members] opened member list via early scroll path"
+            )
+            return True
+
+        # 2026-05-03 P1-A v5 (真机第十一轮分析): 群 1/3 (Files 默认 tab) 进入后
+        # tap 群头紧凑卡片 (bounds.right=407) 之后未到群信息页, 同行/跨行 See all
+        # 都 tap fail. 此处加超详细 [groupinfo-dbg] dump, 输出当前页所有 clickable
+        # 节点 + 含 Members/About/成员 等关键词节点, 一轮真机即可定位真入口.
+        try:
+            _xml_dbg = d.dump_hierarchy() or ""
+            if _xml_dbg:
+                from ..vision.screen_parser import XMLParser as _XPDBG
+                _parsed_dbg = list(_XPDBG.parse(_xml_dbg))
+                _GROUPINFO_KW = (
+                    "Members", "MEMBERS", "members",
+                    "メンバー", "Membri",
+                    "成员", "成員",
+                    "About", "ABOUT", "about", "关于", "關於",
+                    "情報", "Information",
+                    "Public group", "Private group",
+                    "See all", "see all",
+                    "Group info", "Group settings",
+                )
+                _hits_dbg = 0
+                for _n in _parsed_dbg:
+                    if not getattr(_n, "bounds", None):
+                        continue
+                    _t = (getattr(_n, "text", "") or "").strip()
+                    _d_ = (getattr(_n, "content_desc", None) or "").strip()
+                    _clk = bool(getattr(_n, "clickable", False))
+                    _has_kw = any(k in (_t + " " + _d_) for k in _GROUPINFO_KW)
+                    # 输出: clickable 节点 OR 含关键词节点
+                    if not (_clk or _has_kw):
+                        continue
+                    log.info(
+                        "[groupinfo-dbg] t=%r d=%r bounds=%s clk=%s",
+                        _t[:40], _d_[:80], _n.bounds, _clk,
+                    )
+                    _hits_dbg += 1
+                    if _hits_dbg >= 50:
+                        break
+                log.info("[groupinfo-dbg] total hits=%d nodes=%d",
+                          _hits_dbg, len(_parsed_dbg))
+        except Exception as _gid_e:
+            log.debug("[groupinfo-dbg] failed: %s", _gid_e)
 
         # 2026-05-03 P1-A real-device fix: 新版 FB 群头页面布局改了, Members tab
         # 不再作为顶部独立 chip 出现; 群信息入口收敛到一个大按钮, 其 content-desc
