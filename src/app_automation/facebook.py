@@ -5508,28 +5508,35 @@ class FacebookAutomation(BaseAutomation):
                 _sa_cx = (_l + _r) // 2
                 _sa_cy = (_t2 + _b) // 2
                 _best_anchor = None
-                _best_dist = 9999
+                _best_priority = 99
+                _best_sort = 99999
+                _is_clickable = bool(getattr(_n, "clickable", False))
                 for _alabel, (_al, _at, _ar, _ab) in anchor_bounds:
                     _a_cx = (_al + _ar) // 2
                     _a_cy = (_at + _ab) // 2
-                    # 严格: 必须同一行 (y 差 < 80) + anchor 在 See all 左侧
-                    # 容忍向下 80px 偏差 (覆盖 "标题在第一行, 整行可点 See all
-                    # 在第二行" 这种 FB 新 UI 模式)
-                    _y_diff = _sa_cy - _a_cy   # +: see-all 在 anchor 下方
-                    if not (-30 <= _y_diff <= 100):
-                        continue
                     if _a_cx >= _sa_cx:
+                        continue   # anchor 必须在 See all 左侧
+                    _y_diff = _sa_cy - _a_cy   # +: see-all 在 anchor 下方
+                    # 2026-05-03 P1-A v4 (真机第十轮分析): 群 1/3 layout 有同
+                    # 行 See all + 下一行全宽 See all (实际属于其它 section).
+                    # priority 分层: 同一行总是优先于跨行, 杜绝"下一 section
+                    # 全宽 clickable 抢位".
+                    if abs(_y_diff) <= 30:
+                        _priority = 0   # 同一行 (FB 标准 "标题左 See all 右")
+                        _sort = abs(_a_cx - _sa_cx)
+                    elif 30 < _y_diff <= 100 and _is_clickable:
+                        _priority = 1   # 跨行整行 See all (覆盖群 2 第 8 轮 layout)
+                        _sort = _y_diff   # y 距离作为 sort
+                    else:
                         continue
-                    _dist = _sa_cx - _a_cx
-                    # clickable 节点优先 (减小其 sort 距离, 优先被 tap)
-                    if bool(getattr(_n, "clickable", False)):
-                        _dist = max(0, _dist - 1000)
-                    if _dist < _best_dist:
-                        _best_dist = _dist
+                    if (_priority, _sort) < (_best_priority, _best_sort):
+                        _best_priority = _priority
+                        _best_sort = _sort
                         _best_anchor = _alabel
                 if _best_anchor:
                     see_all_candidates.append(
-                        (_best_dist, _t2, _l, _r, _b, _best_anchor)
+                        (_best_priority, _best_sort, _t2, _l, _r, _b,
+                         _best_anchor)
                     )
             see_all_candidates.sort()
             log.info(
@@ -5537,7 +5544,7 @@ class FacebookAutomation(BaseAutomation):
                 "(anchors found: %d, strict-row mode)",
                 len(see_all_candidates), len(anchor_bounds),
             )
-            for _dist, _top, _l, _r, _b, _alabel in see_all_candidates[:3]:
+            for _prio, _sort, _top, _l, _r, _b, _alabel in see_all_candidates[:3]:
                 self.hb.tap(d, (_l + _r) // 2, (_top + _b) // 2)
                 time.sleep(1.5)
                 if _after_tap_ok():
@@ -5548,13 +5555,14 @@ class FacebookAutomation(BaseAutomation):
                     except Exception:
                         pass
                     log.info(
-                        "[extract_members] tap See all (anchor=%r dist=%d) ✓",
-                        _alabel, _dist,
+                        "[extract_members] tap See all (anchor=%r prio=%d "
+                        "sort=%d) ✓",
+                        _alabel, _prio, _sort,
                     )
                     return True
                 log.info(
-                    "[extract_members] anchor See all (anchor=%r) tap 后非"
-                    " 成员列表, back + 试下一个", _alabel,
+                    "[extract_members] anchor See all (anchor=%r prio=%d) "
+                    "tap 后非成员列表, back + 试下一个", _alabel, _prio,
                 )
                 try:
                     d.press("back")
