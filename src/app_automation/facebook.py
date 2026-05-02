@@ -4695,8 +4695,16 @@ class FacebookAutomation(BaseAutomation):
                 return True
         return advanced
 
-    def _current_group_page_requires_join(self, d) -> bool:
-        """Detect whether the current group page still exposes a Join button."""
+    def _current_group_page_requires_join(self, d,
+                                            group_name: str = "") -> bool:
+        """Detect whether the current group page still exposes a Join button.
+
+        2026-05-03 v11: 群名 ADB stdout 解码乱码导致精确字面量永不命中, 改用
+        位置约束 — FB 群信息页布局固定: 群头按钮 y=557-689, Join 当前群 button
+        紧邻其下 y=705-855. Suggested groups section 在屏幕中下部 y > 1000.
+        把 _center_safe 收严到 600 <= cy <= 1000, 即可过滤掉 28 个 noise
+        而保留真正的 join button.
+        """
         try:
             xml_probe = d.dump_hierarchy() or ""
         except Exception:
@@ -4708,25 +4716,54 @@ class FacebookAutomation(BaseAutomation):
             return False
 
         def _center_safe(el) -> bool:
+            """v11: 收严 y 区间到 600-1000 (群头下方+子 tab 上方), 排除帖子里
+            'Join us!' (y > 1100) 和 Suggested groups (y > 1000)."""
             try:
                 _cx, cy = self._el_center(el)
-                return 220 <= cy <= 1450
+                return 600 <= cy <= 1000
             except Exception:
                 return False
 
+        # P1-A v10: 优先用 group_name 精确字面量匹配 (避免 28 candidates 噪声)
+        if group_name:
+            _exact_phrases = (
+                f"Join {group_name} group",
+                f"加入{group_name}小组",
+                f"加入{group_name}群组",
+                f"加入{group_name}社團",
+                f"加入{group_name}小組",
+                f"{group_name}に参加",
+            )
+            for _phrase in _exact_phrases:
+                for _key in ("text", "description"):
+                    try:
+                        el = d(**{_key: _phrase, "clickable": True})
+                        if el.exists(timeout=0.25) and _center_safe(el):
+                            log.info(
+                                "[extract_members] join required "
+                                "(exact %s=%r)", _key, _phrase[:40],
+                            )
+                            return True
+                    except Exception:
+                        continue
+
+        # 兜底: 旧路径 + textMatches (group_name 未传或未命中精确版)
+        _JOIN_TIGHT_MATCH = {
+            "Join": r"^Join\s.+\sgroup$",
+            "加入": r"^加入\s.+",
+            "参加": r"^参加\s.+",
+        }
         for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
             sels: List[Dict[str, Any]] = [
                 {"text": label, "clickable": True},
                 {"description": label, "clickable": True},
             ]
-            # 2026-05-03 v8: 短词 'Join'/'加入'/'参加' 加 startsWith 兼容 FB 新版
-            # 按钮 "Join {群名} group" 形式. 旧 d(text='Join') 全等 selector
-            # 永远 miss; XML 兜底也未输出 [join_group] log 说明 raw 提取或缩进
-            # 有问题. 直接加 u2 startsWith 路径最直接.
-            if label in ("Join", "加入", "参加"):
+            # group_name 已知时不再用宽 textMatches (避免 suggested groups 噪声)
+            if not group_name and label in _JOIN_TIGHT_MATCH:
+                _re = _JOIN_TIGHT_MATCH[label]
                 sels.extend([
-                    {"textStartsWith": label + " ", "clickable": True},
-                    {"descriptionStartsWith": label + " ", "clickable": True},
+                    {"textMatches": _re, "clickable": True},
+                    {"descriptionMatches": _re, "clickable": True},
                 ])
             for sel in sels:
                 try:
@@ -4768,27 +4805,68 @@ class FacebookAutomation(BaseAutomation):
             log.debug("[extract_members] join-required detection failed: %s", e)
         return False
 
-    def _tap_group_join_button(self, d, did: str) -> bool:
-        """点击群主页上的 Join/加入按钮, 避免旧 smart_tap 坐标污染。"""
+    def _tap_group_join_button(self, d, did: str,
+                                group_name: str = "") -> bool:
+        """点击群主页上的 Join/加入按钮, 避免旧 smart_tap 坐标污染。
+
+        v11 (2026-05-03): 位置约束 600 <= cy <= 1000 排除 Suggested groups
+        噪声 (y > 1000) 和帖子里 'Join us!' 文本 (y > 1100). FB 群信息页里
+        当前群的 Join button 紧邻群头下方 (y=705-855).
+        """
         def _center_safe(el) -> Optional[Tuple[int, int]]:
             try:
                 cx, cy = self._el_center(el)
-                if cy < 220 or cy > 1450:
+                # v11: 严格区间. 群头下方 + 子 tab 上方
+                if cy < 600 or cy > 1000:
                     return None
                 return cx, cy
             except Exception:
                 return None
 
+        # v10: 优先精确字面量 (避免 suggested groups 噪声)
+        if group_name:
+            _exact_phrases = (
+                f"Join {group_name} group",
+                f"加入{group_name}小组",
+                f"加入{group_name}群组",
+                f"加入{group_name}社團",
+                f"加入{group_name}小組",
+                f"{group_name}に参加",
+            )
+            for _phrase in _exact_phrases:
+                for _key in ("text", "description"):
+                    try:
+                        el = d(**{_key: _phrase, "clickable": True})
+                        if el.exists(timeout=0.5):
+                            pos = _center_safe(el)
+                            if not pos:
+                                continue
+                            self.hb.tap(d, *pos)
+                            time.sleep(0.8)
+                            log.info(
+                                "[join_group] tap join button (exact %s=%r)",
+                                _key, _phrase[:40],
+                            )
+                            return True
+                    except Exception:
+                        continue
+
+        # 兜底: 旧路径 (group_name 未传时)
+        _JOIN_TIGHT_MATCH = {
+            "Join": r"^Join\s.+\sgroup$",
+            "加入": r"^加入\s.+",
+            "参加": r"^参加\s.+",
+        }
         for label in self._FB_JOIN_GROUP_BUTTON_TEXTS:
             sels: List[Dict[str, Any]] = [
                 {"text": label, "clickable": True},
                 {"description": label, "clickable": True},
             ]
-            # v8: 短词加 startsWith 兼容 "Join {群名} group" 真按钮
-            if label in ("Join", "加入", "参加"):
+            if not group_name and label in _JOIN_TIGHT_MATCH:
+                _re = _JOIN_TIGHT_MATCH[label]
                 sels.extend([
-                    {"textStartsWith": label + " ", "clickable": True},
-                    {"descriptionStartsWith": label + " ", "clickable": True},
+                    {"textMatches": _re, "clickable": True},
+                    {"descriptionMatches": _re, "clickable": True},
                 ])
             for sel in sels:
                 try:
@@ -4867,9 +4945,9 @@ class FacebookAutomation(BaseAutomation):
         exposes a Join CTA. Re-searching from that state is slower and can land
         on a different public group row, so try the visible page first.
         """
-        if not self._current_group_page_requires_join(d):
+        if not self._current_group_page_requires_join(d, group_name):
             return True, "already_joined_or_accessible"
-        if not self._tap_group_join_button(d, did):
+        if not self._tap_group_join_button(d, did, group_name):
             return False, "join_button_not_found"
 
         for _ in range(8):
@@ -4890,7 +4968,7 @@ class FacebookAutomation(BaseAutomation):
                 "membership_questions_required",
             ):
                 return False, state
-            if not self._current_group_page_requires_join(d):
+            if not self._current_group_page_requires_join(d, group_name):
                 return True, "joined_no_cta"
         return False, "join_state_unknown_after_tap"
 
@@ -5107,7 +5185,7 @@ class FacebookAutomation(BaseAutomation):
                 return False
 
             _set_step("提交加入群组", group_name)
-            if not self._tap_group_join_button(d, did):
+            if not self._tap_group_join_button(d, did, group_name):
                 log.warning("[join_group] join button not found group=%r",
                             group_name)
                 return self._join_group_outcome("join_button_not_found")
@@ -7220,7 +7298,7 @@ class FacebookAutomation(BaseAutomation):
             )
             return members
 
-        if group_name and self._current_group_page_requires_join(d):
+        if group_name and self._current_group_page_requires_join(d, group_name):
             if join_if_needed:
                 _set_step("加入目标群组", group_name)
                 join_ok = False
@@ -7285,7 +7363,7 @@ class FacebookAutomation(BaseAutomation):
                         reason="enter_group after join returned False",
                     )
                     return members
-                if self._current_group_page_requires_join(d):
+                if self._current_group_page_requires_join(d, group_name):
                     _record_extract_error(did, "group_requires_join")
                     _capture_immediate_async(
                         did, step_name="extract_group_requires_join",
