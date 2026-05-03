@@ -6241,7 +6241,65 @@ class FacebookAutomation(BaseAutomation):
         if self._open_group_info_then_members(d, did, preferred_source):
             return True
 
-        log.warning("[extract_members] Members tab 4 种路径全部失败, 需跑"
+        # 2026-05-03 P1-A v14 (真机第 19 轮 dump 重大发现): 新版 FB 群页面布局
+        # **完全移除 Members 子 tab**, 子 tab 仅有 Reels/You/Photos/Events/Files.
+        # Members 入口收敛到顶部 "Member tools more options" 三点菜单. 旧 4
+        # 路径全部依赖 Members tab text/desc 永远 miss. 加第 5 路径: tap
+        # Member tools 弹菜单 → 选 Members 选项.
+        try:
+            for _mt_sel in (
+                {"descriptionContains": "Member tools", "clickable": True},
+                {"description": "Member tools more options", "clickable": True},
+            ):
+                _el_mt = d(**_mt_sel)
+                if not _el_mt.exists(timeout=0.6):
+                    continue
+                self.hb.tap(d, *self._el_center(_el_mt))
+                time.sleep(1.8)
+                # 弹菜单后找 Members 选项 (text/desc/contains 多路尝试)
+                for _mem_lbl in (
+                    "Members", "Member list", "All members", "View members",
+                    "成员", "成員", "メンバー",
+                ):
+                    for _sel2 in (
+                        {"text": _mem_lbl, "clickable": True},
+                        {"description": _mem_lbl, "clickable": True},
+                        {"textContains": _mem_lbl, "clickable": True},
+                        {"descriptionContains": _mem_lbl, "clickable": True},
+                    ):
+                        try:
+                            _el2 = d(**_sel2)
+                            if not _el2.exists(timeout=0.4):
+                                continue
+                            try:
+                                _cnt2 = _el2.count
+                            except Exception:
+                                _cnt2 = 1
+                            if _cnt2 > 5:
+                                continue
+                            self.hb.tap(d, *self._el_center(_el2))
+                            time.sleep(2.0)
+                            if _is_on_members_list():
+                                log.info(
+                                    "[extract_members] tap Members via "
+                                    "Member tools menu (label=%r) ✓",
+                                    _mem_lbl,
+                                )
+                                return True
+                        except Exception:
+                            continue
+                # 菜单点开但没找到 Members → back 关菜单
+                try:
+                    d.press("back")
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+                break  # Member tools 只 tap 一次
+        except Exception as _mt_e:
+            log.debug("[extract_members] Member tools menu path failed: %s",
+                       _mt_e)
+
+        log.warning("[extract_members] Members tab 5 路径全部失败, 需跑"
                      " debug_extract_members_trace.py 诊断真实 UI 结构")
         return False
 
