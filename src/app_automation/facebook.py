@@ -4555,7 +4555,13 @@ class FacebookAutomation(BaseAutomation):
 
     def _classify_join_group_page(self, xml: str,
                                   group_name: str = "") -> str:
-        """识别加入后的真实状态。空字符串表示还无法判断。"""
+        """识别加入后的真实状态。空字符串表示还无法判断。
+
+        2026-05-03 v13: FB 真机 join 成功后 button text 变 'joined {群名} group'
+        (小写 'joined') — 不在 _FB_JOINED_MARKERS 大写列表里. 加小写 'joined '
+        前缀 + group_name 精确短语作为额外信号, 让 8 次循环里第一次就识别为
+        joined, 不再 wait 8 秒.
+        """
         text = xml or ""
         if not text:
             return ""
@@ -4565,6 +4571,16 @@ class FacebookAutomation(BaseAutomation):
             return "join_requested_pending_approval"
         if any(marker in text for marker in self._FB_JOINED_MARKERS):
             return "joined"
+        # v13: 小写 'joined {群名} group' 精确短语 (FB 真机第 18 轮抓到)
+        if group_name:
+            _joined_phrases = (
+                f"joined {group_name} group",
+                f"Joined {group_name} group",
+                f"已加入{group_name}",
+                f"{group_name}に参加済み",
+            )
+            if any(p in text for p in _joined_phrases):
+                return "joined"
         has_group_name = bool(group_name and group_name in text)
         has_group_tab = any(tok in text for tok in self._GROUP_PAGE_SIGNATURE_TOKENS)
         if has_group_name and has_group_tab and not self._join_button_present_in_xml(text):
@@ -4747,7 +4763,9 @@ class FacebookAutomation(BaseAutomation):
                     except Exception:
                         continue
 
-        # 兜底: 旧路径 + textMatches (group_name 未传或未命中精确版)
+        # 2026-05-03 v12: group_name 因 ADB stdout 乱码常常无法精确字面量匹配,
+        # 必须保留宽 textMatches 兜底. 抗噪靠 _center_safe 的位置约束 + 限制
+        # 候选数量上限 — 真 Join button 1 个, Suggested groups ≥ 5 个 noise.
         _JOIN_TIGHT_MATCH = {
             "Join": r"^Join\s.+\sgroup$",
             "加入": r"^加入\s.+",
@@ -4758,8 +4776,7 @@ class FacebookAutomation(BaseAutomation):
                 {"text": label, "clickable": True},
                 {"description": label, "clickable": True},
             ]
-            # group_name 已知时不再用宽 textMatches (避免 suggested groups 噪声)
-            if not group_name and label in _JOIN_TIGHT_MATCH:
+            if label in _JOIN_TIGHT_MATCH:
                 _re = _JOIN_TIGHT_MATCH[label]
                 sels.extend([
                     {"textMatches": _re, "clickable": True},
@@ -4768,10 +4785,23 @@ class FacebookAutomation(BaseAutomation):
             for sel in sels:
                 try:
                     el = d(**sel)
-                    if el.exists(timeout=0.25) and _center_safe(el):
+                    if not el.exists(timeout=0.25):
+                        continue
+                    # v12: 候选数 > 3 视为噪声 (Suggested groups), 跳过该 selector
+                    try:
+                        _cnt = el.count
+                    except Exception:
+                        _cnt = 1
+                    if _cnt > 3:
                         log.info(
-                            "[extract_members] join required (sel=%s)",
-                            list(sel.keys())[0],
+                            "[extract_members] skip noisy join sel=%s "
+                            "count=%d", list(sel.keys())[0], _cnt,
+                        )
+                        continue
+                    if _center_safe(el):
+                        log.info(
+                            "[extract_members] join required (sel=%s count=%d)",
+                            list(sel.keys())[0], _cnt,
                         )
                         return True
                 except Exception:
@@ -4851,7 +4881,7 @@ class FacebookAutomation(BaseAutomation):
                     except Exception:
                         continue
 
-        # 兜底: 旧路径 (group_name 未传时)
+        # v12: 兜底 textMatches 始终启用, 位置约束 + 候选数限制抗噪
         _JOIN_TIGHT_MATCH = {
             "Join": r"^Join\s.+\sgroup$",
             "加入": r"^加入\s.+",
@@ -4862,7 +4892,7 @@ class FacebookAutomation(BaseAutomation):
                 {"text": label, "clickable": True},
                 {"description": label, "clickable": True},
             ]
-            if not group_name and label in _JOIN_TIGHT_MATCH:
+            if label in _JOIN_TIGHT_MATCH:
                 _re = _JOIN_TIGHT_MATCH[label]
                 sels.extend([
                     {"textMatches": _re, "clickable": True},
@@ -4871,16 +4901,24 @@ class FacebookAutomation(BaseAutomation):
             for sel in sels:
                 try:
                     el = d(**sel)
-                    if el.exists(timeout=0.5):
-                        pos = _center_safe(el)
-                        if not pos:
-                            continue
-                        self.hb.tap(d, *pos)
-                        time.sleep(0.8)
-                        _kind = next(iter(sel.keys()))
-                        log.info("[join_group] tap join button by %s=%r",
-                                 _kind, label)
-                        return True
+                    if not el.exists(timeout=0.5):
+                        continue
+                    try:
+                        _cnt = el.count
+                    except Exception:
+                        _cnt = 1
+                    if _cnt > 3:
+                        # noisy selector, skip
+                        continue
+                    pos = _center_safe(el)
+                    if not pos:
+                        continue
+                    self.hb.tap(d, *pos)
+                    time.sleep(0.8)
+                    _kind = next(iter(sel.keys()))
+                    log.info("[join_group] tap join button by %s=%r count=%d",
+                             _kind, label, _cnt)
+                    return True
                 except Exception:
                     continue
 
