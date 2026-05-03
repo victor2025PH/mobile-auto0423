@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
@@ -78,17 +79,19 @@ class CentralCustomerStore:
         pool_min: int = DEFAULT_POOL_MIN,
         pool_max: int = DEFAULT_POOL_MAX,
     ):
-        # F9 fix (RUNBOOK):
-        #   client_encoding=utf8     — force query/data wire to UTF-8
-        # 真正根治 zh_CN.GBK 错误消息 (byte 0xd6) 需要 PG superuser 运行:
-        #   ALTER ROLE openclaw_app SET lc_messages='C';
-        # 见 docs/SYSTEM_RUNBOOK.md 安装步骤. PGOPTIONS '-c lc_messages=C'
-        # 不能在 DSN 设, 因 lc_messages 是 SUSET, 普通 user 改会被 PG 拒.
-        # 没 SUSET 时由 _conn 的 UnicodeDecodeError catch 兜底丢弃中毒连接.
+        # F9 fix (RUNBOOK) + P2.X-3 (2026-04-30):
+        #   client_encoding=utf8         — force query/data wire to UTF-8
+        #   options='-c lc_messages=C'   — connection-time GUC, force PG 错误
+        #     消息走 C (ASCII) locale 而不是 zh_CN.GBK. 历史注释说 SUSET 改不
+        #     了, 实测 PG 13+ 允许 connection-time '-c lc_messages=C' (与 SET
+        #     不同). 即使 PG 拒该参数, psycopg2 也只会警告, 不会让 connect
+        #     报错 — 比"得手动 ALTER ROLE"更可移植.
+        # 仍保留 _conn UnicodeDecodeError catch 作为兜底.
         self._dsn = (
             f"host={host} port={port} dbname={dbname} user={user} "
             f"password={password} application_name=openclaw_central "
-            f"client_encoding=utf8"
+            f"client_encoding=utf8 "
+            f"options='-c lc_messages=C'"
         )
         self._pool: Optional[ThreadedConnectionPool] = None
         self._pool_lock = threading.Lock()
@@ -1278,16 +1281,87 @@ class CentralCustomerStore:
 _store_singleton: Optional[CentralCustomerStore] = None
 _singleton_lock = threading.Lock()
 
+# P2.X-3 (2026-04-30) circuit breaker:
+# 真实 incident: PG 在 zh_CN.GBK locale 下返认证错误消息 → psycopg2 解码崩 →
+# init 抛 UnicodeDecodeError. 历史无熔断, 4 设备并发 callback 每秒数十次
+# 重试 init+reset+retry → CPU 烧爆 + 日志 152KB/2min → host 进程~3min 内
+# 不响应被外层视作 down.
+#
+# 状态机:
+#   CLOSED   (默认) — 每次调用都正常 attempt
+#   失败计数累计到 _BREAKER_THRESHOLD → OPEN
+#   OPEN     — 后续 _BREAKER_OPEN_SEC 秒内全部短路, raise 缓存异常,
+#              不再 attempt PG. 到时间后 → HALF_OPEN
+#   HALF_OPEN — 放行 1 次试探性 init. 成功 → CLOSED. 失败 → 重回 OPEN.
+_BREAKER_THRESHOLD = 3       # 连续 3 次失败进熔断
+_BREAKER_OPEN_SEC = 60.0     # 熔断保持 60s 不再重试
+_init_breaker_state: Dict[str, Any] = {
+    "consecutive_failures": 0,
+    "last_failure_at": 0.0,    # monotonic time of last failure
+    "last_exception": None,    # 缓存最近一次 init exception 用于短路 raise
+    "open_until": 0.0,         # monotonic time, < now 表示可再试
+}
+
+
+def _breaker_should_short_circuit() -> Optional[BaseException]:
+    """若熔断 OPEN 且未到超时, 返回缓存的 exception (调用方应直接 raise);
+    否则返回 None (放行 attempt).
+    """
+    now = time.monotonic()
+    if _init_breaker_state["open_until"] > now:
+        return _init_breaker_state.get("last_exception")
+    return None
+
+
+def _breaker_record_failure(exc: BaseException) -> None:
+    s = _init_breaker_state
+    s["consecutive_failures"] = int(s.get("consecutive_failures") or 0) + 1
+    s["last_failure_at"] = time.monotonic()
+    s["last_exception"] = exc
+    if s["consecutive_failures"] >= _BREAKER_THRESHOLD:
+        s["open_until"] = time.monotonic() + _BREAKER_OPEN_SEC
+        logger.error(
+            "[central_store] circuit breaker OPEN for %.0fs after %d "
+            "consecutive init failures (last=%s: %s). 后续调用将短路 "
+            "避免 PG 不可达时烧 CPU. 修复 PG 连接后 %.0fs 内会自动放行试探.",
+            _BREAKER_OPEN_SEC, s["consecutive_failures"],
+            type(exc).__name__, str(exc)[:120],
+            _BREAKER_OPEN_SEC,
+        )
+
+
+def _breaker_record_success() -> None:
+    _init_breaker_state["consecutive_failures"] = 0
+    _init_breaker_state["last_exception"] = None
+    _init_breaker_state["open_until"] = 0.0
+
 
 def get_store() -> CentralCustomerStore:
-    """获取/初始化单例."""
+    """获取/初始化单例 (含 circuit breaker, P2.X-3)."""
     global _store_singleton
     if _store_singleton is not None:
         return _store_singleton
+
+    # 短路检查: 在拿锁前先看, 减少锁竞争
+    cached_exc = _breaker_should_short_circuit()
+    if cached_exc is not None:
+        raise cached_exc
+
     with _singleton_lock:
-        if _store_singleton is None:
+        if _store_singleton is not None:
+            return _store_singleton
+        # 双重检查: 拿到锁后再看一次熔断状态 (其他线程可能刚刚触发熔断)
+        cached_exc = _breaker_should_short_circuit()
+        if cached_exc is not None:
+            raise cached_exc
+        try:
             _store_singleton = CentralCustomerStore()
-        return _store_singleton
+        except BaseException as exc:
+            _breaker_record_failure(exc)
+            raise
+        else:
+            _breaker_record_success()
+            return _store_singleton
 
 
 def reset_for_tests(**kwargs) -> CentralCustomerStore:
