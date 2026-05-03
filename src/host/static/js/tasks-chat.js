@@ -417,10 +417,101 @@ async function _refreshTaskHealthChips(){
   }catch(e){console.warn('[health-chips] refresh failed',e);}
 }
 
+// P1 Sprint B/C/P1.5: outcome → 徽章映射
+//   ok                                 → 不显示徽章
+//   missing_param:*                    → 红色"配置缺失" → 点击走重配置 dialog (Sprint C)
+//   zero_result                        → 黄色泛标识     → 点击走重配置 dialog
+//   automation_extract_zero_after_enter → 紫色"进群无成员" → 点击直接看失败现场 (P1.5)
+//   automation_*                       → 紫色"自动化失败"  → 点击直接看失败现场 (P1.5)
+//   upstream_failed                    → 灰色"上游未产出"  → 不可点
+const _OUTCOME_BADGES={
+  zero_result: {cls:'warn', emoji:'🔍', text:'未获得结果', action:'reopen'},
+  upstream_failed: {cls:'dim', emoji:'⤴', text:'上游未产出', action:'none'},
+  // P2.X: 区分 enter / tab / extract 三段失败, 让运营一眼看出真因
+  automation_enter_group_failed: {
+    cls:'forensics', emoji:'📸', text:'未进入目标群', action:'forensics'},
+  automation_members_tab_not_found: {
+    cls:'forensics', emoji:'📸', text:'找不到成员标签', action:'forensics'},
+  automation_extract_zero_after_enter: {
+    cls:'forensics', emoji:'📸', text:'进群后未拿到成员', action:'forensics'},
+};
+
+// 通用 automation_* 兜底
+const _AUTOMATION_FALLBACK={cls:'forensics', emoji:'📸', text:'自动化执行异常', action:'forensics'};
+
+function _renderOutcomeBadge(outcome, errMsg, taskId){
+  if(!outcome) return '';
+  // 1. missing_param:* — 配置层错误，走重配置 dialog
+  if(outcome.indexOf && outcome.indexOf('missing_param')===0){
+    const field=outcome.split(':')[1]||'参数';
+    const clickAttr=taskId
+      ? `onclick="event.stopPropagation();fbReopenByTaskId('${taskId}')" style="cursor:pointer"`
+      : '';
+    return `<span class="task-outcome err" ${clickAttr}
+              title="${taskId?'点击重新配置参数':((errMsg||'').substring(0,200))}">⚙ 配置缺失: ${field}${taskId?' ↻':''}</span>`;
+  }
+  // 2. automation_* — 真机执行层错误，走 forensics 证据查看
+  let meta=_OUTCOME_BADGES[outcome];
+  if(!meta && outcome.indexOf && outcome.indexOf('automation_')===0){
+    meta=_AUTOMATION_FALLBACK;
+  }
+  if(!meta) return '';
+  const action=meta.action||'none';
+  let clickAttr='', suffix='';
+  if(taskId && action==='reopen'){
+    clickAttr=`onclick="event.stopPropagation();fbReopenByTaskId('${taskId}')" style="cursor:pointer"`;
+    suffix=' ↻';
+  } else if(taskId && action==='forensics'){
+    clickAttr=`onclick="event.stopPropagation();fbOpenForensicsByTaskId('${taskId}')" style="cursor:pointer"`;
+    suffix=' 📸';
+  }
+  const tip=action==='reopen' ? '点击重新配置参数'
+    : (action==='forensics' ? '点击查看失败现场截图与诊断' : (errMsg||'').substring(0,200));
+  return `<span class="task-outcome ${meta.cls}" ${clickAttr}
+            title="${tip}">${meta.emoji} ${meta.text}${suffix}</span>`;
+}
+
+// P1 Sprint C: outcome 徽章点击桥接 — 重配置路径
+window.fbReopenByTaskId=function(taskId){
+  const t=(allTasks||[]).find(function(x){return (x.task_id||x.id)===taskId;});
+  if(!t){ showToast('任务不在当前列表，请刷新','warning'); return; }
+  if(!t.type || t.type.indexOf('facebook_')!==0){
+    showToast('该任务类型暂不支持快捷重配置','info');
+    return;
+  }
+  if(typeof window.fbReopenLaunchByTask==='function'){
+    window.fbReopenLaunchByTask(Object.assign({},t,{id:t.task_id||t.id}));
+  } else {
+    showToast('Facebook 模块未加载（请刷新页面）','warning');
+  }
+};
+
+// P1.5 (2026-04-30): outcome 徽章 → forensics 现场查看
+// 直接打开任务详情模态并跳转到「失败证据」面板（已存在 _loadForensicsPanel）
+window.fbOpenForensicsByTaskId=function(taskId){
+  const t=(allTasks||[]).find(function(x){return (x.task_id||x.id)===taskId;});
+  if(!t){ showToast('任务不在当前列表，请刷新','warning'); return; }
+  // 全局函数优先 window.showTaskDetail，回退到裸 showTaskDetail（dashboard.html 顶级 script 注入）
+  const fn=(typeof window.showTaskDetail==='function')
+    ? window.showTaskDetail
+    : (typeof showTaskDetail==='function' ? showTaskDetail : null);
+  if(!fn){ showToast('任务详情模块未就绪（请刷新页面）','warning'); return; }
+  fn(taskId);
+  // 详情打开后滚动到 forensics 区
+  setTimeout(function(){
+    const fp=document.getElementById('forensics-panel');
+    if(fp) fp.scrollIntoView({behavior:'smooth',block:'center'});
+  }, 400);
+};
+
 function _getTaskOutcome(t){
   if(!t.result||t.status==='pending'||t.status==='cancelled')return '';
   const r=t.result;
   const parts=[];
+  // P1 Sprint B/C: 优先显示 outcome 徽章；fb 任务带 taskId 让徽章可点击重配
+  const _isFb=(t.type||'').indexOf('facebook_')===0;
+  const ocBadge=_renderOutcomeBadge(r.outcome, r.error || '', _isFb ? (t.task_id||t.id||'') : '');
+  if(ocBadge) parts.push(ocBadge);
   // 关注
   if(r.followed!=null) parts.push(r.followed>0?`<span class="task-outcome ok">+${r.followed}关注</span>`:`<span class="task-outcome dim">0关注</span>`);
   // 私信发送
@@ -444,7 +535,9 @@ function _taskRowInner(t,isTrashList){
   const bcls='badge-'+(t.status||'pending');
   const alias=t.device_label||ALIAS[t.device_id]||t.device_id?.substring(0,8)||'全部';
   const originTag=t.task_origin_label_zh?`<span style="font-size:9px;color:var(--text-muted);margin-left:4px">· ${t.task_origin_label_zh}</span>`:'';
-  const tname=t.type_label_zh||TASK_NAMES[t.type]||t.type?.replace('tiktok_','').replace('telegram_','')||'未知';
+  const tname=(typeof taskDisplayName==='function'
+    ? taskDisplayName(t)
+    : (TASK_NAMES[t.type]||t.type_label_zh||t.type?.replace('tiktok_','').replace('telegram_','')||'未知'));
   // P0 — 任务名加 group_name + persona, 不再混淆 8 行同名"FB 加入群组"
   const _p=t.params||{};
   const tnameMeta=(_p.group_name||_p.persona_key||_p.target_country)?
@@ -961,6 +1054,7 @@ function _renderFbProfileHuntCard(r){
 }
 
 /* ── 任务详情 Modal ── */
+// P1.5: 显式挂 window，让外部模块（如 facebook-ops 通过 outcome 徽章）能 typeof 检查
 async function showTaskDetail(taskId){
   const incTrash=typeof currentFilter!=='undefined'&&currentFilter==='trash';
   let t=allTasks.find(x=>x.task_id===taskId);
@@ -973,7 +1067,9 @@ async function showTaskDetail(taskId){
   }
   if(!t){showToast('任务未找到','error');return;}
   const alias=t.device_label||ALIAS[t.device_id]||t.device_id?.substring(0,8)||'未知';
-  const tname=t.type_label_zh||TASK_NAMES[t.type]||t.type||'未知';
+  const tname=(typeof taskDisplayName==='function'
+    ? taskDisplayName(t)
+    : (TASK_NAMES[t.type]||t.type_label_zh||t.type||'未知'));
   const stLabel={running:'🟢 运行中',completed:'✅ 已完成',failed:'❌ 失败',pending:'⏳ 等待中',cancelled:'🚫 已取消'}[t.status]||t.status;
   const tm=t.created_at?new Date(t.created_at).toLocaleString('zh-CN'):'—';
   const upd=t.updated_at?new Date(t.updated_at).toLocaleString('zh-CN'):'—';
@@ -1001,7 +1097,9 @@ async function showTaskDetail(taskId){
         :` <span style="font-size:10px;color:#f59e0b" title="超过 1 小时无步骤刷新, 可能卡死">${Math.round(ageSec/3600)} 小时前 ⚠</span>`;
     }catch(_){}
   }
-  const currentStepRow=(t.status==='running'&&t.current_step)?`<div class="detail-row"><span class="detail-label">当前步骤</span><span style="font-size:12px;color:var(--accent);font-weight:500">${t.current_step}${t.current_sub_step?` <span style="color:var(--text-dim);font-weight:normal">— ${t.current_sub_step}</span>`:''}${stepFreshness}</span></div>`:'';
+  const stepText=(typeof businessSafeText==='function')?businessSafeText(t.current_step):t.current_step;
+  const subStepText=(typeof businessSafeText==='function')?businessSafeText(t.current_sub_step):t.current_sub_step;
+  const currentStepRow=(t.status==='running'&&t.current_step)?`<div class="detail-row"><span class="detail-label">当前步骤</span><span style="font-size:12px;color:var(--accent);font-weight:500">${stepText}${t.current_sub_step?` <span style="color:var(--text-dim);font-weight:normal">— ${subStepText}</span>`:''}${stepFreshness}</span></div>`:'';
   const ge=result.gate_evaluation;
   const geoGlossary=_taskDetailGeoGlossary(params,ge);
   const failHints=_taskDetailFailureHints(err, ge);
@@ -1042,7 +1140,7 @@ async function showTaskDetail(taskId){
   const canRestore=inTrash;
   const canErase=inTrash;
   const canRetry=t.status==='failed'&&!inTrash;
-  // Sprint C-1: extract_members 任务完成后可以"一键串链"到 profile_hunt
+  // Sprint C-1: 群成员打招呼任务完成后可以"一键串链"到 profile_hunt
   const memberCount=(result&&result.members&&result.members.length)||0;
   const canHunt=(t.type==='facebook_extract_members')&&(t.status==='completed')&&(!inTrash)&&(memberCount>0);
 
@@ -1088,7 +1186,7 @@ async function showTaskDetail(taskId){
       ${resultHtml}
       ${t.status==='failed'?`<div class="detail-row" id="forensics-row"><span class="detail-label">📸 失败证据</span><div id="forensics-panel" style="flex:1;font-size:11px;color:var(--text-dim)">加载中...</div></div>`:''}
       <div style="display:flex;gap:8px;margin-top:20px;flex-wrap:wrap">
-        ${canHunt?`<button class="qa-btn" style="color:#a78bfa;border-color:#8b5cf6;background:rgba(139,92,246,.15);font-weight:600" onclick="_tdLaunchHunt('${taskId}','${t.device_id||''}',${memberCount})">🧠 用这批 ${memberCount} 人做画像识别</button>`:''}
+        ${canHunt?`<button class="qa-btn" style="color:#a78bfa;border-color:#8b5cf6;background:rgba(139,92,246,.15);font-weight:600" onclick="_tdLaunchHunt('${taskId}','${t.device_id||''}',${memberCount})">🧠 用这批 ${memberCount} 位成员做画像识别</button>`:''}
         ${canCancel?`<button class="qa-btn" style="color:var(--yellow);border-color:var(--yellow)" onclick="_tdAction('cancel','${taskId}')">⏹ 取消任务</button>`:''}
         ${canRetry?`<button class="qa-btn" style="color:var(--accent);border-color:var(--accent)" onclick="_tdAction('retry','${taskId}')">🔄 重新提交</button>`:''}
         ${canRestore?`<button class="qa-btn" style="color:#22c55e;border-color:#22c55e" onclick="_tdAction('restore','${taskId}')">♻ 恢复任务</button>`:''}
@@ -1239,7 +1337,7 @@ async function _tdAction(action,taskId){
   }catch(e){showToast('操作失败: '+e.message,'error');}
 }
 
-/* Sprint C-1: 从 extract_members 任务一键创建 profile_hunt。
+/* Sprint C-1: 从群成员打招呼任务一键创建 profile_hunt。
    预填 candidates_from_task_id=<上游任务 ID>，持 device 一致，
    命中画像的人由用户选"仅识别"/"自动关注"/"加好友"。 */
 async function _tdLaunchHunt(upstreamTaskId, deviceId, memberCount){
@@ -1259,11 +1357,11 @@ async function _tdLaunchHunt(upstreamTaskId, deviceId, memberCount){
   modal.innerHTML=`
     <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:22px;width:min(460px,95vw);box-shadow:0 20px 60px rgba(0,0,0,.4)">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-        <div style="font-size:16px;font-weight:700">🧠 从群成员创建画像识别</div>
+        <div style="font-size:16px;font-weight:700">🧠 从群成员打招呼创建画像识别</div>
         <button onclick="document.getElementById('hunt-launch-modal').remove()" style="background:none;border:none;color:var(--text-muted);font-size:20px;cursor:pointer">✕</button>
       </div>
       <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px;padding:8px 10px;background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.28);border-radius:8px">
-        将对上游任务的 <b style="color:#a78bfa">${memberCount}</b> 个群成员批量跑 L1+L2 识别，命中目标画像的人可选择自动动作。
+        将对上游任务的 <b style="color:#a78bfa">${memberCount}</b> 位群成员批量跑 L1+L2 识别，命中目标画像的人可选择自动动作。
       </div>
       <div style="display:flex;flex-direction:column;gap:10px;font-size:13px">
         <div style="display:flex;align-items:center;gap:10px"><span style="min-width:90px">目标画像</span>

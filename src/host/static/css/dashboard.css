@@ -833,6 +833,8 @@ body{font-family:-apple-system,'Segoe UI','Microsoft YaHei',sans-serif;backgroun
 .task-outcome.hot{background:rgba(239,68,68,.15);color:#f87171}
 .task-outcome.escalate{background:rgba(234,179,8,.15);color:#fbbf24}
 .task-outcome.err{background:rgba(239,68,68,.1);color:#f87171;cursor:help;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-outcome.warn{background:rgba(245,158,11,.12);color:#fbbf24;cursor:help;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-outcome.forensics{background:rgba(168,85,247,.13);color:#c084fc;cursor:help;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid rgba(168,85,247,.3)}
 .task-outcome.dim{background:rgba(148,163,184,.08);color:var(--text-muted)}
 
 /* ── TikTok 三阶段漏斗布局 ── */

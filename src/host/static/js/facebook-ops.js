@@ -180,6 +180,9 @@
         <button class="qa-btn" onclick="fbOpenLeadsModal()" style="padding:6px 10px;font-size:12px;background:rgba(59,130,246,.15);color:#3b82f6">
           🎯 高分线索
         </button>
+        <button class="qa-btn" onclick="fbOpenNameHunterCandidates()" style="padding:6px 10px;font-size:12px;background:rgba(14,165,233,.15);color:#38bdf8">
+          🔎 点名候选
+        </button>
         <button class="qa-btn" onclick="fbOpenInsightsModal()" style="padding:6px 10px;font-size:12px;background:rgba(139,92,246,.18);color:#a78bfa">
           🧠 画像识别
         </button>
@@ -447,7 +450,17 @@
   };
 
   // 包装版:从模态读取 persona + 群组,再调用 fbLaunchPreset
-  window.fbLaunchPresetWithPersona = function (presetKey, deviceId) {
+  //
+  // 2026-04-30 hotfix (real device complaint "点确定无响应"):
+  // 原版同步函数, 若用户在 _fbPresets 未加载完时点启动 → preset=undefined →
+  // schema=null → 跳过 schema-form dialog → 走原生 confirm → API 返 422
+  // missing_required_inputs → fbLaunchPreset 把 422 当作"由 dialog 标红"
+  // 静默吞了 → 用户看到的就是"点确定无响应". 改异步先 await 加载 preset.
+  window.fbLaunchPresetWithPersona = async function (presetKey, deviceId) {
+    // 关键: 确保 preset 元数据 (含 input_schema) 已加载, 否则下面所有分支
+    // 都会判定为"无 schema" → 错误地落到原生 confirm 分支.
+    try { await _fbLoadPresets(); } catch (e) { /* ignore, 下面会兜底 */ }
+
     const personaSel = document.getElementById('fb-persona-select');
     const groupsInput = document.getElementById('fb-target-groups');
     const persona_key = (personaSel && personaSel.value) || '';
@@ -458,11 +471,24 @@
     const target_groups = (groupsInput && groupsInput.value || '')
       .split(',').map(function (g) { return g.trim(); }).filter(Boolean);
 
-    // 2026-04-23: 检查预设的 needs_input（如 name_hunter 需要 add_friend_targets）
     const preset = (_fbPresets || []).find(function (x) { return x.key === presetKey; });
     const needs = (preset && preset.needs_input) || [];
+    const schema = (preset && preset.input_schema) || null;
+
+    // P1 (Sprint A): 通用 schema-driven 表单（friend_growth / group_hunter 等新版 preset）
+    // 只要 preset 声明了 input_schema 就走这条路径，覆盖 add_friend_targets 之外的全部字段。
+    if (schema && Object.keys(schema).length > 0) {
+      fbOpenLaunchInputDialog(presetKey, deviceId, {
+        persona_key: persona_key,
+        target_country: target_country,
+        language: language,
+        target_groups: target_groups,
+      });
+      return;
+    }
+
+    // 向后兼容：name_hunter 仅声明 needs_input=add_friend_targets，没 schema → 老逻辑
     if (needs.includes('add_friend_targets')) {
-      // 弹输入框收集名字列表
       fbOpenNameHunterInput(presetKey, deviceId, {
         persona_key: persona_key,
         target_country: target_country,
@@ -480,7 +506,7 @@
     });
   };
 
-  // 2026-04-23: 点名添加输入模态 —— 收集名字列表 + 可选打招呼文案覆盖
+  // 2026-05-01: 点名添加输入模态 —— 姓名生成/导入去重/评分预览/确认后启动
   window.fbOpenNameHunterInput = function (presetKey, deviceId, extra) {
     const overlay = _fbModalOverlay('fb-name-hunter-input');
     const personaLabel = (extra && extra.persona_key) || '默认';
@@ -492,64 +518,200 @@
       lastGreeting = localStorage.getItem('fb_name_hunter_greeting') || '';
     } catch (e) { /* ignore */ }
     overlay.innerHTML = `
-      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:20px;max-width:580px;width:96%">
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:20px;max-width:760px;width:96%;max-height:90vh;overflow-y:auto">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
           <div>
-            <div style="font-size:17px;font-weight:700">🔎 点名添加 — 输入目标名字</div>
+            <div style="font-size:17px;font-weight:700">🔎 点名添加 — 精准名单</div>
             <div style="font-size:11px;color:var(--text-muted);margin-top:2px">
-              客群: <code>${personaLabel}</code> · 每行一个名字,或逗号分隔
+              客群: <code>${personaLabel}</code> · 先生成/导入并预览，再确认启动
             </div>
           </div>
           <button onclick="document.getElementById('fb-name-hunter-input').remove()"
                   style="background:none;border:none;color:var(--text-muted);font-size:22px;cursor:pointer">✕</button>
         </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
+          <button id="fb-nh-gen-mixed" data-pack="mixed"
+            style="padding:8px 10px;background:rgba(14,165,233,.16);border:1px solid rgba(14,165,233,.35);color:#38bdf8;border-radius:8px;cursor:pointer;font-size:12px">
+            生成混合常用名
+          </button>
+          <button id="fb-nh-gen-46" data-pack="46_55"
+            style="padding:8px 10px;background:rgba(168,85,247,.14);border:1px solid rgba(168,85,247,.35);color:#c084fc;border-radius:8px;cursor:pointer;font-size:12px">
+            生成 46-55 名字包
+          </button>
+          <button id="fb-nh-clear"
+            style="padding:8px 10px;background:transparent;border:1px solid var(--border);color:var(--text-muted);border-radius:8px;cursor:pointer;font-size:12px">
+            清空
+          </button>
+        </div>
+
         <textarea id="fb-nh-names" rows="8"
           placeholder="山田花子&#10;佐藤美咲&#10;鈴木 由美"
           style="width:100%;box-sizing:border-box;background:var(--bg-main);border:1px solid var(--border);color:var(--text);padding:10px;border-radius:8px;font-size:13px;font-family:inherit;resize:vertical">${lastNames.replace(/</g,'&lt;')}</textarea>
         ${lastNames ? '<div style="font-size:10px;color:var(--text-dim);margin-top:4px">🕑 已回填上次输入</div>' : ''}
+
         <div style="margin-top:10px">
           <div style="font-size:11px;color:var(--text-muted);margin-bottom:4px">打招呼文案(可选,为空则按客群自动生成本地化问候)</div>
           <textarea id="fb-nh-greeting" rows="2"
             placeholder="例:はじめまして😊つながれて嬉しいです🌸"
             style="width:100%;box-sizing:border-box;background:var(--bg-main);border:1px solid var(--border);color:var(--text);padding:8px;border-radius:6px;font-size:12px;font-family:inherit;resize:vertical">${lastGreeting.replace(/</g,'&lt;')}</textarea>
         </div>
-        <div style="margin-top:10px;padding:8px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;font-size:11px;color:#fbbf24">
-          ⚠ 单次任务最多处理 playbook.max_friends_per_run 个(mature=5 / growth=3 / cold_start=0);
-          phase=cold_start/cooldown 会整体跳过打招呼。
+
+        <div style="margin-top:10px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px" id="fb-nh-kpis">
+          <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:8px">
+            <div style="font-size:10px;color:var(--text-dim)">唯一姓名</div>
+            <div id="fb-nh-kpi-unique" style="font-size:18px;font-weight:700;color:#60a5fa">-</div>
+          </div>
+          <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:8px">
+            <div style="font-size:10px;color:var(--text-dim)">高置信种子</div>
+            <div id="fb-nh-kpi-high" style="font-size:18px;font-weight:700;color:#22c55e">-</div>
+          </div>
+          <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:8px">
+            <div style="font-size:10px;color:var(--text-dim)">需确认</div>
+            <div id="fb-nh-kpi-review" style="font-size:18px;font-weight:700;color:#f59e0b">-</div>
+          </div>
+          <div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:8px">
+            <div style="font-size:10px;color:var(--text-dim)">弱种子</div>
+            <div id="fb-nh-kpi-weak" style="font-size:18px;font-weight:700;color:#ef4444">-</div>
+          </div>
+        </div>
+
+        <div id="fb-nh-preview" style="margin-top:10px;display:none;background:var(--bg-main);border:1px solid var(--border);border-radius:8px;max-height:220px;overflow:auto"></div>
+
+        <div style="margin-top:10px;padding:8px 12px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:6px;font-size:11px;color:#fbbf24;line-height:1.5">
+          ⚠ 名字只是搜索入口，不作为客户判定。系统会搜索资料并走画像识别；默认仅把评分 ≥80 的高置信姓名种子送入任务。
+          单次实际处理量仍受 playbook 阶段上限控制，cold_start/cooldown 会跳过主动触达。
         </div>
         <div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
           <button onclick="document.getElementById('fb-name-hunter-input').remove()"
                   style="padding:8px 16px;background:none;border:1px solid var(--border);color:var(--text-muted);border-radius:8px;cursor:pointer">取消</button>
+          <button id="fb-nh-preview-btn"
+                  style="padding:8px 16px;background:transparent;color:#38bdf8;border:1px solid rgba(56,189,248,.45);border-radius:8px;font-weight:600;cursor:pointer">
+            预览评分
+          </button>
           <button id="fb-nh-submit"
-                  style="padding:8px 16px;background:#0ea5e9;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer">
-            ▶ 启动点名添加
+                  disabled
+                  style="padding:8px 16px;background:#334155;color:#94a3b8;border:none;border-radius:8px;font-weight:600;cursor:not-allowed">
+            ▶ 确认启动
           </button>
         </div>
       </div>
     `;
+    let previewRows = [];
+    let launchTargets = [];
+
+    function _nhCurrentNamesRaw() {
+      return (document.getElementById('fb-nh-names') || {}).value || '';
+    }
+    function _nhSetSubmitEnabled(enabled) {
+      const btn = document.getElementById('fb-nh-submit');
+      if (!btn) return;
+      btn.disabled = !enabled;
+      btn.style.background = enabled ? '#0ea5e9' : '#334155';
+      btn.style.color = enabled ? '#fff' : '#94a3b8';
+      btn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+    }
+    function _nhRenderPreview(r) {
+      previewRows = (r && r.rows) || [];
+      launchTargets = (r && r.launch_targets) || [];
+      const setTxt = function (id, val) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = String(val);
+      };
+      setTxt('fb-nh-kpi-unique', r.unique_count || 0);
+      setTxt('fb-nh-kpi-high', r.high_confidence_count || 0);
+      setTxt('fb-nh-kpi-review', r.review_required_count || 0);
+      setTxt('fb-nh-kpi-weak', r.weak_count || 0);
+      const box = document.getElementById('fb-nh-preview');
+      if (!box) return;
+      box.style.display = 'block';
+      const rows = previewRows.slice(0, 80).map(function (x) {
+        const color = x.score >= 80 ? '#22c55e' : (x.score >= 50 ? '#f59e0b' : '#ef4444');
+        const reasons = (x.reasons || []).join(' / ');
+        return `<div style="display:grid;grid-template-columns:150px 58px 1fr;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--border);font-size:12px">
+          <div style="font-weight:600;color:var(--text)">${_escHtml(x.name || '')}</div>
+          <div style="font-weight:700;color:${color}">${x.score || 0}</div>
+          <div style="color:var(--text-dim);font-size:11px">${_escHtml(reasons)}</div>
+        </div>`;
+      }).join('');
+      box.innerHTML = rows || '<div style="padding:12px;color:var(--text-muted);font-size:12px">暂无可预览姓名</div>';
+      _nhSetSubmitEnabled(launchTargets.length > 0);
+    }
+    async function _nhPreview() {
+      const raw = _nhCurrentNamesRaw();
+      if (!raw.trim()) {
+        showToast('请先输入或生成名字', 'warning');
+        return;
+      }
+      const btn = document.getElementById('fb-nh-preview-btn');
+      if (btn) btn.textContent = '预览中...';
+      try {
+        const r = await api('POST', '/facebook/name-hunter/preview', {
+          persona_key: (extra && extra.persona_key) || '',
+          names: raw,
+        });
+        _nhRenderPreview(r || {});
+      } catch (e) {
+        showToast('预览失败: ' + (e.message || e), 'error');
+      } finally {
+        if (btn) btn.textContent = '预览评分';
+      }
+    }
+
+    ['fb-nh-gen-mixed', 'fb-nh-gen-46'].forEach(function (id) {
+      const genBtn = document.getElementById(id);
+      if (!genBtn) return;
+      genBtn.onclick = async function () {
+        const pack = genBtn.getAttribute('data-pack') || 'mixed';
+        try {
+          const r = await api('POST', '/facebook/name-hunter/suggest', {
+            persona_key: (extra && extra.persona_key) || '',
+            age_pack: pack,
+            count: 30,
+          });
+          const names = ((r && r.names) || []).map(function (x) { return x.name; }).filter(Boolean);
+          const ta = document.getElementById('fb-nh-names');
+          if (ta) ta.value = names.join('\n');
+          _nhRenderPreview({ rows: r.names || [], launch_targets: r.names || [],
+            unique_count: names.length, high_confidence_count: names.length,
+            review_required_count: 0, weak_count: 0 });
+        } catch (e) {
+          showToast('生成失败: ' + (e.message || e), 'error');
+        }
+      };
+    });
+    const clearBtn = document.getElementById('fb-nh-clear');
+    if (clearBtn) clearBtn.onclick = function () {
+      const ta = document.getElementById('fb-nh-names');
+      if (ta) ta.value = '';
+      _nhRenderPreview({ rows: [], launch_targets: [], unique_count: 0,
+        high_confidence_count: 0, review_required_count: 0, weak_count: 0 });
+    };
+    const previewBtn = document.getElementById('fb-nh-preview-btn');
+    if (previewBtn) previewBtn.onclick = _nhPreview;
+    const ta = document.getElementById('fb-nh-names');
+    if (ta) ta.oninput = function () { _nhSetSubmitEnabled(false); };
+
     const submitBtn = document.getElementById('fb-nh-submit');
-    submitBtn.onclick = function () {
+    submitBtn.onclick = async function () {
       const namesRaw = (document.getElementById('fb-nh-names') || {}).value || '';
       const greetingRaw = (document.getElementById('fb-nh-greeting') || {}).value || '';
-      // 拆分为 [{"name": "..."}, ...]  后端也有兜底拆分,此处优先客户端标准化。
-      const names = namesRaw.split(/[,\n;]+/)
-        .map(function (s) { return s.trim(); })
-        .filter(Boolean);
-      if (!names.length) {
+      if (!namesRaw.trim()) {
         showToast('请至少输入 1 个名字', 'warning');
         return;
       }
-      // 2026-04-23: playbook.send_greeting.max_friends_per_run 当前最高 mature=5
-      // 超过这个数的名字会被静默丢弃,提示用户一下,避免误会
-      const softLimit = 20;
-      if (names.length > softLimit) {
-        if (!confirm('你输入了 ' + names.length + ' 个名字, playbook 每次任务通常只处理前 3~5 个, '
-                     + '其余会在下次 run 继续(24h 上限仍按 daily_cap 管控)。继续?')) {
-          return;
-        }
+      if (!launchTargets.length) {
+        await _nhPreview();
       }
+      if (!launchTargets.length) {
+        showToast('没有评分达到执行门槛的姓名种子', 'warning');
+        return;
+      }
+      if (!confirm('将提交 ' + launchTargets.length + ' 个已预览姓名种子。系统仍会在搜索资料后再按画像过滤，继续?')) return;
       const payload = Object.assign({}, extra || {}, {
-        add_friend_targets: names.map(function (n) { return { name: n }; }),
+        add_friend_targets: launchTargets.map(function (x) {
+          return { name: x.name, seed_score: x.score, seed_stage: x.stage, candidate_id: x.candidate_id || 0 };
+        }),
       });
       // 记住本次输入,方便刷新后复用
       try {
@@ -562,6 +724,553 @@
       if (m) m.remove();
       fbLaunchPreset(presetKey, deviceId, payload);
     };
+  };
+
+  window.fbOpenNameHunterCandidates = async function () {
+    const overlay = _fbModalOverlay('fb-name-hunter-candidates');
+    overlay.innerHTML = `
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:20px;max-width:980px;width:96%;max-height:88vh;overflow-y:auto">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <div>
+            <div style="font-size:18px;font-weight:700">🔎 点名候选池</div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:2px">姓名种子 → 资料识别 → qualified 后才允许触达</div>
+          </div>
+          <button onclick="document.getElementById('fb-name-hunter-candidates').remove()" style="background:none;border:none;color:var(--text-muted);font-size:22px;cursor:pointer">✕</button>
+        </div>
+        <div id="fb-nh-cand-body" style="font-size:12px;color:var(--text-dim)">加载中...</div>
+      </div>`;
+    try {
+      const personaKey = (_fbActivePersona && _fbActivePersona.persona_key) || '';
+      const qs = (personaKey ? '&persona_key=' + encodeURIComponent(personaKey) : '');
+      const pair = await Promise.all([
+        api('GET', '/facebook/name-hunter/candidates?limit=120' + qs),
+        api('GET', '/facebook/name-hunter/stats?' + (personaKey ? 'persona_key=' + encodeURIComponent(personaKey) : '')),
+      ]);
+      const r = pair[0] || {};
+      const stats = pair[1] || {};
+      const rows = (r && r.items) || [];
+      const body = document.getElementById('fb-nh-cand-body');
+      if (!body) return;
+      const qualifiedN = rows.filter(function (x) { return x.status === 'qualified'; }).length;
+      const minReady = 3;
+      const badgeColor = function (st) {
+        if (st === 'qualified') return '#22c55e';
+        if (st === 'seeded') return '#38bdf8';
+        if (st === 'review_required') return '#f59e0b';
+        if (st === 'rejected' || st === 'weak_seed') return '#ef4444';
+        if (st === 'friend_requested' || st === 'greeted') return '#a78bfa';
+        return '#94a3b8';
+      };
+      const html = rows.map(function (x) {
+        const ins = x.insights || {};
+        const ev = ins.qualification_evidence || {};
+        const gaps = ev.gaps || [];
+        const reasons = (gaps.length ? gaps : (ins.reasons || ins.top_reasons || [])).join(' / ');
+        const seed = ins.seed_score == null ? '-' : String(ins.seed_score);
+        const prof = ins.profile_score == null ? '-' : String(ins.profile_score);
+        const evidence = ev.age_37plus_confirmed
+          ? '37+'
+          : (gaps.indexOf('age_30s_needs_manual_37plus_review') >= 0 ? '30s复核' : '-');
+        return `<tr>
+          <td style="padding:8px;font-weight:600;color:var(--text)">${_escHtml(x.display_name || '')}</td>
+          <td style="padding:8px"><span style="color:${badgeColor(x.status)};font-weight:700">${_escHtml(x.status || '')}</span></td>
+          <td style="padding:8px;text-align:right;color:#38bdf8;font-weight:700">${seed}</td>
+          <td style="padding:8px;text-align:right;color:#22c55e;font-weight:700">${prof}</td>
+          <td style="padding:8px;text-align:center;color:${ev.age_37plus_confirmed ? '#22c55e' : '#f59e0b'};font-weight:700">${_escHtml(evidence)}</td>
+          <td style="padding:8px;color:var(--text-dim);font-size:11px">${_escHtml(reasons)}</td>
+          <td style="padding:8px;color:var(--text-muted);font-size:11px">${_escHtml(x.last_touch_at || x.created_at || '')}</td>
+          <td style="padding:8px;text-align:right;white-space:nowrap">
+            <button onclick="fbNameHunterCandidateAction(${Number(x.id) || 0}, 'qualify')" title="人工确认为高匹配" style="padding:4px 7px;border:1px solid rgba(34,197,94,.35);background:rgba(34,197,94,.12);color:#22c55e;border-radius:6px;cursor:pointer;font-size:11px">通过</button>
+            <button onclick="fbNameHunterCandidateAction(${Number(x.id) || 0}, 'requeue')" title="重新进入资料预筛" style="padding:4px 7px;border:1px solid rgba(14,165,233,.35);background:rgba(14,165,233,.12);color:#38bdf8;border-radius:6px;cursor:pointer;font-size:11px">重筛</button>
+            <button onclick="fbNameHunterCandidateAction(${Number(x.id) || 0}, 'blocklist')" title="排除该候选" style="padding:4px 7px;border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.12);color:#ef4444;border-radius:6px;cursor:pointer;font-size:11px">排除</button>
+          </td>
+        </tr>`;
+      }).join('');
+      const sourceRows = ((stats && stats.sources) || []).slice(0, 4).map(function (s) {
+        const health = s.source_health || 'learning';
+        const hc = health === 'strong' ? '#22c55e' : (health === 'degraded' ? '#ef4444' : '#f59e0b');
+        return `<div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:9px">
+          <div style="font-size:10px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_escHtml(s.source_ref || 'name_hunter')}</div>
+          <div style="display:flex;justify-content:space-between;gap:6px;margin-top:4px">
+            <span style="color:#22c55e;font-weight:700">Q ${Number(s.qualified || 0)}</span>
+            <span style="color:var(--text-muted)">总 ${Number(s.total || 0)}</span>
+            <span style="color:#38bdf8">${Math.round(Number(s.qualified_rate || 0) * 100)}%</span>
+          </div>
+          <div style="margin-top:4px;color:${hc};font-size:10px;font-weight:700">${_escHtml(health)}</div>
+        </div>`;
+      }).join('');
+      body.innerHTML = `
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px;flex-wrap:wrap">
+          <button onclick="fbStartNameHunterPrescreen()" style="padding:7px 12px;background:rgba(14,165,233,.16);border:1px solid rgba(14,165,233,.4);color:#38bdf8;border-radius:8px;font-weight:600;cursor:pointer;font-size:12px">
+            只预筛资料
+          </button>
+          <button onclick="fbStartNameHunterTouchQualified()" ${qualifiedN >= minReady ? '' : 'disabled'}
+            style="padding:7px 12px;background:${qualifiedN >= minReady ? '#22c55e' : '#334155'};border:0;color:${qualifiedN >= minReady ? '#fff' : '#94a3b8'};border-radius:8px;font-weight:600;cursor:${qualifiedN >= minReady ? 'pointer' : 'not-allowed'};font-size:12px">
+            触达 qualified (${qualifiedN}/${minReady})
+          </button>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:10px">
+          ${['seeded','qualified','rejected','greeted'].map(function (st) {
+            const n = rows.filter(function (x) { return x.status === st; }).length;
+            return `<div style="background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:10px">
+              <div style="font-size:10px;color:var(--text-dim)">${st}</div>
+              <div style="font-size:20px;font-weight:700;color:${badgeColor(st)}">${n}</div>
+            </div>`;
+          }).join('')}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:10px">
+          ${sourceRows || '<div style="grid-column:1/-1;color:var(--text-muted);background:var(--bg-main);border:1px solid var(--border);border-radius:8px;padding:10px">暂无名字包复盘数据</div>'}
+        </div>
+        <table style="width:100%;border-collapse:collapse;background:var(--bg-main);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+          <thead><tr style="color:var(--text-muted);font-size:11px">
+            <th style="text-align:left;padding:8px">姓名</th>
+            <th style="text-align:left;padding:8px">状态</th>
+            <th style="text-align:right;padding:8px">种子分</th>
+            <th style="text-align:right;padding:8px">资料分</th>
+            <th style="text-align:center;padding:8px">37+</th>
+            <th style="text-align:left;padding:8px">原因</th>
+            <th style="text-align:left;padding:8px">更新时间</th>
+            <th style="text-align:right;padding:8px">操作</th>
+          </tr></thead>
+          <tbody>${html || '<tr><td colspan="8" style="padding:18px;text-align:center;color:var(--text-muted)">暂无候选</td></tr>'}</tbody>
+        </table>`;
+    } catch (e) {
+      const body = document.getElementById('fb-nh-cand-body');
+      if (body) body.innerHTML = '<div style="color:#ef4444">加载失败: ' + _escHtml(e.message || e) + '</div>';
+    }
+  };
+
+  window.fbNameHunterCandidateAction = async function (candidateId, action) {
+    if (!candidateId) return;
+    if (action === 'blocklist' && !confirm('排除后该候选不会再进入触达，继续?')) return;
+    try {
+      await api('POST', '/facebook/name-hunter/candidates/' + encodeURIComponent(candidateId) + '/action', {
+        action: action,
+      });
+      showToast('候选已更新: ' + action, 'success');
+      fbOpenNameHunterCandidates();
+    } catch (e) {
+      showToast('候选更新失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  async function _fbFirstOnlineDevice() {
+    const r = await api('GET', '/platforms/facebook/device-grid');
+    const d = ((r && r.devices) || []).find(function (x) { return x.online; });
+    return d && d.device_id;
+  }
+
+  window.fbStartNameHunterPrescreen = async function () {
+    try {
+      const did = await _fbFirstOnlineDevice();
+      if (!did) { showToast('没有在线 Facebook 设备', 'warning'); return; }
+      const personaKey = (_fbActivePersona && _fbActivePersona.persona_key) || '';
+      const r = await api('POST', '/facebook/name-hunter/prescreen', {
+        device_id: did,
+        persona_key: personaKey,
+        max_targets: 20,
+      });
+      showToast('已创建点名预筛任务: ' + ((r && r.task_id) || ''), 'success');
+    } catch (e) {
+      showToast('创建预筛任务失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  window.fbStartNameHunterTouchQualified = async function () {
+    try {
+      const did = await _fbFirstOnlineDevice();
+      if (!did) { showToast('没有在线 Facebook 设备', 'warning'); return; }
+      if (!confirm('只会触达候选池中 status=qualified 的用户，继续?')) return;
+      const personaKey = (_fbActivePersona && _fbActivePersona.persona_key) || '';
+      const r = await api('POST', '/facebook/name-hunter/touch-qualified', {
+        device_id: did,
+        persona_key: personaKey,
+        max_targets: 5,
+        min_qualified_ready: 3,
+        send_greeting_inline: true,
+      });
+      showToast('已创建 qualified 触达任务: ' + ((r && r.task_id) || ''), 'success');
+    } catch (e) {
+      showToast('创建触达任务失败: ' + (e.message || e), 'error');
+    }
+  };
+
+  // ════════════════════════════════════════════════════════
+  // P1 Sprint A: 通用 schema-driven 启动对话框
+  // 根据 preset.input_schema 动态渲染表单字段，覆盖 friend_growth / group_hunter 等新版 preset
+  // ════════════════════════════════════════════════════════
+  function _escHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function _lsKey(presetKey, field) { return 'fb_launch_input::' + presetKey + '::' + field; }
+
+  function _readLastValue(presetKey, field) {
+    try { return localStorage.getItem(_lsKey(presetKey, field)) || ''; }
+    catch (e) { return ''; }
+  }
+
+  function _saveValue(presetKey, field, value) {
+    try { localStorage.setItem(_lsKey(presetKey, field), value || ''); }
+    catch (e) { /* ignore */ }
+  }
+
+  // 渲染单个字段的 HTML — 根据 spec.type 分发
+  // prefill: 调用方提供的预填值；非空时优先于 localStorage（用于"任务徽章重打 dialog"场景）
+  function _renderField(presetKey, field, spec, persona, prefill) {
+    const label = _escHtml(spec.label || field);
+    const help = spec.help ? `<div style="font-size:10px;color:var(--text-dim);margin-top:3px;line-height:1.4">${_escHtml(spec.help)}</div>` : '';
+    const required = spec.required ? '<span style="color:#ef4444;margin-left:3px">*</span>' : '';
+    const aiBtn = spec.ai_assist
+      ? `<button type="button" data-ai-field="${field}"
+            onclick="fbDialogAiSuggest('${presetKey}','${field}')"
+            style="position:absolute;top:6px;right:8px;padding:2px 8px;background:rgba(168,85,247,.15);
+                   border:1px solid rgba(168,85,247,.4);color:#c084fc;border-radius:4px;
+                   font-size:10px;cursor:pointer">✨ AI 建议</button>`
+      : '';
+    // 优先级：prefill (任务参数回填) > localStorage (用户上次输入)
+    let lastVal;
+    if (prefill != null && prefill !== '') {
+      lastVal = Array.isArray(prefill) ? prefill.join('\n') : String(prefill);
+    } else {
+      lastVal = _readLastValue(presetKey, field);
+    }
+    const personaSeeds = (persona.seed_group_keywords || []).slice(0, 3).join('\n');
+    let inputHtml = '';
+    if (spec.type === 'list_str') {
+      // 多行 textarea；fallback_from=persona.seed_group_keywords 时提示当前 persona 的 seeds
+      const ph = _escHtml(spec.placeholder || (personaSeeds || ''));
+      const fb = spec.fallback_from === 'persona.seed_group_keywords' && personaSeeds
+        ? `<div style="font-size:10px;color:#60a5fa;margin-top:3px">💡 留空将使用客群默认: ${_escHtml(personaSeeds.split('\n').join(' / '))}</div>`
+        : '';
+      inputHtml = `
+        <textarea data-field="${field}" data-type="list_str" rows="${Math.min(Math.max(spec.max||3,2),5)}"
+          placeholder="${ph}"
+          style="width:100%;box-sizing:border-box;background:var(--bg-main);border:1px solid var(--border);
+                 color:var(--text);padding:8px 10px;border-radius:6px;font-size:13px;
+                 font-family:inherit;resize:vertical">${_escHtml(lastVal)}</textarea>${fb}`;
+    } else if (spec.type === 'text') {
+      const ph = _escHtml(spec.placeholder || '');
+      const max = spec.max_chars || 200;
+      inputHtml = `
+        <div style="position:relative">
+          ${aiBtn}
+          <textarea data-field="${field}" data-type="text" rows="${max > 80 ? 3 : 2}"
+            maxlength="${max}" placeholder="${ph}"
+            oninput="fbDialogCharCount('${field}', ${max})"
+            style="width:100%;box-sizing:border-box;background:var(--bg-main);border:1px solid var(--border);
+                   color:var(--text);padding:8px 10px;${spec.ai_assist?'padding-right:80px;':''}
+                   border-radius:6px;font-size:12px;font-family:inherit;resize:vertical">${_escHtml(lastVal)}</textarea>
+          <div style="font-size:10px;color:var(--text-dim);text-align:right;margin-top:2px">
+            <span data-charcount="${field}">${lastVal.length}</span>/${max}
+          </div>
+        </div>`;
+    } else if (spec.type === 'int') {
+      const def = lastVal || (spec.default != null ? spec.default : '');
+      inputHtml = `
+        <input type="number" data-field="${field}" data-type="int"
+          min="${spec.min || 1}" max="${spec.max || 999}" value="${_escHtml(def)}"
+          style="width:120px;background:var(--bg-main);border:1px solid var(--border);
+                 color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px">
+        <span style="font-size:11px;color:var(--text-dim);margin-left:8px">
+          范围 ${spec.min || 1}–${spec.max || 999}
+        </span>`;
+    } else {
+      inputHtml = `<div style="color:#f87171;font-size:11px">⚠ 未知字段类型: ${_escHtml(spec.type)}</div>`;
+    }
+    return `
+      <div data-field-row="${field}" style="margin-bottom:14px">
+        <label style="display:block;font-size:12px;color:var(--text);font-weight:600;margin-bottom:4px">
+          ${label}${required}
+        </label>
+        ${inputHtml}
+        ${help}
+      </div>`;
+  }
+
+  // 字符数实时更新
+  window.fbDialogCharCount = function (field, max) {
+    const ta = document.querySelector('textarea[data-field="' + field + '"]');
+    const cnt = document.querySelector('span[data-charcount="' + field + '"]');
+    if (ta && cnt) cnt.textContent = ta.value.length;
+  };
+
+  // ✨ AI 建议（第一版：模板下拉，未来接入 LLM API）
+  window.fbDialogAiSuggest = function (presetKey, field) {
+    const persona = (_fbActivePersona || {});
+    const personaKey = persona.persona_key || 'jp_female_midlife';
+    // 内置 P1 阶段的本地化候选（按 persona 的国家/语言风格预设）。
+    // P2 (Sprint D) 会替换为后端 /ai/fb/suggest-line 调用。
+    const TEMPLATES = {
+      verification_note: {
+        jp: ['您好🌸看到我们都在同一个群，想认识下志同道合的朋友 ☺️',
+             'はじめまして🌸同じグループで拝見しました。仲良くしていただけたら嬉しいです',
+             '同じ趣味の方とつながりたく、フォロー失礼します😊'],
+        in: ['Hello! Saw we are in the same group — would love to connect 🌸',
+             'Hi there, I noticed we share similar interests. Nice to meet you!',
+             'Namaste 🙏 saw your profile in our group, would be great to connect.'],
+        zh: ['您好，看到我们都在同一个群组，想认识一下 🌸',
+             '你好呀，刚刚在群里看到你的留言，希望能交个朋友 ☺️',
+             '同好相聚，希望能多多交流'],
+      },
+      greeting: {
+        jp: ['ご通過ありがとうございます😊これからよろしくお願いいたします🌸',
+             'こんにちは🌸お友達になっていただけて嬉しいです。よろしくお願いします',
+             'はじめまして！同じ趣味でつながれて嬉しいです、よろしくお願いします😊'],
+        in: ['Thanks for accepting! Looking forward to chatting 🌸',
+             'Hi! So glad we connected — what brought you to the group?',
+             'Hello there! Would love to know more about your interests 😊'],
+        zh: ['谢谢通过！很高兴认识你 🌸',
+             '你好呀～我也是在群里看到你的，期待多多交流',
+             '感谢通过好友请求，希望我们可以多多交流分享'],
+      },
+    };
+    const lang = (persona.language || personaKey || '').slice(0, 2).toLowerCase();
+    const candidates = (TEMPLATES[field] || {})[lang]
+      || (TEMPLATES[field] || {}).jp
+      || ['（暂无该字段的预设模板）'];
+    // 简易候选弹层
+    const existing = document.getElementById('fb-ai-suggest-pop');
+    if (existing) existing.remove();
+    const pop = document.createElement('div');
+    pop.id = 'fb-ai-suggest-pop';
+    pop.style.cssText = 'position:fixed;z-index:10001;background:var(--bg-card);border:1px solid #a855f7;'
+      + 'border-radius:10px;padding:12px;max-width:520px;width:92%;box-shadow:0 10px 40px rgba(0,0,0,.5);'
+      + 'top:50%;left:50%;transform:translate(-50%,-50%)';
+    pop.innerHTML = `
+      <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#c084fc">
+        ✨ ${field === 'verification_note' ? '验证语' : '打招呼'}建议
+        <span style="font-size:10px;color:var(--text-dim);font-weight:normal;margin-left:6px">
+          基于客群 ${_escHtml(personaKey)}
+        </span>
+      </div>
+      ${candidates.map(function (c, i) {
+        return `<div style="padding:8px 10px;background:var(--bg-main);border:1px solid var(--border);
+                    border-radius:6px;margin-bottom:6px;font-size:12px;cursor:pointer;line-height:1.5"
+                    onclick="fbDialogApplySuggest('${field}', ${i})"
+                    onmouseover="this.style.borderColor='#a855f7'"
+                    onmouseout="this.style.borderColor='var(--border)'">
+                  ${_escHtml(c)}
+                </div>`;
+      }).join('')}
+      <div style="display:flex;gap:8px;margin-top:8px;justify-content:flex-end">
+        <button onclick="document.getElementById('fb-ai-suggest-pop').remove()"
+                style="padding:5px 14px;background:none;border:1px solid var(--border);
+                       color:var(--text-muted);border-radius:6px;cursor:pointer;font-size:11px">关闭</button>
+      </div>
+      <script>window._fbAiSuggestList=${JSON.stringify(candidates)};</script>`;
+    document.body.appendChild(pop);
+    // 注入候选数据（避免内联 script 在某些 CSP 下失效）
+    window._fbAiSuggestList = candidates;
+  };
+
+  window.fbDialogApplySuggest = function (field, idx) {
+    const list = window._fbAiSuggestList || [];
+    const text = list[idx];
+    if (text == null) return;
+    const ta = document.querySelector('textarea[data-field="' + field + '"]');
+    if (ta) {
+      ta.value = text;
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
+    }
+    const pop = document.getElementById('fb-ai-suggest-pop');
+    if (pop) pop.remove();
+  };
+
+  // 收集表单值并归一化
+  function _collectFormValues(presetKey, schema) {
+    const out = {};
+    Object.keys(schema).forEach(function (field) {
+      const spec = schema[field] || {};
+      const el = document.querySelector('[data-field="' + field + '"]');
+      if (!el) return;
+      const raw = el.value || '';
+      _saveValue(presetKey, field, raw);
+      if (spec.type === 'list_str') {
+        out[field] = raw.split(/[,\n;]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+      } else if (spec.type === 'int') {
+        const n = parseInt(raw, 10);
+        if (!isNaN(n)) out[field] = n;
+      } else {
+        out[field] = raw.trim();
+      }
+    });
+    return out;
+  }
+
+  // 客户端预校验（与后端 _validate_preset_inputs 同义）
+  function _localValidate(preset, values, persona) {
+    const needs = preset.needs_input || [];
+    const schema = preset.input_schema || {};
+    const missing = [];
+    needs.forEach(function (field) {
+      const spec = schema[field] || {};
+      if (!spec.required) return;
+      const v = values[field];
+      let filled = false;
+      if (Array.isArray(v)) filled = v.length > 0;
+      else if (typeof v === 'string') filled = v.trim().length > 0;
+      else if (v != null) filled = true;
+      if (filled) return;
+      // fallback 路径
+      if (spec.fallback_from === 'persona.seed_group_keywords') {
+        const seeds = (persona.seed_group_keywords || []);
+        if (seeds.length > 0) return;
+      }
+      missing.push(field);
+    });
+    return missing;
+  }
+
+  // 标红字段（接收 422 detail.missing 或本地预校验结果）
+  function _markFieldErrors(missingFields) {
+    document.querySelectorAll('[data-field-row]').forEach(function (row) {
+      row.style.borderLeft = '';
+      row.style.paddingLeft = '';
+    });
+    missingFields.forEach(function (field) {
+      const row = document.querySelector('[data-field-row="' + field + '"]');
+      if (row) {
+        row.style.borderLeft = '3px solid #ef4444';
+        row.style.paddingLeft = '8px';
+      }
+    });
+  }
+
+  window.fbOpenLaunchInputDialog = function (presetKey, deviceId, extra) {
+    extra = extra || {};
+    const preset = (_fbPresets || []).find(function (x) { return x.key === presetKey; });
+    if (!preset || !preset.input_schema) {
+      // 安全网：schema 不存在直接降级到无表单启动
+      return fbLaunchPreset(presetKey, deviceId, extra);
+    }
+    const persona = (_fbAvailablePersonas || []).find(function (x) {
+      return x.persona_key === extra.persona_key;
+    }) || _fbActivePersona || {};
+
+    const overlay = _fbModalOverlay('fb-launch-input-dialog');
+    const schema = preset.input_schema;
+    const prefill = extra.prefill || null;
+    const fieldsHtml = Object.keys(schema).map(function (f) {
+      return _renderField(presetKey, f, schema[f], persona, prefill ? prefill[f] : null);
+    }).join('');
+    // 来自失败任务徽章重打开时显示提示横幅
+    const reopenHint = extra.reopenFromTask
+      ? `<div style="margin-bottom:10px;padding:8px 12px;background:rgba(245,158,11,.1);
+                     border:1px solid rgba(245,158,11,.35);border-radius:6px;color:#fbbf24;font-size:11px">
+           🔁 已回填上次失败任务的参数（${_escHtml(extra.reopenFromTask)}），请修改必填项后重启
+         </div>`
+      : '';
+
+    overlay.innerHTML = `
+      <div style="background:var(--bg-card);border:1px solid var(--border);border-left:4px solid ${_escHtml(preset.color || '#60a5fa')};
+                  border-radius:14px;padding:20px;max-width:640px;width:96%;max-height:90vh;overflow-y:auto">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <div>
+            <div style="font-size:17px;font-weight:700">${_escHtml(preset.name)} — 配置参数</div>
+            <div style="font-size:11px;color:var(--text-muted);margin-top:3px">
+              ${_escHtml(preset.desc)} · 客群 <code>${_escHtml(persona.persona_key || extra.persona_key || '默认')}</code>
+              ${deviceId ? ' · 设备 ' + _escHtml((deviceId+'').substring(0,8)) : ' · 全设备'}
+            </div>
+          </div>
+          <button onclick="document.getElementById('fb-launch-input-dialog').remove()"
+            style="background:none;border:none;color:var(--text-muted);font-size:22px;cursor:pointer">✕</button>
+        </div>
+
+        ${reopenHint}
+
+        <div id="fb-launch-input-error"
+             style="display:none;margin-bottom:10px;padding:8px 12px;background:rgba(239,68,68,.1);
+                    border:1px solid rgba(239,68,68,.4);border-radius:6px;color:#fca5a5;font-size:12px"></div>
+
+        ${fieldsHtml}
+
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;padding-top:12px;border-top:1px solid var(--border)">
+          <button onclick="document.getElementById('fb-launch-input-dialog').remove()"
+                  style="padding:8px 16px;background:none;border:1px solid var(--border);
+                         color:var(--text-muted);border-radius:8px;cursor:pointer">取消</button>
+          <button id="fb-launch-input-submit"
+                  style="padding:8px 18px;background:${_escHtml(preset.color || '#60a5fa')};color:#fff;
+                         border:none;border-radius:8px;font-weight:600;cursor:pointer">
+            ▶ 启动
+          </button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('fb-launch-input-submit').onclick = async function () {
+      const values = _collectFormValues(presetKey, schema);
+      const missing = _localValidate(preset, values, persona);
+      if (missing.length) {
+        _markFieldErrors(missing);
+        const errBox = document.getElementById('fb-launch-input-error');
+        errBox.style.display = 'block';
+        errBox.innerHTML = '请填写必填字段：' + missing.map(function (f) {
+          return _escHtml((schema[f] || {}).label || f);
+        }).join('、');
+        return;
+      }
+      _markFieldErrors([]);
+      // 合并 extra（persona/target_country/language）+ 表单值
+      const payload = Object.assign({}, extra, values);
+      // 422 错误捕获 → 字段级标红
+      const res = await fbLaunchPreset(presetKey, deviceId, payload, { suppressConfirm: true });
+      if (res && res.error422) {
+        const errFields = (res.error422.missing || []).map(function (m) { return m.field; });
+        _markFieldErrors(errFields);
+        const errBox = document.getElementById('fb-launch-input-error');
+        errBox.style.display = 'block';
+        errBox.textContent = res.error422.message || '后端校验失败：缺少必填参数';
+        return;
+      }
+      // 成功关闭
+      const m = document.getElementById('fb-launch-input-dialog');
+      if (m) m.remove();
+      // 关闭外层 preset 选择模态
+      const m2 = document.getElementById('fb-presets-modal');
+      if (m2) m2.remove();
+    };
+  };
+
+  // P1 Sprint C: 从失败/0 结果任务一键重打 dialog 并回填参数
+  // 入口：tasks-chat.js 的 outcome 徽章 onclick / 详情页"重新配置"按钮
+  window.fbReopenLaunchByTask = async function (task) {
+    if (!task || !task.params) {
+      showToast('任务数据缺失，无法回填', 'warning');
+      return;
+    }
+    const presetKey = task.params._preset_key || task.params.preset_key;
+    if (!presetKey) {
+      showToast('该任务非 preset 启动，无法重新配置（请走完整启动入口）', 'info');
+      return;
+    }
+    await _fbLoadPresets();
+    const preset = (_fbPresets || []).find(function (p) { return p.key === presetKey; });
+    if (!preset || !preset.input_schema) {
+      showToast('该 preset (' + presetKey + ') 无配置表单', 'info');
+      return;
+    }
+    // 反向映射 task.params → 字段值
+    const p = task.params || {};
+    const prefill = {};
+    Object.keys(preset.input_schema).forEach(function (field) {
+      if (field === 'target_groups') {
+        // launch 注入：campaign_run 拿 target_groups 列表；群成员打招呼任务拿 group_name 单值
+        prefill[field] = p.target_groups || (p.group_name ? [p.group_name] : []);
+      } else if (p[field] != null) {
+        prefill[field] = p[field];
+      }
+    });
+    fbOpenLaunchInputDialog(presetKey, task.device_id || null, {
+      persona_key: p.persona_key || '',
+      target_country: p.target_country || '',
+      language: p.language || '',
+      prefill: prefill,
+      reopenFromTask: (task.id || task.task_id || '').substring(0, 12),
+    });
   };
 
   // 向后兼容旧名字（设备侧边栏、其他入口可能还在调）
@@ -696,36 +1405,40 @@
   // ════════════════════════════════════════════════════════
   // 启动单个预设
   // ════════════════════════════════════════════════════════
-  window.fbLaunchPreset = async function (presetKey, deviceId, extra) {
+  window.fbLaunchPreset = async function (presetKey, deviceId, extra, opts) {
     extra = extra || {};
+    opts = opts || {};
     let devices = [];
     if (deviceId) {
       devices = [deviceId];
     } else {
-      // 全设备模式 — 从 platform-grid 缓存或重新查
       try {
         const r = await api('GET', '/platforms/facebook/device-grid');
         devices = ((r && r.devices) || []).filter(function (d) { return d.online; }).map(function (d) { return d.device_id; });
       } catch (e) {
         showToast('无法获取设备列表: ' + e.message, 'error');
-        return;
+        return { ok: false };
       }
     }
 
     if (!devices.length) {
       showToast('没有在线设备可启动', 'warning');
-      return;
+      return { ok: false };
     }
 
-    const geoTxt = extra.target_country ? ('  GEO=' + extra.target_country) : '';
-    const grpTxt = (extra.target_groups || []).length ? ('  目标群=' + extra.target_groups.length + '个') : '';
-    const nameTxt = (extra.add_friend_targets || []).length
-      ? ('  名字=' + extra.add_friend_targets.length + '个') : '';
-    if (!confirm('将在 ' + devices.length + ' 台设备上启动「' + presetKey + '」预设'
-                 + geoTxt + grpTxt + nameTxt + ',确认?')) return;
+    // suppressConfirm: 由新版 dialog 调用时跳过原生 confirm（用户已经在表单里点了"启动"）
+    if (!opts.suppressConfirm) {
+      const geoTxt = extra.target_country ? ('  GEO=' + extra.target_country) : '';
+      const grpTxt = (extra.target_groups || []).length ? ('  目标群=' + extra.target_groups.length + '个') : '';
+      const nameTxt = (extra.add_friend_targets || []).length
+        ? ('  名字=' + extra.add_friend_targets.length + '个') : '';
+      if (!confirm('将在 ' + devices.length + ' 台设备上启动「' + presetKey + '」预设'
+                   + geoTxt + grpTxt + nameTxt + ',确认?')) return { ok: false, cancelled: true };
+    }
 
     let okCount = 0;
     let workerCapWarnShown = false;
+    let error422 = null;     // 任一设备拿到 422 → 缓存 detail 给调用方做字段级标红
     for (const did of devices) {
       try {
         const body = { preset_key: presetKey };
@@ -733,12 +1446,14 @@
         if (extra.target_country) body.target_country = extra.target_country;
         if (extra.language) body.language = extra.language;
         if (extra.target_groups && extra.target_groups.length) body.target_groups = extra.target_groups;
-        // 2026-04-23: 点名添加 / 独立打招呼 新增字段
         if (extra.add_friend_targets && extra.add_friend_targets.length) {
           body.add_friend_targets = extra.add_friend_targets;
         }
         if (extra.greeting) body.greeting = extra.greeting;
         if (extra.verification_note) body.verification_note = extra.verification_note;
+        // P1 Sprint A 新增：透传 max_friends_per_run / max_members
+        if (extra.max_friends_per_run != null) body.max_friends_per_run = extra.max_friends_per_run;
+        if (extra.max_members != null) body.max_members = extra.max_members;
         const data = await api('POST', '/facebook/device/' + did + '/launch', body);
         if (data && data.worker_capabilities_warning && typeof showToast === 'function' && !workerCapWarnShown) {
           workerCapWarnShown = true;
@@ -753,14 +1468,42 @@
           showToast((did || '').substring(0, 8) + '… 仅 ' + sum.taskCount + '/' + sum.stepCount + ' 步入队', 'warning');
         }
       } catch (e) {
+        // 捕获 HTTPException(422) — api() 通常把响应体放到 e.detail 或 e.body
+        const status = e && (e.status || e.statusCode || (e.response && e.response.status));
+        const detail = e && (e.detail || (e.body && e.body.detail) || (e.response && e.response.data && e.response.data.detail));
+        if (status === 422 && detail && detail.code === 'missing_required_inputs') {
+          error422 = detail;
+          // 不 toast，由 dialog 字段级标红展示
+          continue;
+        }
         console.warn('launch failed for ' + did, e);
         if (typeof showToast === 'function') showToast((did || '').substring(0, 8) + '… ' + (e.message || e), 'error');
       }
     }
 
+    if (error422) {
+      // 有 schema 表单上下文 → 让 caller 字段标红, 不弹 toast (suppressConfirm=true)
+      // 无表单上下文 → 用户已经点过原生 confirm, 此时静默吞会让人误以为"点了无响应".
+      // 加明确 toast 提示缺哪些字段, 用户能直接定位问题.
+      if (!opts.suppressConfirm && typeof showToast === 'function') {
+        const missing = (error422.missing || [])
+          .map(function (m) { return m.label || m.field; })
+          .filter(Boolean);
+        const msg = missing.length
+          ? ('启动失败: 缺少必填字段 ' + missing.join('、') +
+             ' (preset=' + presetKey + '). 请改用「☰ 启动」表单输入')
+          : ('启动失败: 422 missing_required_inputs (preset=' + presetKey + ')');
+        showToast(msg, 'error');
+      }
+      return { ok: false, error422: error422 };
+    }
+
     showToast('已下发到 ' + okCount + '/' + devices.length + ' 台设备', okCount === devices.length ? 'success' : 'warning');
-    const m = document.getElementById('fb-presets-modal');
-    if (m) m.remove();
+    if (!opts.suppressConfirm) {
+      const m = document.getElementById('fb-presets-modal');
+      if (m) m.remove();
+    }
+    return { ok: okCount > 0, ok_count: okCount, total: devices.length };
   };
 
   // ════════════════════════════════════════════════════════

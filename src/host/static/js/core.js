@@ -279,11 +279,16 @@ async function loadAliases(){
   // 刷新未编号计数徽章
   if(typeof _updateUnsetCount==='function') _updateUnsetCount();
 }
-// TASK_NAMES 是前端兜底字典：当后端 task_labels_zh（/tasks/meta/labels）不可用或
-// 网络延迟时使用。实际优先级：task.type_label_zh > TASK_NAMES[task.type] > task.type。
+// TASK_NAMES 是前端当前展示字典：后端可能返回历史任务创建时的旧 type_label_zh，
+// 因此前端展示优先使用 TASK_NAMES，再回退到 type_label_zh。
 // 本字典在启动时会被 refreshTaskLabels() 覆盖并保持 Object 引用不变（Object.assign）。
-let TASK_NAMES={tiktok_warmup:'养号',tiktok_watch:'刷视频',tiktok_browse_feed:'刷视频',tiktok_follow:'关注',tiktok_test_follow:'测试关注',tiktok_send_dm:'发私信',tiktok_check_inbox:'查收件箱',tiktok_acquisition:'全流程获客',tiktok_auto:'全流程获客',tiktok_check_and_chat_followbacks:'回关私信',vpn_setup:'配置VPN',vpn_status:'VPN状态',telegram_send_message:'Telegram 发消息',telegram_read_messages:'Telegram 读消息',telegram_send_file:'Telegram 发文件',telegram_workflow:'Telegram 工作流',telegram_auto_reply:'Telegram 自动回复',telegram_join_group:'Telegram 加群',telegram_send_group:'Telegram 群消息',telegram_monitor_chat:'Telegram 监控',whatsapp_send_message:'WhatsApp 发消息',whatsapp_read_messages:'WhatsApp 读消息',whatsapp_auto_reply:'WhatsApp 自动回复',whatsapp_send_media:'WhatsApp 发媒体',whatsapp_list_chats:'WhatsApp 聊天列表',facebook_send_message:'Facebook 发私信',facebook_add_friend:'Facebook 加好友(安全)',facebook_browse_feed:'Facebook 浏览动态',facebook_browse_feed_by_interest:'Facebook 兴趣刷帖',facebook_search_leads:'Facebook 搜索潜客',facebook_join_group:'Facebook 加入群组',facebook_browse_groups:'Facebook 浏览我的群组',facebook_group_engage:'Facebook 群组互动',facebook_extract_members:'Facebook 提取群成员',facebook_check_inbox:'Facebook Messenger 收件箱',facebook_check_message_requests:'Facebook 陌生人收件箱',facebook_check_friend_requests:'Facebook 好友请求处理',facebook_campaign_run:'Facebook 全链路剧本',linkedin_send_message:'LinkedIn 发消息',linkedin_read_messages:'LinkedIn 读消息',linkedin_post_update:'LinkedIn 发动态',linkedin_search_profile:'LinkedIn 搜人脉',linkedin_send_connection:'LinkedIn 发邀请',linkedin_accept_connections:'LinkedIn 接受邀请',linkedin_like_post:'LinkedIn 点赞',linkedin_comment_post:'LinkedIn 评论',instagram_browse_feed:'Instagram 浏览首页',instagram_browse_hashtag:'Instagram 浏览标签',instagram_search_leads:'Instagram 搜用户',instagram_send_dm:'Instagram 发私信',twitter_browse_timeline:'X 浏览时间线',twitter_search_leads:'X 搜用户',twitter_search_and_engage:'X 关键词互动',twitter_send_dm:'X 发私信'};
+let TASK_NAMES={tiktok_warmup:'养号',tiktok_watch:'刷视频',tiktok_browse_feed:'刷视频',tiktok_follow:'关注',tiktok_test_follow:'测试关注',tiktok_send_dm:'发私信',tiktok_check_inbox:'查收件箱',tiktok_acquisition:'全流程获客',tiktok_auto:'全流程获客',tiktok_check_and_chat_followbacks:'回关私信',vpn_setup:'配置VPN',vpn_status:'VPN状态',telegram_send_message:'Telegram 发消息',telegram_read_messages:'Telegram 读消息',telegram_send_file:'Telegram 发文件',telegram_workflow:'Telegram 工作流',telegram_auto_reply:'Telegram 自动回复',telegram_join_group:'Telegram 加群',telegram_send_group:'Telegram 群消息',telegram_monitor_chat:'Telegram 监控',whatsapp_send_message:'WhatsApp 发消息',whatsapp_read_messages:'WhatsApp 读消息',whatsapp_auto_reply:'WhatsApp 自动回复',whatsapp_send_media:'WhatsApp 发媒体',whatsapp_list_chats:'WhatsApp 聊天列表',facebook_send_message:'Facebook 发私信',facebook_add_friend:'Facebook 加好友(安全)',facebook_browse_feed:'Facebook 浏览动态',facebook_browse_feed_by_interest:'Facebook 兴趣刷帖',facebook_search_leads:'Facebook 搜索潜客',facebook_join_group:'Facebook 加入群组',facebook_browse_groups:'Facebook 浏览我的群组',facebook_group_engage:'Facebook 群组互动',facebook_extract_members:'Facebook 群成员候选采集',facebook_group_member_greet:'Facebook 群成员好友打招呼',facebook_check_inbox:'Facebook Messenger 收件箱',facebook_check_message_requests:'Facebook 陌生人收件箱',facebook_check_friend_requests:'Facebook 好友请求处理',facebook_campaign_run:'Facebook 剧本任务',linkedin_send_message:'LinkedIn 发消息',linkedin_read_messages:'LinkedIn 读消息',linkedin_post_update:'LinkedIn 发动态',linkedin_search_profile:'LinkedIn 搜人脉',linkedin_send_connection:'LinkedIn 发邀请',linkedin_accept_connections:'LinkedIn 接受邀请',linkedin_like_post:'LinkedIn 点赞',linkedin_comment_post:'LinkedIn 评论',instagram_browse_feed:'Instagram 浏览首页',instagram_browse_hashtag:'Instagram 浏览标签',instagram_search_leads:'Instagram 搜用户',instagram_send_dm:'Instagram 发私信',twitter_browse_timeline:'X 浏览时间线',twitter_search_leads:'X 搜用户',twitter_search_and_engage:'X 关键词互动',twitter_send_dm:'X 发私信'};
 window.TASK_NAMES = TASK_NAMES;
+function applyBusinessSafeTaskNames(){
+  TASK_NAMES.facebook_extract_members = 'Facebook 群成员候选采集';
+  TASK_NAMES.facebook_group_member_greet = 'Facebook 群成员好友打招呼';
+  TASK_NAMES.facebook_campaign_run = 'Facebook 剧本任务';
+}
 // 从后端拉取统一的 task_type -> 中文 字典，覆盖本地兜底。启动时调一次即可。
 async function refreshTaskLabels(){
   try{
@@ -291,14 +296,28 @@ async function refreshTaskLabels(){
     const labels = (r && r.labels) || {};
     if(labels && typeof labels === 'object'){
       Object.assign(TASK_NAMES, labels);
+      applyBusinessSafeTaskNames();
     }
   }catch(e){ /* 后端不可用时保持兜底字典即可 */ }
+  applyBusinessSafeTaskNames();
 }
-// 统一入口：任务对象 -> 展示名（后端 type_label_zh 优先）
+applyBusinessSafeTaskNames();
+window.businessSafeText = function(text){
+  return String(text == null ? '' : text)
+    .replace(/FB 提取群成员/g, 'FB 群成员候选采集')
+    .replace(/Facebook 提取群成员/g, 'Facebook 群成员候选采集')
+    .replace(/提取群成员/g, '群成员候选采集')
+    .replace(/群成员提取/g, '群成员候选采集')
+    .replace(/成员采集/g, '成员整理')
+    .replace(/圈层拓客/g, '社群客服拓展')
+    .replace(/好友拓展/g, '好友打招呼')
+    .replace(/全链路获客/g, '全链路客服拓展');
+};
+// 统一入口：任务对象 -> 展示名（当前前端字典优先，历史 type_label_zh 只作回退）
 window.taskDisplayName = function(task){
   if(!task) return '';
-  const t = task.type_label_zh || (task.type && TASK_NAMES[task.type]) || task.type || '';
-  return t;
+  const t = (task.type && TASK_NAMES[task.type]) || task.type_label_zh || task.type || '';
+  return businessSafeText(t);
 };
 refreshTaskLabels();
 let allDevices=[], allTasks=[], currentFilter='all';
@@ -328,11 +347,13 @@ async function api(method,path,body,timeoutMs){
     if(!r.ok){
       const txt=await r.text().catch(()=>'');
       let detail=txt.substring(0,400);
+      let detailObj=null;     // 结构化 detail，给需要逐字段处理的调用方用（如 P1 fb-launch dialog）
       try{
         if(txt && txt.trim().charAt(0)==='{'){
           const j=JSON.parse(txt);
           const d=j&&j.detail;
           if(d&&typeof d==='object'){
+            detailObj=d;
             const msg=(d.message||d.msg||d.error||'').trim();
             const hint=(d.hint||'').trim();
             const code=(d.code||'').trim();
@@ -344,7 +365,12 @@ async function api(method,path,body,timeoutMs){
       if(r.status===404&&path&&(path.indexOf('install-apk')>=0||path.indexOf('install-apk-cluster')>=0)){
         errLine+=' [提示: 主控需已部署含集群 APK 转发的版本并已重启；反代须放行 /batch/install-apk-cluster 与 /cluster/batch/install-apk；可 GET /health 查看 capabilities]';
       }
-      throw new Error(errLine);
+      const err=new Error(errLine);
+      // 增强属性 — 不影响既有 e.message 用法，让新代码能区分 422 等业务错误
+      err.status=r.status;
+      err.statusText=r.statusText;
+      if(detailObj) err.detail=detailObj;
+      throw err;
     }
     return await r.json();
   }catch(e){

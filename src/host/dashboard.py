@@ -2950,14 +2950,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <script src="/static/js/jmuxer.min.js" onerror="window._jmuxerFailed=true"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" onerror="this.onerror=null;this.src='https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js'"></script>
-<script src="/static/js/core.js?v=20260420e"></script>
+<script src="/static/js/core.js?v=20260501a"></script>
 <script src="/static/js/devices.js?v=20260413a"></script>
 <script src="/static/js/overview.js?v=20260417q"></script>
 <script src="/static/js/video-stream.js?v=20260330g"></script>
 <script src="/static/js/grid-control.js?v=20260419c"></script>
 <script src="/static/js/macros.js?v=20260330g"></script>
 <script src="/static/js/batch-ops.js?v=20260417r"></script>
-<script src="/static/js/tasks-chat.js?v=20260418n"></script>
+<script src="/static/js/tasks-chat.js?v=20260501a"></script>
 <script src="/static/js/analytics.js?v=20260408b"></script>
 <script src="/static/js/cluster-ops.js?v=20260417r"></script>
 <script src="/static/js/alerts-notify.js?v=20260408d"></script>
@@ -2974,7 +2974,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script src="/static/js/campaigns.js"></script>
 <script src="/static/js/platform-shell.js?v=20260420c"></script>
 <script src="/static/js/tiktok-ops.js?v=20260417i"></script>
-<script src="/static/js/facebook-ops.js?v=20260420d"></script>
+<script src="/static/js/facebook-ops.js?v=20260430a"></script>
 <script src="/static/js/lead-mesh-ui.js?v=20260426pr66c"></script>
 <script src="/static/js/platform-grid.js?v=20260417a"></script>
 <script src="/static/js/studio.js?v=20260411f"></script>
