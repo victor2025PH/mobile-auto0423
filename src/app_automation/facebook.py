@@ -7359,12 +7359,13 @@ class FacebookAutomation(BaseAutomation):
 
         return stats
 
-    # 2026-05-03 v16: FB 帖子顶部"更多操作"按钮 desc 形如
-    # "More options for {author}'s post" / "More options for {author}'s
-    # post" (用 ’ Right Single Quotation Mark) — FB 跨语言一致用此模式,
-    # 提取作者名最稳定的锚点. 用 unicode 兼容 ASCII ' 和 unicode '.
+    # 2026-05-03 v16/v18: FB 帖子顶部"更多操作"按钮 desc 形如
+    # "More options for {author}’s post". v17 真机抓到实际 desc 用的是
+    # U+2019 RIGHT SINGLE QUOTATION MARK (不是 ASCII U+0027). 用字符类
+    # ['’] 同时兼容两种, 避免上版正则因终端 encoding 把两个
+    # apostrophe 都写成 ASCII 0x27 而永不匹配的 bug.
     _FB_FEED_AUTHOR_DESC_PATTERN = re.compile(
-        r"^More options for (.+?)(?:'s|’s)\s+post$",
+        "^More options for (.+?)['’]s\\s+post$",
         re.UNICODE,
     )
 
@@ -7442,19 +7443,20 @@ class FacebookAutomation(BaseAutomation):
                     pass
 
         seen_names: set = set()
-        deadline = time.time() + max(60.0, min(180.0, max_scrolls * 12.0))
+        # v17 (2026-05-03): 取消 wall-clock cap (180s 上限被 dump_hierarchy
+        # 慢路径吃掉, 真机第 22 轮只滚屏 3 次就超时). 改成单纯 max_scrolls
+        # 上限. 先盲滚 2 次让帖子流出现 (避开 cover/header 区).
+        try:
+            for _ in range(2):
+                self.hb.scroll_down(d)
+                self.hb.wait_read(random.randint(1200, 2000))
+        except Exception:
+            pass
 
         with self.guarded("extract_authors", device_id=did, weight=0.4):
             _set_step("浏览群帖子流", group_name)
             for _scroll_i in range(max_scrolls):
                 if len(members) >= max_members:
-                    break
-                if time.time() > deadline:
-                    log.warning(
-                        "[extract_authors] reached wall-clock cap "
-                        "scrolls=%d max_scrolls=%d members=%d",
-                        _scroll_i, max_scrolls, len(members),
-                    )
                     break
 
                 is_risk, msg = self._detect_risk_dialog(d)
@@ -7464,7 +7466,32 @@ class FacebookAutomation(BaseAutomation):
                 try:
                     xml = d.dump_hierarchy() or ""
                     from ..vision.screen_parser import XMLParser
-                    for node in XMLParser.parse(xml):
+                    parsed_authors = list(XMLParser.parse(xml))
+                    # v17 [authors-dbg]: 第一次循环输出含 "post"/"More
+                    # options"/"options for" 的 desc 节点, 让下次老化定位提速.
+                    if _scroll_i == 0:
+                        _dbg_hits = 0
+                        for _n in parsed_authors:
+                            _ddesc = (
+                                getattr(_n, "content_desc", None) or ""
+                            ).strip()
+                            if not _ddesc:
+                                continue
+                            if any(k in _ddesc for k in (
+                                "More options", "options for",
+                                "post", "Post",
+                                "Profile picture",
+                                "プロフィール写真",
+                            )):
+                                log.info(
+                                    "[authors-dbg] desc=%r bounds=%s",
+                                    _ddesc[:90],
+                                    getattr(_n, "bounds", None),
+                                )
+                                _dbg_hits += 1
+                                if _dbg_hits >= 20:
+                                    break
+                    for node in parsed_authors:
                         if not getattr(node, "bounds", None):
                             continue
                         desc = (
@@ -7509,7 +7536,7 @@ class FacebookAutomation(BaseAutomation):
                         d.swipe(0.5, 0.78, 0.5, 0.32, duration=0.35)
                     except Exception:
                         pass
-                self.hb.wait_read(random.randint(1500, 3000))
+                self.hb.wait_read(random.randint(1200, 2200))
 
         if group_name and not members:
             if not _LAST_EXTRACT_ERROR.get(did):
