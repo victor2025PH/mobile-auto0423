@@ -6256,9 +6256,41 @@ class FacebookAutomation(BaseAutomation):
                     continue
                 self.hb.tap(d, *self._el_center(_el_mt))
                 time.sleep(1.8)
+                # v15 (2026-05-03): tap Member tools 后 dump 菜单所有节点,
+                # 看真实选项名 (可能不是 "Members" 而是 "View all members" 或
+                # "Member list" 等). 一轮真机即可拿数据.
+                try:
+                    _menu_xml = d.dump_hierarchy() or ""
+                    if _menu_xml:
+                        from ..vision.screen_parser import XMLParser as _XPMENU
+                        _menu_hits = 0
+                        for _mn in _XPMENU.parse(_menu_xml):
+                            if not getattr(_mn, "bounds", None):
+                                continue
+                            _mt2 = (getattr(_mn, "text", "") or "").strip()
+                            _md2 = (
+                                getattr(_mn, "content_desc", None) or ""
+                            ).strip()
+                            if not (_mt2 or _md2):
+                                continue
+                            _mc = bool(getattr(_mn, "clickable", False))
+                            if _mc or any(k in (_mt2 + _md2) for k in (
+                                "Member", "member", "成员", "メンバー",
+                                "View", "All", "List",
+                            )):
+                                log.info(
+                                    "[menu-dbg] t=%r d=%r bounds=%s clk=%s",
+                                    _mt2[:50], _md2[:80], _mn.bounds, _mc,
+                                )
+                                _menu_hits += 1
+                                if _menu_hits >= 30:
+                                    break
+                except Exception as _menu_dbg_e:
+                    log.debug("[menu-dbg] failed: %s", _menu_dbg_e)
                 # 弹菜单后找 Members 选项 (text/desc/contains 多路尝试)
                 for _mem_lbl in (
                     "Members", "Member list", "All members", "View members",
+                    "View all members", "See all members",
                     "成员", "成員", "メンバー",
                 ):
                     for _sel2 in (
