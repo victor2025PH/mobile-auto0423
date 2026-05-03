@@ -564,19 +564,25 @@ def classify(
     _vlm_error = meta.get("error") or meta.get("parse_error", "")
     _vlm_ok = bool(meta.get("ok", False)) and bool(insights)
     if not _vlm_ok and _vlm_error:
-        # VLM 故障降级
-        _l1_high = l1_score >= 50
-        passed = _l1_high
+        # VLM 故障降级 — v25 (2026-05-03): 第 29 轮看到 candidate l1 普遍 20
+        # (FB 罗马字日文姓 = 15 + bio_has_japanese 等 = 20). 阈值 50 永远不达.
+        # 改为复用 yaml l1_pass_threshold=20 (本来 L1 pass 就该进 L2). 等价于:
+        # "L1 已判合格 + VLM 不可用 → 视同 PASS, 不让 VLM 故障拖累已 L1-pass
+        # 的候选". 比硬编码 50 更尊重 yaml 配置.
+        _l1_qualified = bool(l1_pass)   # l1_score >= l1_pass_th
+        passed = _l1_qualified
         match_reasons = [
             f"vlm_unavailable_l1_fallback (l1={l1_score}, "
-            f"l1_high={_l1_high}, vlm_err={_vlm_error[:60]})"
+            f"l1_pass_th={l1_pass_th}, qualified={_l1_qualified}, "
+            f"vlm_err={_vlm_error[:60]})"
         ]
         insights = insights or {}
-        l2_score = float(l1_score) if _l1_high else 0.0
+        l2_score = float(l1_score) if _l1_qualified else 0.0
         confidence = 0.0
         logger.warning(
-            "[classify] VLM 故障 L1 降级: name=%r l1=%d passed=%s vlm_err=%s",
-            display_name, l1_score, passed, _vlm_error[:80],
+            "[classify] VLM 故障 L1 降级: name=%r l1=%d/%d passed=%s vlm_err=%s",
+            display_name, l1_score, int(l1_pass_th), passed,
+            _vlm_error[:80],
         )
     else:
         passed, match_reasons = (
