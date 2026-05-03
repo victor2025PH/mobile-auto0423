@@ -463,7 +463,15 @@ FB_FLOW_PRESETS: List[dict] = [
                         "broad_keyword": True, "discover_groups": True,
                         "max_groups": 3, "max_groups_to_extract": 3,
                         "max_members_per_group": 20,
-                        "member_sources": ["mutual_members", "contributors"],
+                        # 2026-05-03 v16: 真机 21 轮迭代发现新版 FB 已关闭非
+                        # 管理员视角的 Members 列表入口 (Members tab 移除 +
+                        # Member tools 菜单无 Members 选项). mutual_members /
+                        # contributors 池长期产出 0. feed_authors 路径从帖子流
+                        # 提取作者作为候选 — 绕过权限限制, 候选都是活跃发帖
+                        # 用户. 必要时可加回 ["mutual_members", "contributors"]
+                        # 让旧路径作 fallback.
+                        "member_sources": ["feed_authors"],
+                        "feed_max_scrolls": 12,
                         "auto_join_groups": True, "join_if_needed": True,
                         "skip_visited": True,
                         "max_friends_per_run": 5,

@@ -3615,7 +3615,9 @@ def _as_str_list(value: Any) -> List[str]:
 
 def _campaign_member_sources(params: Dict[str, Any]) -> List[str]:
     sources = _as_str_list(params.get("member_sources") or params.get("member_source"))
-    allowed = {"mutual_members", "contributors", "general"}
+    # 2026-05-03 v16: feed_authors 加入合法 source — 新版 FB 关闭了 Members
+    # 列表入口, 帖子作者法是合法兜底.
+    allowed = {"mutual_members", "contributors", "general", "feed_authors"}
     clean = [s for s in sources if s in allowed]
     return clean or ["mutual_members", "contributors", "general"]
 
@@ -3707,7 +3709,19 @@ def _campaign_extract_members(fb, resolved: str, params: Dict[str, Any],
             }
             if source:
                 kwargs["member_source"] = source
-            members_g = fb.extract_group_members(**kwargs) or []
+            # 2026-05-03 v16: feed_authors 走独立 helper (从帖子流抓作者),
+            # 绕过 FB 已限制的 Members 列表权限. 其它 source 仍走传统
+            # extract_group_members.
+            if source == "feed_authors" and hasattr(
+                fb, "extract_group_feed_authors"
+            ):
+                _kw_authors = dict(kwargs)
+                _kw_authors.setdefault(
+                    "max_scrolls", int(params.get("feed_max_scrolls", 12))
+                )
+                members_g = fb.extract_group_feed_authors(**_kw_authors) or []
+            else:
+                members_g = fb.extract_group_members(**kwargs) or []
             for m in members_g:
                 if isinstance(m, dict):
                     m.setdefault("source_section", source or "general")

@@ -7359,6 +7359,177 @@ class FacebookAutomation(BaseAutomation):
 
         return stats
 
+    # 2026-05-03 v16: FB 帖子顶部"更多操作"按钮 desc 形如
+    # "More options for {author}'s post" / "More options for {author}'s
+    # post" (用 ’ Right Single Quotation Mark) — FB 跨语言一致用此模式,
+    # 提取作者名最稳定的锚点. 用 unicode 兼容 ASCII ' 和 unicode '.
+    _FB_FEED_AUTHOR_DESC_PATTERN = re.compile(
+        r"^More options for (.+?)(?:'s|’s)\s+post$",
+        re.UNICODE,
+    )
+
+    @_with_fb_foreground
+    def extract_group_feed_authors(self, group_name: str = "",
+                                    max_members: int = 20,
+                                    max_scrolls: int = 12,
+                                    use_llm_scoring: bool = False,
+                                    target_country: str = "",
+                                    device_id: Optional[str] = None,
+                                    persona_key: Optional[str] = None,
+                                    phase: Optional[str] = None,
+                                    member_source: str = "feed_authors",
+                                    join_if_needed: bool = False,
+                                    **_kw: Any) -> List[Dict[str, Any]]:
+        """从群帖子流提取帖子作者作为候选成员 — FB 限制 Members 列表后的合法路径.
+
+        2026-05-03 真机 21 轮迭代发现新版 FB 已彻底移除非管理员视角的 Members
+        列表入口 (Members tab 不存在 + Member tools 菜单无 Members 选项).
+        但帖子作者天然是群成员且公开可见, 是合法且数据量稳定的候选发现路径.
+
+        策略: 进群 → 滚屏看 N 帖 → 每帖抽顶部"更多操作"按钮 desc
+        ('More options for {author}'s post') → 正则提取作者名 → 去重收集.
+
+        签名与 extract_group_members 同构, 让 _campaign_extract_members 调度
+        层用相同 kwargs 即可切换 source.
+        """
+        did = self._did(device_id)
+        d = self._u2(did)
+        members: List[Dict[str, Any]] = []
+        try:
+            self._last_group_member_source = ""
+        except Exception:
+            pass
+        try:
+            _LAST_EXTRACT_ERROR.pop(did, None)
+        except Exception:
+            pass
+
+        if max_members <= 0:
+            return members
+
+        if not target_country and persona_key:
+            try:
+                from src.host.fb_target_personas import get_persona_display
+                target_country = (
+                    get_persona_display(persona_key).get("country_code") or ""
+                ).upper()
+            except Exception:
+                pass
+
+        if group_name and not self.enter_group(group_name, device_id=did):
+            log.warning("[extract_authors] 无法进入群组: %s", group_name)
+            _record_extract_error(did, "enter_group_failed")
+            _capture_immediate_async(
+                did, step_name="extract_authors_enter_group_failed",
+                hint=f"group={group_name!r}",
+                reason="enter_group returned False",
+            )
+            return members
+
+        # 公共群非成员也可看帖子流, 不强求 join 成功. 但仍尝试 (与
+        # extract_group_members 行为一致), 失败则继续浏览预览.
+        if group_name and self._current_group_page_requires_join(d, group_name):
+            if join_if_needed:
+                try:
+                    self._join_current_group_page_if_needed(d, did, group_name)
+                except Exception as _je:
+                    log.debug("[extract_authors] join attempt failed: %s",
+                                _je)
+                time.sleep(1.0)
+                try:
+                    self._continue_group_welcome_if_present(d, did, group_name)
+                except Exception:
+                    pass
+
+        seen_names: set = set()
+        deadline = time.time() + max(60.0, min(180.0, max_scrolls * 12.0))
+
+        with self.guarded("extract_authors", device_id=did, weight=0.4):
+            _set_step("浏览群帖子流", group_name)
+            for _scroll_i in range(max_scrolls):
+                if len(members) >= max_members:
+                    break
+                if time.time() > deadline:
+                    log.warning(
+                        "[extract_authors] reached wall-clock cap "
+                        "scrolls=%d max_scrolls=%d members=%d",
+                        _scroll_i, max_scrolls, len(members),
+                    )
+                    break
+
+                is_risk, msg = self._detect_risk_dialog(d)
+                if is_risk:
+                    break
+
+                try:
+                    xml = d.dump_hierarchy() or ""
+                    from ..vision.screen_parser import XMLParser
+                    for node in XMLParser.parse(xml):
+                        if not getattr(node, "bounds", None):
+                            continue
+                        desc = (
+                            getattr(node, "content_desc", None) or ""
+                        ).strip()
+                        if not desc:
+                            continue
+                        m = self._FB_FEED_AUTHOR_DESC_PATTERN.match(desc)
+                        if not m:
+                            continue
+                        raw_name = m.group(1).strip()
+                        name = self._clean_group_member_candidate_name(raw_name)
+                        if not name or name in seen_names:
+                            continue
+                        # 过滤明显是页面 / 群组 / 不是真人的名字
+                        if any(kw in name for kw in (
+                            "Page", "Group", "页面", "公页",
+                        )):
+                            continue
+                        seen_names.add(name)
+                        members.append({
+                            "name": name,
+                            "source_section": member_source or "feed_authors",
+                            "source_group": group_name,
+                            "discover_method": "feed_post_author",
+                            "profile_snippet": "",
+                        })
+                        _set_step(
+                            "群成员打招呼",
+                            f"第 {len(members)}/{max_members} 人(帖子作者)"
+                            f" — {name}",
+                        )
+                        if len(members) >= max_members:
+                            break
+                except Exception as e:
+                    log.warning("[extract_authors] 解析失败: %s", e)
+
+                try:
+                    self.hb.scroll_down(d)
+                except Exception:
+                    try:
+                        d.swipe(0.5, 0.78, 0.5, 0.32, duration=0.35)
+                    except Exception:
+                        pass
+                self.hb.wait_read(random.randint(1500, 3000))
+
+        if group_name and not members:
+            if not _LAST_EXTRACT_ERROR.get(did):
+                _record_extract_error(did, "feed_authors_zero")
+            _capture_immediate_async(
+                did, step_name="extract_authors_zero",
+                hint=f"group={group_name!r} max_scrolls={max_scrolls}",
+                reason="feed authors not found in scrolled posts",
+            )
+
+        try:
+            self._last_group_member_source = member_source or "feed_authors"
+        except Exception:
+            pass
+        log.info(
+            "[extract_authors] group=%r yielded=%d/%d (scrolls)",
+            group_name, len(members), max_members,
+        )
+        return members
+
     @_with_fb_foreground
     def extract_group_members(self, group_name: str = "",
                               max_members: int = 30,
