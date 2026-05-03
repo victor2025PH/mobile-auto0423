@@ -486,7 +486,11 @@ FB_FLOW_PRESETS: List[dict] = [
                         "send_greeting_inline": True,
                         "require_verification_note": True,
                         "require_outreach_goal": True,
-                        "do_l2_gate": True,
+                        # 2026-05-03 v26: 真机第 30 轮 L1 降级生效但 VLM 3 次
+                        # 重试每候选浪费 ~10s, 20 候选累计超 1200s 任务被
+                        # watchdog 杀. ollama 不可用时关闭 L2 跳过 VLM 调用,
+                        # L1 通过即 PASS. 运营恢复 ollama 后改 True.
+                        "do_l2_gate": False,
                         "strict_persona_gate": True,
                         "l2_gate_shots": 2,
                         "walk_candidates": True,
