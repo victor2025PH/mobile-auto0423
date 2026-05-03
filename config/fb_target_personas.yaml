@@ -308,9 +308,9 @@ personas:
     # 阈值 0.55→0.40 让"中等可能"候选也通过.
     match_criteria:
       require_has_face: false                   # v22 放宽: 宠物头像不直接 REJECT
-      require_is_profile_page: true             # 保留 (避免误抓非 profile)
-      age_bands_allowed: [30s, 40s, 50s, 60s, unknown]   # v22 加 unknown
-      genders_allowed: [female, unknown]                 # v22 加 unknown
-      require_is_japanese: true
-      min_overall_confidence: 0.40              # v22 0.55→0.40
-      min_japanese_confidence: 0.40             # v22 0.50→0.40
+      require_is_profile_page: false            # v23 放宽: profile dump 抢失败时也放行
+      age_bands_allowed: [30s, 40s, 50s, 60s, unknown]
+      genders_allowed: [female, unknown]
+      require_is_japanese: false                # v23 放宽: 名字判定为主, 不强求 LLM 标注
+      min_overall_confidence: 0.0               # v23 临时: 让 LLM 不返回 0 分都通过
+      min_japanese_confidence: 0.0              # v23 临时
