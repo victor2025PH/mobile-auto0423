@@ -28,6 +28,82 @@ from src.host.database import get_conn
 
 logger = logging.getLogger(__name__)
 
+
+def _name_hunter_qualification_evidence(
+    *,
+    matched: bool,
+    score: float,
+    insights: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Strict customer gate for point-name acquisition.
+
+    Name seeds and generic L2 matches are not enough for outreach. This helper
+    requires explicit persona evidence, especially age 37+. A VLM ``30s`` band
+    is kept for manual review because it may include 30-36.
+    """
+    ins = dict(insights or {})
+    reasons: List[str] = []
+    gaps: List[str] = []
+    profile_score = float(score or ins.get("profile_score") or 0)
+
+    gender = str(ins.get("gender") or "").strip().lower()
+    if gender == "female":
+        reasons.append("gender=female")
+        gender_ok = True
+    else:
+        gender_ok = False
+        gaps.append("gender_not_confirmed_female")
+
+    jp = ins.get("is_japanese")
+    jp_conf = float(ins.get("is_japanese_confidence") or 0)
+    locale = str(ins.get("locale") or ins.get("language") or "").lower()
+    jp_ok = bool(jp is True or jp_conf >= 0.5 or locale.startswith("ja"))
+    if jp_ok:
+        reasons.append("japanese_context_confirmed")
+    else:
+        gaps.append("japanese_context_not_confirmed")
+
+    age_band = str(ins.get("age_band") or "").strip().lower()
+    explicit_age = None
+    for key in ("age", "estimated_age", "age_estimate"):
+        try:
+            if ins.get(key) is not None:
+                explicit_age = int(float(ins.get(key)))
+                break
+        except Exception:
+            continue
+    if explicit_age is not None and explicit_age >= 37:
+        age_ok = True
+        reasons.append(f"explicit_age>={explicit_age}")
+    elif age_band in {"40s", "50s", "60s"}:
+        age_ok = True
+        reasons.append(f"age_band={age_band}")
+    else:
+        age_ok = False
+        if age_band == "30s":
+            gaps.append("age_30s_needs_manual_37plus_review")
+        else:
+            gaps.append("age_37plus_not_confirmed")
+
+    confidence = float(ins.get("overall_confidence") or 0)
+    if confidence and confidence < 0.55:
+        gaps.append("overall_confidence_low")
+
+    qualified = bool(matched and profile_score >= 70 and gender_ok and jp_ok and age_ok)
+    if not matched:
+        gaps.append("profile_l2_not_matched")
+    if profile_score < 70:
+        gaps.append("profile_score_below_70")
+    return {
+        "qualified": qualified,
+        "reasons": reasons,
+        "gaps": gaps,
+        "age_37plus_confirmed": age_ok,
+        "gender_confirmed": gender_ok,
+        "japanese_confirmed": jp_ok,
+        "profile_score": profile_score,
+    }
+
 # ── Schema DDL ─────────────────────────────────────────────────────────────
 
 _FB_TARGETS_SCHEMA = [
@@ -326,6 +402,324 @@ def mark_status(
         conn.commit()
     logger.debug("[mark_status] id=%d → %s", target_id, status)
     return True
+
+
+def upsert_name_hunter_candidate(
+    *,
+    name: str,
+    persona_key: str = "jp_female_midlife",
+    seed_score: float = 0,
+    seed_stage: str = "",
+    source_ref: str = "name_hunter",
+    status: str = "seeded",
+    insights: Optional[Dict[str, Any]] = None,
+    device_id: str = "",
+) -> int:
+    """Create/update a name-hunter candidate in ``fb_targets_global``.
+
+    This is the candidate-pool layer for point-name acquisition. It stores only
+    review metadata; actual add/greet still requires the strict L2 gate.
+    """
+    ensure_schema()
+    display_name = (name or "").strip()
+    if not display_name:
+        return 0
+    ik, it = normalize_identity(display_name)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    meta = dict(insights or {})
+    meta.update({
+        "seed_score": float(seed_score or 0),
+        "seed_stage": seed_stage or "",
+        "source": "name_hunter",
+        "touch_policy": "high_match_l2_only",
+    })
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO fb_targets_global
+               (identity_key, identity_type, persona_key, display_name,
+                source_mode, source_ref, status, qualified, insights_json,
+                last_touch_by, last_touch_at, created_at)
+               VALUES (?, ?, ?, ?, 'name_hunter', ?, ?, 0, ?, ?, ?, ?)
+               ON CONFLICT(identity_key, identity_type, persona_key) DO UPDATE SET
+                 display_name=excluded.display_name,
+                 source_mode='name_hunter',
+                 source_ref=excluded.source_ref,
+                 status=CASE
+                   WHEN fb_targets_global.status IN
+                        ('friend_requested','friended','greeted','replied','opt_out')
+                   THEN fb_targets_global.status
+                   ELSE excluded.status END,
+                 insights_json=excluded.insights_json,
+                 last_touch_by=excluded.last_touch_by,
+                 last_touch_at=excluded.last_touch_at""",
+            (ik, it, persona_key, display_name, source_ref, status,
+             json.dumps(meta, ensure_ascii=False), device_id, now_str, now_str),
+        )
+        row = conn.execute(
+            """SELECT id FROM fb_targets_global
+               WHERE identity_key=? AND identity_type=? AND persona_key=?""",
+            (ik, it, persona_key),
+        ).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def mark_name_hunter_profile_result(
+    *,
+    name: str,
+    persona_key: str,
+    matched: bool,
+    score: float = 0,
+    stage: str = "L2",
+    insights: Optional[Dict[str, Any]] = None,
+    device_id: str = "",
+) -> int:
+    """Persist profile classification result for a name-hunter candidate."""
+    ensure_schema()
+    ik, it = normalize_identity(name)
+    existing_meta: Dict[str, Any] = {}
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT source_ref, insights_json FROM fb_targets_global
+               WHERE identity_key=? AND identity_type=? AND persona_key=?""",
+            (ik, it, persona_key),
+        ).fetchone()
+        if row:
+            source_ref = row["source_ref"] or "name_hunter"
+            try:
+                existing_meta = json.loads(row["insights_json"] or "{}")
+            except Exception:
+                existing_meta = {}
+        else:
+            source_ref = "name_hunter"
+    merged = {
+        **existing_meta,
+        **(insights or {}),
+        "profile_stage": stage,
+        "profile_match": bool(matched),
+        "profile_score": float(score or 0),
+        "profile_checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    evidence = _name_hunter_qualification_evidence(
+        matched=matched,
+        score=score,
+        insights=merged,
+    )
+    merged["qualification_evidence"] = evidence
+    if evidence["qualified"]:
+        status = "qualified"
+    elif matched:
+        status = "review_required"
+    else:
+        status = "rejected"
+    target_id = upsert_name_hunter_candidate(
+        name=name,
+        persona_key=persona_key,
+        seed_score=float(merged.get("seed_score") or 0),
+        seed_stage=str(merged.get("seed_stage") or ""),
+        source_ref=source_ref,
+        status=status,
+        insights=merged,
+        device_id=device_id,
+    )
+    if target_id:
+        mark_status(
+            target_id,
+            status,
+            device_id=device_id,
+            extra_fields={
+                "qualified": 1 if evidence["qualified"] else 0,
+            },
+        )
+    return target_id
+
+
+def mark_name_hunter_touched(
+    *,
+    name: str,
+    persona_key: str,
+    status: str,
+    device_id: str = "",
+) -> int:
+    """Move a candidate after an outbound action succeeds or is attempted."""
+    ensure_schema()
+    ik, it = normalize_identity(name)
+    existing_meta: Dict[str, Any] = {}
+    with get_conn() as conn:
+        row = conn.execute(
+            """SELECT source_ref, insights_json FROM fb_targets_global
+               WHERE identity_key=? AND identity_type=? AND persona_key=?""",
+            (ik, it, persona_key),
+        ).fetchone()
+        if row:
+            source_ref = row["source_ref"] or "name_hunter"
+            try:
+                existing_meta = json.loads(row["insights_json"] or "{}")
+            except Exception:
+                existing_meta = {}
+        else:
+            source_ref = "name_hunter"
+    target_id = upsert_name_hunter_candidate(
+        name=name,
+        persona_key=persona_key,
+        seed_score=float(existing_meta.get("seed_score") or 0),
+        seed_stage=str(existing_meta.get("seed_stage") or ""),
+        source_ref=source_ref,
+        status=status,
+        insights={**existing_meta, "last_outbound_status": status},
+        device_id=device_id,
+    )
+    if target_id:
+        extra: Dict[str, Any] = {}
+        if status in ("friend_requested", "friended"):
+            extra["friended_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if status == "greeted":
+            extra["greeted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mark_status(target_id, status, device_id=device_id, extra_fields=extra)
+    return target_id
+
+
+def list_name_hunter_candidates(
+    *,
+    persona_key: str = "jp_female_midlife",
+    status: str = "",
+    q: str = "",
+    min_seed_score: float = 0,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """List candidate-pool rows for the Facebook point-name workflow."""
+    ensure_schema()
+    clauses = ["source_mode='name_hunter'", "persona_key=?"]
+    params: list = [persona_key]
+    if status:
+        clauses.append("status=?")
+        params.append(status)
+    if q:
+        clauses.append("display_name LIKE ?")
+        params.append(f"%{q}%")
+    sql = (
+        "SELECT * FROM fb_targets_global WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY last_touch_at DESC, id DESC LIMIT ?"
+    )
+    params.append(max(1, min(int(limit or 100), 500)))
+    out: List[Dict[str, Any]] = []
+    with get_conn() as conn:
+        for row in conn.execute(sql, params).fetchall():
+            d = dict(row)
+            try:
+                d["insights"] = json.loads(d.get("insights_json") or "{}")
+            except Exception:
+                d["insights"] = {}
+            if min_seed_score and float(d["insights"].get("seed_score") or 0) < min_seed_score:
+                continue
+            out.append(d)
+    return out
+
+
+def name_hunter_stats(*, persona_key: str = "jp_female_midlife") -> Dict[str, Any]:
+    """Aggregate point-name candidate funnel by source/name pack."""
+    ensure_schema()
+    rows: List[Dict[str, Any]] = []
+    with get_conn() as conn:
+        for row in conn.execute(
+            """SELECT source_ref, status, qualified, insights_json
+               FROM fb_targets_global
+               WHERE source_mode='name_hunter' AND persona_key=?""",
+            (persona_key,),
+        ).fetchall():
+            d = dict(row)
+            try:
+                d["insights"] = json.loads(d.get("insights_json") or "{}")
+            except Exception:
+                d["insights"] = {}
+            rows.append(d)
+
+    statuses = [
+        "seeded", "review_required", "weak_seed", "qualified", "rejected",
+        "friend_requested", "friended", "greeted", "replied", "opt_out",
+    ]
+    totals = {s: 0 for s in statuses}
+    sources: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        st = r.get("status") or ""
+        if st in totals:
+            totals[st] += 1
+        src = r.get("source_ref") or r["insights"].get("source") or "name_hunter"
+        bucket = sources.setdefault(src, {"source_ref": src, "total": 0, **{s: 0 for s in statuses}})
+        bucket["total"] += 1
+        if st in statuses:
+            bucket[st] += 1
+    for b in sources.values():
+        total = max(1, int(b.get("total") or 0))
+        b["qualified_rate"] = round(float(b.get("qualified", 0)) / total, 3)
+        b["reject_rate"] = round(float(b.get("rejected", 0)) / total, 3)
+        b["touch_rate"] = round(
+            float((b.get("friend_requested", 0) or 0) + (b.get("greeted", 0) or 0)) / total,
+            3,
+        )
+        if b.get("total", 0) >= 5 and b["qualified_rate"] < 0.2:
+            b["source_health"] = "degraded"
+            b["recommended_action"] = "lower_priority_or_regenerate"
+        elif b.get("qualified", 0) >= 3 and b["qualified_rate"] >= 0.5:
+            b["source_health"] = "strong"
+            b["recommended_action"] = "scale"
+        else:
+            b["source_health"] = "learning"
+            b["recommended_action"] = "collect_more_prescreen"
+    return {
+        "total": len(rows),
+        "statuses": totals,
+        "sources": sorted(sources.values(), key=lambda x: (-x.get("qualified_rate", 0), -x.get("total", 0))),
+    }
+
+
+def name_hunter_source_quality(
+    *,
+    persona_key: str = "jp_female_midlife",
+    source_ref: str = "name_hunter",
+) -> Dict[str, Any]:
+    """Return quality metadata for a name-pack/source."""
+    stats = name_hunter_stats(persona_key=persona_key)
+    for src in stats.get("sources") or []:
+        if src.get("source_ref") == source_ref:
+            return src
+    return {
+        "source_ref": source_ref,
+        "total": 0,
+        "qualified": 0,
+        "qualified_rate": 0.0,
+        "source_health": "new",
+        "recommended_action": "collect_more_prescreen",
+    }
+
+
+def name_hunter_touch_targets(
+    *,
+    persona_key: str = "jp_female_midlife",
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Return qualified candidates that have not been touched yet."""
+    ensure_schema()
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM fb_targets_global
+               WHERE source_mode='name_hunter'
+                 AND persona_key=?
+                 AND status='qualified'
+                 AND qualified=1
+               ORDER BY last_touch_at ASC, id ASC
+               LIMIT ?""",
+            (persona_key, max(1, min(int(limit or 20), 200))),
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["insights"] = json.loads(d.get("insights_json") or "{}")
+        except Exception:
+            d["insights"] = {}
+        out.append(d)
+    return out
 
 
 def get_target(target_id: int) -> Optional[Dict[str, Any]]:
