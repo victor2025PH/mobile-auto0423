@@ -265,11 +265,13 @@ class TestSchemasRegistry:
         vals = {t.value for t in TaskType}
         assert "facebook_add_friend_and_greet" in vals
         assert "facebook_send_greeting" in vals
+        assert "facebook_group_member_greet" in vals
 
     def test_task_labels_zh(self):
         from src.host.task_labels_zh import task_label_zh
         assert "加好友" in task_label_zh("facebook_add_friend_and_greet")
         assert "打招呼" in task_label_zh("facebook_send_greeting")
+        assert "群成员" in task_label_zh("facebook_group_member_greet")
 
 
 # ─── Presets registry ─────────────────────────────────────────────────────────
@@ -286,13 +288,277 @@ class TestPresets:
         # send_greeting_inline 默认开启
         step_params = p["steps"][0]["params"]
         assert step_params.get("send_greeting_inline") is True
+        assert step_params.get("require_high_match") is True
+        assert step_params.get("min_seed_score") == 80
+        assert step_params.get("do_l2_gate") is True
+        assert step_params.get("strict_persona_gate") is True
 
     def test_friend_growth_still_runs_add_friends(self):
         from src.host.routers.facebook import FB_FLOW_PRESETS
         p = next(p for p in FB_FLOW_PRESETS if p["key"] == "friend_growth")
-        step_params = p["steps"][1]["params"]
+        assert len(p["steps"]) == 1
+        assert p["steps"][0]["type"] == "facebook_group_member_greet"
+        step_params = p["steps"][0]["params"]
+        assert "extract_members" in step_params["steps"]
         assert "add_friends" in step_params["steps"]
         assert step_params.get("send_greeting_inline") is True
+
+
+class TestNameHunterPreview:
+    def test_suggest_jp_names_returns_scored_rows(self, tmp_db):
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+
+        with TestClient(app) as c:
+            r = c.post("/facebook/name-hunter/suggest", json={
+                "persona_key": "jp_female_midlife",
+                "age_pack": "46_55",
+                "count": 8,
+            })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["ok"] is True
+        assert data["count"] == 8
+        assert all(row["score"] >= 80 for row in data["names"])
+        assert all(row["name"] for row in data["names"])
+
+    def test_preview_dedupes_and_scores_launch_targets(self, tmp_db):
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+
+        with TestClient(app) as c:
+            r = c.post("/facebook/name-hunter/preview", json={
+                "persona_key": "jp_female_midlife",
+                "names": "山田花子\n山田 花子, Alice",
+            })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["unique_count"] == 2
+        names = {row["name"] for row in data["rows"]}
+        assert names == {"山田花子", "Alice"}
+        assert data["high_confidence_count"] == 1
+        assert data["weak_count"] == 1
+        assert [row["name"] for row in data["launch_targets"]] == ["山田花子"]
+        assert data["policy"]["auto_touch_allowed"] is False
+        assert data["policy"]["minimum_score_for_launch"] == 80
+        assert data["policy"]["strict_profile_l2_required"] is True
+
+    def test_executor_high_match_filter_keeps_only_seed_score_80_plus(self):
+        from src.host.executor import _fb_filter_high_match_targets
+
+        rows, meta = _fb_filter_high_match_targets(
+            [
+                {"name": "山田花子", "seed_score": 95},
+                {"name": "Alice", "seed_score": 20},
+            ],
+            {"require_high_match": True, "min_seed_score": 80},
+        )
+        assert [r["name"] for r in rows] == ["山田花子"]
+        assert meta["skipped"] == 1
+
+    def test_preview_persists_candidate_pool(self, tmp_db):
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+
+        with TestClient(app) as c:
+            r = c.post("/facebook/name-hunter/preview", json={
+                "persona_key": "jp_female_midlife",
+                "names": "山田花子\nAlice",
+            })
+            assert r.status_code == 200, r.text
+            q = c.get("/facebook/name-hunter/candidates", params={
+                "persona_key": "jp_female_midlife",
+                "limit": 10,
+            })
+        assert q.status_code == 200, q.text
+        items = q.json()["items"]
+        by_name = {x["display_name"]: x for x in items}
+        assert by_name["山田花子"]["status"] == "seeded"
+        assert by_name["山田花子"]["insights"]["seed_score"] >= 80
+        assert by_name["Alice"]["status"] == "weak_seed"
+
+    def test_mark_profile_result_promotes_candidate_to_qualified(self, tmp_db):
+        from src.host.fb_targets_store import (
+            mark_name_hunter_profile_result,
+            list_name_hunter_candidates,
+            upsert_name_hunter_candidate,
+            name_hunter_touch_targets,
+        )
+
+        upsert_name_hunter_candidate(
+            name="山田花子",
+            persona_key="jp_female_midlife",
+            seed_score=95,
+            seed_stage="high_confidence_seed",
+            status="seeded",
+        )
+        mark_name_hunter_profile_result(
+            name="山田花子",
+            persona_key="jp_female_midlife",
+            matched=True,
+            score=91,
+            insights={"age_band": "40s", "gender": "female", "is_japanese": True},
+            device_id="D1",
+        )
+        rows = list_name_hunter_candidates(persona_key="jp_female_midlife")
+        row = next(x for x in rows if x["display_name"] == "山田花子")
+        assert row["status"] == "qualified"
+        assert row["qualified"] == 1
+        assert row["insights"]["seed_score"] == 95
+        assert row["insights"]["profile_score"] == 91
+        assert row["insights"]["qualification_evidence"]["age_37plus_confirmed"] is True
+        q = name_hunter_touch_targets(persona_key="jp_female_midlife")
+        assert [x["display_name"] for x in q] == ["山田花子"]
+
+    def test_30s_profile_match_requires_manual_37plus_review(self, tmp_db):
+        from src.host.fb_targets_store import (
+            mark_name_hunter_profile_result,
+            list_name_hunter_candidates,
+            upsert_name_hunter_candidate,
+            name_hunter_touch_targets,
+        )
+
+        upsert_name_hunter_candidate(
+            name="佐藤美咲",
+            persona_key="jp_female_midlife",
+            seed_score=95,
+            status="seeded",
+        )
+        mark_name_hunter_profile_result(
+            name="佐藤美咲",
+            persona_key="jp_female_midlife",
+            matched=True,
+            score=90,
+            insights={"age_band": "30s", "gender": "female", "is_japanese": True},
+            device_id="D1",
+        )
+        row = next(x for x in list_name_hunter_candidates(persona_key="jp_female_midlife")
+                   if x["display_name"] == "佐藤美咲")
+        assert row["status"] == "review_required"
+        assert row["qualified"] == 0
+        assert "age_30s_needs_manual_37plus_review" in row["insights"]["qualification_evidence"]["gaps"]
+        assert name_hunter_touch_targets(persona_key="jp_female_midlife") == []
+
+    def test_prescreen_and_touch_routes_create_tasks(self, monkeypatch, tmp_db):
+        captured = []
+
+        def _fake_create_task(task_type, device_id, params, **kwargs):
+            captured.append((task_type, device_id, params))
+            return "tid_" + str(len(captured))
+
+        monkeypatch.setattr("src.host.task_store.create_task", _fake_create_task)
+        from src.host.fb_targets_store import mark_name_hunter_profile_result, upsert_name_hunter_candidate
+
+        upsert_name_hunter_candidate(
+            name="山田花子",
+            persona_key="jp_female_midlife",
+            seed_score=95,
+            seed_stage="high_confidence_seed",
+            status="seeded",
+        )
+        mark_name_hunter_profile_result(
+            name="山田花子",
+            persona_key="jp_female_midlife",
+            matched=True,
+            score=91,
+            insights={"age_band": "40s", "gender": "female", "is_japanese": True},
+        )
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+
+        with TestClient(app) as c:
+            r1 = c.post("/facebook/name-hunter/prescreen", json={
+                "device_id": "D1",
+                "persona_key": "jp_female_midlife",
+            })
+            r2 = c.post("/facebook/name-hunter/touch-qualified", json={
+                "device_id": "D1",
+                "persona_key": "jp_female_midlife",
+            })
+        assert r1.status_code == 200, r1.text
+        assert r2.status_code == 200, r2.text
+        assert captured[0][0] == "facebook_name_hunter_prescreen"
+        assert captured[1][0] == "facebook_name_hunter_touch_qualified"
+        assert captured[0][2]["status"] == "seeded"
+        assert captured[1][2]["_preset_key"] == "name_hunter"
+
+    def test_touch_route_blocks_when_no_qualified_candidates(self, monkeypatch, tmp_db):
+        def _fake_create_task(*args, **kwargs):
+            raise AssertionError("touch task should not be created without qualified candidates")
+
+        monkeypatch.setattr("src.host.task_store.create_task", _fake_create_task)
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+
+        with TestClient(app) as c:
+            r = c.post("/facebook/name-hunter/touch-qualified", json={
+                "device_id": "D1",
+                "persona_key": "jp_female_midlife",
+                "min_qualified_ready": 1,
+            })
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["qualified_ready"] == 0
+
+    def test_candidate_action_and_stats_preserve_source_pack(self, tmp_db):
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+        from src.host.fb_targets_store import mark_name_hunter_profile_result
+
+        with TestClient(app) as c:
+            r = c.post("/facebook/name-hunter/preview", json={
+                "persona_key": "jp_female_midlife",
+                "source_ref": "jp_46_55_pack",
+                "names": "山田花子\n佐藤美咲",
+            })
+            assert r.status_code == 200, r.text
+            first_id = r.json()["rows"][0]["candidate_id"]
+
+            a = c.post(f"/facebook/name-hunter/candidates/{first_id}/action", json={
+                "action": "qualify",
+            })
+            assert a.status_code == 200, a.text
+
+            mark_name_hunter_profile_result(
+                name="佐藤美咲",
+                persona_key="jp_female_midlife",
+                matched=True,
+                score=88,
+                insights={"age_band": "50s", "gender": "female", "is_japanese": True},
+            )
+            s = c.get("/facebook/name-hunter/stats", params={
+                "persona_key": "jp_female_midlife",
+            })
+        assert s.status_code == 200, s.text
+        pack = next(x for x in s.json()["sources"] if x["source_ref"] == "jp_46_55_pack")
+        assert pack["total"] == 2
+        assert pack["qualified"] == 2
+
+    def test_degraded_source_pack_is_auto_downranked(self, tmp_db):
+        from fastapi.testclient import TestClient
+        from src.host.api import app
+        from src.host.fb_targets_store import upsert_name_hunter_candidate
+
+        for i in range(5):
+            upsert_name_hunter_candidate(
+                name=f"低質{i}",
+                persona_key="jp_female_midlife",
+                seed_score=95,
+                source_ref="poor_pack",
+                status="rejected",
+            )
+
+        with TestClient(app) as c:
+            r = c.post("/facebook/name-hunter/preview", json={
+                "persona_key": "jp_female_midlife",
+                "source_ref": "poor_pack",
+                "names": "山田花子",
+                "persist": False,
+            })
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["source_quality"]["source_health"] == "degraded"
+        assert data["rows"][0]["score"] == 85
+        assert "自动降权" in " / ".join(data["rows"][0]["reasons"])
 
 
 # ─── Launch 端点注入 add_friend_targets (集成测试) ───────────────────────────
@@ -390,8 +656,7 @@ class TestLaunchTargetsInjection:
         assert "打招呼" in (detail.get("error") or "")
 
     def test_friend_growth_also_receives_targets(self, monkeypatch, tmp_db):
-        """friend_growth 预设有 facebook_extract_members + facebook_campaign_run 两 step,
-        add_friend_targets 应只注到 campaign_run,不污染 extract_members。"""
+        """friend_growth 现在只创建一个闭环任务，手工 targets 注入到该任务。"""
         import src.host.routers.facebook as fb_router
         captured = []
         monkeypatch.setattr(fb_router, "_post_create_task",
@@ -404,14 +669,14 @@ class TestLaunchTargetsInjection:
             r = c.post("/facebook/device/test_dev/launch", json={
                 "preset_key": "friend_growth",
                 "persona_key": "jp_female_midlife",
+                "target_groups": ["ペット"],
+                "verification_note": "同じグループで拝見しました",
+                "greeting": "よろしくお願いします",
                 "add_friend_targets": ["Z1", "Z2"],
             })
         assert r.status_code == 200
-        extract_params = next(p["params"] for p in captured
-                              if p["type"] == "facebook_extract_members")
-        campaign_params = next(p["params"] for p in captured
-                               if p["type"] == "facebook_campaign_run")
-        # extract_members 不是注入白名单里的 → 不污染
-        assert "add_friend_targets" not in extract_params
-        # campaign_run 正确带到
-        assert len(campaign_params["add_friend_targets"]) == 2
+        assert len(captured) == 1
+        assert captured[0]["type"] == "facebook_group_member_greet"
+        params = captured[0]["params"]
+        assert len(params["add_friend_targets"]) == 2
+        assert params["steps"] == ["extract_members", "add_friends"]

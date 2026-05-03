@@ -10,7 +10,7 @@
     # Facebook 引流日报 (2026-04-19)
     ## 概览
     - 群组:7 个(新增 2)
-    - 提取成员:142 人(目标群占 80%)
+    - 群成员打招呼准备:142 人(目标群占 80%)
     - 好友请求:25 发出 / 18 通过(72%)
     ## 风险
     - 002 号机 14:32 触发风控 → 已自动降级
@@ -176,11 +176,11 @@ def _fallback_brief(m: Dict[str, Any]) -> str:
     return f"""# Facebook 引流日报 (设备: {m['scope_device']})
 
 ## 概览
-过去 {m['hours']}h 已加入 {m['groups_count']} 个群,提取 {f['stage_extracted_members']} 人,
+过去 {m['hours']}h 已加入 {m['groups_count']} 个群,整理出 {f['stage_extracted_members']} 个群成员招呼对象,
 发出 {f['stage_friend_request_sent']} 个好友请求,通过 {f['stage_friend_accepted']}(通过率 {f['rate_accept']*100:.0f}%)。
 
 ## 漏斗
-- 提取成员: {f['stage_extracted_members']}
+- 群成员招呼对象: {f['stage_extracted_members']}
 - 好友请求发出: {f['stage_friend_request_sent']}
 - 通过: {f['stage_friend_accepted']} ({f['rate_accept']*100:.0f}%)
 - DM 收到: {f['stage_inbox_incoming']}
