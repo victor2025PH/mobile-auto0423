@@ -98,7 +98,7 @@
 | `schedules` | 定时任务定义 | Scheduler |
 | `facebook_friend_requests` | A 加好友记录 | `add_friend_with_note` |
 | `facebook_inbox_messages` | A/B 双写：A 写 outgoing greeting，B 写 incoming + AI 回复 | `send_greeting_after_add_friend` / `_ai_reply_and_send` |
-| `facebook_groups` | A 群成员提取 | `extract_group_members` |
+| `facebook_groups` | A 群成员打招呼 | `extract_group_members` |
 | `facebook_phase_state` | 设备阶段状态 | facebook.py |
 | `customer_profiles` | A/B 共享客户画像（L1/L2） | central_customer_store |
 | `cluster_hosts` | 集群主机（coordinator-only） | multi_host |

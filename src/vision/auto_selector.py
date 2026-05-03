@@ -347,11 +347,11 @@ class SelectorStore:
 # 但 **不允许写学习 cache**, 防止污染重灾区. 适用于 "已经有硬编码
 # helper 替代主路径, smart_tap 只是 fallback" 的场景.
 #
-# 2026-04-27 加 (圈层拓客 5h 死循环事故 R3 治本):
+# 2026-04-27 加 (社群客服拓展 5h 死循环事故 R3 治本):
 # 这些 target 历史上反复被 AutoSelector 学错 (4-23 第一次, 4-26 又来
 # 一次), 见 memory/autoselector_pitfall.md. 现已有硬编码 helper:
 #
-# 圈层拓客 / Groups 相关流程:
+# 社群客服拓展 / Groups 相关流程:
 #   "Search bar or search icon"        → _tap_search_bar_preferred
 #   "Groups tab"                       → _tap_groups_bottom_tab
 #   "Groups tab or filter"             → _tap_search_results_groups_filter

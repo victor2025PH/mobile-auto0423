@@ -808,12 +808,12 @@ async function _pgFallbackProfile(deviceId, dev) {
         action: { label: '立即开始养号', type: 'run_task', task_type: 'facebook_browse_feed_by_interest' } };
     } else if (phase === 'growth') {
       level = 'low';
-      suggestion = { tone: 'info', text: '📈 健康成长期，可下发加好友/群成员提取/群内互动',
+      suggestion = { tone: 'info', text: '📈 健康成长期，可下发加好友/群成员打招呼/群内互动',
         action: { label: '发起加好友', type: 'run_task', task_type: 'facebook_add_friend' } };
     } else if (phase === 'mature') {
       level = 'low';
       suggestion = { tone: 'ok', text: '🌳 账号成熟，可承担营销动作 — 保持节奏',
-        action: { label: '全链路获客', type: 'run_task', task_type: 'facebook_campaign_run' } };
+        action: { label: '全链路客服拓展', type: 'run_task', task_type: 'facebook_campaign_run' } };
     } else {
       level = 'low';
       suggestion = { tone: 'info', text: '✓ 账号状态正常', action: null };

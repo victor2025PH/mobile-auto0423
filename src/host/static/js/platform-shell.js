@@ -238,7 +238,7 @@
     const leads = opts.leads || [];
     if (!leads.length) {
       return '<div style="padding:40px;text-align:center;color:var(--text-muted)">'
-        + '暂无高分线索 — 跑一次"提取群成员"即可。</div>';
+        + '暂无高分线索 — 跑一次"群成员打招呼"即可。</div>';
     }
     const showTags = opts.showTagsCol !== false;
     const showReasons = opts.showReasonsCol !== false;
