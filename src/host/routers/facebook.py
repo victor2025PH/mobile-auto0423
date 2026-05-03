@@ -472,7 +472,11 @@ FB_FLOW_PRESETS: List[dict] = [
                         # 让旧路径作 fallback.
                         "member_sources": ["feed_authors"],
                         "feed_max_scrolls": 12,
-                        "min_l1_score": 30,
+                        # 2026-05-03 v21: 第 25 轮显示 fb_lead_scorer 给非完美
+                        # 匹配普遍 0 分, min_l1_score=30 把所有候选全杀.
+                        # 关闭预筛 (默认 0), Page 过滤独立保留. 后续运营调
+                        # scorer 后再开启此阈值.
+                        "min_l1_score": 0,
                         "auto_join_groups": True, "join_if_needed": True,
                         "skip_visited": True,
                         "max_friends_per_run": 5,
