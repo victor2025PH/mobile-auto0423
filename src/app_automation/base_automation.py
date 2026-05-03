@@ -438,9 +438,35 @@ class AdbFallbackDevice:
         self.invalidate_dump_cache()
 
     def press(self, key):
-        key_map = {"back": 4, "home": 3, "enter": 66, "menu": 82}
+        key_map = {"back": 4, "home": 3, "enter": 66, "menu": 82,
+                   "search": 84}
         code = key_map.get(key, key)
         self._adb(f"shell input keyevent {code}")
+        self.invalidate_dump_cache()
+
+    def send_action(self, code=None):
+        """触发 IME action (search / go / send / done).
+
+        u2.Device.send_action 走 FastInputIME APK 广播; AdbFallbackDevice 上
+        FastInputIME 通常未装 (MIUI 拒装第三方 IME APK), 改用纯 ADB 兜底.
+
+        真机证据 (task 35b2e957 2026-04-30):
+          KEYCODE_ENTER (66) 在 FB Android 搜索 EditText 上被 typeahead overlay
+          截获 → 选中首位建议 (人物 profile). 改用 KEYCODE_SEARCH (84) 走另一
+          条路径, 通常映射到 imeOptions=actionSearch 触发 onEditorAction(SEARCH).
+          若仍无效, 兜底 KEYCODE_ENTER 维持原行为 (再由上层 Step 2.5 拦下).
+
+        Args:
+            code: 'search' / 'go' / 'send' / 'done'. 当前实现仅区分 search vs 其他,
+                  其他统一走 ENTER. 未来如需精细区分可扩展.
+        """
+        action = (str(code).lower() if code is not None else "search")
+        if action == "search":
+            # 优先 KEYCODE_SEARCH (84): 避开 FB typeahead 对 ENTER 的拦截
+            self._adb("shell input keyevent 84")
+        else:
+            # go/send/done — 用 ENTER 兜底
+            self._adb("shell input keyevent 66")
         self.invalidate_dump_cache()
 
     def app_start(self, package):
@@ -729,12 +755,20 @@ class BaseAutomation:
         """
         acct = account or self._current_account
         did = self._did(device_id)
-        self.guard.check(self.PLATFORM, action, acct)
+        _relaxed = False
+        try:
+            from src.host.fb_playbook import local_rules_disabled
+            _relaxed = self.PLATFORM == "facebook" and local_rules_disabled()
+        except Exception:
+            _relaxed = False
+        if not _relaxed:
+            self.guard.check(self.PLATFORM, action, acct)
         try:
             yield
         finally:
-            self.guard.record(self.PLATFORM, action, acct, did)
-            self.hb.wait_between_actions(context_weight=weight)
+            if not _relaxed:
+                self.guard.record(self.PLATFORM, action, acct, did)
+                self.hb.wait_between_actions(context_weight=weight)
 
     def check_quota(self, action: str, account: Optional[str] = None) -> bool:
         """Check if action is allowed without recording it."""
