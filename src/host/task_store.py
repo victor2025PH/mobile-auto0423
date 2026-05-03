@@ -339,7 +339,7 @@ def set_task_step(step: str, sub_step: str = "",
     """更新 running task 的当前业务步骤 — dashboard 实时可见 + Phase 2 P0 #2.
 
     Args:
-        step: 主步骤 (e.g. "搜索群组" / "提取群成员" / "添加好友")
+        step: 主步骤 (e.g. "搜索群组" / "群成员打招呼" / "添加好友")
         sub_step: 副步骤 (e.g. "ママ友" / "第 5/30 人" / "@john")
         task_id: 任务 ID; 默认从 thread-local task_context 隐式取
                  (executor.run_task 已 set_task_context → 业务方法不需显式传)
@@ -378,7 +378,7 @@ def set_task_step(step: str, sub_step: str = "",
         with get_conn() as conn:
             cur = conn.execute(
                 "UPDATE tasks SET "
-                " checkpoint = json_patch(COALESCE(checkpoint, '{}'), ?), "
+                " checkpoint = json_patch(COALESCE(NULLIF(checkpoint, ''), '{}'), ?), "
                 " updated_at = ? "
                 "WHERE task_id = ? AND status = 'running'",
                 (payload, now, task_id),
@@ -459,10 +459,28 @@ def set_task_result(task_id: str, success: bool, error: str = "",
     _push(f"task.{status}", task_id=task_id, success=success,
           error=error, device_id=device_id)
     # P2-② 失败任务自动留证据 (异步 fail-safe, 不阻塞当前调用)
-    if status == "failed" and device_id:
+    # P1.5 (2026-04-30): 扩展触发条件 —— task.status='success' 但内部含
+    # automation_* outcome 或 steps_failed 时, 仍触发取证。原因：FB campaign_run
+    # 即便有 step 失败, 整任务返回 True (partial 也算 done), 导致历来失败现场零证据。
+    _need_forensics = (status == "failed")
+    if not _need_forensics and isinstance(result, dict):
+        _oc = str(result.get("outcome") or "")
+        if _oc.startswith("automation_") or _oc.startswith("missing_param"):
+            _need_forensics = True
+        elif result.get("steps_failed"):
+            # 任一子步骤标记失败 → 也取证（campaign_run 多步剧本场景）
+            _need_forensics = True
+    if _need_forensics and device_id:
         try:
             from .task_forensics import capture_forensics
-            capture_forensics(task_id=task_id, device_id=device_id, error_text=error)
+            _err_for_forensics = error or (
+                isinstance(result, dict)
+                and (result.get("outcome") or
+                     (result.get("steps_failed") or [{}])[0].get("error", ""))
+                or ""
+            )
+            capture_forensics(task_id=task_id, device_id=device_id,
+                              error_text=str(_err_for_forensics))
         except Exception as _fe:
             logger.debug("forensics 触发异常 (已忽略): %s", _fe)
     # 连续失败追踪 → Telegram 告警

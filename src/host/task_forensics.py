@@ -132,7 +132,17 @@ def _do_capture(task_id: str, device_id: str, error_text: str,
             "params": _redact_params(params_snapshot or {}),
         }
 
-        # ── 1. screencap (PNG bytes 直接到 stdout) ──
+        # ── 0. P2.0: 优先 promote 该设备的 pending 快照（失败那一刻同步抓的） ──
+        # 这些快照比 fallback screencap 更"真"——屏幕可能已经过去了 1-2 分钟。
+        try:
+            promoted = promote_pending_to_task(task_id, device_id, out_dir)
+            meta["promoted_pending_count"] = promoted
+        except Exception as e:
+            logger.debug("[forensics] promote_pending in _do_capture failed: %s", e)
+            meta["promoted_pending_count"] = 0
+
+        # ── 1. screencap (兜底: 即便 pending 已 promote, 此处再补一张"取证那一刻"的画面,
+        #     方便对比"失败那一刻 vs 取证那一刻", 看屏幕是否已飘走) ──
         png_path = out_dir / "screencap.png"
         try:
             proc = subprocess.run(
@@ -145,6 +155,7 @@ def _do_capture(task_id: str, device_id: str, error_text: str,
                 png_path.write_bytes(proc.stdout)
                 meta["screencap"] = {
                     "ok": True, "size_bytes": len(proc.stdout),
+                    "note": "fallback_realtime",
                 }
             else:
                 meta["screencap"] = {
@@ -192,6 +203,239 @@ def _do_capture(task_id: str, device_id: str, error_text: str,
     except Exception as e:
         # 整体兜底, 取证不阻塞 task 状态写入
         logger.warning("[forensics] _do_capture top-level failed: %s", e)
+
+
+# ── P2.0 (2026-04-30): automation 层即时取证 ──────────────────────────────
+#
+# 动机：原 capture_forensics 在 task_store.update_task_status('failed') 时触发,
+# 但 FB 多步任务可能已跑过 1-2 分钟, 屏幕已经回首页 → 截到的不是失败那一刻。
+#
+# 解决方案：automation 函数(如 extract_group_members)失败时立即调
+# capture_immediate(device_id, step), 把当前 PNG + hierarchy XML 暂存到
+# data/forensics/_pending/<device_id>/. 后续 task_store 触发 forensics 时,
+# promote_pending_to_task 优先把 pending 快照 mv 到正式目录 (按设备维度收割)。
+#
+# 设计要点：
+# - automation 层不持有 task_id, 故按 device_id 索引 pending
+# - hierarchy dump 用 ADB 命令而非 u2.dump_hierarchy() — 更原子, 无 u2 连接依赖
+# - 每设备保留最多 N 个 pending (FIFO 滚动), 防磁盘累积
+# - 失败完全静默, 不影响 automation 主流程
+
+PENDING_ROOT = FORENSICS_ROOT / "_pending"
+PENDING_PER_DEVICE_MAX = 10  # 每设备最多保留多少 pending 快照
+PENDING_RETENTION_S = 1800   # pending 快照超过 30 分钟未 promote → 视为孤儿, 清掉
+
+
+def capture_immediate(device_id: str, step_name: str,
+                      hint: str = "", reason: str = "") -> Optional[str]:
+    """automation 层即时取证 — 在失败那一刻同步抓 PNG + XML 到 _pending 区。
+
+    返回快照目录名 (形如 'extract_zero_after_enter_20260430T071230Z') 或 None。
+    全程吞异常, 不影响调用方主流程。
+
+    与 capture_forensics 区别：
+    - 同步执行 (调用方在失败 return 前调, 确保截到失败那一刻)
+    - 不需要 task_id (automation 层通常拿不到)
+    - 不写 logcat (logcat 由后续 promote 阶段补)
+    """
+    if not device_id:
+        return None
+    try:
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        snap_name = f"{_safe_seg(step_name) or 'unknown'}_{ts}"
+        out_dir = PENDING_ROOT / _safe_seg(device_id) / snap_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        meta: Dict[str, Any] = {
+            "device_id": device_id,
+            "step": step_name,
+            "captured_at_utc": ts,
+            "hint": (hint or "")[:300],
+            "reason": (reason or "")[:300],
+            "pending": True,
+        }
+
+        # 1. screencap (同步, 失败时也继续 dump XML)
+        try:
+            proc = subprocess.run(
+                ["adb", "-s", device_id, "exec-out", "screencap", "-p"],
+                capture_output=True,
+                timeout=FORENSICS_TIMEOUT_S,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if proc.returncode == 0 and proc.stdout and len(proc.stdout) > 100:
+                (out_dir / "screencap.png").write_bytes(proc.stdout)
+                meta["screencap"] = {"ok": True, "size_bytes": len(proc.stdout)}
+            else:
+                meta["screencap"] = {
+                    "ok": False,
+                    "reason": f"rc={proc.returncode}, bytes={len(proc.stdout or b'')}",
+                }
+        except Exception as e:
+            meta["screencap"] = {"ok": False, "reason": f"exception: {type(e).__name__}"}
+
+        # 2. hierarchy dump (uiautomator dump → /sdcard, 再 cat 出来)
+        # 比 u2.dump_hierarchy() 更原子: 不依赖 u2 连接, 网络中断也能跑
+        #
+        # P2.X-4 (2026-04-30) retry: uiautomator dump 在动画中 / 输入法弹起时
+        # 偶发返回空文件 (历史: caefd0e0 hierarchy.ok=false reason=empty_or_too_small).
+        # 最多重试 _HIERARCHY_DUMP_MAX_RETRIES 次, 每次间隔 0.5s; 同时校验
+        # XML 是否以 '<' 开头 (排除 adb 输出错误信息) 且长度 > 200 字节。
+        _HIERARCHY_DUMP_MAX_RETRIES = 2
+        _HIERARCHY_DUMP_RETRY_DELAY_S = 0.5
+        _HIERARCHY_DUMP_MIN_BYTES = 200   # 小于此视为损坏/空文件 (50→200 更严格)
+        # 用 device_id 后缀防多设备并发写同一文件
+        _dev_tag = re.sub(r"[^a-zA-Z0-9]", "_", (device_id or "dev"))[:12]
+        _dump_path = f"/sdcard/_p1_{_dev_tag}.xml"
+        try:
+            xml = ""
+            last_fail_reason = "never_attempted"
+            for _attempt in range(_HIERARCHY_DUMP_MAX_RETRIES + 1):
+                if _attempt > 0:
+                    time.sleep(_HIERARCHY_DUMP_RETRY_DELAY_S)
+                try:
+                    subprocess.run(
+                        ["adb", "-s", device_id, "shell",
+                         "uiautomator", "dump", _dump_path],
+                        capture_output=True,
+                        timeout=min(FORENSICS_TIMEOUT_S, 8),   # 单次最长 8s
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    proc2 = subprocess.run(
+                        ["adb", "-s", device_id, "shell", "cat", _dump_path],
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace",
+                        timeout=FORENSICS_TIMEOUT_S,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    candidate = (proc2.stdout or "").strip()
+                    # 有效 XML 必须以 '<' 开头 (排除 adb 错误文字) 且足够大
+                    if candidate and candidate.startswith("<") and len(candidate) >= _HIERARCHY_DUMP_MIN_BYTES:
+                        xml = candidate
+                        break
+                    last_fail_reason = (
+                        f"empty_or_too_small (attempt={_attempt}, "
+                        f"size={len(candidate)}, "
+                        f"starts_lt={'<' if candidate else 'empty'})"
+                    )
+                except Exception as _e:
+                    last_fail_reason = f"exception: {type(_e).__name__} (attempt={_attempt})"
+
+            if xml:
+                (out_dir / "hierarchy.xml").write_text(xml, encoding="utf-8")
+                meta["hierarchy"] = {
+                    "ok": True,
+                    "size_bytes": len(xml),
+                    "attempts": _attempt + 1,
+                }
+            else:
+                meta["hierarchy"] = {
+                    "ok": False,
+                    "reason": last_fail_reason,
+                    "attempts": _HIERARCHY_DUMP_MAX_RETRIES + 1,
+                }
+        except Exception as e:
+            meta["hierarchy"] = {"ok": False, "reason": f"exception: {type(e).__name__}"}
+
+        # 3. meta.json
+        try:
+            (out_dir / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+        # 4. FIFO 滚动 — 每设备保留 N 个最新, 超出删最老
+        try:
+            _trim_pending_per_device(device_id)
+        except Exception:
+            pass
+
+        logger.info("[forensics-immediate] device=%s step=%s dir=%s",
+                    str(device_id)[:8], step_name, snap_name)
+        return snap_name
+    except Exception as e:
+        logger.debug("[forensics-immediate] failed: %s", e)
+        return None
+
+
+def _trim_pending_per_device(device_id: str) -> None:
+    """FIFO 滚动: 每设备最多保留 PENDING_PER_DEVICE_MAX 个最新快照。"""
+    dev_dir = PENDING_ROOT / _safe_seg(device_id)
+    if not dev_dir.is_dir():
+        return
+    snaps = []
+    for d in dev_dir.iterdir():
+        if d.is_dir():
+            try:
+                snaps.append((d.stat().st_mtime, d))
+            except Exception:
+                continue
+    if len(snaps) <= PENDING_PER_DEVICE_MAX:
+        return
+    snaps.sort(key=lambda x: x[0])  # 升序: 最老在前
+    for _, old in snaps[:len(snaps) - PENDING_PER_DEVICE_MAX]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def promote_pending_to_task(task_id: str, device_id: str,
+                             dst_dir: Path) -> int:
+    """task_store 触发 forensics 时, 把该设备 _pending 区所有快照 mv 到正式目录。
+
+    返回 promote 的快照数。已存在同名子目录则跳过。pending 区为空时返回 0。
+    """
+    if not device_id:
+        return 0
+    src_dev = PENDING_ROOT / _safe_seg(device_id)
+    if not src_dev.is_dir():
+        return 0
+    moved = 0
+    try:
+        for snap in list(src_dev.iterdir()):
+            if not snap.is_dir():
+                continue
+            target = dst_dir / snap.name
+            if target.exists():
+                continue
+            try:
+                shutil.move(str(snap), str(target))
+                moved += 1
+            except Exception as e:
+                logger.debug("[forensics] promote %s failed: %s", snap.name, e)
+    except Exception as e:
+        logger.debug("[forensics] promote_pending walk failed: %s", e)
+    if moved:
+        logger.info("[forensics] promoted %d pending snapshot(s) for task=%s device=%s",
+                    moved, str(task_id)[:8], str(device_id)[:8])
+    return moved
+
+
+def cleanup_orphan_pending() -> int:
+    """清理 PENDING_RETENTION_S 内未 promote 的孤儿快照。
+    server.py startup_cleanup piggyback 调用即可。"""
+    if not PENDING_ROOT.is_dir():
+        return 0
+    cutoff = time.time() - PENDING_RETENTION_S
+    cleaned = 0
+    try:
+        for dev_dir in PENDING_ROOT.iterdir():
+            if not dev_dir.is_dir():
+                continue
+            for snap in list(dev_dir.iterdir()):
+                if not snap.is_dir():
+                    continue
+                try:
+                    if snap.stat().st_mtime < cutoff:
+                        shutil.rmtree(snap, ignore_errors=True)
+                        cleaned += 1
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.debug("[forensics] cleanup_orphan_pending failed: %s", e)
+    if cleaned:
+        logger.info("[forensics] cleanup_orphan_pending removed %d orphans", cleaned)
+    return cleaned
 
 
 def _redact_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -278,6 +522,9 @@ def startup_cleanup(retention_days: int = FORENSICS_RETENTION_DAYS) -> int:
         for task_dir in FORENSICS_ROOT.iterdir():
             if not task_dir.is_dir():
                 continue
+            # P2.0: _pending 由 cleanup_orphan_pending 单独管理（30min 而非 7 days）
+            if task_dir.name == "_pending":
+                continue
             try:
                 # 用目录最后修改时间判断 (子目录新增也会刷新)
                 if task_dir.stat().st_mtime < cutoff:
@@ -290,4 +537,9 @@ def startup_cleanup(retention_days: int = FORENSICS_RETENTION_DAYS) -> int:
     if cleaned:
         logger.info("[forensics] startup_cleanup removed %d old dirs (> %d days)",
                     cleaned, retention_days)
+    # P2.0: piggyback 清理 _pending 区孤儿快照（超过 30 分钟未 promote）
+    try:
+        cleanup_orphan_pending()
+    except Exception:
+        pass
     return cleaned
