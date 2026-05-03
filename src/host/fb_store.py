@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from .database import _connect
@@ -17,6 +18,32 @@ def _now_iso() -> str:
     return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 logger = logging.getLogger(__name__)
+
+_GROUP_META_ONLY_RE = re.compile(
+    r"^\s*"
+    r"(?:公开|公開|公有|私密|私人|非公開|Public|Private)"
+    r"(?:\s*(?:小组|群组|社團|グループ|group))?"
+    r"\s*(?:[·・,，]\s*)?"
+    r"[\d,.]+(?:\s*[万萬億kKmM])?"
+    r"(?:\s*(?:位)?(?:成员|成員|members?|メンバー))?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_valid_group_record_name(group_name: str) -> bool:
+    """Reject UI metadata fragments that older discovery code could persist as groups."""
+    name = (group_name or "").strip()
+    if len(name) < 2:
+        return False
+    if _GROUP_META_ONLY_RE.match(name):
+        return False
+    if name in {
+        "公开", "公開", "公有", "私密", "私人", "非公開",
+        "Public", "Private", "Public group", "Private group",
+    }:
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -31,6 +58,10 @@ def upsert_group(device_id: str, group_name: str, *,
     """新加入或更新群信息。返回 row id。"""
     if not device_id or not group_name:
         return 0
+    if not _is_valid_group_record_name(group_name):
+        logger.info("[fb_store] skip invalid group record: %r device=%s",
+                    group_name, device_id)
+        return 0
     now = _now_iso()
     with _connect() as conn:
         row = conn.execute(
@@ -38,16 +69,22 @@ def upsert_group(device_id: str, group_name: str, *,
             (device_id, group_name),
         ).fetchone()
         if row:
+            # discovered/pending 是轻量候选状态, 不能覆盖已经 joined/visited 的群组。
+            status_expr = (
+                "CASE WHEN status IN ('joined','visited') "
+                "AND ? IN ('discovered','pending') "
+                "THEN status ELSE ? END"
+            )
             conn.execute(
                 "UPDATE facebook_groups SET group_url=COALESCE(NULLIF(?,''), group_url),"
                 " member_count=CASE WHEN ?>0 THEN ? ELSE member_count END,"
                 " language=COALESCE(NULLIF(?,''), language),"
                 " country=COALESCE(NULLIF(?,''), country),"
-                " status=?,"
+                f" status={status_expr},"
                 " preset_key=COALESCE(NULLIF(?,''), preset_key)"
                 " WHERE id=?",
                 (group_url, member_count, member_count, language, country,
-                 status, preset_key, row[0]),
+                 status, status, preset_key, row[0]),
             )
             return row[0]
         cur = conn.execute(
@@ -63,13 +100,51 @@ def upsert_group(device_id: str, group_name: str, *,
 
 def mark_group_visit(device_id: str, group_name: str,
                      extracted_count: int = 0):
+    if not _is_valid_group_record_name(group_name):
+        logger.info("[fb_store] skip invalid group visit: %r device=%s",
+                    group_name, device_id)
+        return
     with _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE facebook_groups SET last_visited_at=?, visit_count=visit_count+1,"
-            " extracted_member_count=extracted_member_count+? "
+            " extracted_member_count=extracted_member_count+?,"
+            " status=CASE WHEN status='discovered' THEN 'visited' ELSE status END "
             "WHERE device_id=? AND group_name=?",
             (_now_iso(), int(extracted_count or 0), device_id, group_name),
         )
+        if (cur.rowcount or 0) == 0 and device_id and group_name:
+            conn.execute(
+                "INSERT INTO facebook_groups"
+                " (device_id, group_name, status, joined_at, last_visited_at,"
+                "  visit_count, extracted_member_count)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (device_id, group_name, "visited", _now_iso(), _now_iso(),
+                 1, int(extracted_count or 0)),
+            )
+
+
+def group_visit_state(device_id: str, group_name: str) -> Dict[str, Any]:
+    """返回某设备对某群组的访问/提取状态。"""
+    if not device_id or not group_name:
+        return {}
+    if not _is_valid_group_record_name(group_name):
+        return {}
+    with _connect() as conn:
+        conn.row_factory = __import__("sqlite3").Row
+        row = conn.execute(
+            "SELECT id, status, visit_count, extracted_member_count,"
+            " last_visited_at FROM facebook_groups"
+            " WHERE device_id=? AND group_name=?",
+            (device_id, group_name),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def has_group_been_visited(device_id: str, group_name: str) -> bool:
+    st = group_visit_state(device_id, group_name)
+    return bool((st.get("visit_count") or 0) > 0 or st.get("status") in (
+        "visited", "joined",
+    ))
 
 
 def list_groups(device_id: Optional[str] = None,
@@ -88,7 +163,34 @@ def list_groups(device_id: Optional[str] = None,
     with _connect() as conn:
         conn.row_factory = __import__("sqlite3").Row
         rows = conn.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
+    return [
+        dict(r) for r in rows
+        if _is_valid_group_record_name(dict(r).get("group_name", ""))
+    ]
+
+
+def list_unvisited_groups(device_id: Optional[str] = None,
+                          keyword: str = "",
+                          limit: int = 50) -> List[Dict]:
+    """列出已发现但尚未访问/提取的群组候选。"""
+    sql = ("SELECT * FROM facebook_groups WHERE COALESCE(visit_count,0)=0"
+           " AND status IN ('discovered','pending','joined')")
+    params: list = []
+    if device_id:
+        sql += " AND device_id=?"
+        params.append(device_id)
+    if keyword:
+        sql += " AND group_name LIKE ?"
+        params.append(f"%{keyword}%")
+    sql += " ORDER BY joined_at DESC LIMIT ?"
+    params.append(int(limit or 50))
+    with _connect() as conn:
+        conn.row_factory = __import__("sqlite3").Row
+        rows = conn.execute(sql, params).fetchall()
+    return [
+        dict(r) for r in rows
+        if _is_valid_group_record_name(dict(r).get("group_name", ""))
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -493,7 +595,7 @@ def _sync_greeting_replied_contact_event(conn, device_id: str, peer_name: str,
 def get_funnel_metrics(device_id: Optional[str] = None,
                        since_iso: Optional[str] = None,
                        preset_key: Optional[str] = None) -> Dict[str, Any]:
-    """计算完整漏斗:浏览群 → 提取成员 → 加好友 → 通过 → 私信 → 转化。
+    """计算完整漏斗:浏览群 → 群成员打招呼准备 → 加好友 → 通过 → 私信 → 转化。
 
     Sprint 3: 支持 preset_key 切片。
     2026-04-23: 新增 greeting 专项维度
