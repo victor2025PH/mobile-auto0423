@@ -534,12 +534,21 @@ class TestMessengerUIFallback:
 
     # ── _enter_messenger_search 三级 fallback ─────────────────────────
 
-    def test_enter_search_smart_tap_hit_returns(self):
+    def test_enter_search_does_not_call_smart_tap(self):
+        """契约: Messenger 内绝不调 smart_tap (避免 Facebook package healing
+        把当前 com.facebook.orca 切回 com.facebook.katana). v23/v24 历史曾反复
+        '加回又删', 这条测试锁定该行为, 防回归.
+        """
         fb = _make_fb()
         fb.smart_tap = MagicMock(return_value=True)
-        fb._enter_messenger_search(MagicMock(), "devA")  # 不抛
-        fb.smart_tap.assert_called_once_with(
-            "Search in Messenger", device_id="devA")
+        d = MagicMock()
+        # multi-locale L2 命中即可成功 return (不必走到 coordinate / VLM)
+        obj = MagicMock(); obj.exists = MagicMock(return_value=True)
+        d.return_value = obj
+        with patch("src.app_automation.facebook.time.sleep"):
+            fb._enter_messenger_search(d, "devA")
+        # 关键契约: smart_tap 在 Messenger 入口绝不能被调用
+        fb.smart_tap.assert_not_called()
 
     def test_enter_search_multi_locale_hit(self):
         fb = _make_fb()
@@ -589,12 +598,20 @@ class TestMessengerUIFallback:
 
     # ── _tap_messenger_send 三级 fallback ───────────────────────────
 
-    def test_tap_send_smart_tap_hit(self):
+    def test_tap_send_does_not_call_smart_tap(self):
+        """契约: _tap_messenger_send 绝不调 smart_tap (理由同 search: 防 package
+        healing 把页面切回 katana). 实际入口是 multi-locale selector + composer
+        adjacent coordinate + VLM 三级 fallback.
+        """
         fb = _make_fb()
         fb.smart_tap = MagicMock(return_value=True)
-        fb._tap_messenger_send(MagicMock(), "devA")
-        fb.smart_tap.assert_called_once_with(
-            "Send message button", device_id="devA")
+        d = MagicMock()
+        # multi-locale L2 命中即可成功 return
+        obj = MagicMock(); obj.exists = MagicMock(return_value=True)
+        d.return_value = obj
+        fb._tap_messenger_send(d, "devA")
+        # 关键契约: smart_tap 在 Messenger send 入口绝不能被调用
+        fb.smart_tap.assert_not_called()
 
     def test_tap_send_multi_locale_hit(self):
         fb = _make_fb()
@@ -936,12 +953,21 @@ class TestFirstContactFallback:
 
     # ── L1 smart_tap hit ───────────────────────────────────────────
 
-    def test_l1_smart_tap_hit_returns(self):
+    def test_l1_does_not_call_smart_tap(self):
+        """契约: _tap_first_search_result 在 Messenger 内绝不调 smart_tap
+        (Messenger 包内 smart_tap 会触发 Facebook-package healing 切回 katana).
+        实际入口直接走 L2 XML 语义扫描 (_first_search_result_element).
+        """
         fb = self._mk_fb_unmocked()
         fb.smart_tap = MagicMock(return_value=True)
-        fb._tap_first_search_result(MagicMock(), "devA", "Alice")
-        fb.smart_tap.assert_called_once_with(
-            "First matching contact", device_id="devA")
+        # L2 XML element 命中即返
+        fake_el = type("E", (), {"info": {"bounds": {
+            "left": 40, "top": 300, "right": 680, "bottom": 400}}})()
+        fb._first_search_result_element = MagicMock(return_value=fake_el)
+        d = MagicMock()
+        fb._tap_first_search_result(d, "devA", "Alice")
+        # 关键契约: smart_tap 绝不能被调用
+        fb.smart_tap.assert_not_called()
 
     # ── L2 XML semantic hit ────────────────────────────────────────
 

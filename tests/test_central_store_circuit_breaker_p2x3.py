@@ -25,6 +25,11 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+# CI 环境无 psycopg2 时 ``central_customer_store`` 顶层 import 会 ModuleNotFoundError,
+# 跟原 ``test_central_customer_store.py`` 一致地走 importorskip 跳过整个文件
+# (不影响其他 P2.X-3 相关 contract 在装了 psycopg2 的环境上跑).
+pytest.importorskip("psycopg2")
+
 
 def _reset_breaker(ccs):
     ccs._init_breaker_state.update({
