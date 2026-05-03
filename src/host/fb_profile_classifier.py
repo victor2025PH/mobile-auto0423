@@ -36,6 +36,43 @@ from src.host import ollama_vlm
 
 logger = logging.getLogger(__name__)
 
+
+# 2026-05-03 v27: VLM healthcheck 全局缓存. 真机第 30 轮显示 ollama 服务挂时
+# 每候选 3 次重试浪费 ~10s, 20 候选累计超 task timeout 1200s 被 watchdog
+# 杀. 第一次 classify_images 失败后, 5 分钟内全局降级跳过 VLM (直接走 L1
+# fallback PASS), 节省 ~10s × N 候选 ≈ 数分钟. 5 分钟后自动重新探测一次,
+# 让运营恢复 ollama 后无需重启 server 自动恢复.
+_VLM_HEALTH = {
+    "down_until": 0.0,
+    "last_err": "",
+    "down_count": 0,
+}
+_VLM_DOWN_TTL_SEC = 300.0   # 5 分钟
+
+
+def _vlm_globally_down() -> bool:
+    """是否处于 VLM 全局降级窗口期内."""
+    return time.time() < _VLM_HEALTH["down_until"]
+
+
+def _mark_vlm_down(err: str) -> None:
+    """记录 VLM 故障, 触发 5 分钟全局降级."""
+    _VLM_HEALTH["down_until"] = time.time() + _VLM_DOWN_TTL_SEC
+    _VLM_HEALTH["last_err"] = (err or "")[:200]
+    _VLM_HEALTH["down_count"] = int(_VLM_HEALTH.get("down_count") or 0) + 1
+    logger.warning(
+        "[vlm-health] 标记 VLM 全局降级 5 分钟 (累计 %d 次), err=%s",
+        _VLM_HEALTH["down_count"], _VLM_HEALTH["last_err"],
+    )
+
+
+def _clear_vlm_down() -> None:
+    """VLM 调用成功时清除 down 状态."""
+    if _VLM_HEALTH["down_until"] > 0:
+        logger.info("[vlm-health] VLM 恢复, 清除全局降级状态")
+    _VLM_HEALTH["down_until"] = 0.0
+    _VLM_HEALTH["last_err"] = ""
+
 # 日文脚本检测（假名 / 汉字）
 _HIRAGANA_RE = re.compile(r"[\u3040-\u309F]")
 _KATAKANA_RE = re.compile(r"[\u30A0-\u30FF]")
@@ -544,16 +581,36 @@ def classify(
         return result
 
     # 3) L2 VLM
-    prompt = _build_vlm_prompt(persona, ctx)
-    t0 = time.time()
-    insights, meta = ollama_vlm.classify_images(
-        prompt=prompt,
-        image_paths=l2_image_paths,
-        scene="fb_profile_l2",
-        task_id=task_id,
-        device_id=device_id,
-    )
-    latency_ms = int((time.time() - t0) * 1000)
+    # v27 healthcheck: ollama 全局降级窗口内不调 classify_images, 立即走 L1
+    # fallback. 节省每候选 ~10s 重试时间.
+    if _vlm_globally_down():
+        insights = {}
+        meta = {
+            "ok": False,
+            "error": (
+                f"vlm_globally_down (last_err={_VLM_HEALTH['last_err'][:80]})"
+            ),
+            "model": "vlm_globally_down",
+        }
+        latency_ms = 0
+    else:
+        prompt = _build_vlm_prompt(persona, ctx)
+        t0 = time.time()
+        insights, meta = ollama_vlm.classify_images(
+            prompt=prompt,
+            image_paths=l2_image_paths,
+            scene="fb_profile_l2",
+            task_id=task_id,
+            device_id=device_id,
+        )
+        latency_ms = int((time.time() - t0) * 1000)
+        # v27: 调用结果反馈 healthcheck 状态
+        if meta.get("ok") and insights:
+            _clear_vlm_down()
+        elif meta.get("error") or meta.get("parse_error"):
+            _mark_vlm_down(
+                str(meta.get("error") or meta.get("parse_error") or "")
+            )
 
     # 2026-05-03 v24: VLM 不可用 (Ollama 未启动 / 模型未加载) 时 healthy
     # degradation — 真机第 25-28 轮显示 ollama 服务挂了, 所有 L2 调用 insights

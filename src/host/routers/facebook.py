@@ -458,11 +458,15 @@ FB_FLOW_PRESETS: List[dict] = [
         "steps": [
             {"type": "facebook_group_member_greet",
              "params": {"steps": ["extract_members", "add_friends"],
-                        "max_members": 20, "extract_max_members": 20,
+                        # 2026-05-03 v27: 真机第 31 轮 sent=1/5 因候选池太小
+                        # (16 候选只 1 个 search_people+add_friend 全程成功).
+                        # 扩到 40 候选给 add_friend gate / quota / 找不到目标
+                        # 等多重过滤后留够基数让 sent 接近 outreach_goal=5.
+                        "max_members": 40, "extract_max_members": 40,
                         "persona_key": _DEFAULT_PERSONA,
                         "broad_keyword": True, "discover_groups": True,
                         "max_groups": 3, "max_groups_to_extract": 3,
-                        "max_members_per_group": 20,
+                        "max_members_per_group": 40,
                         # 2026-05-03 v16: 真机 21 轮迭代发现新版 FB 已关闭非
                         # 管理员视角的 Members 列表入口 (Members tab 移除 +
                         # Member tools 菜单无 Members 选项). mutual_members /
@@ -471,7 +475,8 @@ FB_FLOW_PRESETS: List[dict] = [
                         # 用户. 必要时可加回 ["mutual_members", "contributors"]
                         # 让旧路径作 fallback.
                         "member_sources": ["feed_authors"],
-                        "feed_max_scrolls": 12,
+                        # v27: 滚屏 12→18 让候选池能撑到 max_members=40
+                        "feed_max_scrolls": 18,
                         # 2026-05-03 v21: 第 25 轮显示 fb_lead_scorer 给非完美
                         # 匹配普遍 0 分, min_l1_score=30 把所有候选全杀.
                         # 关闭预筛 (默认 0), Page 过滤独立保留. 后续运营调
