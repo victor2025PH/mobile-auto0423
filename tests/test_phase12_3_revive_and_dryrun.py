@@ -10,11 +10,18 @@
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import time
 
 import pytest
 from unittest.mock import MagicMock, patch
+
+
+def _iso_days_ago(days: int) -> str:
+    """生成 N 天前的 UTC ISO 时间戳, 替代硬编码日期防 date-rot."""
+    return (_dt.datetime.now(_dt.timezone.utc)
+            - _dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @pytest.fixture(autouse=True)
@@ -217,20 +224,20 @@ class TestSendReferralDryRun:
 class TestRecycleDeadPeers:
     def test_recycle_old_dead_peer(self, tmp_db):
         from src.host.executor import _line_pool_recycle_dead_peers
-        # 老 dead (10 天前) — 应被复活
+        # 老 dead (11 天前) — 应被复活 (>= 7 天阈值)
         _seed_l2_lead("OldDead",
             extra_tags=["referral_dead"],
             extra_meta={
                 "referral_dead_reason": "recipient_not_found",
-                "referral_dead_at": "2026-04-14T00:00:00Z",  # 11 天前 (今天 04-25)
+                "referral_dead_at": _iso_days_ago(11),
                 "referral_fail_count_recipient_not_found": 1,
             })
-        # 新 dead (1 天前) — 不该动
+        # 新 dead (1 天前) — 不该动 (< 7 天阈值)
         _seed_l2_lead("NewDead",
             extra_tags=["referral_dead"],
             extra_meta={
                 "referral_dead_reason": "recipient_not_found",
-                "referral_dead_at": "2026-04-24T00:00:00Z",
+                "referral_dead_at": _iso_days_ago(1),
                 "referral_fail_count_recipient_not_found": 1,
             })
         ok, _m, stats = _line_pool_recycle_dead_peers({"days": 7})
@@ -244,7 +251,7 @@ class TestRecycleDeadPeers:
             extra_tags=["referral_dead"],
             extra_meta={
                 "referral_dead_reason": "recipient_not_found",
-                "referral_dead_at": "2026-04-14T00:00:00Z",
+                "referral_dead_at": _iso_days_ago(11),  # >= 7 天阈值, 应被 revive
             })
         _ok, _m, stats = _line_pool_recycle_dead_peers(
             {"days": 7, "dry_run": True})
