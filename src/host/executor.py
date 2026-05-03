@@ -3719,6 +3719,13 @@ def _campaign_extract_members(fb, resolved: str, params: Dict[str, Any],
                 _kw_authors.setdefault(
                     "max_scrolls", int(params.get("feed_max_scrolls", 12))
                 )
+                # v19: 透传 L1 预筛阈值 + target_groups 给 scorer
+                _kw_authors["min_l1_score"] = int(
+                    params.get("min_l1_score", 30)
+                )
+                _kw_authors["target_groups"] = (
+                    params.get("target_groups") or []
+                )
                 members_g = fb.extract_group_feed_authors(**_kw_authors) or []
             else:
                 members_g = fb.extract_group_members(**kwargs) or []

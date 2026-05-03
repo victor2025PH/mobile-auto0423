@@ -472,6 +472,7 @@ FB_FLOW_PRESETS: List[dict] = [
                         # 让旧路径作 fallback.
                         "member_sources": ["feed_authors"],
                         "feed_max_scrolls": 12,
+                        "min_l1_score": 30,
                         "auto_join_groups": True, "join_if_needed": True,
                         "skip_visited": True,
                         "max_friends_per_run": 5,

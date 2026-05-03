@@ -7506,9 +7506,15 @@ class FacebookAutomation(BaseAutomation):
                         name = self._clean_group_member_candidate_name(raw_name)
                         if not name or name in seen_names:
                             continue
-                        # 过滤明显是页面 / 群组 / 不是真人的名字
+                        # 2026-05-03 v19 (真机 24 轮反馈): 加严 Page / 商家 /
+                        # 媒体名过滤. 从 dump 看 'ホテル ニュー' 这类 Page 会被
+                        # 抓为帖子作者. 启发式过滤明显非个人名字.
+                        _name_low = name.lower()
                         if any(kw in name for kw in (
-                            "Page", "Group", "页面", "公页",
+                            "Page", "Group", "页面", "公页", "公式",
+                            "Official", "official", "Channel",
+                            "ホテル", "Hotel", "Shop", "Store",
+                            "Co.", "Inc.", "Ltd",
                         )):
                             continue
                         seen_names.add(name)
@@ -7546,6 +7552,47 @@ class FacebookAutomation(BaseAutomation):
                 hint=f"group={group_name!r} max_scrolls={max_scrolls}",
                 reason="feed authors not found in scrolled posts",
             )
+
+        # 2026-05-03 v19 L1 启发式预筛: 真机第 24 轮 20 候选全被 L2 视觉 gate
+        # reject (男性/罗马字/Page 等非目标画像), 浪费每候选 ~30 秒 search_people
+        # + ~15 秒 visual gate = ~750 秒/全池. 在抽取阶段就用 fb_lead_scorer 的
+        # 启发式 (姓名语言/性别/群质量) 算 L1 score, 过滤 score < min_l1_score
+        # 的明显非目标. 留下的进 L2 (视觉) 命中率显著提升.
+        # 预算: 默认 min_l1_score=30 (保留 tier C 及以上, 过滤 D).
+        _min_l1 = max(0, int(_kw.get("min_l1_score", 30)))
+        if _min_l1 > 0 and members:
+            try:
+                from src.ai.fb_lead_scorer import score_member as _score_member
+                _filtered: List[Dict[str, Any]] = []
+                _dropped = 0
+                for _m in members:
+                    try:
+                        _r = _score_member(
+                            _m.get("name", ""),
+                            source_group=group_name,
+                            target_country=target_country or "",
+                            target_groups=_kw.get("target_groups") or None,
+                        ) or {}
+                    except Exception:
+                        _filtered.append(_m)   # scorer fail 不过滤 (保守)
+                        continue
+                    _s = int(_r.get("score") or 0)
+                    if _s >= _min_l1:
+                        _m["l1_score"] = _s
+                        _m["l1_tier"] = _r.get("tier", "")
+                        _m["l1_reasons"] = _r.get("reasons", [])
+                        _filtered.append(_m)
+                    else:
+                        _dropped += 1
+                log.info(
+                    "[extract_authors] L1 prefilter: kept=%d dropped=%d "
+                    "(min_l1=%d)",
+                    len(_filtered), _dropped, _min_l1,
+                )
+                members = _filtered
+            except Exception as _l1_e:
+                log.warning("[extract_authors] L1 prefilter failed: %s",
+                              _l1_e)
 
         try:
             self._last_group_member_source = member_source or "feed_authors"
