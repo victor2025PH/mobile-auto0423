@@ -57,6 +57,14 @@ def check_add_friend_gate(device_id: str, params: Dict[str, Any]) -> Tuple[Optio
     * ``skip_add_friend_gate`` / ``force_add_friend`` → 不拦
     """
     meta: Dict[str, Any] = {"card_type": "fb_add_friend_gate"}
+    try:
+        from src.host.fb_playbook import local_rules_disabled
+        if local_rules_disabled():
+            meta["skipped"] = True
+            meta["reason"] = "local_rules_disabled"
+            return None, meta
+    except Exception:
+        pass
     if not device_id:
         meta["reason"] = "no_device_id"
         return None, meta
@@ -112,6 +120,14 @@ def check_send_greeting_gate(device_id: str,
     count_outgoing_messages_since(ai_decision='greeting')。
     """
     meta: Dict[str, Any] = {"card_type": "fb_send_greeting_gate"}
+    try:
+        from src.host.fb_playbook import local_rules_disabled
+        if local_rules_disabled():
+            meta["skipped"] = True
+            meta["reason"] = "local_rules_disabled"
+            return None, meta
+    except Exception:
+        pass
     if not device_id:
         meta["reason"] = "no_device_id"
         return None, meta
