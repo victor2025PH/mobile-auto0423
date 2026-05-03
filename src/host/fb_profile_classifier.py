@@ -555,9 +555,36 @@ def classify(
     )
     latency_ms = int((time.time() - t0) * 1000)
 
-    passed, match_reasons = _evaluate_match(persona, insights) if insights else (False, ["VLM 返回为空"])
-    l2_score = _score_l2(insights, passed)
-    confidence = float(insights.get("overall_confidence", 0) or 0)
+    # 2026-05-03 v24: VLM 不可用 (Ollama 未启动 / 模型未加载) 时 healthy
+    # degradation — 真机第 25-28 轮显示 ollama 服务挂了, 所有 L2 调用 insights
+    # 空, passed=False, score=0, 100% reject. 但 L1 (姓名启发式) 已经能给出
+    # 合理判别. fallback: 当 insights 空 + meta 含 vlm_error 时, 用 L1 score
+    # 作为 L2 score, 高分 (>=50) 直接 PASS, 让 L1-strong 候选不被 VLM 故障拖
+    # 累. 运营恢复 ollama 后行为自动回归原样 (insights 非空走原路径).
+    _vlm_error = meta.get("error") or meta.get("parse_error", "")
+    _vlm_ok = bool(meta.get("ok", False)) and bool(insights)
+    if not _vlm_ok and _vlm_error:
+        # VLM 故障降级
+        _l1_high = l1_score >= 50
+        passed = _l1_high
+        match_reasons = [
+            f"vlm_unavailable_l1_fallback (l1={l1_score}, "
+            f"l1_high={_l1_high}, vlm_err={_vlm_error[:60]})"
+        ]
+        insights = insights or {}
+        l2_score = float(l1_score) if _l1_high else 0.0
+        confidence = 0.0
+        logger.warning(
+            "[classify] VLM 故障 L1 降级: name=%r l1=%d passed=%s vlm_err=%s",
+            display_name, l1_score, passed, _vlm_error[:80],
+        )
+    else:
+        passed, match_reasons = (
+            _evaluate_match(persona, insights) if insights
+            else (False, ["VLM 返回为空"])
+        )
+        l2_score = _score_l2(insights, passed)
+        confidence = float(insights.get("overall_confidence", 0) or 0)
 
     result["stage_reached"] = "L2"
     result["l2"] = {
