@@ -1270,6 +1270,119 @@ class FacebookAutomation(BaseAutomation):
         except Exception:
             return False
 
+    # 2026-05-03 v20 P1-B 雏形: 主页二次确认数据采集.
+    # 用户原需求: "进个人主页 → 下翻看贴子 → 再次分析是否目标客户".
+    # 当前 phase10_l2 视觉 gate 只看 profile 顶部头像+简介, 不读贴子内容.
+    # 此 helper 采集 profile 页最近 N 条贴子文本, 后续可接 LLM/视觉
+    # gate 的 prompt 做更精准判别 (P1-B 完整链路).
+    _PROFILE_POST_TEXT_SKIP_KEYWORDS = (
+        "Like", "Comment", "Share", "Reply",
+        "Add Friend", "Add friend", "Send Message", "Message",
+        "Follow", "Following", "Unfollow",
+        "ago", "Public", "Private",
+        "See more", "See translation",
+        "ライク", "コメント", "シェア",
+        "友達になる", "メッセージ", "フォロー",
+        "点赞", "评论", "分享", "添加好友",
+    )
+
+    def inspect_user_profile_posts(self, device_id: Optional[str] = None,
+                                    max_posts: int = 5,
+                                    max_scrolls: int = 4,
+                                    min_post_chars: int = 20,
+                                    max_post_chars: int = 800,
+                                    ) -> Dict[str, Any]:
+        """主页二次确认数据采集 (P1-B 雏形).
+
+        前提: 调用方已经把设备页面带到目标用户的 FB 个人资料页.
+        策略: 滚屏 N 次, 每次 dump 找到 text 长度 20-800 的非 UI 文本节点,
+        视为贴子正文. 去重收集前 N 条返回.
+
+        Returns:
+            {
+                "ok": bool,
+                "posts": List[str],   # 贴子正文列表 (按出现顺序)
+                "scrolls_used": int,
+                "reason": str,        # 失败原因 (ok=True 时为空)
+            }
+
+        集成方向 (P1-B 完整版):
+          1. add_friend_and_greet 在 tap profile 后调本 helper 采集 posts
+          2. posts 拼到 phase10_l2 gate 的 LLM prompt
+          3. LLM 综合 头像+简介+贴子内容 判定 is_target
+        """
+        did = self._did(device_id)
+        d = self._u2(did)
+        if not self._is_likely_fb_profile_page(d):
+            return {
+                "ok": False,
+                "posts": [],
+                "scrolls_used": 0,
+                "reason": "not_on_profile_page",
+            }
+        posts: List[str] = []
+        seen: set = set()
+        scrolls_used = 0
+        skip_kws = self._PROFILE_POST_TEXT_SKIP_KEYWORDS
+        try:
+            from ..vision.screen_parser import XMLParser
+        except Exception as e:
+            return {
+                "ok": False,
+                "posts": [],
+                "scrolls_used": 0,
+                "reason": f"parser_import_fail:{e}",
+            }
+        for _ in range(max(1, max_scrolls)):
+            if len(posts) >= max_posts:
+                break
+            try:
+                xml = d.dump_hierarchy() or ""
+            except Exception:
+                xml = ""
+            if not xml:
+                break
+            for node in XMLParser.parse(xml):
+                if len(posts) >= max_posts:
+                    break
+                txt = (getattr(node, "text", "") or "").strip()
+                if not txt:
+                    continue
+                if not (min_post_chars <= len(txt) <= max_post_chars):
+                    continue
+                # 跳过 UI 按钮 / 时间戳类短文本
+                _low = txt.lower()
+                if any(kw.lower() in _low for kw in skip_kws):
+                    # UI 词命中 → 大概率非贴子内容
+                    continue
+                # 去重 (相同文本只取一次)
+                _key = txt[:80]
+                if _key in seen:
+                    continue
+                seen.add(_key)
+                posts.append(txt)
+            scrolls_used += 1
+            if len(posts) >= max_posts:
+                break
+            try:
+                self.hb.scroll_down(d)
+            except Exception:
+                try:
+                    d.swipe(0.5, 0.78, 0.5, 0.32, duration=0.35)
+                except Exception:
+                    pass
+            self.hb.wait_read(random.randint(1200, 2200))
+        log.info(
+            "[inspect_profile] collected posts=%d scrolls=%d",
+            len(posts), scrolls_used,
+        )
+        return {
+            "ok": True,
+            "posts": posts[:max_posts],
+            "scrolls_used": scrolls_used,
+            "reason": "",
+        }
+
     def navigate_to_profile(self, candidate: str,
                             device_id: Optional[str] = None,
                             post_open_dwell_sec: Tuple[float, float] = (2.5, 4.0),
