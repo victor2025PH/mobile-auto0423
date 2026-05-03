@@ -182,6 +182,174 @@ def _post_create_task(base: str, payload: dict, timeout: int = 10) -> dict:
 # 切换客群时只需改 YAML 的 default_persona 字段并调 /facebook/presets/reload。
 _DEFAULT_PERSONA = "jp_female_midlife"
 
+
+_JP_MIDLIFE_FAMILY_NAMES = [
+    "佐藤", "鈴木", "高橋", "田中", "渡辺", "伊藤", "山本", "中村",
+    "小林", "加藤", "吉田", "山田", "佐々木", "山口", "松本", "井上",
+    "木村", "林", "清水", "山崎", "森", "池田", "橋本", "阿部",
+]
+
+_JP_MIDLIFE_GIVEN_NAMES = [
+    "恵子", "裕子", "陽子", "直子", "智子", "美穂", "由美", "久美子",
+    "真由美", "香織", "美香", "由美子", "恵美", "真理子", "千恵", "紀子",
+    "幸子", "明美", "典子", "里美", "佳代", "和美", "順子", "雅子",
+    "玲子", "尚子", "美智子", "良子", "昭子", "洋子", "京子", "早苗",
+    "花子", "美咲",
+]
+
+_JP_MIDLIFE_NAME_PACKS: Dict[str, List[str]] = {
+    "37_45": ["美香", "香織", "美穂", "恵美", "由美", "千恵", "直子", "佳代"],
+    "46_55": ["真由美", "由美子", "智子", "陽子", "里美", "紀子", "和美", "尚子"],
+    "56_60": ["恵子", "裕子", "幸子", "典子", "雅子", "玲子", "京子", "洋子"],
+}
+
+
+def _split_name_targets(raw: Any) -> List[dict]:
+    """Normalize name-hunter input into ``[{"name": "..."}]`` with stable dedupe."""
+    import re as _re
+
+    rows: List[dict] = []
+
+    def _push(name: str, meta: Optional[dict] = None) -> None:
+        nm = str(name or "").strip()
+        if not nm:
+            return
+        item = {"name": nm}
+        if meta:
+            for k, v in meta.items():
+                if k != "name" and v not in (None, ""):
+                    item[k] = v
+        rows.append(item)
+
+    if isinstance(raw, str):
+        for line in _re.split(r"[,\n;、，；\t]+", raw):
+            _push(line)
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                _push(item)
+            elif isinstance(item, dict):
+                _push(str(item.get("name") or ""), item)
+
+    seen = set()
+    out: List[dict] = []
+    for item in rows:
+        key = str(item.get("name") or "").replace(" ", "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _generate_jp_midlife_names(count: int = 30, age_pack: str = "mixed") -> List[dict]:
+    """Return deterministic Japanese female-name seeds suitable for manual review."""
+    count = max(1, min(int(count or 30), 200))
+    pack = str(age_pack or "mixed")
+    if pack in _JP_MIDLIFE_NAME_PACKS:
+        given = list(_JP_MIDLIFE_NAME_PACKS[pack])
+    else:
+        given = list(_JP_MIDLIFE_GIVEN_NAMES)
+    names: List[dict] = []
+    for i in range(count):
+        family = _JP_MIDLIFE_FAMILY_NAMES[i % len(_JP_MIDLIFE_FAMILY_NAMES)]
+        g = given[(i * 7 + i // len(_JP_MIDLIFE_FAMILY_NAMES)) % len(given)]
+        names.append({
+            "name": f"{family}{g}",
+            "source": f"jp_female_common_name:{pack}",
+        })
+    return _split_name_targets(names)
+
+
+def _score_name_hunter_target(target: dict, persona_ctx: dict) -> dict:
+    """Static pre-search score; profile/VLM stages still decide final customer match."""
+    name = str((target or {}).get("name") or "").strip()
+    compact = name.replace(" ", "")
+    reasons: List[str] = []
+    score = 0
+
+    if any(ch in compact for ch in _JP_MIDLIFE_FAMILY_NAMES):
+        score += 25
+        reasons.append("日本常见姓氏")
+    if any(ch in compact for ch in _JP_MIDLIFE_GIVEN_NAMES):
+        score += 35
+        reasons.append("37岁以上女性常见名")
+    if any("\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff" for ch in compact):
+        score += 15
+        reasons.append("日文姓名字符")
+    if (persona_ctx or {}).get("country_code") == "JP":
+        score += 10
+        reasons.append("目标客群为日本")
+    if (persona_ctx or {}).get("gender") == "female":
+        score += 10
+        reasons.append("目标客群为女性")
+
+    age_min = (persona_ctx or {}).get("age_min")
+    age_max = (persona_ctx or {}).get("age_max")
+    if age_min and int(age_min) >= 35:
+        score += 5
+        reasons.append(f"年龄画像 {age_min}-{age_max or '?'}")
+
+    score = min(score, 100)
+    if score >= 80:
+        stage = "high_confidence_seed"
+        action = "preview_then_confirm"
+    elif score >= 50:
+        stage = "review_required"
+        action = "manual_review"
+    else:
+        stage = "weak_seed"
+        action = "skip_or_enrich"
+    return {
+        **target,
+        "score": score,
+        "stage": stage,
+        "recommended_action": action,
+        "reasons": reasons or ["仅作为姓名种子，需搜索资料确认"],
+    }
+
+
+def _validate_preset_inputs(preset: dict, provided: dict, persona_ctx: dict) -> List[dict]:
+    """根据 preset.needs_input + input_schema 校验已规范化的入参。
+
+    ``provided`` 是经过字符串拆分、persona 兜底之后的实际值字典。
+    返回缺失字段列表（每项 {field, label, schema}）；为空表示通过。
+
+    支持 ``input_schema[field].fallback_from`` 声明回退源：
+      * ``persona.seed_group_keywords`` — 当 persona_ctx 该键非空时视为已填
+    """
+    needs = preset.get("needs_input") or []
+    schema = preset.get("input_schema") or {}
+    missing: List[dict] = []
+    for field in needs:
+        spec = schema.get(field) or {}
+        if not spec.get("required", True):
+            continue
+        val = provided.get(field)
+        # "已填"语义：list/str 非空 / int 非 None / 其它真值
+        filled = False
+        if isinstance(val, (list, tuple)):
+            filled = len(val) > 0
+        elif isinstance(val, str):
+            filled = bool(val.strip())
+        elif val is not None:
+            filled = bool(val)
+        if filled:
+            continue
+        # fallback 路径
+        fb_path = spec.get("fallback_from") or ""
+        if fb_path == "persona.seed_group_keywords":
+            seeds = persona_ctx.get("seed_group_keywords") or []
+            if seeds:
+                continue
+        missing.append({
+            "field": field,
+            "label": spec.get("label") or field,
+            "schema": spec,
+        })
+    return missing
+
+
 FB_FLOW_PRESETS: List[dict] = [
     {
         "key": "warmup",
@@ -203,13 +371,28 @@ FB_FLOW_PRESETS: List[dict] = [
     },
     {
         "key": "group_hunter",
-        "name": "🎯 圈层拓客",
+        "name": "🎯 社群客服拓展",
         "color": "#f59e0b",
-        "label": "猎客机",
-        "desc": "进群浏览 + 评论曝光 + 提取群成员",
-        "detail": "FB 引流核心入口,日采 30-50 精准女性成员",
+        "label": "社群机",
+        "desc": "进群浏览 + 评论互动 + 群成员打招呼",
+        "detail": "FB 社群客服拓展入口,每日按节奏联系 30-50 位匹配成员",
         "estimated_minutes": 60,
         "estimated_output": "20-40 潜在线索",
+        "needs_input": ["target_groups"],
+        "input_schema": {
+            "target_groups": {
+                "type": "list_str", "label": "目标群组（一行一个，1-3 个）",
+                "required": True, "min": 1, "max": 3,
+                "placeholder": "ペット\nカレー\nママ友",
+                "help": "可填宽关键词或群组名；系统会先搜索相关群组，记录已进入/已申请/已沟通准备状态。"
+                        "若 persona 已配 seed_group_keywords 可留空使用默认。",
+                "fallback_from": "persona.seed_group_keywords",
+            },
+            "max_members": {
+                "type": "int", "label": "每群最多打招呼成员数",
+                "default": 20, "min": 5, "max": 100,
+            },
+        },
         "steps": [
             {"type": "facebook_browse_groups",
              "params": {"max_groups": 2, "persona_key": _DEFAULT_PERSONA}},
@@ -217,29 +400,105 @@ FB_FLOW_PRESETS: List[dict] = [
              "params": {"max_posts": 5, "comment_probability": 0.15,
                         "like_probability": 0.40, "persona_key": _DEFAULT_PERSONA}},
             {"type": "facebook_extract_members",
-             "params": {"max_members": 20, "persona_key": _DEFAULT_PERSONA}},
+             "params": {"max_members": 20, "persona_key": _DEFAULT_PERSONA,
+                        "broad_keyword": True, "discover_groups": True,
+                        "max_groups": 3, "max_groups_to_extract": 3,
+                        "max_members_per_group": 20,
+                        "auto_join_groups": True, "join_if_needed": True,
+                        "skip_visited": True}},
         ],
     },
     {
         "key": "friend_growth",
-        "name": "👥 好友拓展",
+        "name": "👥 好友打招呼",
         "color": "#60a5fa",
-        "label": "拓展机",
-        "desc": "群成员 → 进主页 → 带验证语好友请求 → 打招呼 DM",
+        "label": "招呼机",
+        "desc": "群成员 → 进主页筛选 → 带验证语好友请求 → 打招呼 DM",
         "detail": "通过率 25-35%;日本女性保守档每号每日 15 请求 + 上限 8 条打招呼;"
                   "打招呼走 profile 页 Message 按钮（方案 A2，全程不换 app）",
         "estimated_minutes": 75,
         "estimated_output": "4-6 通过好友 + 3-5 条打招呼曝光",
+        "needs_input": ["target_groups", "verification_note", "greeting"],
+        "input_schema": {
+            "target_groups": {
+                "type": "list_str", "label": "目标群组（用于打招呼）",
+                "required": True, "min": 1, "max": 3,
+                "placeholder": "ペット\nカレー\nママ友",
+                "help": "至少 1 个宽关键词或群组名；任务会先发现相关群、入群/记录状态、整理成员，再发好友请求。",
+                "fallback_from": "persona.seed_group_keywords",
+            },
+            "verification_note": {
+                "type": "text", "label": "好友请求验证语",
+                "required": True, "max_chars": 60,
+                "placeholder": "您好🌸看到我们都在 XX 群，想认识下志同道合的朋友 ☺️",
+                "help": "FB 好友请求的「打招呼」字段，60 字内。强烈建议带情境（同群/同兴趣）。",
+                "ai_assist": True,
+            },
+            "greeting": {
+                "type": "text", "label": "通过后首条打招呼话术",
+                "required": True, "max_chars": 200,
+                "placeholder": "您好～我也是关注美食的，请多多指教 🌸",
+                "help": "好友通过后通过 Profile→Message 发送的首条 DM。AI 可基于 persona 生成。",
+                "ai_assist": True,
+            },
+            "max_friends_per_run": {
+                "type": "int", "label": "本次最多发出的好友请求数（节流上限）",
+                "default": 5, "min": 1, "max": 15,
+                "help": "单次任务在一个时间窗内的硬节流上限，达到即停。保守档建议 ≤5；"
+                        "日本中年女性人设硬上限 8。注意：这是节流，不是任务完成的目标线。",
+            },
+            "outreach_goal": {
+                "type": "int", "label": "本次目标完成数（业务目标）",
+                "default": 5, "min": 1, "max": 15,
+                "help": "任务完成判定线：成功发出好友请求数 ≥ 该值才记为「业务达成」，"
+                        "否则任务以「outreach_goal_not_met」结束。"
+                        "通常等于 max_friends_per_run；调小可让任务更早判达成。",
+            },
+        },
         "steps": [
-            {"type": "facebook_extract_members",
-             "params": {"max_members": 20, "persona_key": _DEFAULT_PERSONA}},
-            {"type": "facebook_campaign_run",
-             "params": {"steps": ["add_friends"], "max_friends_per_run": 5,
+            {"type": "facebook_group_member_greet",
+             "params": {"steps": ["extract_members", "add_friends"],
+                        # 2026-05-03 v27: 真机第 31 轮 sent=1/5 因候选池太小
+                        # (16 候选只 1 个 search_people+add_friend 全程成功).
+                        # 扩到 40 候选给 add_friend gate / quota / 找不到目标
+                        # 等多重过滤后留够基数让 sent 接近 outreach_goal=5.
+                        "max_members": 40, "extract_max_members": 40,
+                        "persona_key": _DEFAULT_PERSONA,
+                        "broad_keyword": True, "discover_groups": True,
+                        "max_groups": 3, "max_groups_to_extract": 3,
+                        "max_members_per_group": 40,
+                        # 2026-05-03 v16: 真机 21 轮迭代发现新版 FB 已关闭非
+                        # 管理员视角的 Members 列表入口 (Members tab 移除 +
+                        # Member tools 菜单无 Members 选项). mutual_members /
+                        # contributors 池长期产出 0. feed_authors 路径从帖子流
+                        # 提取作者作为候选 — 绕过权限限制, 候选都是活跃发帖
+                        # 用户. 必要时可加回 ["mutual_members", "contributors"]
+                        # 让旧路径作 fallback.
+                        "member_sources": ["feed_authors"],
+                        # v27: 滚屏 12→18 让候选池能撑到 max_members=40
+                        "feed_max_scrolls": 18,
+                        # 2026-05-03 v21: 第 25 轮显示 fb_lead_scorer 给非完美
+                        # 匹配普遍 0 分, min_l1_score=30 把所有候选全杀.
+                        # 关闭预筛 (默认 0), Page 过滤独立保留. 后续运营调
+                        # scorer 后再开启此阈值.
+                        "min_l1_score": 0,
+                        "auto_join_groups": True, "join_if_needed": True,
+                        "skip_visited": True,
+                        "max_friends_per_run": 5,
+                        "outreach_goal": 5,
                         "verification_note": "",
                         "greeting": "",
                         "send_greeting_inline": True,
                         "require_verification_note": True,
-                        "persona_key": _DEFAULT_PERSONA}},
+                        "require_outreach_goal": True,
+                        # 2026-05-03 v28: 切换到智谱 GLM-4V-flash 云端视觉
+                        # 模型, 不占本地内存, 延迟 ~4s. 重新开启 L2 双层判
+                        # 别 (L1 名字/群质量启发式 + L2 视觉 LLM 看头像).
+                        "do_l2_gate": True,
+                        "strict_persona_gate": True,
+                        "l2_gate_shots": 2,
+                        "walk_candidates": True,
+                        "max_l2_calls": 5}},
         ],
     },
     {
@@ -262,6 +521,13 @@ FB_FLOW_PRESETS: List[dict] = [
                         "greeting": "",
                         "send_greeting_inline": True,
                         "require_verification_note": True,
+                        "require_high_match": True,
+                        "min_seed_score": 80,
+                        "do_l2_gate": True,
+                        "strict_persona_gate": True,
+                        "l2_gate_shots": 2,
+                        "walk_candidates": True,
+                        "max_l2_calls": 5,
                         "add_friend_targets": [],   # 运行时由前端填充: [{"name": "山田花子"}, ...]
                         "persona_key": _DEFAULT_PERSONA}},
         ],
@@ -288,10 +554,10 @@ FB_FLOW_PRESETS: List[dict] = [
     },
     {
         "key": "full_funnel",
-        "name": "⚡ 全链路获客",
+        "name": "⚡ 全链路客服拓展",
         "color": "#ef4444",
         "label": "全程机",
-        "desc": "养号 → 进群 → 提取 → 加好友 → 收件,完整闭环",
+        "desc": "养号 → 进群 → 群成员打招呼 → 加好友 → 收件,完整闭环",
         "detail": "日常首选,日本女性保守档每号每日 3-6 个 LINE 引流",
         "estimated_minutes": 150,
         "estimated_output": "3-6 个 LINE 引流",
@@ -381,6 +647,254 @@ def get_active_persona(persona_key: Optional[str] = None):
         "yaml_default_key": get_yaml_default_persona_key(),
         "override_key": read_active_persona_override(),
     }
+
+
+@router.post("/name-hunter/suggest")
+def post_name_hunter_suggest(body: dict = Body(default={})):
+    """生成日本女性常用名种子。
+
+    这里只生成“搜索入口”，不是客户判定结果；最终是否 37 岁以上女性仍由
+    profile 资料与 L1/L2 画像识别确认。
+    """
+    persona_key = body.get("persona_key") or get_default_persona_key()
+    persona = get_persona_display(persona_key)
+    names = _generate_jp_midlife_names(
+        count=int(body.get("count") or 30),
+        age_pack=str(body.get("age_pack") or "mixed"),
+    )
+    rows = [_score_name_hunter_target(n, persona) for n in names]
+    return {
+        "ok": True,
+        "persona": persona,
+        "count": len(rows),
+        "names": rows,
+        "note": "姓名仅用于搜索入口；需搜索资料并确认画像后再触达。",
+    }
+
+
+@router.post("/name-hunter/preview")
+def post_name_hunter_preview(body: dict = Body(default={})):
+    """预处理点名添加名单：拆分、去重、静态评分、给出执行建议。"""
+    persona_key = body.get("persona_key") or get_default_persona_key()
+    persona = get_persona_display(persona_key)
+    raw = body.get("names")
+    if raw is None:
+        raw = body.get("add_friend_targets") or []
+    targets = _split_name_targets(raw)
+    scored = [_score_name_hunter_target(t, persona) for t in targets]
+    source_ref = body.get("source_ref") or "name_hunter"
+    source_quality = {
+        "source_ref": source_ref,
+        "source_health": "new",
+        "qualified_rate": 0.0,
+        "recommended_action": "collect_more_prescreen",
+    }
+    try:
+        from src.host.fb_targets_store import name_hunter_source_quality
+        source_quality = name_hunter_source_quality(persona_key=persona_key, source_ref=source_ref)
+    except Exception:
+        pass
+    if source_quality.get("source_health") == "degraded":
+        for row in scored:
+            row["score"] = max(0, int(row.get("score") or 0) - 15)
+            row["stage"] = (
+                "high_confidence_seed" if row["score"] >= 80
+                else ("review_required" if row["score"] >= 50 else "weak_seed")
+            )
+            row["recommended_action"] = "manual_review"
+            row.setdefault("reasons", []).append("来源名字包历史 qualified 率偏低，自动降权")
+    if body.get("persist", True):
+        try:
+            from src.host.fb_targets_store import upsert_name_hunter_candidate
+            for row in scored:
+                s = float(row.get("score") or 0)
+                st = "seeded" if s >= 80 else ("review_required" if s >= 50 else "weak_seed")
+                row["candidate_id"] = upsert_name_hunter_candidate(
+                    name=row.get("name") or "",
+                    persona_key=persona_key,
+                    seed_score=s,
+                    seed_stage=row.get("stage") or "",
+                    status=st,
+                    source_ref=source_ref or row.get("source") or "name_hunter",
+                    insights={
+                        "reasons": row.get("reasons") or [],
+                        "recommended_action": row.get("recommended_action") or "",
+                        "source": source_ref or row.get("source") or "name_hunter",
+                        "source_quality": source_quality,
+                    },
+                )
+        except Exception as e:
+            logger.debug("[name_hunter_preview] candidate persist skipped: %s", e)
+    high = [r for r in scored if r["score"] >= 80]
+    review = [r for r in scored if 50 <= r["score"] < 80]
+    weak = [r for r in scored if r["score"] < 50]
+    return {
+        "ok": True,
+        "persona": persona,
+        "input_count": len(targets),
+        "unique_count": len(scored),
+        "high_confidence_count": len(high),
+        "review_required_count": len(review),
+        "weak_count": len(weak),
+        "launch_targets": high,
+        "rows": scored,
+        "source_quality": source_quality,
+        "policy": {
+            "default_launch_mode": "confirm_then_launch",
+            "auto_touch_allowed": False,
+            "minimum_score_for_launch": 80,
+            "strict_profile_l2_required": True,
+            "qualified_requires_age_37plus_evidence": True,
+            "age_band_30s_requires_manual_review": True,
+        },
+    }
+
+
+@router.get("/name-hunter/candidates")
+def get_name_hunter_candidates(persona_key: Optional[str] = None,
+                               status: str = "",
+                               q: str = "",
+                               min_seed_score: int = 0,
+                               limit: int = 100):
+    """候选资料池：展示点名添加产生并持续更新的候选。"""
+    pk = persona_key or get_default_persona_key()
+    try:
+        from src.host.fb_targets_store import list_name_hunter_candidates
+        rows = list_name_hunter_candidates(
+            persona_key=pk,
+            status=status.strip(),
+            q=q.strip(),
+            min_seed_score=float(min_seed_score or 0),
+            limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"query candidates failed: {e}") from e
+    return {
+        "ok": True,
+        "persona": get_persona_display(pk),
+        "items": rows,
+        "count": len(rows),
+        "policy": {
+            "touch_requires_status": "qualified",
+            "touch_requires_profile_l2": True,
+            "minimum_seed_score": 80,
+        },
+    }
+
+
+@router.get("/name-hunter/stats")
+def get_name_hunter_stats(persona_key: Optional[str] = None):
+    """名字包/候选池运营复盘统计。"""
+    pk = persona_key or get_default_persona_key()
+    try:
+        from src.host.fb_targets_store import name_hunter_stats
+        stats = name_hunter_stats(persona_key=pk)
+    except Exception as e:
+        raise HTTPException(500, f"query name hunter stats failed: {e}") from e
+    return {"ok": True, "persona": get_persona_display(pk), **stats}
+
+
+@router.post("/name-hunter/candidates/{candidate_id}/action")
+def post_name_hunter_candidate_action(candidate_id: int, body: dict = Body(default={})):
+    """候选池人工操作：拉黑、重筛、标记 qualified/rejected。"""
+    action = (body.get("action") or "").strip().lower()
+    if action not in {"blocklist", "requeue", "qualify", "reject"}:
+        raise HTTPException(400, "action 必须是 blocklist/requeue/qualify/reject")
+    try:
+        from src.host.fb_targets_store import add_to_blocklist, get_target, mark_status
+        target = get_target(candidate_id)
+        if not target:
+            raise HTTPException(404, "candidate not found")
+        name = target.get("display_name") or target.get("identity_key") or ""
+        if action == "blocklist":
+            add_to_blocklist(name, reason=body.get("reason") or "name_hunter_manual")
+            status = "opt_out"
+            mark_status(candidate_id, status, device_id=body.get("device_id") or "",
+                        extra_fields={"qualified": 0})
+        elif action == "requeue":
+            status = "seeded"
+            mark_status(candidate_id, status, device_id=body.get("device_id") or "",
+                        extra_fields={"qualified": 0})
+        elif action == "qualify":
+            status = "qualified"
+            mark_status(candidate_id, status, device_id=body.get("device_id") or "",
+                        extra_fields={"qualified": 1})
+        else:
+            status = "rejected"
+            mark_status(candidate_id, status, device_id=body.get("device_id") or "",
+                        extra_fields={"qualified": 0})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"candidate action failed: {e}") from e
+    return {"ok": True, "candidate_id": candidate_id, "action": action, "status": status}
+
+
+@router.post("/name-hunter/prescreen")
+def post_name_hunter_prescreen(body: dict = Body(default={})):
+    """创建“只搜索资料+画像识别”的点名预筛任务，不触达。"""
+    device_id = (body.get("device_id") or "").strip()
+    if not device_id:
+        raise HTTPException(400, "device_id 必填")
+    persona_key = body.get("persona_key") or get_default_persona_key()
+    params = {
+        "persona_key": persona_key,
+        "max_targets": int(body.get("max_targets") or 20),
+        "min_seed_score": float(body.get("min_seed_score") or 80),
+        "status": body.get("status") or "seeded",
+        "shot_count": int(body.get("shot_count") or 3),
+        "inter_target_min_sec": float(body.get("inter_target_min_sec") or 20),
+        "inter_target_max_sec": float(body.get("inter_target_max_sec") or 34),
+    }
+    if body.get("candidates"):
+        params["candidates"] = body.get("candidates")
+    try:
+        from src.host.task_store import create_task
+        tid = create_task("facebook_name_hunter_prescreen", device_id, params)
+    except Exception as e:
+        raise HTTPException(500, f"create prescreen task failed: {e}") from e
+    return {"ok": True, "task_id": tid, "type": "facebook_name_hunter_prescreen"}
+
+
+@router.post("/name-hunter/touch-qualified")
+def post_name_hunter_touch_qualified(body: dict = Body(default={})):
+    """创建“只触达 qualified 候选”的任务。"""
+    device_id = (body.get("device_id") or "").strip()
+    if not device_id:
+        raise HTTPException(400, "device_id 必填")
+    persona_key = body.get("persona_key") or get_default_persona_key()
+    max_targets = int(body.get("max_targets") or 5)
+    min_ready = int(body.get("min_qualified_ready") or 1)
+    try:
+        from src.host.fb_targets_store import name_hunter_touch_targets
+        ready = name_hunter_touch_targets(persona_key=persona_key, limit=max(max_targets, min_ready, 1))
+    except Exception as e:
+        raise HTTPException(500, f"query qualified candidates failed: {e}") from e
+    if len(ready) < min_ready:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "qualified 候选不足，先执行资料预筛或人工复核",
+                "qualified_ready": len(ready),
+                "min_qualified_ready": min_ready,
+            },
+        )
+    params = {
+        "persona_key": persona_key,
+        "max_targets": max_targets,
+        "max_friends_per_run": int(body.get("max_friends_per_run") or 5),
+        "min_seed_score": float(body.get("min_seed_score") or 80),
+        "send_greeting_inline": bool(body.get("send_greeting_inline", True)),
+        "verification_note": body.get("verification_note") or "",
+        "greeting": body.get("greeting") or "",
+        "_preset_key": "name_hunter",
+    }
+    try:
+        from src.host.task_store import create_task
+        tid = create_task("facebook_name_hunter_touch_qualified", device_id, params)
+    except Exception as e:
+        raise HTTPException(500, f"create touch task failed: {e}") from e
+    return {"ok": True, "task_id": tid, "type": "facebook_name_hunter_touch_qualified"}
 
 
 @router.post("/active-persona")
@@ -514,19 +1028,7 @@ def fb_device_launch(device_id: str, body: dict = Body(default={})):
     #   * List[str]  : ["山田花子", "佐藤美咲"]
     #   * str        : "山田花子\n佐藤美咲" / "山田花子, 佐藤美咲"
     raw_targets = body.get("add_friend_targets") or []
-    add_friend_targets: List[dict] = []
-    if isinstance(raw_targets, str):
-        import re as _re
-        for line in _re.split(r"[,\n;]+", raw_targets):
-            nm = line.strip()
-            if nm:
-                add_friend_targets.append({"name": nm})
-    elif isinstance(raw_targets, list):
-        for item in raw_targets:
-            if isinstance(item, str) and item.strip():
-                add_friend_targets.append({"name": item.strip()})
-            elif isinstance(item, dict) and item.get("name"):
-                add_friend_targets.append({"name": str(item["name"]).strip()})
+    add_friend_targets: List[dict] = _split_name_targets(raw_targets)
     # body.greeting 允许用户覆盖 persona 默认打招呼文案（name_hunter 常用）
     greeting_override = body.get("greeting") or ""
 
@@ -543,6 +1045,96 @@ def fb_device_launch(device_id: str, body: dict = Body(default={})):
     if not target_groups and persona_ctx.get("seed_group_keywords"):
         # 没显式指定群组时，用 persona 的默认种子词（日本女性 = ママ友等）
         target_groups = list(persona_ctx["seed_group_keywords"])[:2]
+    if preset_key == "name_hunter" and add_friend_targets:
+        enriched_targets: List[dict] = []
+        for item in add_friend_targets:
+            if isinstance(item, dict) and item.get("seed_score") is not None:
+                enriched_targets.append(item)
+            else:
+                enriched_targets.append(_score_name_hunter_target(item, persona_ctx))
+        add_friend_targets = enriched_targets
+
+    # ── P0-3: 必填参数前置校验 ──────────────────────────────────
+    # preset 声明 needs_input 的字段，在所有兜底之后仍为空 → 422 拒绝创建任务
+    # 同时把 input_schema 回传，前端可据此动态生成填表对话框（避免用户瞎点"一键启动"
+    # 然后任务失败的反馈循环）。
+    if preset_key:
+        _spec = next((p for p in FB_FLOW_PRESETS if p["key"] == preset_key), None)
+        if _spec and _spec.get("needs_input"):
+            _provided = {
+                "target_groups": target_groups,
+                "verification_note": verification_note,
+                "greeting": greeting_override,
+                "add_friend_targets": add_friend_targets,
+                "max_friends_per_run": body.get("max_friends_per_run"),
+                "max_members": body.get("max_members"),
+            }
+            _missing = _validate_preset_inputs(_spec, _provided, persona_ctx)
+            if _missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "missing_required_inputs",
+                        "preset_key": preset_key,
+                        "preset_name": _spec.get("name"),
+                        "missing": _missing,
+                        "input_schema": _spec.get("input_schema") or {},
+                        "message": (
+                            f"方案「{_spec.get('name')}」缺少必填参数：" +
+                            "、".join(m["field"] for m in _missing) +
+                            "。请在启动对话框中填写后再试。"
+                        ),
+                    },
+                )
+
+    # ── 双任务防御层 ────────────────────────────────────────────
+    # 历史问题: 用户选 friend_growth("好友打招呼")时同时产生
+    # facebook_group_member_greet + facebook_campaign_run 两个任务,
+    # 任务"完成"语义被串号. 守卫两条:
+    #   A) 单步预设硬锁: friend_growth/name_hunter 只能产生约定的单步任务,
+    #      即便 body.flow_steps 被外部篡改/旧版预设残留也强行收敛.
+    #   B) 同 launch 内 step type+params 完全相同的重复条目去重.
+    # 任何被丢弃的 step 写 warning 日志, 便于回查根因.
+    _SINGLE_STEP_PRESETS: Dict[str, str] = {
+        "friend_growth": "facebook_group_member_greet",
+    }
+    _expected_single = _SINGLE_STEP_PRESETS.get(preset_key or "")
+    if _expected_single:
+        _kept = [s for s in flow_steps if s.get("type") == _expected_single]
+        if _kept and len(_kept) != len(flow_steps):
+            _dropped = [s.get("type") for s in flow_steps
+                        if s.get("type") != _expected_single]
+            logger.warning(
+                "[fb_launch] single-step lock: preset=%s kept=%s dropped=%s",
+                preset_key, _expected_single, _dropped,
+            )
+            flow_steps = _kept
+        elif not _kept:
+            # 预设结构异常（约定的单步 type 都没有）→ 仍按原序列继续，
+            # 让下游报错暴露问题而不是静默吞掉。
+            logger.error(
+                "[fb_launch] single-step lock: preset=%s 没有期望的 step type=%s, "
+                "原始 steps=%s",
+                preset_key, _expected_single,
+                [s.get("type") for s in flow_steps],
+            )
+
+    _seen_step_keys: set = set()
+    _deduped_steps: List[dict] = []
+    for _st in flow_steps:
+        _k = _json.dumps(
+            {"t": _st.get("type", ""), "p": _st.get("params") or {}},
+            sort_keys=True, ensure_ascii=False,
+        )
+        if _k in _seen_step_keys:
+            logger.warning(
+                "[fb_launch] dedupe: skip duplicate step type=%s preset=%s device=%s",
+                _st.get("type"), preset_key, device_id,
+            )
+            continue
+        _seen_step_keys.add(_k)
+        _deduped_steps.append(_st)
+    flow_steps = _deduped_steps
 
     is_local = _is_local_device(device_id)
     base = local_api_base() if is_local else _W03_BASE
@@ -566,17 +1158,40 @@ def fb_device_launch(device_id: str, body: dict = Body(default={})):
             if s_type in ("facebook_group_engage", "facebook_extract_members") \
                     and "group_name" not in s_params:
                 s_params["group_name"] = target_groups[0]
-            if s_type == "facebook_campaign_run" and "target_groups" not in s_params:
+            if s_type == "facebook_extract_members" and preset_key in (
+                    "friend_growth", "group_hunter"):
+                s_params.setdefault("broad_keyword", True)
+                s_params.setdefault("discover_groups", True)
+                s_params.setdefault("max_groups", min(max(len(target_groups), 3), 5))
+                s_params.setdefault("max_groups_to_extract", s_params["max_groups"])
+                s_params.setdefault("max_members_per_group",
+                                    s_params.get("max_members", 20))
+                s_params.setdefault("auto_join_groups", True)
+                s_params.setdefault("join_if_needed", True)
+                s_params.setdefault("skip_visited", True)
+            if s_type in ("facebook_campaign_run", "facebook_group_member_greet") \
+                    and "target_groups" not in s_params:
                 s_params["target_groups"] = target_groups
-        if verification_note and s_type in ("facebook_add_friend", "facebook_campaign_run"):
-            s_params.setdefault("verification_note", verification_note)
-            s_params.setdefault("note", verification_note)
+        if verification_note and s_type in (
+                "facebook_add_friend",
+                "facebook_campaign_run",
+                "facebook_group_member_greet",
+        ):
+            # 2026-05-03 真机第八轮 bug fix: 与 add_friend_targets / greeting 同
+            # 源问题. friend_growth 预设里预填 "verification_note": "" 占位,
+            # setdefault 因 key 已存在不写入 → body 传入的话术被吞掉, add_friends
+            # step skip empty verification_note. 改为 "if not get" 才覆盖.
+            if not (s_params.get("verification_note") or "").strip():
+                s_params["verification_note"] = verification_note
+            if not (s_params.get("note") or "").strip():
+                s_params["note"] = verification_note
 
         # 2026-04-23: name_hunter 预设 — 注入名字列表 + 覆盖打招呼文案
         # 注意: 不能用 setdefault, 因为 name_hunter 预设里预填了 add_friend_targets=[],
         # 空列表虽然 falsy 但 key 已存在,setdefault 不会覆盖 → body 的名字会被吞掉
         if add_friend_targets and s_type in (
                 "facebook_campaign_run",
+                "facebook_group_member_greet",
                 "facebook_add_friend",
                 "facebook_add_friend_and_greet",
                 "facebook_send_greeting"):
@@ -584,10 +1199,22 @@ def fb_device_launch(device_id: str, body: dict = Body(default={})):
                 s_params["add_friend_targets"] = add_friend_targets
         if greeting_override and s_type in (
                 "facebook_campaign_run",
+                "facebook_group_member_greet",
                 "facebook_add_friend_and_greet",
                 "facebook_send_greeting"):
             if not s_params.get("greeting"):
                 s_params["greeting"] = greeting_override
+
+        if s_type in ("facebook_campaign_run", "facebook_group_member_greet"):
+            if body.get("max_friends_per_run") is not None:
+                s_params["max_friends_per_run"] = int(body.get("max_friends_per_run") or 0)
+            if body.get("outreach_goal") is not None:
+                s_params["outreach_goal"] = int(body.get("outreach_goal") or 0)
+            if body.get("max_members") is not None:
+                _max_members = int(body.get("max_members") or 0)
+                s_params["max_members"] = _max_members
+                s_params["extract_max_members"] = _max_members
+                s_params["max_members_per_group"] = _max_members
 
         # Sprint 3 P0: 自动透传 preset_key,让漏斗能按预设切片
         if preset_key:
@@ -737,7 +1364,7 @@ def _funnel_steps_from_metrics(m: dict, groups_count: int) -> list:
     return [
         {"key": "groups_joined", "label": "已加入群组",
          "value": groups_count},
-        {"key": "members_extracted", "label": "群成员提取",
+        {"key": "members_extracted", "label": "群成员打招呼",
          "value": m["stage_extracted_members"]},
         {"key": "friend_requests_sent", "label": "好友请求发送",
          "value": m["stage_friend_request_sent"]},
@@ -758,7 +1385,7 @@ def fb_funnel(device_id: Optional[str] = None,
               since_hours: int = 168,
               preset_key: Optional[str] = None,
               group_by: Optional[str] = None):
-    """FB 引流漏斗:进群 → 提取 → 加好友 → 通过 → DM → WA 引流。
+    """FB 客服拓展漏斗:进群 → 群成员打招呼 → 加好友 → 通过 → DM → WA 引流。
 
     Sprint 3 P1: 支持 group_by=preset_key 切片对比 + preset_key 过滤。
 
@@ -1136,7 +1763,7 @@ def fb_account_profile(device_id: str):
         out["risk"]["level"] = "low"
         out["suggestion"] = {
             "tone": "info",
-            "text": "📈 健康成长期，可下发：加好友（中频）/ 群成员提取 / 群内互动",
+            "text": "📈 健康成长期，可下发：加好友（中频）/ 群成员打招呼 / 群内互动",
             "action": {"label": "发起加好友", "type": "run_task",
                        "task_type": "facebook_add_friend"},
         }
@@ -1145,7 +1772,7 @@ def fb_account_profile(device_id: str):
         out["suggestion"] = {
             "tone": "ok",
             "text": "🌳 账号成熟，可承担营销动作（私信、群发）— 保持节奏",
-            "action": {"label": "全链路获客", "type": "run_task",
+            "action": {"label": "全链路客服拓展", "type": "run_task",
                        "task_type": "facebook_campaign_run"},
         }
     else:
@@ -1163,7 +1790,7 @@ def fb_account_profile(device_id: str):
 def fb_quota_status(device_id: str):
     """单台设备的 facebook 各 action quota 余量 + 下次可派 ETA.
 
-    2026-04-27 P4: 圈层拓客真机重试时 quota 满任务 fail 但 dashboard 看不见
+    2026-04-27 P4: 社群客服拓展真机重试时 quota 满任务 fail 但 dashboard 看不见
     quota 状态. 本 endpoint 给 dashboard chip / preflight UI 显示用.
 
     返回 schema:
@@ -1182,8 +1809,8 @@ def fb_quota_status(device_id: str):
         }
       }
 
-    注: account 参数在 ComplianceGuard 里默认空字符串("一台设备一个 facebook 账号"
-    现行假设, 见 compliance_guard.py 写入语义), 所以不需 device 上的账号 id.
+    注: join_group 执行链路已按 device_id 作为 quota account 记录，避免一台
+    设备的重试耗尽其他设备额度；旧动作仍沿用默认空账号。
     """
     try:
         from src.behavior.compliance_guard import get_compliance_guard
@@ -1194,10 +1821,12 @@ def fb_quota_status(device_id: str):
                     "error": "facebook platform 限制未配置"}
         actions: dict = {}
         for action_name in plimits.actions:
-            remaining = guard.get_remaining("facebook", action_name)
-            eta_sec = guard.get_next_slot_eta("facebook", action_name)
+            account = device_id if action_name == "join_group" else ""
+            remaining = guard.get_remaining("facebook", action_name, account)
+            eta_sec = guard.get_next_slot_eta("facebook", action_name, account)
             eta_min = max(1, int((eta_sec + 30) // 60)) if eta_sec > 0 else 0
             actions[action_name] = {
+                "quota_account": account,
                 "hourly_used": remaining["hourly_used"],
                 "hourly_limit": plimits.actions[action_name].hourly,
                 "hourly_remaining": remaining["hourly_remaining"],

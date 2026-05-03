@@ -32,9 +32,50 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.host import fb_target_personas as fb_personas
-from src.host import ollama_vlm
+# 2026-05-03 v28: 切换到智谱 GLM-4V-flash 云端视觉模型. 真机第 30-32 轮
+# ollama 本地 6GB qwen2.5vl:7b 内存不足无法加载, 全部 L2 失败. 智谱云端
+# API 不占本地资源, 延迟 ~4s, 调用稳定. zhipu_vlm.classify_images 与
+# ollama_vlm 同签名, 零侵入切换.
+from src.host import zhipu_vlm as ollama_vlm
 
 logger = logging.getLogger(__name__)
+
+
+# 2026-05-03 v27: VLM healthcheck 全局缓存. 真机第 30 轮显示 ollama 服务挂时
+# 每候选 3 次重试浪费 ~10s, 20 候选累计超 task timeout 1200s 被 watchdog
+# 杀. 第一次 classify_images 失败后, 5 分钟内全局降级跳过 VLM (直接走 L1
+# fallback PASS), 节省 ~10s × N 候选 ≈ 数分钟. 5 分钟后自动重新探测一次,
+# 让运营恢复 ollama 后无需重启 server 自动恢复.
+_VLM_HEALTH = {
+    "down_until": 0.0,
+    "last_err": "",
+    "down_count": 0,
+}
+_VLM_DOWN_TTL_SEC = 300.0   # 5 分钟
+
+
+def _vlm_globally_down() -> bool:
+    """是否处于 VLM 全局降级窗口期内."""
+    return time.time() < _VLM_HEALTH["down_until"]
+
+
+def _mark_vlm_down(err: str) -> None:
+    """记录 VLM 故障, 触发 5 分钟全局降级."""
+    _VLM_HEALTH["down_until"] = time.time() + _VLM_DOWN_TTL_SEC
+    _VLM_HEALTH["last_err"] = (err or "")[:200]
+    _VLM_HEALTH["down_count"] = int(_VLM_HEALTH.get("down_count") or 0) + 1
+    logger.warning(
+        "[vlm-health] 标记 VLM 全局降级 5 分钟 (累计 %d 次), err=%s",
+        _VLM_HEALTH["down_count"], _VLM_HEALTH["last_err"],
+    )
+
+
+def _clear_vlm_down() -> None:
+    """VLM 调用成功时清除 down 状态."""
+    if _VLM_HEALTH["down_until"] > 0:
+        logger.info("[vlm-health] VLM 恢复, 清除全局降级状态")
+    _VLM_HEALTH["down_until"] = 0.0
+    _VLM_HEALTH["last_err"] = ""
 
 # 日文脚本检测（假名 / 汉字）
 _HIRAGANA_RE = re.compile(r"[\u3040-\u309F]")
@@ -544,20 +585,73 @@ def classify(
         return result
 
     # 3) L2 VLM
-    prompt = _build_vlm_prompt(persona, ctx)
-    t0 = time.time()
-    insights, meta = ollama_vlm.classify_images(
-        prompt=prompt,
-        image_paths=l2_image_paths,
-        scene="fb_profile_l2",
-        task_id=task_id,
-        device_id=device_id,
-    )
-    latency_ms = int((time.time() - t0) * 1000)
+    # v27 healthcheck: ollama 全局降级窗口内不调 classify_images, 立即走 L1
+    # fallback. 节省每候选 ~10s 重试时间.
+    if _vlm_globally_down():
+        insights = {}
+        meta = {
+            "ok": False,
+            "error": (
+                f"vlm_globally_down (last_err={_VLM_HEALTH['last_err'][:80]})"
+            ),
+            "model": "vlm_globally_down",
+        }
+        latency_ms = 0
+    else:
+        prompt = _build_vlm_prompt(persona, ctx)
+        t0 = time.time()
+        insights, meta = ollama_vlm.classify_images(
+            prompt=prompt,
+            image_paths=l2_image_paths,
+            scene="fb_profile_l2",
+            task_id=task_id,
+            device_id=device_id,
+        )
+        latency_ms = int((time.time() - t0) * 1000)
+        # v27: 调用结果反馈 healthcheck 状态
+        if meta.get("ok") and insights:
+            _clear_vlm_down()
+        elif meta.get("error") or meta.get("parse_error"):
+            _mark_vlm_down(
+                str(meta.get("error") or meta.get("parse_error") or "")
+            )
 
-    passed, match_reasons = _evaluate_match(persona, insights) if insights else (False, ["VLM 返回为空"])
-    l2_score = _score_l2(insights, passed)
-    confidence = float(insights.get("overall_confidence", 0) or 0)
+    # 2026-05-03 v24: VLM 不可用 (Ollama 未启动 / 模型未加载) 时 healthy
+    # degradation — 真机第 25-28 轮显示 ollama 服务挂了, 所有 L2 调用 insights
+    # 空, passed=False, score=0, 100% reject. 但 L1 (姓名启发式) 已经能给出
+    # 合理判别. fallback: 当 insights 空 + meta 含 vlm_error 时, 用 L1 score
+    # 作为 L2 score, 高分 (>=50) 直接 PASS, 让 L1-strong 候选不被 VLM 故障拖
+    # 累. 运营恢复 ollama 后行为自动回归原样 (insights 非空走原路径).
+    _vlm_error = meta.get("error") or meta.get("parse_error", "")
+    _vlm_ok = bool(meta.get("ok", False)) and bool(insights)
+    if not _vlm_ok and _vlm_error:
+        # VLM 故障降级 — v25 (2026-05-03): 第 29 轮看到 candidate l1 普遍 20
+        # (FB 罗马字日文姓 = 15 + bio_has_japanese 等 = 20). 阈值 50 永远不达.
+        # 改为复用 yaml l1_pass_threshold=20 (本来 L1 pass 就该进 L2). 等价于:
+        # "L1 已判合格 + VLM 不可用 → 视同 PASS, 不让 VLM 故障拖累已 L1-pass
+        # 的候选". 比硬编码 50 更尊重 yaml 配置.
+        _l1_qualified = bool(l1_pass)   # l1_score >= l1_pass_th
+        passed = _l1_qualified
+        match_reasons = [
+            f"vlm_unavailable_l1_fallback (l1={l1_score}, "
+            f"l1_pass_th={l1_pass_th}, qualified={_l1_qualified}, "
+            f"vlm_err={_vlm_error[:60]})"
+        ]
+        insights = insights or {}
+        l2_score = float(l1_score) if _l1_qualified else 0.0
+        confidence = 0.0
+        logger.warning(
+            "[classify] VLM 故障 L1 降级: name=%r l1=%d/%d passed=%s vlm_err=%s",
+            display_name, l1_score, int(l1_pass_th), passed,
+            _vlm_error[:80],
+        )
+    else:
+        passed, match_reasons = (
+            _evaluate_match(persona, insights) if insights
+            else (False, ["VLM 返回为空"])
+        )
+        l2_score = _score_l2(insights, passed)
+        confidence = float(insights.get("overall_confidence", 0) or 0)
 
     result["stage_reached"] = "L2"
     result["l2"] = {
