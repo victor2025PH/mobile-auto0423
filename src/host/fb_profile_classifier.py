@@ -32,7 +32,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.host import fb_target_personas as fb_personas
-from src.host import ollama_vlm
+# 2026-05-03 v28: 切换到智谱 GLM-4V-flash 云端视觉模型. 真机第 30-32 轮
+# ollama 本地 6GB qwen2.5vl:7b 内存不足无法加载, 全部 L2 失败. 智谱云端
+# API 不占本地资源, 延迟 ~4s, 调用稳定. zhipu_vlm.classify_images 与
+# ollama_vlm 同签名, 零侵入切换.
+from src.host import zhipu_vlm as ollama_vlm
 
 logger = logging.getLogger(__name__)
 
