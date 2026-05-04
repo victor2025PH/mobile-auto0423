@@ -242,12 +242,18 @@ def test_cross_group_pool_consumption():
 
 
 def test_default_member_sources_when_unspecified():
-    """params 没传 member_sources 时应使用默认三池顺序，确保用户配置缺失时
-    behavior 不退化为单池 Members Tab。"""
+    """params 没传 member_sources 时应使用默认四池顺序，确保用户配置缺失时
+    behavior 不退化为单池 Members Tab。
+
+    2026-05-04: 真机验证新版 FB 公开群已移除 Members tab 与三点菜单中的
+    Members 选项, mutual/contributors/general 三池全 miss 时, feed_authors
+    (从群帖子抓 author) 是仅存可用入口. 默认链尾追加 feed_authors 兜底.
+    """
     fb = _FakeFB({
         "mutual_members": [{"name": "M1"}],
         "contributors": [{"name": "C1"}],
         "general": [{"name": "G1"}],
+        "feed_authors": [{"name": "F1"}],
     })
     dispatcher = _import_dispatcher()
     _members, meta = dispatcher(fb, "test-dev", {
@@ -257,6 +263,7 @@ def test_default_member_sources_when_unspecified():
         # member_sources 故意不传 — 应该走默认值
     }, "ペット")
     assert meta["member_sources"] == [
-        "mutual_members", "contributors", "general"]
+        "mutual_members", "contributors", "general", "feed_authors"]
     sources_called = [c.get("member_source") for c in fb.calls]
-    assert sources_called == ["mutual_members", "contributors", "general"]
+    assert sources_called == [
+        "mutual_members", "contributors", "general", "feed_authors"]

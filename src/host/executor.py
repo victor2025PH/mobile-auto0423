@@ -3619,7 +3619,10 @@ def _campaign_member_sources(params: Dict[str, Any]) -> List[str]:
     # 列表入口, 帖子作者法是合法兜底.
     allowed = {"mutual_members", "contributors", "general", "feed_authors"}
     clean = [s for s in sources if s in allowed]
-    return clean or ["mutual_members", "contributors", "general"]
+    # 2026-05-04: 真机验证新版 FB 公开群 Members tab/section 全部移除
+    # (Featured/You/Photos/Events 顶 tab bar, 三点菜单也无 Members 选项).
+    # 把 feed_authors 加入默认 fallback 链, 让前 3 路径全 miss 后还有出路.
+    return clean or ["mutual_members", "contributors", "general", "feed_authors"]
 
 
 def _campaign_extract_members(fb, resolved: str, params: Dict[str, Any],
@@ -4053,6 +4056,38 @@ def _run_facebook_campaign(fb, resolved, params):
                     if not name:
                         continue
 
+                    # 2026-05-04: feed_authors source 已经在群帖子流抓到 author
+                    # 头像 bounds. 直接 tap 进 profile 页, 避免 fb.search '斉藤正和'
+                    # 在 FB 全局搜不到精确个人 (同名太多 + Page 噪音). 然后
+                    # 透传 from_current_profile=True 让下游不再 search.
+                    _profile_pic_bounds = (
+                        t.get("profile_pic_bounds")
+                        if isinstance(t, dict) else None
+                    )
+                    _from_current_profile = False
+                    if _profile_pic_bounds and len(_profile_pic_bounds) == 4:
+                        try:
+                            # 2026-05-04: 不能用 _r 当 right 变量名 — 函数顶 import random as _r,
+                            # 解包会把 random 模块覆盖成 int, 后面 _r.uniform() 炸 'int has no uniform'
+                            _bx_l, _bx_t, _bx_r, _bx_b = _profile_pic_bounds
+                            _cx = (int(_bx_l) + int(_bx_r)) // 2
+                            _cy = (int(_bx_t) + int(_bx_b)) // 2
+                            import time as _t_mod
+                            fb._u2(resolved).click(_cx, _cy)
+                            _t_mod.sleep(2.5)
+                            _from_current_profile = True
+                            logger.info(
+                                "[FB Campaign] tap feed_authors profile pic "
+                                "bounds=(%d,%d,%d,%d) center=(%d,%d) for %s",
+                                int(_bx_l), int(_bx_t), int(_bx_r), int(_bx_b),
+                                _cx, _cy, name,
+                            )
+                        except Exception as _tap_e:
+                            logger.debug(
+                                "[FB Campaign] tap profile pic 失败 %s: %s",
+                                name, _tap_e,
+                            )
+
                     # P2.1: 逐人生成 (AI on; 失败→兜底到 params 配的 batch 文本)
                     per_note = note
                     per_greet = greeting
@@ -4115,6 +4150,7 @@ def _run_facebook_campaign(fb, resolved, params):
                             phase=_ph,
                             preset_key=_pr,
                             source=_camp_src,
+                            from_current_profile=_from_current_profile,
                             force=_relaxed_local_rules or bool(params.get("force_add_friend")),
                             ai_dynamic_greeting=(bool(_ai_g) if _ai_g is not None else None),
                             force_send_greeting=(
@@ -4124,7 +4160,10 @@ def _run_facebook_campaign(fb, resolved, params):
                             **_p10_extra,
                         ) or {}
                         ok = bool(res.get("add_friend_ok"))
-                        if ok:
+                        # 方案 A (2026-05-04): dm_only_sent 同样计入 sent (业务
+                        # 目标 "触达此人" 已达成, outcome 用 fallback marker 区分)
+                        _dm_only = bool(res.get("dm_only_sent"))
+                        if ok or _dm_only:
                             sent += 1
                         if res.get("greet_ok"):
                             greeted += 1
