@@ -134,12 +134,30 @@ def test_reconnect_control_closes_old_socket(monkeypatch):
         pass
 
 
-def test_reconnect_control_fallback_to_video_only_no_listener():
-    """reconnect_control 没人 listen 时, has_control=False 但不抛异常."""
-    port = _free_port()
+def test_reconnect_control_fallback_to_video_only_no_listener(monkeypatch):
+    """reconnect_control 没人 listen 时, has_control=False 但不抛异常.
+
+    2026-05-04 修: 旧版调真 socket connect 走 _connect_control hardcoded
+    5+3 attempts × 5s timeout + 5s wait = ~50s, 全 suite pytest --timeout=20
+    触发 stack trace 卡死 (Stage 0 baseline + Stage D 验证都中招).
+
+    fix: mock _connect_control_once 永远返 False 模拟 no-listener, 跳过
+    实际 socket. 保留 reconnect_control 的契约断言 (关旧 sock + 调
+    _connect_control + 返 has_control). 真 socket 行为已由
+    test_connect_control_once_no_listener_returns_false 用 attempts=2 +
+    delay=0.1 验证 (那里 elapsed<12s 不卡).
+    """
+    # mock _connect_control_once 立即返 False, 跳真 socket 50s 卡顿
+    monkeypatch.setattr(
+        ScrcpySession, "_connect_control_once",
+        lambda self, attempts, delay, label: False,
+    )
+    # 跳 _connect_control 内 phase1→phase2 之间 5s sleep
+    monkeypatch.setattr(time, "sleep", lambda *a, **k: None)
+
     sess = ScrcpySession.__new__(ScrcpySession)
     sess.device_id = "DEVICE_TEST"
-    sess.port = port
+    sess.port = 1  # 任意 port (不会真用 _connect_control_once 已 mock)
     sess._control_socket = None
     sess.has_control = False
     sess._ctrl_lock = threading.Lock()
