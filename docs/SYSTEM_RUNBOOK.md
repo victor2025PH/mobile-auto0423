@@ -231,6 +231,17 @@ curl http://127.0.0.1:8000/health
 | **其它方案** | 1) PG server 全局 `postgresql.conf` 改 `lc_messages='C'` + 重启；2) PG server locale utf-8（`initdb -E UTF8 --locale=C`，需重做 cluster）；3) 临时绕过：注释 `src/host/api.py` 里 central_store init 调用 |
 | **TODO** | 完整诊断 → `docs/runbook/L2_OPS_HANDBOOK.md` |
 
+#### F10 — Worker scrcpy 实时流不出帧 / 双向控制不通（WinError 2）
+
+| | |
+|---|---|
+| **症状** | 前端打设备实时画面永远转圈；`/cluster/devices/{did}/stream/ws` WebSocket 握手成功但**永远不发 `{"type":"config"}` 配置帧**；HTTP 截图、`/input/tap` 等其它接口正常。 |
+| **根因** | Worker 被 schtasks / Windows Service / 任何只继承 system PATH 的方式拉起，但 adb 装在 user PATH 下（实测 W175: `C:\Users\Administrator\adb.exe`）。`scrcpy_manager.py` 通过 `subprocess.run(["adb", ...])` 推 server jar / 装 forward 时 CreateProcess 抛 `WinError 2 系统找不到指定的文件` → `acquire_session` 内部 hang → WS handler 阻塞在 `await _asyncio.to_thread(...)` 不返回。device_manager 用 uiautomator2/adbutils（Python 内置 adb 解析）不依赖 PATH，所以设备发现不受影响——**唯独 scrcpy 这条路全死**。 |
+| **检测命令** | 1) `Select-String C:\openclaw\mobile-auto-project\logs\openclaw.log -Pattern 'WinError 2.*adb' -Tail 200` 看是否反复出现；<br>2) `[Environment]::GetEnvironmentVariable('Path','Machine')` 看 system PATH 里有没有 adb 目录；<br>3) `curl http://<worker>:8000/streams` 返回 `{"sessions":[]}` 且 `/devices/{id}/stream/stats` 返回 `{"active":false}`。 |
+| **修（首选, 已合 PR #158）** | 升级 worker 代码到 main HEAD，`src/host/scrcpy_manager.py` 已用 `_resolve_adb()` 模块级常量解析 adb：env `OPENCLAW_ADB_PATH` → `shutil.which` → 已知 Windows 路径 fallback → 裸 `"adb"`。从根上消除 PATH 依赖。 |
+| **修（旧 worker 临时绕过）** | 在 worker 上加 system PATH：`[Environment]::SetEnvironmentVariable('Path', $cur + ';C:\platform-tools', 'Machine')` + 重启 worker（schtasks Stop+Start）。仅当 worker 还跑老版本 scrcpy_manager 时用。 |
+| **新机部署 checklist** | `setx /M OPENCLAW_ADB_PATH C:\platform-tools\adb.exe`（显式覆盖兜底）+ schtasks `OpenClawWorker` 注册 BootTrigger + S4U Administrator（保留 `~\.android\adbkey` 信任链，避免设备重新授权）。 |
+
 ### 故障码字典（MessengerError）
 
 源代码：`src/app_automation/facebook.py`，grep `MessengerError(code=`。常见码（详见代码注释）：
@@ -288,6 +299,7 @@ curl http://127.0.0.1:8000/health
 | 2026-04-26 | `mobile-auto-project/` 历史子目录归档到 `docs/_archive_old_subproject/` | Claude |
 | 2026-04-26 | F9 修复尝试 #1 — DSN 加 `options='-c lc_messages=C'`（**后被 linter/用户修正**: lc_messages 是 SUSET，普通用户改会被 PG 拒） | Claude |
 | 2026-04-26 | F9 修复尝试 #2（最终）— DSN 只保留 `client_encoding=utf8`；中毒连接由 `_conn()` 的 UnicodeDecodeError catch + discard 兜底（Phase-13 已有）；真正根治需 PG superuser 跑 `ALTER ROLE openclaw_app SET lc_messages='C';` | victor + Claude |
+| 2026-05-04 | 新增 F10（worker scrcpy 实时流不出帧 / WinError 2）；scrcpy_manager.py adb 解析重构成 `_ADB` 常量 + `_resolve_adb()` 4 级 fallback（PR #158）；W03/W175 注册 schtasks `OpenClawWorker` BootTrigger + S4U Administrator 持久化 | Claude |
 
 ## §7 — sibling Claude 协同事故图谱（2026-04-26）
 
