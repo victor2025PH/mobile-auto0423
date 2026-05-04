@@ -241,6 +241,7 @@ curl http://127.0.0.1:8000/health
 | **修（首选, 已合 PR #158）** | 升级 worker 代码到 main HEAD，`src/host/scrcpy_manager.py` 已用 `_resolve_adb()` 模块级常量解析 adb：env `OPENCLAW_ADB_PATH` → `shutil.which` → 已知 Windows 路径 fallback → 裸 `"adb"`。从根上消除 PATH 依赖。 |
 | **修（旧 worker 临时绕过）** | 在 worker 上加 system PATH：`[Environment]::SetEnvironmentVariable('Path', $cur + ';C:\platform-tools', 'Machine')` + 重启 worker（schtasks Stop+Start）。仅当 worker 还跑老版本 scrcpy_manager 时用。 |
 | **新机部署 checklist** | `setx /M OPENCLAW_ADB_PATH C:\platform-tools\adb.exe`（显式覆盖兜底）+ schtasks `OpenClawWorker` 注册 BootTrigger + S4U Administrator（保留 `~\.android\adbkey` 信任链，避免设备重新授权）。 |
+| **⚠️ setx 后 SSH 看不到新 env 的踩坑** | OpenSSH on Windows 在服务启动时缓存 system env block；`[Environment]::SetEnvironmentVariable(scope='Machine')` 不广播 `WM_SETTINGCHANGE`，所以已运行的 sshd 一直用老 env。**症状**：setx 完成后 `ssh w03 "echo %OPENCLAW_ADB_PATH%"` 返回字面量 `%OPENCLAW_ADB_PATH%`（cmd 不识别这变量）。**真相验证**：用 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create` 起进程才读 fresh registry env（与 schtasks 拉 worker 行为一致）。**修法**：要让 SSH session 看到新 env，需 `Restart-Service sshd`（带外触发，不能在自己 SSH 里跑会自杀）。**worker 不受影响**——它由 schtasks 拉起，每次都读 fresh registry。 |
 
 ### 故障码字典（MessengerError）
 
