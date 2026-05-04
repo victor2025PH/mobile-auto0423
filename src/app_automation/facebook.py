@@ -2686,6 +2686,101 @@ class FacebookAutomation(BaseAutomation):
             status="sent")
         return True
 
+    def _ensure_screen_awake(self, device_id: str,
+                              probe_dump: bool = True,
+                              retry_after_heal: bool = True) -> bool:
+        """task 入口或关键操作前确保屏幕亮 + uiautomator dump 可用.
+
+        背景: forensics task 808adb92 (2026-05-04 17:05) 真实事故 — IJ8H 设备
+        ``adb shell uiautomator dump`` 被系统直接 SIGKILL (exit 137), 业务
+        enter_group 5 路 IME 实际成功了但 dump 拿空 hierarchy → bot 看不见
+        UI 状态 → 全链路误判 ``automation_extract_zero_after_discovery``.
+        u2 通过 atx-agent stub APK 走 jsonrpc 仍可用 — 是 forensics 的 adb
+        shell uiautomator 路径与业务的 u2 路径触发条件不同导致.
+
+        防线 (按代价升序):
+          1. KEYCODE_WAKEUP + KEYCODE_MENU — 不论是否息屏都打一次 (idempotent)
+          2. svc power stayon usb — USB 充电时屏幕保持亮 (task 跑期间 0 耗电)
+          3. u2.dump_hierarchy() probe — 真验 atx-agent 能拿到 hierarchy
+          4. healthcheck() 重启 atx-agent stub 后再 probe
+
+        Returns: True = 屏幕亮 + dump probe 通. False = 设备状态异常 (调用方
+            可继续跑, OEM 限制不一定阻塞所有操作但需要 forensics 区分原因).
+        """
+        import subprocess as _sp_w
+        _CF = getattr(_sp_w, "CREATE_NO_WINDOW", 0)
+
+        # 1. wake + 解锁 menu (idempotent, 失败吞掉)
+        for _kc in ("KEYCODE_WAKEUP", "KEYCODE_MENU"):
+            try:
+                _sp_w.run(
+                    ["adb", "-s", device_id, "shell", "input", "keyevent", _kc],
+                    timeout=3, creationflags=_CF, capture_output=True,
+                )
+            except Exception:
+                pass
+
+        # 2. svc power stayon usb (充电维持, 0 额外耗电)
+        try:
+            _sp_w.run(
+                ["adb", "-s", device_id, "shell",
+                 "svc", "power", "stayon", "usb"],
+                timeout=3, creationflags=_CF, capture_output=True,
+            )
+        except Exception:
+            pass
+
+        if not probe_dump:
+            return True
+
+        # 3. u2 dump probe — 真验 atx-agent + uiautomator stub
+        def _try_dump() -> Tuple[bool, int]:
+            try:
+                d = self._u2(device_id)
+                xml = d.dump_hierarchy()
+                return (bool(xml and len(xml) > 500), len(xml or ""))
+            except Exception as _e:
+                log.warning(
+                    "[ensure_awake] dump probe %s exception: %s",
+                    device_id, _e,
+                )
+                return (False, 0)
+
+        ok, sz = _try_dump()
+        if ok:
+            return True
+        log.warning(
+            "[ensure_awake] %s 首次 dump probe 失败 size=%d", device_id, sz,
+        )
+
+        if not retry_after_heal:
+            return False
+
+        # 4. healthcheck 重启 atx-agent + stub
+        try:
+            d = self._u2(device_id)
+            if hasattr(d, "healthcheck"):
+                d.healthcheck()
+                time.sleep(2.5)
+        except Exception as _e:
+            log.warning(
+                "[ensure_awake] healthcheck %s 失败: %s", device_id, _e,
+            )
+
+        ok2, sz2 = _try_dump()
+        if ok2:
+            log.info(
+                "[ensure_awake] %s healthcheck 后 dump 恢复 size=%d",
+                device_id, sz2,
+            )
+            return True
+        log.warning(
+            "[ensure_awake] %s healthcheck 后 dump 仍空 size=%d "
+            "(OEM/system kill uiautomator? screen issue?)",
+            device_id, sz2,
+        )
+        return False
+
     def _send_msg_from_current_profile(self, d, did: str,
                                         message: str) -> Tuple[bool, str]:
         """方案 A fallback: 当前已在 profile 页 (from_current_profile 流), 但

@@ -3613,6 +3613,57 @@ def _as_str_list(value: Any) -> List[str]:
     return out
 
 
+def _rank_groups(candidates: List[Dict[str, Any]],
+                  max_keep: int = 5) -> List[Dict[str, Any]]:
+    """挑群智能评分 (P3-B 2026-05-04, forensics task 808adb92 教训驱动).
+
+    背景: 旧逻辑 ``discovered[:max_groups]`` 取前 N 候选 — discovered list 顺序
+    由 FB 搜索结果决定, 不一定最优. 用户截图 17:08 显示搜 '潮味' 返回 7 个
+    Public 群但全是 ``Join`` 状态 (需审批), bot 任意挑一个 join_request 就
+    pending — extract 全 0. 智能评分让 bot 先选最容易跑通的群.
+
+    评分维度 (经验值, 真机迭代调整):
+      already_joined  +1000  (无需 Join, 直接 enter, 100% 跑通)
+      Public           +30   (开放群直接 Join 不需审批)
+      Private          -20   (需审批, pending 概率高)
+      members ∈ [100, 100k]  +50   (sweet spot: 活跃 + 风控不严)
+      members > 100k         +20   (大群活跃但 anti-spam 严格)
+      members < 100          +5    (小群成员太少, extract 收益低)
+      posts/day            +min(p, 10) * 3   (活跃度上限 30 加分)
+
+    候选 dict 接受字段 (兼容 discover_groups_by_keyword 输出 + UI 抓的字段):
+      already_joined / joined / is_joined  → bool
+      members / member_count               → int
+      posts_per_day / posts_24h            → float
+      is_public / privacy ('public'/'private')  → bool/str
+    """
+    def _score(g: Dict[str, Any]) -> float:
+        s = 0.0
+        if (g.get("already_joined") or g.get("joined")
+                or g.get("is_joined")):
+            s += 1000.0
+        members = int(g.get("members") or g.get("member_count") or 0)
+        if 100 <= members <= 100_000:
+            s += 50.0
+        elif members > 100_000:
+            s += 20.0
+        else:
+            s += 5.0
+        ppd = float(g.get("posts_per_day") or g.get("posts_24h") or 0)
+        s += min(ppd, 10.0) * 3.0
+        privacy = (g.get("privacy") or "").lower()
+        if g.get("is_public") or privacy == "public":
+            s += 30.0
+        elif privacy == "private":
+            s -= 20.0
+        return s
+
+    if not candidates:
+        return []
+    ranked = sorted(candidates, key=_score, reverse=True)
+    return ranked[:max_keep]
+
+
 def _campaign_member_sources(params: Dict[str, Any]) -> List[str]:
     sources = _as_str_list(params.get("member_sources") or params.get("member_source"))
     # 2026-05-03 v16: feed_authors 加入合法 source — 新版 FB 关闭了 Members
@@ -3678,6 +3729,22 @@ def _campaign_extract_members(fb, resolved: str, params: Dict[str, Any],
     if not discovered:
         discovered = [{"group_name": group_name, "keyword": group_name,
                        "requires_join": False}]
+
+    # P3-B (2026-05-04): 智能评分挑群 — already_joined > Public 中等规模 > 私群.
+    # 旧逻辑直接 ``discovered[:max_groups]`` 取顺序前 N, 容易选到全是需审批
+    # 的私群导致全 task pending. 评分让 bot 先跑最容易通的群.
+    if len(discovered) > 1:
+        try:
+            _ranked = _rank_groups(discovered, max_keep=max_groups * 2)
+            if _ranked:
+                logger.info(
+                    "[FB Campaign] 挑群评分: 候选 %d 取 top %d (top1=%r)",
+                    len(discovered), len(_ranked),
+                    _ranked[0].get("group_name"),
+                )
+                discovered = _ranked
+        except Exception as _rk_e:
+            logger.warning("[FB Campaign] _rank_groups 失败 (用原顺序): %s", _rk_e)
 
     all_members: List[Dict[str, Any]] = []
     group_results: List[Dict[str, Any]] = []
@@ -3877,6 +3944,26 @@ def _run_facebook_campaign(fb, resolved, params):
     # 透传已抽取成员，add_friends 可以接着发
     if resumed_state.get("last_extracted_members"):
         result["last_extracted_members"] = resumed_state["last_extracted_members"]
+
+    # P3-A (2026-05-04): task 入口主动唤屏 + dump probe.
+    # 防 IJ8H 类设备 uiautomator dump 偶发被 system SIGKILL 致 task 全链路
+    # 误判失败 (forensics task 808adb92 2026-05-04 17:05 真实事故根因 —
+    # 5 路 IME 实际成功了但 dump 拿空 hierarchy → bot 看不见 UI).
+    if hasattr(fb, "_ensure_screen_awake"):
+        try:
+            _wake_ok = fb._ensure_screen_awake(resolved)
+            result["screen_awake_probe"] = bool(_wake_ok)
+            if not _wake_ok:
+                logger.warning(
+                    "[FB Campaign] %s screen/dump probe 失败 — task 仍继续, "
+                    "但若后续步骤 hierarchy 拿空, 优先排查 OEM/system "
+                    "kill uiautomator (forensics 区分依据)",
+                    resolved,
+                )
+        except Exception as _wake_e:
+            logger.warning(
+                "[FB Campaign] _ensure_screen_awake exception: %s", _wake_e,
+            )
 
     for idx, step in enumerate(steps):
         if step in already_done:
