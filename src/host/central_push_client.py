@@ -133,9 +133,20 @@ def reset_async_executor_for_tests() -> None:
         ex = _async_executor
         _async_executor = None
     if ex is not None:
-        # cancel_futures=True 让 pending 但未启动的 task 直接丢弃
-        # (Python 3.9+); wait=True 等已启动的 task 跑完.
-        ex.shutdown(wait=True, cancel_futures=True)
+        # 2026-05-04 Stage E.5 修 D.4 副作用: 旧版 wait=True 让 t.join()
+        # 在 worker thread 跑真 _http_post_json 卡 30s+ urlopen 时永挂
+        # (E.2 全 suite trace: conftest.py:85 → reset_async_executor_for_tests
+        # → ex.shutdown wait=True → t.join → 永挂 timeout).
+        #
+        # 改 wait=False: cancel_futures=True 丢 pending submission, 已 started
+        # worker 在 daemon thread (ThreadPoolExecutor worker default daemon=True
+        # since Python 3.9) 自然跑完后 process exit 清理.
+        #
+        # trade-off: 已 started task 跑到结束前可能 inc 1-2 次 metric, 但
+        # 因为 fixture 的 _http_post_json monkeypatch 还在 (P2-⑨ teardown
+        # LIFO 顺序: 此处 stop 在 monkeypatch undo 之前), worker 跑的还是
+        # mock 状态, inc 也在 reset_push_metrics_for_tests 的 scope 里清掉.
+        ex.shutdown(wait=False, cancel_futures=True)
 
 # UUIDv5 namespace: worker 离线时也能算出确定性 customer_id, 主控收到 push
 # 时若已存在 (canonical_source, canonical_id) 则 ON CONFLICT 走 update 路径,
