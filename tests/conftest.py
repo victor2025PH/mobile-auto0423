@@ -92,6 +92,11 @@ def _p29_reset_global_state():
         ("src.host.routers.tasks", "_RETRY_THROTTLE", "dict", "clear"),
         ("src.host.task_store", "_device_fail_streak", "dict", "clear"),
         ("src.host.fb_store", "_PEER_NAME_REJECT_COUNTER", "dict", "reset_count"),
+        # 2026-05-04 Stage E.3 audit 发现: fb_store 已有 _COUNTER 兜底, 但 by-event
+        # dict + recent samples list 漏盖, 跨 test 累积. scripts/audit_module_globals.py
+        # 22 SUSPICIOUS 中前 5 个 high-priority 优先入册.
+        ("src.host.fb_store", "_PEER_NAME_REJECT_BY_EVENT", "dict", "clear"),
+        ("src.host.fb_store", "_PEER_NAME_REJECT_RECENT", "list", "clear"),
         ("src.host.preflight", "_cache", "dict", "clear"),
         ("src.host.routers.cluster", "_WEBHOOK_COOLDOWN", "dict", "clear"),
     ]
