@@ -3626,10 +3626,17 @@ def _rank_groups(candidates: List[Dict[str, Any]],
       already_joined  +1000  (无需 Join, 直接 enter, 100% 跑通)
       Public           +30   (开放群直接 Join 不需审批)
       Private          -20   (需审批, pending 概率高)
-      members ∈ [100, 100k]  +50   (sweet spot: 活跃 + 风控不严)
-      members > 100k         +20   (大群活跃但 anti-spam 严格)
+      members ∈ [100, 10k]   +50   (sweet spot: 活跃 + Join 通常无 question wall)
+      members ∈ (10k, 100k]  +20   (中型群活跃但 question wall 概率上升)
+      members > 100k         +10   (70K+ 大群 Join 时 question wall 几乎必现 -
+                                    真机 task 5af81143 '香港燒味關注組' 70K 实测)
       members < 100          +5    (小群成员太少, extract 收益低)
       posts/day            +min(p, 10) * 3   (活跃度上限 30 加分)
+
+    P4-B (2026-05-04) sweet spot 从 [100,100k] 缩到 [100,10k]: 真机
+    task 5af81143 暴露 70K Public 大群 Join 时 FB 弹 'Write an answer'
+    question wall, bot 卡住 extract 0 人. 评分降权大群让 bot 优先选小型
+    Public 群 (不依赖 question wall 识别也能工作).
 
     候选 dict 接受字段 (兼容 discover_groups_by_keyword 输出 + UI 抓的字段):
       already_joined / joined / is_joined  → bool
@@ -3643,10 +3650,12 @@ def _rank_groups(candidates: List[Dict[str, Any]],
                 or g.get("is_joined")):
             s += 1000.0
         members = int(g.get("members") or g.get("member_count") or 0)
-        if 100 <= members <= 100_000:
+        if 100 <= members <= 10_000:
             s += 50.0
-        elif members > 100_000:
+        elif 10_000 < members <= 100_000:
             s += 20.0
+        elif members > 100_000:
+            s += 10.0
         else:
             s += 5.0
         ppd = float(g.get("posts_per_day") or g.get("posts_24h") or 0)

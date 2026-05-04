@@ -5014,6 +5014,14 @@ class FacebookAutomation(BaseAutomation):
         "Membership questions",
         "回答问题", "回答以下问题", "会员问题", "成员资格问题",
         "質問に回答", "メンバーシップに関する質問",
+        # P4-A (2026-05-04) 真机 task 5af81143 [memtab-debug] 实测: 新版 FB 70K
+        # Public 群 Join 时 question wall 用 EditText placeholder 'Write an answer'
+        # + 单 'Submit' button, 没用 'Answer questions' 之类的明文标题. 加这两个
+        # 短语 + 多语言变体, 让 _classify_join_group_page 能识别新 UI.
+        "Write an answer", "Submit your answer",
+        "Answer to join", "Answer this question",
+        "回答以加入", "回答後加入", "答えて参加",
+        "回答以参加",
     )
     _FB_JOINED_MARKERS = (
         "Joined", "已加入", "已是成员", "已是成員",
