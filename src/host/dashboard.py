@@ -890,7 +890,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input type="checkbox" id="auto-refresh-all" onchange="toggleAutoRefreshAll()" style="accent-color:var(--accent);width:13px;height:13px"> 自动刷新
         </label>
         <label style="font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:3px;cursor:pointer">
-          <input type="checkbox" id="show-cluster-devices" onchange="toggleClusterDevices()" style="accent-color:#8b5cf6;width:13px;height:13px"> 集群设备
+          <input type="checkbox" id="show-cluster-devices" checked onchange="toggleClusterDevices()" style="accent-color:#8b5cf6;width:13px;height:13px"> 集群设备
         </label>
         <label style="font-size:11px;color:var(--text-muted);display:flex;align-items:center;gap:3px;cursor:pointer" title="关闭时VPN仅在任务运行期间自动重连">
           <input type="checkbox" id="vpn-auto-reconnect" onchange="toggleVpnAutoReconnect()" style="accent-color:#22c55e;width:13px;height:13px"> VPN自动重连

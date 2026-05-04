@@ -87,18 +87,13 @@ const _PAGE_LOADERS={
   'chat':()=>setTimeout(()=>document.getElementById('chat-input')?.focus(),100),
   'screens':async()=>{
     try{await loadDevices();}catch(e){console.debug('screens loadDevices',e);}
-    // 主控无本地设备时自动启用集群视图
-    const localDevs=allDevices.filter(d=>!d._isCluster);
-    if(!localDevs.length && allDevices.length>0){
-      const cb=document.getElementById('show-cluster-devices');
-      if(cb&&!cb.checked){cb.checked=true;await toggleClusterDevices();_autoEnableScreenRefresh();return;}
-    }
-    // 本地也无、集群也无时，尝试强制拉取集群设备
-    if(!allDevices.length){
-      try{
-        const cb=document.getElementById('show-cluster-devices');
-        if(cb){cb.checked=true;await toggleClusterDevices();_autoEnableScreenRefresh();return;}
-      }catch(e){}
+    // 2026-05-04: checkbox 默认 ON, page-load 永远 fetch /cluster/devices 一次
+    // 让主控有本机 USB 设备时也能看到 W03/W175 worker 上的设备
+    // (旧版只在 localDevs.length===0 时自动 toggle, 主控有手机时 worker 设备
+    //  默认隐藏 → 用户痛点 "看不到 W03/W175").
+    const cb=document.getElementById('show-cluster-devices');
+    if(cb&&cb.checked){
+      try{await toggleClusterDevices();}catch(e){console.debug('cluster devices fetch:',e);}
     }
     renderScreens();_autoEnableScreenRefresh();
   },
