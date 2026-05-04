@@ -114,6 +114,29 @@ def reset_push_metrics_for_tests() -> None:
         for k in _metrics:
             _metrics[k] = 0
 
+
+def reset_async_executor_for_tests() -> None:
+    """仅测试用. shutdown 现有 _async_executor 强制 cancel pending tasks.
+
+    2026-05-04 修: 旧 reset_state fixture 仅 monkeypatch.setattr 设
+    _async_executor=None, monkeypatch undo 后旧 executor (E1) 还 alive 持
+    4 worker thread + 残留 fire_and_forget task. E1 worker 在下一 test setup
+    之后跑 → 调真 _http_post_json (mock 已 undo) → enqueue 本地 → inc
+    push_async_enqueue counter → 污染下一 test (test_metrics_async_enqueue_counter
+    在 alphabetical 全 suite 跑序下 actual=N+1 vs expected=1).
+
+    fix 同 central_push_drain.reset_for_tests: 进 reset 就 shutdown +
+    cancel_futures, 防孤儿 executor leak.
+    """
+    global _async_executor
+    with _async_lock:
+        ex = _async_executor
+        _async_executor = None
+    if ex is not None:
+        # cancel_futures=True 让 pending 但未启动的 task 直接丢弃
+        # (Python 3.9+); wait=True 等已启动的 task 跑完.
+        ex.shutdown(wait=True, cancel_futures=True)
+
 # UUIDv5 namespace: worker 离线时也能算出确定性 customer_id, 主控收到 push
 # 时若已存在 (canonical_source, canonical_id) 则 ON CONFLICT 走 update 路径,
 # customer_id 保持为首次写入时的值 (PK 不变).

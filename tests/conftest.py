@@ -69,6 +69,10 @@ def _p29_reset_global_state():
     # 这种"清后不重建"型 reset 必须 test 自己显式调用, 不适合 autouse.
     reset_targets = [
         ("src.host.central_push_client", "reset_push_metrics_for_tests"),
+        # 2026-05-04 D.4: shutdown 旧 ThreadPoolExecutor + cancel_futures, 防
+        # fire_and_forget task leak 到下一 test 调真 _http_post_json 后 inc
+        # push_async_enqueue counter (test_metrics_async_enqueue_counter flaky).
+        ("src.host.central_push_client", "reset_async_executor_for_tests"),
         ("src.host.central_push_drain", "reset_for_tests"),
         ("src.host.fb_concurrency", "reset_metrics_for_tests"),
         ("src.host.cluster_lock_client", "reset_caches_for_tests"),
