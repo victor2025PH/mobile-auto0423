@@ -31,6 +31,11 @@ def reset_state(tmp_path, monkeypatch):
     drain_mod.reset_for_tests()
     yield
     # cleanup: 停 drain 线程
+    # critical 顺序约定 (2026-05-04 Stage D.2): 此处 stop 跑在 monkeypatch
+    # undo 之前 (pytest fixture LIFO teardown). 删了之后 daemon 在 monkeypatch
+    # undo 后才被 conftest P2-⑨ 兜底 stop, 这期间 thread tick 调真
+    # _http_post_json (mock 已 undo) → 真 push_total inc → 污染下一 test.
+    # C.2 的 reset_for_tests stop+join 是 conftest 兜底, 不替代此处 primary stop.
     drain_mod.stop_drain_thread(timeout_sec=2.0)
 
 
