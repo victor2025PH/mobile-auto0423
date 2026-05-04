@@ -2809,106 +2809,129 @@ class FacebookAutomation(BaseAutomation):
             log.warning("[profile-msg-fallback] type_text 后 pkg=%s 离开 fb/orca", _p2)
             return _fail(f"left_chat_after_input:{_p2}")
 
-        # Step 3 (NEW 2026-05-04): IME send action 优先 — katana 内嵌 chat
-        # React Native 渲染没 resourceId, 14:51 真机 task dcb5f9ff 在 245 个
-        # element 里试 8 个硬 selector **全 0 candidates**. 改用 send_action
-        # 走 KEYCODE_ENTER 触发输入框 onEditorAction(SEND), 不依赖 hierarchy.
-        # success signal = input 清空 (输入栏 React commit 后会清 EditText.text).
+        # Step 3-5: 三层发送策略 (2026-05-04 v40 优化 ①):
+        #   * orca (Messenger app) — selector 命中率高, 优先 selector 省 1.5s IME 等待
+        #   * katana / lite (内嵌 chat) — React Native 无 resourceId, IME 优先
+        # 三策略按 pkg 决定执行顺序, 几何法永远兜底.
         sent = False
         sent_via = ""
+
+        # 提前读 displayHeight 给几何法 y-下半屏强约束用 (2026-05-04 v40 优化 ②)
         try:
-            d.send_action("send")
-            time.sleep(1.5)
-            try:
-                _ed_after = d(className="android.widget.EditText")
-                if _ed_after.exists(timeout=1.0):
-                    _txt_after = _ed_after.get_text() or ""
-                    if not _txt_after.strip():
-                        _p_ime = _cur_pkg()
-                        if _p_ime in _ALLOWED_FB:
-                            sent = True
-                            sent_via = "ime_action"
-                            log.info(
-                                "[profile-msg-fallback] sent via IME action "
-                                "(input cleared) pkg=%s", _p_ime,
-                            )
-            except Exception:
-                pass
-        except Exception as _ime_e:
-            log.debug("[profile-msg-fallback] IME send_action 失败: %s", _ime_e)
+            _disp_h = int((d.info or {}).get("displayHeight") or 1440)
+        except Exception:
+            _disp_h = 1440
+        _y_min_geo = int(_disp_h * 0.5)
 
-        # Step 4: u2 selector 试错 — 扩展 katana / orca 多语言候选.
-        # 绝不调 smart_tap (smart_tap 含 katana healing, Messenger 内调会
-        # force-restart 切回 FB - 见 memory feedback_smart_tap_messenger_contract).
-        if not sent:
-            for sel in _PROFILE_SEND_BTN_SELECTORS:
+        if _p2 == "com.facebook.orca":
+            _strategies = ("selector", "ime", "geometry")
+        else:
+            _strategies = ("ime", "selector", "geometry")
+
+        for _strategy in _strategies:
+            if sent:
+                break
+
+            if _strategy == "ime":
+                # IME send_action 走 KEYCODE_ENTER 触发输入框 onEditorAction(SEND),
+                # 不依赖 hierarchy. success signal = input 清空 + 仍在 fb/orca pkg.
+                # (14:51 真机 task dcb5f9ff 在 245 个 element 里试 8 个硬 selector
+                # 全 0 candidates, IME 才是 React Native 渲染场景的根本解.)
                 try:
-                    el = d(**sel)
-                    if el.exists(timeout=1.0):
-                        el.click()
-                        sent = True
-                        sent_via = f"selector:{sel}"
-                        log.info("[profile-msg-fallback] Send via u2 %s", sel)
-                        break
-                except Exception:
-                    pass
+                    d.send_action("send")
+                    time.sleep(1.5)
+                    try:
+                        _ed_after = d(className="android.widget.EditText")
+                        if _ed_after.exists(timeout=1.0):
+                            _txt_after = _ed_after.get_text() or ""
+                            if not _txt_after.strip():
+                                _p_ime = _cur_pkg()
+                                if _p_ime in _ALLOWED_FB:
+                                    sent = True
+                                    sent_via = "ime_action"
+                                    log.info(
+                                        "[profile-msg-fallback] sent via IME action "
+                                        "(input cleared) pkg=%s", _p_ime,
+                                    )
+                    except Exception:
+                        pass
+                except Exception as _ime_e:
+                    log.debug("[profile-msg-fallback] IME send_action 失败: %s", _ime_e)
 
-        # Step 5 (NEW 2026-05-04): 几何法兜底 — EditText 右侧 clickable 节点.
-        # katana React Native 渲染时 send button 既无 resourceId / description
-        # 也无 text, 但 chat 输入栏标准布局是 [...] [ EditText ] [ send ], send
-        # 必在 EditText 右侧, y 范围重叠. 用 bounds 几何关系定位是兜底中的兜底.
-        if not sent:
-            try:
-                _ed = d(className="android.widget.EditText")
-                if _ed.exists():
-                    _ebnd = _ed.bounds()  # (l, t, r, b)
-                    if _ebnd:
-                        _ed_right, _ed_top, _ed_bot = _ebnd[2], _ebnd[1], _ebnd[3]
-                        _xml = d.dump_hierarchy()
-                        import re as _re_geo
-                        _node_pat = _re_geo.compile(
-                            r'<node[^>]*?clickable="true"[^>]*?'
-                            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
-                            _re_geo.DOTALL,
-                        )
-                        _candidates = []
-                        for _m in _node_pat.finditer(_xml):
-                            _l, _t, _r, _b = (int(_m.group(i)) for i in (1, 2, 3, 4))
-                            if _l < _ed_right:
-                                continue
-                            if _b < _ed_top - 20 or _t > _ed_bot + 20:
-                                continue
-                            _w, _hh = _r - _l, _b - _t
-                            if _w < 30 or _w > 250 or _hh < 30 or _hh > 250:
-                                continue
-                            _candidates.append((_l, _t, _r, _b))
-                        # 最右 candidate 优先 (chat 输入栏 send 永远在最右)
-                        _candidates.sort(key=lambda x: x[0], reverse=True)
-                        for _l, _t, _r, _b in _candidates[:2]:
-                            _cx, _cy = (_l + _r) // 2, (_t + _b) // 2
-                            log.info(
-                                "[profile-msg-fallback] 几何法 tap right-of-EditText "
-                                "(%d,%d) bounds=(%d,%d,%d,%d)",
-                                _cx, _cy, _l, _t, _r, _b,
+            elif _strategy == "selector":
+                # u2 selector 试错 (selector 列表见 module-level _PROFILE_SEND_BTN_SELECTORS).
+                # 绝不调 smart_tap (smart_tap 含 katana healing, Messenger 内调会
+                # force-restart 切回 FB - 见 memory feedback_smart_tap_messenger_contract).
+                for sel in _PROFILE_SEND_BTN_SELECTORS:
+                    try:
+                        el = d(**sel)
+                        if el.exists(timeout=1.0):
+                            el.click()
+                            sent = True
+                            sent_via = f"selector:{sel}"
+                            log.info("[profile-msg-fallback] Send via u2 %s", sel)
+                            break
+                    except Exception:
+                        pass
+
+            elif _strategy == "geometry":
+                # 几何法兜底 — chat 输入栏标准布局 [...] [ EditText ] [ send ],
+                # send 必在 EditText 右侧 + 屏幕下半部. ② 加 y > h*0.5 强约束防误点
+                # chat header 的 phone/video/back icon (它们也 clickable=true).
+                try:
+                    _ed = d(className="android.widget.EditText")
+                    if _ed.exists():
+                        _ebnd = _ed.bounds()  # (l, t, r, b)
+                        if _ebnd:
+                            _ed_right, _ed_top, _ed_bot = _ebnd[2], _ebnd[1], _ebnd[3]
+                            _xml = d.dump_hierarchy()
+                            import re as _re_geo
+                            _node_pat = _re_geo.compile(
+                                r'<node[^>]*?clickable="true"[^>]*?'
+                                r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+                                _re_geo.DOTALL,
                             )
-                            d.click(_cx, _cy)
-                            time.sleep(1.2)
-                            try:
-                                _ed_check = d(className="android.widget.EditText")
-                                if _ed_check.exists(timeout=1.0):
-                                    _t2 = _ed_check.get_text() or ""
-                                    if not _t2.strip():
-                                        sent = True
-                                        sent_via = f"geometry:({_cx},{_cy})"
-                                        log.info(
-                                            "[profile-msg-fallback] 几何法 sent "
-                                            "(input cleared)",
-                                        )
-                                        break
-                            except Exception:
-                                pass
-            except Exception as _geo_e:
-                log.debug("[profile-msg-fallback] 几何法兜底失败: %s", _geo_e)
+                            _candidates = []
+                            for _m in _node_pat.finditer(_xml):
+                                _l, _t, _r, _b = (int(_m.group(i)) for i in (1, 2, 3, 4))
+                                if _l < _ed_right:
+                                    continue
+                                if _b < _ed_top - 20 or _t > _ed_bot + 20:
+                                    continue
+                                # ② y 强约束: 必须在屏幕下半部 (输入栏一定在底部)
+                                if _t < _y_min_geo:
+                                    continue
+                                _w, _hh = _r - _l, _b - _t
+                                if _w < 30 or _w > 250 or _hh < 30 or _hh > 250:
+                                    continue
+                                _candidates.append((_l, _t, _r, _b))
+                            # 最右 candidate 优先 (chat 输入栏 send 永远在最右)
+                            _candidates.sort(key=lambda x: x[0], reverse=True)
+                            for _l, _t, _r, _b in _candidates[:2]:
+                                _cx, _cy = (_l + _r) // 2, (_t + _b) // 2
+                                log.info(
+                                    "[profile-msg-fallback] 几何法 tap right-of-EditText "
+                                    "(%d,%d) bounds=(%d,%d,%d,%d)",
+                                    _cx, _cy, _l, _t, _r, _b,
+                                )
+                                d.click(_cx, _cy)
+                                time.sleep(1.2)
+                                try:
+                                    _ed_check = d(className="android.widget.EditText")
+                                    if _ed_check.exists(timeout=1.0):
+                                        _t2 = _ed_check.get_text() or ""
+                                        if not _t2.strip():
+                                            sent = True
+                                            sent_via = f"geometry:({_cx},{_cy})"
+                                            log.info(
+                                                "[profile-msg-fallback] 几何法 sent "
+                                                "(input cleared)",
+                                            )
+                                            break
+                                except Exception:
+                                    pass
+                except Exception as _geo_e:
+                    log.debug("[profile-msg-fallback] 几何法兜底失败: %s", _geo_e)
 
         if not sent:
             return _fail("send_failed_no_button")
