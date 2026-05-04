@@ -2653,6 +2653,270 @@ class FacebookAutomation(BaseAutomation):
             status="sent")
         return True
 
+    def _send_msg_from_current_profile(self, d, did: str,
+                                        message: str) -> Tuple[bool, str]:
+        """方案 A fallback: 当前已在 profile 页 (from_current_profile 流), 但
+        没 Add Friend 按钮 (FB 冷账号风控). 找 "Message" / "メッセージ" 按钮
+        点开 1on1 chat 直接发消息 — 不需要好友关系.
+
+        每步都 verify current pkg ∈ {katana, orca} 防 atx-agent hierarchy
+        cache 滞后导致 click 落到 GMS 弹窗 / 系统 launcher.
+
+        返回 (ok, reason):
+          * (True, "sent") — 消息已发
+          * (False, "not_in_fb_or_orca") — 当前已在第三方 app
+          * (False, "no_message_button") — profile 页连 Message 按钮也没有
+          * (False, "chat_input_missing") — 进入 chat 但找不到输入框
+          * (False, "send_failed") — 输入了但 Send 没成功
+        """
+        import subprocess as _sp
+
+        def _cur_pkg() -> str:
+            try:
+                p = (d.app_current() or {}).get("package", "") or ""
+                if p:
+                    return p
+            except Exception:
+                pass
+            # adb fallback
+            try:
+                out = _sp.run(
+                    ["adb", "-s", did, "shell", "dumpsys", "window"],
+                    capture_output=True, timeout=3,
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+                ).stdout.decode("utf-8", "ignore")
+                for ln in out.splitlines():
+                    if "mCurrentFocus" in ln and "/" in ln:
+                        return ln.split("u0 ")[-1].split("/")[0].strip()
+            except Exception:
+                pass
+            return ""
+
+        _ALLOWED_FB = {"com.facebook.katana", "com.facebook.orca",
+                        "com.facebook.lite"}
+
+        # 内联取证 helper — 各 return False 分支统一抓 PNG+XML 到 _pending/.
+        # 替代靠 MessengerError raise 才触发 forensics 的旧设计 (PR #157 真机
+        # task dcb5f9ff 14:47-14:52 全部 fallback 失败但 0 取证落盘的事故根因).
+        def _fail(reason: str) -> Tuple[bool, str]:
+            try:
+                _capture_immediate_async(
+                    did,
+                    step_name=f"profile_msg_fallback_{reason}",
+                    hint=f"target_msg={(message or '')[:40]}",
+                    reason=reason,
+                )
+            except Exception:
+                pass
+            return False, reason
+
+        if not message:
+            return False, "empty_message"
+
+        # Pre-check: 当前必须在 FB / Messenger 系内
+        _p0 = _cur_pkg()
+        if _p0 and _p0 not in _ALLOWED_FB:
+            log.warning("[profile-msg-fallback] 已在第三方 app pkg=%s, abort", _p0)
+            return _fail(f"not_in_fb_or_orca:{_p0}")
+
+        # Step 1: 在当前 profile 页找 Message 按钮
+        msg_clicked = False
+        for sel in (
+            {"text": "Message"},
+            {"description": "Message"},
+            {"textContains": "Message"},
+            {"descriptionContains": "Message"},
+            {"text": "メッセージ"},
+            {"description": "メッセージ"},
+            {"textContains": "メッセージ"},
+            {"text": "发消息"},
+            {"description": "发消息"},
+            {"text": "傳送訊息"},
+            {"description": "傳送訊息"},
+        ):
+            try:
+                el = d(**sel)
+                if el.exists(timeout=1.0):
+                    el.click()
+                    msg_clicked = True
+                    log.info("[profile-msg-fallback] Message btn via %s", sel)
+                    break
+            except Exception:
+                pass
+        if not msg_clicked:
+            return _fail("no_message_button")
+        time.sleep(2.5)
+
+        # Verify chat 真的打开 — 必须在 com.facebook.orca / katana
+        _p1 = _cur_pkg()
+        if _p1 not in _ALLOWED_FB:
+            log.warning("[profile-msg-fallback] tap Message 后 pkg=%s 不是 fb/orca", _p1)
+            return _fail(f"chat_did_not_open:{_p1}")
+        # orca 是 Messenger app, 是预期; katana 内嵌 chat (lite 模式) 也接受
+        log.info("[profile-msg-fallback] 进入 chat pkg=%s", _p1)
+
+        # Step 2: chat 已打开. 找 EditText 输入消息.
+        # race fix (2026-05-04): 旧 exists(timeout=2.5) 在 14:47/14:50 task
+        # dcb5f9ff 真机连续 2 人 chat_input_missing — katana 内嵌 chat 走
+        # React Native 渲染, hierarchy 加载比 orca 慢. wait(timeout=8.0) 等真值.
+        try:
+            input_el = d(className="android.widget.EditText")
+            if not input_el.wait(timeout=8.0):
+                return _fail("chat_input_missing")
+            # Verify input 真的可见 — bounds 必须在屏幕内
+            try:
+                _ib = input_el.bounds()
+                _info = d.info or {}
+                _h = int(_info.get("displayHeight") or 1440)
+                # input 必须在屏幕下半部 (chat 通常底部输入)
+                if _ib and _ib[1] < _h * 0.4:
+                    log.warning("[profile-msg-fallback] EditText 位置异常 bounds=%s", _ib)
+                    return _fail("chat_input_position_unexpected")
+            except Exception:
+                pass
+            self.hb.tap(d, *self._el_center(input_el))
+            time.sleep(0.5)
+            self.hb.type_text(d, message[:500])
+            time.sleep(0.6)
+        except Exception as e:
+            log.debug("[profile-msg-fallback] input 失败: %s", e)
+            return _fail("chat_input_missing")
+
+        # Verify input 后仍在 orca/katana
+        _p2 = _cur_pkg()
+        if _p2 not in _ALLOWED_FB:
+            log.warning("[profile-msg-fallback] type_text 后 pkg=%s 离开 fb/orca", _p2)
+            return _fail(f"left_chat_after_input:{_p2}")
+
+        # Step 3 (NEW 2026-05-04): IME send action 优先 — katana 内嵌 chat
+        # React Native 渲染没 resourceId, 14:51 真机 task dcb5f9ff 在 245 个
+        # element 里试 8 个硬 selector **全 0 candidates**. 改用 send_action
+        # 走 KEYCODE_ENTER 触发输入框 onEditorAction(SEND), 不依赖 hierarchy.
+        # success signal = input 清空 (输入栏 React commit 后会清 EditText.text).
+        sent = False
+        sent_via = ""
+        try:
+            d.send_action("send")
+            time.sleep(1.5)
+            try:
+                _ed_after = d(className="android.widget.EditText")
+                if _ed_after.exists(timeout=1.0):
+                    _txt_after = _ed_after.get_text() or ""
+                    if not _txt_after.strip():
+                        _p_ime = _cur_pkg()
+                        if _p_ime in _ALLOWED_FB:
+                            sent = True
+                            sent_via = "ime_action"
+                            log.info(
+                                "[profile-msg-fallback] sent via IME action "
+                                "(input cleared) pkg=%s", _p_ime,
+                            )
+            except Exception:
+                pass
+        except Exception as _ime_e:
+            log.debug("[profile-msg-fallback] IME send_action 失败: %s", _ime_e)
+
+        # Step 4: u2 selector 试错 — 扩展 katana / orca 多语言候选.
+        # 绝不调 smart_tap (smart_tap 含 katana healing, Messenger 内调会
+        # force-restart 切回 FB - 见 memory feedback_smart_tap_messenger_contract).
+        if not sent:
+            for sel in (
+                {"resourceId": "com.facebook.orca:id/send"},
+                {"resourceId": "com.facebook.orca:id/send_button"},
+                {"description": "Send"},
+                {"description": "送信"},
+                {"description": "送る"},
+                {"description": "发送"},
+                {"description": "发送消息"},
+                {"description": "傳送"},
+                {"description": "傳送訊息"},
+                {"text": "Send"},
+                {"descriptionContains": "Send a message"},
+                {"descriptionContains": "メッセージを送"},
+            ):
+                try:
+                    el = d(**sel)
+                    if el.exists(timeout=1.0):
+                        el.click()
+                        sent = True
+                        sent_via = f"selector:{sel}"
+                        log.info("[profile-msg-fallback] Send via u2 %s", sel)
+                        break
+                except Exception:
+                    pass
+
+        # Step 5 (NEW 2026-05-04): 几何法兜底 — EditText 右侧 clickable 节点.
+        # katana React Native 渲染时 send button 既无 resourceId / description
+        # 也无 text, 但 chat 输入栏标准布局是 [...] [ EditText ] [ send ], send
+        # 必在 EditText 右侧, y 范围重叠. 用 bounds 几何关系定位是兜底中的兜底.
+        if not sent:
+            try:
+                _ed = d(className="android.widget.EditText")
+                if _ed.exists():
+                    _ebnd = _ed.bounds()  # (l, t, r, b)
+                    if _ebnd:
+                        _ed_right, _ed_top, _ed_bot = _ebnd[2], _ebnd[1], _ebnd[3]
+                        _xml = d.dump_hierarchy()
+                        import re as _re_geo
+                        _node_pat = _re_geo.compile(
+                            r'<node[^>]*?clickable="true"[^>]*?'
+                            r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+                            _re_geo.DOTALL,
+                        )
+                        _candidates = []
+                        for _m in _node_pat.finditer(_xml):
+                            _l, _t, _r, _b = (int(_m.group(i)) for i in (1, 2, 3, 4))
+                            if _l < _ed_right:
+                                continue
+                            if _b < _ed_top - 20 or _t > _ed_bot + 20:
+                                continue
+                            _w, _hh = _r - _l, _b - _t
+                            if _w < 30 or _w > 250 or _hh < 30 or _hh > 250:
+                                continue
+                            _candidates.append((_l, _t, _r, _b))
+                        # 最右 candidate 优先 (chat 输入栏 send 永远在最右)
+                        _candidates.sort(key=lambda x: x[0], reverse=True)
+                        for _l, _t, _r, _b in _candidates[:2]:
+                            _cx, _cy = (_l + _r) // 2, (_t + _b) // 2
+                            log.info(
+                                "[profile-msg-fallback] 几何法 tap right-of-EditText "
+                                "(%d,%d) bounds=(%d,%d,%d,%d)",
+                                _cx, _cy, _l, _t, _r, _b,
+                            )
+                            d.click(_cx, _cy)
+                            time.sleep(1.2)
+                            try:
+                                _ed_check = d(className="android.widget.EditText")
+                                if _ed_check.exists(timeout=1.0):
+                                    _t2 = _ed_check.get_text() or ""
+                                    if not _t2.strip():
+                                        sent = True
+                                        sent_via = f"geometry:({_cx},{_cy})"
+                                        log.info(
+                                            "[profile-msg-fallback] 几何法 sent "
+                                            "(input cleared)",
+                                        )
+                                        break
+                            except Exception:
+                                pass
+            except Exception as _geo_e:
+                log.debug("[profile-msg-fallback] 几何法兜底失败: %s", _geo_e)
+
+        if not sent:
+            return _fail("send_failed_no_button")
+
+        # Final verify: send 后仍在 orca/katana, 没跑到第三方 app
+        time.sleep(1.0)
+        _p3 = _cur_pkg()
+        if _p3 not in _ALLOWED_FB:
+            log.warning("[profile-msg-fallback] send 后 pkg=%s 跑到第三方", _p3)
+            return _fail(f"left_chat_after_send:{_p3}")
+        log.info(
+            "[profile-msg-fallback] 消息已发送 via %s (绕开 add_friend 风控) pkg=%s",
+            sent_via, _p3,
+        )
+        return True, "sent"
+
     @_with_fb_foreground
     def add_friend(self, profile_name: str,
                    device_id: Optional[str] = None) -> bool:
@@ -4188,7 +4452,8 @@ class FacebookAutomation(BaseAutomation):
                              walk_candidates: bool = False,
                              l2_gate_shots: int = 1,
                              max_l2_calls: int = 3,
-                             strict_persona_gate: bool = False) -> Dict[str, Any]:
+                             strict_persona_gate: bool = False,
+                             from_current_profile: bool = False) -> Dict[str, Any]:
         """一体化: 搜索 → 加好友(带验证语) → 打招呼 DM(同 profile 页)。
 
         这是**方案 A2** 的默认入口 —— 把两个原子动作组合,让上层调用只需
@@ -4218,6 +4483,7 @@ class FacebookAutomation(BaseAutomation):
             "greet_ok": False,
             "greet_skipped_reason": "",
             "profile_name": profile_name,
+            "dm_only_sent": False,  # 方案 A: profile DM fallback 成功时置 True
         }
 
         add_ok = self.add_friend_with_note(
@@ -4229,6 +4495,7 @@ class FacebookAutomation(BaseAutomation):
             phase=phase,
             source=source,
             preset_key=preset_key,
+            from_current_profile=from_current_profile,
             do_l2_gate=do_l2_gate,
             force=force,
             walk_candidates=walk_candidates,
@@ -4237,6 +4504,29 @@ class FacebookAutomation(BaseAutomation):
             strict_persona_gate=strict_persona_gate,
         )
         out["add_friend_ok"] = bool(add_ok)
+
+        # 方案 A (2026-05-04): add_friend 失败 + from_current_profile=True 时,
+        # 当前应该还在 profile 页 (add_friend_with_note 内部失败前只 scroll
+        # 没切页). 检测 Message 按钮直接发 DM 绕开冷账号 add_friend 风控.
+        if not add_ok and from_current_profile and (greeting or note):
+            try:
+                _did = self._did(device_id)
+                _d = self._u2(_did)
+                _msg = greeting or note
+                _ok_dm, _why = self._send_msg_from_current_profile(_d, _did, _msg)
+                if _ok_dm:
+                    out["dm_only_sent"] = True
+                    out["greet_ok"] = True
+                    out["greet_skipped_reason"] = "via_profile_dm_fallback"
+                    log.info("[add_friend_and_greet] profile-DM fallback 成功 "
+                             "(冷账号无 Add Friend 按钮): %s", profile_name)
+                    return out
+                else:
+                    log.info("[add_friend_and_greet] profile-DM fallback 跳过 "
+                             "(reason=%s): %s", _why, profile_name)
+            except Exception as _dm_e:
+                log.debug("[add_friend_and_greet] profile-DM fallback 异常: %s",
+                          _dm_e)
 
         if not add_ok and not greet_on_failure:
             out["greet_skipped_reason"] = "add_friend_failed"
@@ -4844,6 +5134,32 @@ class FacebookAutomation(BaseAutomation):
         ):
             return False
 
+        # 2026-05-04 关键: 优先检查"Joined"按钮 (新版 FB 群顶部 Joined ▼).
+        # 如果存在 + 屏幕上方 (cy<800) → 当前群已加入, 不需 join.
+        # 之前 v22-v24 fail 因为漏判: 屏幕下方 Related groups 区有别群的 Join
+        # 按钮 (cy~1300), require_join 误判"当前群未加入"触发 join 流程.
+        try:
+            from src.vision.screen_parser import XMLParser as _XPJ
+            for _n in _XPJ.parse(xml_probe):
+                if not getattr(_n, "bounds", None):
+                    continue
+                _t_ = (getattr(_n, "text", "") or "").strip()
+                _d_ = (getattr(_n, "content_desc", None) or "").strip()
+                _clk = bool(getattr(_n, "clickable", False))
+                _l, _tt, _r, _b = _n.bounds
+                _cy = (_tt + _b) // 2
+                # Joined 按钮 (Joined / Joined ▼ / 已加入 / 加入済み / 已加入)
+                if _clk and _cy < 900 and _t_ in (
+                    "Joined", "已加入", "已加入小组", "加入済み", "已加入群组",
+                ):
+                    log.info("[extract_members] joined button found at cy=%d, skip require_join check", _cy)
+                    return False
+                if _clk and _cy < 900 and _d_.startswith(("Joined ", "joined ")) and "group" in _d_:
+                    log.info("[extract_members] joined-group desc found cy=%d, skip require_join", _cy)
+                    return False
+        except Exception:
+            pass
+
         def _center_safe(el) -> bool:
             """v11: 收严 y 区间到 600-1000 (群头下方+子 tab 上方), 排除帖子里
             'Join us!' (y > 1100) 和 Suggested groups (y > 1000)."""
@@ -4959,8 +5275,10 @@ class FacebookAutomation(BaseAutomation):
         def _center_safe(el) -> Optional[Tuple[int, int]]:
             try:
                 cx, cy = self._el_center(el)
-                # v11: 严格区间. 群头下方 + 子 tab 上方
-                if cy < 600 or cy > 1000:
+                # 2026-05-04 放宽: 新版 FB Join 按钮 y 跨度更大 (cover bottom +
+                # 100~250). 老 v11 600-1000 太严, 真机 v23 22 candidates 全 reject.
+                # 改 400-1300 覆盖 Joined ▼/Invite 按钮位置 (cover_bottom + 100-250).
+                if cy < 400 or cy > 1300:
                     return None
                 return cx, cy
             except Exception:
@@ -5517,12 +5835,16 @@ class FacebookAutomation(BaseAutomation):
         "mutual", "共同好友", "共通の友達",
     )
     _FB_GROUP_MEMBER_LIST_STRONG_MARKERS = (
-        "搜索成员", "Search members", "メンバーを検索",
+        "搜索成员", "Search members", "Search Members", "メンバーを検索",
         "新加入这个小组的用户", "新加入這個小組的用戶",
         "New to the group", "New members",
         "管理员和版主", "管理員和版主",
-        "Admins and moderators", "Administrators and moderators",
-        "小组专家", "小組專家", "Group experts",
+        # 2026-05-04 新版 FB 大小写改了 (capital M): "Admins and Moderators"
+        "Admins and moderators", "Admins and Moderators",
+        "Administrators and moderators",
+        # 2026-05-04 新版 FB 把 "Group experts" 改名为 "Group contributors"
+        "小组专家", "小組貢獻者", "Group experts", "Group contributors",
+        "グループの投稿者",
     )
     _FB_GROUP_MEMBER_ADD_BUTTON_TEXTS = (
         "加为好友", "添加好友", "加为朋友", "加為好友",
@@ -6164,9 +6486,438 @@ class FacebookAutomation(BaseAutomation):
             out.append(item)
         return out
 
+    def _tap_via_search_members_input(self, d, did: str) -> bool:
+        """2026-05-04 P0: 在 Members 列表 preview 页用 "Search Members" 输入框
+        触发 FB 服务端 push 搜索结果, 拿真用户名 (绕开 SDUI 不暴露 contributors
+        真名的限制).
+
+        步骤:
+          1. 当前页面 dump 找 Search Members 输入框 (EditText / hint=Search Members)
+          2. tap 输入框 + 输入随机日文常用字 ("美" / "ま" / "ko" 等)
+          3. 等 1.5s FB 服务端 push 结果
+          4. dump 抓 search results — 真名应该在列表里
+          5. 找到 result 后 return True; 后续 _campaign_add_friends 直接 tap 第一个 row
+
+        注意: 此函数返 True 表示**已触发搜索 + 当前在搜索结果页**, 后续
+        extract_group_members 主流程会从 search results 抽 candidates.
+        """
+        try:
+            from src.vision.screen_parser import XMLParser as _XPSI
+        except Exception:
+            return False
+
+        try:
+            xml_pre = d.dump_hierarchy() or ""
+        except Exception:
+            return False
+
+        # Step 1: 找 Search Members 输入框 (EditText 或 hint='Search Members')
+        # 多语言: 'Search Members' / 'メンバーを検索' / '搜索成员' / '搜尋成員'
+        _search_hints = (
+            "Search Members", "Search members", "Search member",
+            "メンバーを検索", "メンバー検索",
+            "搜索成员", "搜索成員", "搜尋成員",
+            "Buscar miembros", "Cerca membri",
+        )
+        _input_bounds = None
+        for node in _XPSI.parse(xml_pre):
+            if not getattr(node, "bounds", None):
+                continue
+            cls = (getattr(node, "cls", "") or "").strip()
+            txt = (getattr(node, "text", "") or "").strip()
+            desc = (getattr(node, "content_desc", None) or "").strip()
+            hint = (getattr(node, "hint", None) or "").strip()
+            l, t, r, b = node.bounds
+            if t > 600 or t < 100:  # Search Members 输入框通常在顶部 y=180-320
+                continue
+            # 1) class=EditText 在顶部
+            if "EditText" in cls and (b - t) < 100:
+                _input_bounds = (l, t, r, b)
+                log.info("[search-input] 找到 EditText bounds=(%d,%d,%d,%d)",
+                         l, t, r, b)
+                break
+            # 2) text/desc/hint 含 Search 关键词
+            if any(_p in (txt + desc + hint) for _p in _search_hints):
+                _input_bounds = (l, t, r, b)
+                log.info("[search-input] 找到 search hint bounds=(%d,%d,%d,%d) val=%r",
+                         l, t, r, b, (txt or desc or hint)[:40])
+                break
+
+        if not _input_bounds:
+            log.info("[search-input] 当前页面无 Search Members 输入框")
+            return False
+
+        _il, _it, _ir, _ib = _input_bounds
+        _icx, _icy = (_il + _ir) // 2, (_it + _ib) // 2
+
+        # Step 2: tap + 输入随机日文常用字 (jp persona 群里)
+        # 选 1 个常见日本姓氏字, FB 搜索按 "starts with" 匹配, 应有多个结果
+        import random as _rnd
+        _seed_chars = ["田", "佐", "鈴", "山", "中", "高", "斎", "石", "美", "智", "和"]
+        _seed = _rnd.choice(_seed_chars)
+        try:
+            self.hb.tap(d, _icx, _icy)
+            time.sleep(0.6)
+            # 用 atx-agent send_keys 输入 (走 ADBKeyboard 支持 unicode)
+            try:
+                d.send_keys(_seed)
+                time.sleep(1.5)
+            except Exception:
+                # fallback: adb shell input text (英文 OK, unicode 需 ADBKeyboard)
+                import subprocess
+                subprocess.run(
+                    ["adb", "-s", did, "shell", "input", "text", _seed],
+                    capture_output=True, timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                time.sleep(1.5)
+            log.info("[search-input] 输入 %r 到 Search Members", _seed)
+        except Exception as e:
+            log.debug("[search-input] tap+输入失败: %s", e)
+            return False
+
+        # Step 3: 等结果 + dump 验证真名出现
+        time.sleep(1.0)
+        try:
+            xml_results = d.dump_hierarchy() or ""
+        except Exception:
+            return False
+
+        # Step 4: 抽 search results 真名 + bounds, 保存到 instance attribute
+        # 让上层 _campaign_extract_members 直接用 (跳过 SDUI 不暴露的 contributors 抽取).
+        _BUTTON_LABELS = {
+            "Search Members", "Search", "Members", "Add", "Message",
+            "Admin", "Moderator", "View profile", "See all",
+            "メンバー", "メンバーを検索", "管理人", "管理者",
+            "投稿", "Posts", "About", "Files", "Photos", "Events",
+            "Anonymous post", "Feeling", "Poll", "Joined", "Invite",
+            "Featured", "You", "Reels", "Albums",
+            # 2026-05-04: search-input log 实测脏候选
+            "Learn More", "Learn more", "Group experts", "Group expert",
+            "Top contributors", "Group contributors", "Group rules",
+            "Group description", "Suggested", "Group", "Page",
+            "Anyone can post", "Active", "Online", "Friends",
+            "Friend Requests", "Friend requests", "Send Message",
+            "Send message", "Follow", "Following",
+        }
+        # 用 substring 排除 (整行精确等于不够 — "Group experts" 可能带后缀)
+        _BUTTON_PREFIXES = (
+            "Learn ", "Group ", "Top ", "Suggested",
+        )
+        _candidates_with_bounds = []
+        _seen_names = set()  # dedup: 同一 name 多 row 只取第一个
+        for node in _XPSI.parse(xml_results):
+            if not getattr(node, "bounds", None):
+                continue
+            txt = (getattr(node, "text", "") or "").strip()
+            l, t, r, b = node.bounds
+            if t < 300 or t > 1400 or (b - t) > 100:
+                continue
+            if not txt or txt in _BUTTON_LABELS:
+                continue
+            if any(txt.startswith(_p) for _p in _BUTTON_PREFIXES):
+                continue
+            # 排除明显的 metadata 行 (含 "points" / "members" / "Lives in" 等)
+            if any(_meta in txt for _meta in (
+                "points", "members", "mutual friend", "Lives in", "Member of",
+                "Rising contributor", "Top contributor", "All-star contributor",
+                "Admin", "since",
+            )):
+                continue
+            if not (2 <= len(txt) <= 30 and any(
+                "぀" <= c <= "ヿ" or "一" <= c <= "鿿"
+                or c.isalpha() for c in txt
+            )):
+                continue
+            # 真名启发: 至少含一个空格 (Foo Bar) 或全 CJK (山田太郎)
+            _has_space = " " in txt or "　" in txt  # 半角/全角空格
+            _all_cjk = all(
+                "぀" <= c <= "ヿ" or "一" <= c <= "鿿" or c.isspace()
+                for c in txt
+            )
+            if not (_has_space or _all_cjk):
+                continue
+            if txt in _seen_names:
+                continue
+            _seen_names.add(txt)
+            _candidates_with_bounds.append({
+                "name": txt,
+                "bounds": [l, t, r, b],
+            })
+        log.info("[search-input] 输入 %r 后抽到 %d 候选真名 (with bounds)",
+                 _seed, len(_candidates_with_bounds))
+        for _c in _candidates_with_bounds[:5]:
+            log.info("  candidate: name=%r bounds=%s", _c["name"], _c["bounds"])
+
+        if len(_candidates_with_bounds) < 2:
+            return False
+
+        # 保存到 instance attribute, _campaign_extract_members 检查并优先用
+        try:
+            self._search_input_candidates = _candidates_with_bounds
+            self._search_input_seed = _seed
+        except Exception:
+            pass
+        return True
+
+    def _tap_via_about_members_path(self, d, did: str) -> bool:
+        """2026-05-04 8 截图实证的真路径: 群首页 → tap 群名 banner → About 页
+        → Members "See all" → Members 列表页(分组). 然后调用方再决定是否
+        进 Group contributors 完整列表.
+
+        步骤:
+          1. dump 当前页面, 找 顶部"群名" banner 节点(text=group_name 且 y<400
+             且 clickable=True or 父 clickable). 该节点真机截图位于群首页 banner
+             下方 (y≈600), 但 clickable bounds 在更上方 banner 区域.
+          2. tap → 跳到 About 页. dump 含 "About" / "Public group" / "Group activity"
+             / "Members" 字样.
+          3. About 页找 "Members" anchor + 同行 "See all" (clk=True). tap See all.
+          4. 进 Members 页. dump 含 "Search Members" / "Admins and Moderators"
+             / "Group contributors" / "清田" 等. 用 _looks_like_group_members_list_xml
+             判定 PASS.
+
+        失败任一步返 False, 让 fallback 接管.
+        """
+        try:
+            xml0 = d.dump_hierarchy() or ""
+        except Exception:
+            return False
+        if not xml0:
+            return False
+
+        # 已经在 Members 列表页就直接 return True
+        if self._looks_like_group_members_list_xml(xml0):
+            log.info("[about-path] already on members list, skip")
+            return True
+
+        # Step A: tap 群名 banner 跳 About 页
+        # 真机截图: 群首页 顶部 banner 下方有大字群名 (y≈600, clickable=true,
+        # 含 ">" 后缀指示可 tap). 用 XMLParser 找最匹配的群名节点 + 位置在
+        # 屏幕上半部 (y < 700) + clk=True.
+        try:
+            from src.vision.screen_parser import XMLParser
+        except Exception:
+            return False
+
+        # 2026-05-04 新版 FB SDUI: dump_hierarchy 不暴露群名 text 节点
+        # (accessibility tree lazy, screen 上字看得到 dump 抓不到).
+        # 改用 cover photo 节点 bounds 计算群名 banner 位置:
+        # cover photo bottom + 50px = 群名 anchor 中心 y (群名在 cover 下方紧贴一行).
+        _cover_bounds = None
+        for node in XMLParser.parse(xml0):
+            if not getattr(node, "bounds", None):
+                continue
+            desc = (getattr(node, "content_desc", None) or "").strip()
+            if "Cover photo" in desc or "cover photo" in desc.lower():
+                _cover_bounds = node.bounds
+                log.info("[about-path] cover_photo bounds=%s desc=%r",
+                         _cover_bounds, desc[:60])
+                break
+
+        if not _cover_bounds:
+            log.warning("[about-path] 未找到 cover photo anchor, 当前页面可能不是群首页")
+            return False
+
+        _ct = _cover_bounds[1]
+        _cb = _cover_bounds[3]
+        cx = 360  # 屏幕宽度 720, 中心
+        cy = _cb + 50  # cover bottom + 50px = 群名行
+        log.info("[about-path] tap group-name banner via cover_bottom+50 = (%d, %d)",
+                 cx, cy)
+        try:
+            self.hb.tap(d, cx, cy)
+            time.sleep(2.0)
+        except Exception as e:
+            log.debug("[about-path] tap banner failed: %s", e)
+            return False
+
+        # Step B: About 页找 Members section + 同行 See all
+        try:
+            xml_about = d.dump_hierarchy() or ""
+        except Exception:
+            return False
+        if not xml_about:
+            return False
+        if self._looks_like_group_members_list_xml(xml_about):
+            log.info("[about-path] tap banner 直接到 members list (短路 PASS)")
+            return True
+
+        # 找 "Members" anchor (text/desc) + 同行 "See all" (clk=True)
+        members_anchor = None
+        seeall_btns = []
+        for node in XMLParser.parse(xml_about):
+            if not getattr(node, "bounds", None):
+                continue
+            txt = (getattr(node, "text", "") or "").strip()
+            desc = (getattr(node, "content_desc", None) or "").strip()
+            clk = bool(getattr(node, "clickable", False))
+            l, t, r, b = node.bounds
+            if (txt == "Members" or desc == "Members"
+                    or txt == "成员" or txt == "成員"
+                    or txt == "メンバー") and (b - t) < 100:
+                if members_anchor is None or t < members_anchor[1]:
+                    members_anchor = (l, t, r, b)
+            if clk and (txt == "See all" or desc == "See all"
+                        or txt == "查看全部" or txt == "すべて見る"):
+                seeall_btns.append((l, t, r, b))
+
+        log.info("[about-path] members_anchor=%s seeall_btns=%d",
+                 members_anchor, len(seeall_btns))
+        if not members_anchor or not seeall_btns:
+            log.warning("[about-path] About 页未找到 Members + See all anchor")
+            return False
+
+        # 选 y 跟 members_anchor 同行 (差 <= 100px) 的 See all
+        m_top = members_anchor[1]
+        same_row = [s for s in seeall_btns if abs(s[1] - m_top) <= 100]
+        if not same_row:
+            # 退而求其次: 取 y > members_anchor 的最近一个
+            below = [s for s in seeall_btns if s[1] >= m_top]
+            same_row = below[:1] if below else seeall_btns[:1]
+        sl, st, sr, sb = same_row[0]
+        scx, scy = (sl + sr) // 2, (st + sb) // 2
+        log.info("[about-path] tap Members See all bounds=(%d,%d,%d,%d) center=(%d,%d)",
+                 sl, st, sr, sb, scx, scy)
+        try:
+            self.hb.tap(d, scx, scy)
+            time.sleep(2.0)
+        except Exception as e:
+            log.debug("[about-path] tap See all failed: %s", e)
+            return False
+
+        # Step C: 验证已到 Members 列表页
+        try:
+            xml_members = d.dump_hierarchy() or ""
+        except Exception:
+            return False
+        if not self._looks_like_group_members_list_xml(xml_members):
+            log.warning("[about-path] tap Members See all 后未识别为成员列表页")
+            return False
+        log.info("[about-path] ✓ 进入 Members 列表页 (preview)")
+
+        # Step D 2026-05-04 用户截图 006 揭示: Members 列表页顶部只显
+        # admins/experts/contributors *预览*, 完整 contributors 列表要再
+        # tap "See all" (Group contributors / Members With Things in Common
+        # 等 section 下方). Q4N7 默认看 Things in Common preview, IJ8H 看
+        # contributors preview. 不论 section, 都 tap 第二个 See all 进完整列表.
+        try:
+            from src.vision.screen_parser import XMLParser as _XPS
+        except Exception:
+            return True
+
+        # 2026-05-04 P0 优化: 优先用 Search Members 输入路径绕开 SDUI 限制.
+        # FB 服务端按账号活跃度 lazy 渲染 contributors 列表 (低活跃账号 dump
+        # 抓不到真名). 但 search 输入触发 FB 主动 push 搜索结果, 真名必须
+        # 出现在 dump 里 (用户能看到).
+        if self._tap_via_search_members_input(d, did):
+            log.info("[about-path] ✓ 用 Search Members 输入路径")
+            return True
+
+        # 2026-05-04 重构 dump 策略: SDUI lazy load + atx-agent cache 不一致
+        # 导致 task 内 dump 抓不到 "See all members" 文字. 用 retry + raw adb
+        # uiautomator dump fallback + 坐标 fallback 三层保护.
+        _seeall_phrases = ("See all", "查看全部", "すべて見る", "すべて表示",
+                           "see all", "Ver todos", "Mostra tutto")
+
+        def _find_seeall_in_xml(_xml: str) -> list:
+            """从 XML 抽取所有含 See all phrase 的节点 bounds."""
+            _hits = []
+            try:
+                for _n in _XPS.parse(_xml):
+                    if not getattr(_n, "bounds", None):
+                        continue
+                    _txt = (getattr(_n, "text", "") or "").strip()
+                    _dsc = (getattr(_n, "content_desc", None) or "").strip()
+                    _val = _txt or _dsc
+                    if not any(_p in _val for _p in _seeall_phrases):
+                        continue
+                    if len(_val) > 80:
+                        continue
+                    _l, _tt, _r, _b = _n.bounds
+                    if (_b - _tt) < 20 or (_r - _l) < 30:
+                        continue
+                    _hits.append((_l, _tt, _r, _b))
+            except Exception:
+                pass
+            return _hits
+
+        # 第 1 层: atx-agent dump retry 5 次 (每次 sleep 0.7s 让 SDUI 渲染)
+        seeall2 = []
+        for _retry in range(5):
+            time.sleep(0.7)
+            try:
+                _xml_try = d.dump_hierarchy() or ""
+            except Exception:
+                _xml_try = ""
+            _hits = _find_seeall_in_xml(_xml_try)
+            if _hits:
+                seeall2 = _hits
+                log.info("[about-path] retry %d: atx-agent dump 命中 %d 个 See all",
+                         _retry, len(_hits))
+                break
+        else:
+            log.info("[about-path] atx-agent dump 5 retry 仍 0, fallback raw adb")
+
+        # 第 2 层: raw adb uiautomator dump (绕开 atx-agent cache)
+        if not seeall2:
+            try:
+                import subprocess
+                _dump_path = f"/sdcard/_about_path_{did[:8]}.xml"
+                subprocess.run(
+                    ["adb", "-s", did, "shell", "uiautomator", "dump", _dump_path],
+                    capture_output=True, timeout=8,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                _proc = subprocess.run(
+                    ["adb", "-s", did, "shell", "cat", _dump_path],
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=8,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                _xml_raw = (_proc.stdout or "").strip()
+                if _xml_raw and _xml_raw.startswith("<"):
+                    seeall2 = _find_seeall_in_xml(_xml_raw)
+                    log.info("[about-path] raw adb dump 命中 %d 个 See all (xml=%d bytes)",
+                             len(seeall2), len(_xml_raw))
+            except Exception as e:
+                log.debug("[about-path] raw adb dump failed: %s", e)
+
+        # 第 3 层: 坐标 fallback (基于 Members section 已知位置)
+        # Members 列表 preview 页布局固定: top=单人 → admins → experts/contributors
+        # See all 通常在屏幕中段 y=1100-1300. tap 屏幕中心 x=360 + y=1200 试.
+        if not seeall2:
+            log.warning("[about-path] dump 全 0, 用坐标 fallback tap (360, 1200)")
+            try:
+                self.hb.tap(d, 360, 1200)
+                time.sleep(2.0)
+                log.info("[about-path] ✓ 坐标 fallback tap 完成")
+            except Exception as e:
+                log.debug("[about-path] 坐标 tap failed: %s", e)
+            return True
+
+        # 取第二个 (跳过 Things in Common, 进更通用的 contributors 完整列表)
+        seeall2.sort(key=lambda x: x[1])
+        idx = 1 if len(seeall2) >= 2 else 0
+        sl2, st2, sr2, sb2 = seeall2[idx]
+        scx2, scy2 = (sl2 + sr2) // 2, (st2 + sb2) // 2
+        log.info("[about-path] tap See all (idx=%d/n=%d) bounds=(%d,%d,%d,%d) center=(%d,%d)",
+                 idx, len(seeall2), sl2, st2, sr2, sb2, scx2, scy2)
+        try:
+            self.hb.tap(d, scx2, scy2)
+            time.sleep(2.0)
+            log.info("[about-path] ✓ 进入 contributors 完整列表")
+        except Exception as e:
+            log.debug("[about-path] tap See all failed: %s", e)
+        return True
+
     def _tap_group_members_tab(self, d, did: str,
                                preferred_source: str = "") -> bool:
         """点击群内 Members tab 的精确路径。
+
+        2026-05-04 真路径 (8 截图实证): 进群后 tap 群名 banner → About 页 →
+        Members section "See all" → Members 页 → 滚到 Group contributors →
+        其下方 See all → 完整 contributors 列表. 这是新版 FB 的真实入口,
+        feed_authors 是错的 fallback (绕开了实际可用的 Members 入口).
 
         2026-04-24 Phase 9 升级 (对齐 Phase 7 search_bar 修复):
           1. **精确短 text/desc + clickable=True**, 防止命中推荐群长描述
@@ -6177,12 +6928,21 @@ class FacebookAutomation(BaseAutomation):
           4. **噪音过滤** — 即使命中也要看 label 长度: 推荐群卡片 desc
              通常 > 40 字, Members Tab 短 label 一般 ≤ 20
         """
-        deadline = time.time() + 45.0
+        deadline = time.time() + 60.0
 
         def _expired(stage: str) -> bool:
             if time.time() <= deadline:
                 return False
             log.warning("[extract_members] Members tab probe timeout at %s", stage)
+            return True
+
+        # ── ⓪ 2026-05-04 真路径: tap 群名 banner → About → Members See all ──
+        # 8 张真机截图证实新版 FB 公开群的 Members 入口路径:
+        #   群首页(Featured tab) → tap 顶部群名 banner → About 页(含 Members
+        #   section + 蓝字 "See all") → tap See all → Members 列表页(分组:
+        #   清田 / Admins and Moderators / Group experts / Group contributors)
+        # 老 5 路径全部找"Members tab"作为顶 tab bar 子项, 永远 miss (新版没了).
+        if self._tap_via_about_members_path(d, did):
             return True
 
         def _is_on_members_list() -> bool:
@@ -7162,12 +7922,22 @@ class FacebookAutomation(BaseAutomation):
             # (或者被吞掉无任何效果), 后续 Step 3-5 全错位。
             # 只要不在搜索页, 立刻 return False 取证, 让 outcome=enter_group_failed
             # 精确定位到"根本没打开搜索框"。
-            try:
-                _on_search = hierarchy_looks_like_fb_search_surface(
-                    d.dump_hierarchy() or ""
-                )
-            except Exception:
-                _on_search = False
+            #
+            # 2026-05-04 retry fix: atx-agent dump_hierarchy 异步延迟会让首次 dump
+            # 抓到 stale 旧页面 XML (tap Search 按钮还没真正切到 search surface).
+            # 加 3 次 retry + 0.6s 间隔, 真正切到搜索页就立刻 PASS.
+            _on_search = False
+            for _retry in range(3):
+                if _retry > 0:
+                    time.sleep(0.6)
+                try:
+                    _on_search = hierarchy_looks_like_fb_search_surface(
+                        d.dump_hierarchy() or ""
+                    )
+                except Exception:
+                    _on_search = False
+                if _on_search:
+                    break
             if not _on_search:
                 log.warning("[enter_group] Step 1 后未进入搜索页, 终止 (避免 type_text "
                              "在错误位置输入). group=%r", group_name)
@@ -7542,7 +8312,10 @@ class FacebookAutomation(BaseAutomation):
 
         # 公共群非成员也可看帖子流, 不强求 join 成功. 但仍尝试 (与
         # extract_group_members 行为一致), 失败则继续浏览预览.
-        if group_name and self._current_group_page_requires_join(d, group_name):
+        # 2026-05-04: join_if_needed=False 时直接跳过 require_join 检查,
+        # 避免 _current_group_page_requires_join 在 30 noisy candidates +
+        # XML fallback 路径上 atx-agent dump 死锁 (v9/v10 真机 5+ 分钟卡死).
+        if group_name and join_if_needed and self._current_group_page_requires_join(d, group_name):
             if join_if_needed:
                 try:
                     self._join_current_group_page_if_needed(d, did, group_name)
@@ -7604,6 +8377,20 @@ class FacebookAutomation(BaseAutomation):
                                 _dbg_hits += 1
                                 if _dbg_hits >= 20:
                                     break
+                    # 2026-05-04: 同时收集每个帖子里 author Profile picture
+                    # 节点 bounds, 让下游 add_friend 可以直接 tap profile 头像
+                    # 进 profile 页 (绕过 FB search 找不到精确人名问题).
+                    _profile_pic_by_name = {}
+                    for node in parsed_authors:
+                        if not getattr(node, "bounds", None):
+                            continue
+                        _ddesc = (getattr(node, "content_desc", None) or "").strip()
+                        if not _ddesc.endswith(" Profile picture"):
+                            continue
+                        _pic_name = _ddesc[:-len(" Profile picture")].strip()
+                        if _pic_name and _pic_name not in _profile_pic_by_name:
+                            _profile_pic_by_name[_pic_name] = node.bounds
+
                     for node in parsed_authors:
                         if not getattr(node, "bounds", None):
                             continue
@@ -7631,12 +8418,19 @@ class FacebookAutomation(BaseAutomation):
                         )):
                             continue
                         seen_names.add(name)
+                        # 找此 author 的 Profile picture bounds (raw_name 严格匹配)
+                        _pic_bounds = (
+                            _profile_pic_by_name.get(raw_name)
+                            or _profile_pic_by_name.get(name)
+                        )
                         members.append({
                             "name": name,
+                            "raw_name": raw_name,  # 原始 desc 内的名字 (含全形空格)
                             "source_section": member_source or "feed_authors",
                             "source_group": group_name,
                             "discover_method": "feed_post_author",
                             "profile_snippet": "",
+                            "profile_pic_bounds": list(_pic_bounds) if _pic_bounds else None,
                         })
                         _set_step(
                             "群成员打招呼",
@@ -7869,6 +8663,11 @@ class FacebookAutomation(BaseAutomation):
 
         with self.guarded("extract_members", device_id=did, weight=0.6):
             _set_step("打开 Members tab", group_name)
+            # 2026-05-04: 清空 search-input candidates cache 防 race
+            try:
+                self._search_input_candidates = None
+            except Exception:
+                pass
             # 2026-04-23 bug fix: "Members tab in the group header" 的 AutoSelector
             # 学习被污染为 "Suggested group: 50代以上..." 的 bounds(推荐群卡片),
             # 会误点进推荐群。改用硬定位:text/desc 精确匹配 "Members"/"メンバー"。
@@ -7885,6 +8684,37 @@ class FacebookAutomation(BaseAutomation):
                 )
                 return members
             time.sleep(2.0)
+
+            # 2026-05-04 P0: 如果 _tap_via_search_members_input 抽到 candidates,
+            # 直接用 (绕开 SDUI 不暴露 contributors 真名的限制).
+            _sic = getattr(self, "_search_input_candidates", None)
+            if _sic and isinstance(_sic, list) and len(_sic) >= 1:
+                log.info(
+                    "[extract_group_members] 用 search-input 路径抽到的 %d 个 candidates",
+                    len(_sic),
+                )
+                for _c in _sic[:max_members]:
+                    _name = _c.get("name", "").strip()
+                    if not _name:
+                        continue
+                    members.append({
+                        "name": _name,
+                        "raw_name": _name,
+                        "source_section": "search_members_input",
+                        "source_group": group_name,
+                        "discover_method": "search_members_input",
+                        "profile_snippet": "",
+                        "profile_pic_bounds": _c.get("bounds"),
+                    })
+                # 清空 cache 防 race
+                try:
+                    self._search_input_candidates = None
+                except Exception:
+                    pass
+                if members:
+                    log.info("[extract_group_members] search-input 短路: %d members yielded",
+                             len(members))
+                    return members
 
             seen_names = set()
             scrolls = 0
