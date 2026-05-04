@@ -172,6 +172,39 @@ _RISK_DETECT_VERIFY_DELAY = 1.6
 _RISK_DETECT_PROBE_TIMEOUT = 0.25
 
 
+# ─── profile-DM fallback (2026-05-04) selector 表 ─────────────────────────
+# tests/test_facebook_dm_fallback.py 的 fixture (commit 3fa028d) 直接 import
+# 这两个常量做 selector dispatch mock; sibling 漏 commit 致 12 单测全部
+# AttributeError. 提到 module 顶: 函数内每次重建 dict 既慢又难复用 / 测试.
+_PROFILE_MSG_BTN_SELECTORS: Tuple[Dict[str, str], ...] = (
+    {"text": "Message"},
+    {"description": "Message"},
+    {"textContains": "Message"},
+    {"descriptionContains": "Message"},
+    {"text": "メッセージ"},
+    {"description": "メッセージ"},
+    {"textContains": "メッセージ"},
+    {"text": "发消息"},
+    {"description": "发消息"},
+    {"text": "傳送訊息"},
+    {"description": "傳送訊息"},
+)
+_PROFILE_SEND_BTN_SELECTORS: Tuple[Dict[str, str], ...] = (
+    {"resourceId": "com.facebook.orca:id/send"},
+    {"resourceId": "com.facebook.orca:id/send_button"},
+    {"description": "Send"},
+    {"description": "送信"},
+    {"description": "送る"},
+    {"description": "发送"},
+    {"description": "发送消息"},
+    {"description": "傳送"},
+    {"description": "傳送訊息"},
+    {"text": "Send"},
+    {"descriptionContains": "Send a message"},
+    {"descriptionContains": "メッセージを送"},
+)
+
+
 # ─── P0-1: browse_feed 真人节奏常量（2026-04-21 重写）─────────────────────
 # 动机: 旧版 `scroll_count = max(5, duration//6)` + `wait_read(200~800ms)`
 # 意味着 duration=15 → 只滑 5 屏 × 0.5s ≈ 几秒就结束，完全达不到"养号"目的。
@@ -2721,19 +2754,7 @@ class FacebookAutomation(BaseAutomation):
 
         # Step 1: 在当前 profile 页找 Message 按钮
         msg_clicked = False
-        for sel in (
-            {"text": "Message"},
-            {"description": "Message"},
-            {"textContains": "Message"},
-            {"descriptionContains": "Message"},
-            {"text": "メッセージ"},
-            {"description": "メッセージ"},
-            {"textContains": "メッセージ"},
-            {"text": "发消息"},
-            {"description": "发消息"},
-            {"text": "傳送訊息"},
-            {"description": "傳送訊息"},
-        ):
+        for sel in _PROFILE_MSG_BTN_SELECTORS:
             try:
                 el = d(**sel)
                 if el.exists(timeout=1.0):
@@ -2820,20 +2841,7 @@ class FacebookAutomation(BaseAutomation):
         # 绝不调 smart_tap (smart_tap 含 katana healing, Messenger 内调会
         # force-restart 切回 FB - 见 memory feedback_smart_tap_messenger_contract).
         if not sent:
-            for sel in (
-                {"resourceId": "com.facebook.orca:id/send"},
-                {"resourceId": "com.facebook.orca:id/send_button"},
-                {"description": "Send"},
-                {"description": "送信"},
-                {"description": "送る"},
-                {"description": "发送"},
-                {"description": "发送消息"},
-                {"description": "傳送"},
-                {"description": "傳送訊息"},
-                {"text": "Send"},
-                {"descriptionContains": "Send a message"},
-                {"descriptionContains": "メッセージを送"},
-            ):
+            for sel in _PROFILE_SEND_BTN_SELECTORS:
                 try:
                     el = d(**sel)
                     if el.exists(timeout=1.0):
