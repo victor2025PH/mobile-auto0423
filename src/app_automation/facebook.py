@@ -4465,12 +4465,23 @@ class FacebookAutomation(BaseAutomation):
             tlo, thi = sg_cfg.get("think_before_type_sec") or (3, 7)
             time.sleep(random.uniform(float(tlo), float(thi)))
 
-            # 输入文字 + 发送
+            # 输入文字 + 发送 (P5-A 2026-05-04: 复用 v40 _send_msg_from_current_profile 防御)
             try:
                 input_box = d(className="android.widget.EditText")
-                if not input_box.exists(timeout=3.0):
+                # P5-A race fix: 旧 exists(timeout=3.0) 在 react native 渲染慢的设备上
+                # 拿 0 candidates (真机 task 2ec225b8 19:49:51 实测). wait(timeout=8.0)
+                # 等真值 — v40 _send_msg_from_current_profile 同款修复.
+                if not input_box.wait(timeout=8.0):
                     log.warning("[send_greeting] 未找到输入框,放弃: %s", profile_name)
                     self._set_greet_reason("input_miss")
+                    try:
+                        _capture_immediate_async(
+                            did, step_name="send_greeting_input_miss",
+                            hint=f"target={(profile_name or '')[:30]}",
+                            reason="input_miss",
+                        )
+                    except Exception:
+                        pass
                     return False
                 self.hb.tap(d, *self._el_center(input_box))
                 time.sleep(random.uniform(0.4, 0.9))
@@ -4479,6 +4490,14 @@ class FacebookAutomation(BaseAutomation):
             except Exception as e:
                 log.warning("[send_greeting] 输入阶段异常: %s", e)
                 self._set_greet_reason("input_miss")
+                try:
+                    _capture_immediate_async(
+                        did, step_name="send_greeting_input_exception",
+                        hint=f"target={(profile_name or '')[:30]}",
+                        reason=f"input_exception:{type(e).__name__}",
+                    )
+                except Exception:
+                    pass
                 return False
 
             send_ok = False
@@ -4487,7 +4506,21 @@ class FacebookAutomation(BaseAutomation):
             except Exception:
                 send_ok = False
             if not send_ok:
-                # 兜底: 回车键触发发送
+                # P5-A: 复用 v40 _PROFILE_SEND_BTN_SELECTORS 多语言 send button (12 个候选,
+                # 含 send/送信/送る/发送/发送消息/傳送/Send a message/メッセージを送 等).
+                # smart_tap 已经从 AutoSelector cache 找过, 这里是干净的 u2 selector loop.
+                for sel in _PROFILE_SEND_BTN_SELECTORS:
+                    try:
+                        el = d(**sel)
+                        if el.exists(timeout=1.0):
+                            el.click()
+                            send_ok = True
+                            log.info("[send_greeting] Send via u2 %s", sel)
+                            break
+                    except Exception:
+                        pass
+            if not send_ok:
+                # 兜底: 回车键触发发送 (相当于 IME send_action ENTER)
                 try:
                     d.press("enter")
                     time.sleep(0.5)
@@ -4497,6 +4530,14 @@ class FacebookAutomation(BaseAutomation):
             if not send_ok:
                 log.warning("[send_greeting] 未能点击发送按钮: %s", profile_name)
                 self._set_greet_reason("send_miss")
+                try:
+                    _capture_immediate_async(
+                        did, step_name="send_greeting_send_miss",
+                        hint=f"target={(profile_name or '')[:30]} msg={(greeting or '')[:30]}",
+                        reason="send_miss",
+                    )
+                except Exception:
+                    pass
                 return False
             time.sleep(random.uniform(1.0, 2.0))
 
