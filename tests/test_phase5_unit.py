@@ -557,7 +557,15 @@ class TestComplianceGuard:
         finally:
             os.unlink(db_path)
 
-    def test_quota_exceeded_on_overflow(self):
+    def test_quota_exceeded_on_overflow(self, monkeypatch):
+        """2026-05-04 Stage G.2: monkeypatch time.sleep 跳过 _check_cooldown
+        的真等待. test 意图是验 quota 超限 raise QuotaExceeded, 但 check()
+        先调 _check_cooldown(time.sleep(N)) → 阻塞 N 秒触发 pytest --timeout
+        卡死. cooldown 行为已由 test_cooldown_blocks_too_soon 单独验证, 这里
+        只关心 quota 边界."""
+        import time as _time
+        monkeypatch.setattr(_time, "sleep", lambda *a, **k: None)
+
         from src.behavior.compliance_guard import ComplianceGuard, QuotaExceeded
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             db_path = f.name

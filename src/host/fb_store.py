@@ -531,21 +531,51 @@ def mark_greeting_replied_back(device_id: str, peer_name: str, *,
         " AND (replied_at IS NULL OR replied_at='')"
         " ORDER BY id DESC LIMIT 1)"
     )
+    # 2026-05-04 Stage G.1: 在 with _connect() 块内直接 SELECT 取 template_id
+    # +preset_key, 但延后到 with 块结束 (conn commit+close) 再调
+    # record_contact_event 避免嵌套连接死锁 (mark_greeting_replied_back 的 conn1
+    # 持有 reserved lock + record_contact_event 内部 with _connect() 创 conn2 试
+    # write lock → busy_timeout 5s 但 Python sqlite3 + Windows + WAL 实测不 honor
+    # → conn.execute 永挂超 pytest --timeout 触发 stack trace).
+    # 与 record_contact_event line 1114 的 _maybe_revive_stale_on_reply 同模式.
+    rc = 0
+    sync_args: Optional[tuple] = None
     try:
         with _connect() as conn:
             cur = conn.execute(sql, (ts, device_id, peer_name, cutoff))
             rc = cur.rowcount or 0
-            # F1 (A→B review Q1): 命中时同步写一条 fb_contact_events
-            # (Phase 5 事件表, /facebook/greeting-reply-rate 的权威数据源).
-            # Phase 5 未 merge 时 record_contact_event 不在 globals → 静默 skip
-            # 让老 replied_at 一路继续, 新 contact_events 在 merge 后自动激活。
-            if rc > 0:
-                _sync_greeting_replied_contact_event(
-                    conn, device_id, peer_name, ts, window_days)
-            return rc
+            if rc > 0 and "record_contact_event" in globals():
+                row = conn.execute(
+                    "SELECT template_id, preset_key FROM facebook_inbox_messages"
+                    " WHERE device_id=? AND peer_name=? AND direction='outgoing'"
+                    " AND ai_decision='greeting' AND replied_at=?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (device_id, peer_name, ts),
+                ).fetchone()
+                if row:
+                    tid = (row[0] or "").split("|")[0]
+                    pkey = row[1] or ""
+                    sync_args = (device_id, peer_name, tid, pkey, window_days)
     except Exception as e:
         logger.debug("mark_greeting_replied_back 失败: %s", e)
         return 0
+
+    # connection 关闭后 (commit + close), 再写 fb_contact_events 防嵌套锁
+    if sync_args is not None:
+        try:
+            evt_const = globals().get(
+                "CONTACT_EVT_GREETING_REPLIED", "greeting_replied")
+            globals()["record_contact_event"](
+                sync_args[0], sync_args[1], evt_const,
+                template_id=sync_args[2],
+                preset_key=sync_args[3],
+                meta={"via": "mark_greeting_replied_back",
+                      "window_days": sync_args[4]},
+            )
+        except Exception as e:
+            logger.debug(
+                "[mark_greeting_replied_back] contact_event 同步失败: %s", e)
+    return rc
 
 
 def _sync_greeting_replied_contact_event(conn, device_id: str, peer_name: str,
