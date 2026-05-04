@@ -23,18 +23,30 @@ $envFile = Join-Path $ProjectRoot "config\launch.env"
 if (Test-Path $envFile) {
     Write-Host "Loading config/launch.env..."
     $loaded = @()
+    $skipped = @()
     Get-Content $envFile | ForEach-Object {
         $line = $_
         if ($line -match '^\s*#' -or $line -match '^\s*$') { return }
         if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$') {
             $key = $matches[1].Trim()
             $val = $matches[2].Trim().Trim('"').Trim("'")
-            [Environment]::SetEnvironmentVariable($key, $val, 'Process')
-            $loaded += "$key=$val"
+            # Pre-set env wins (caller's `$env:KEY=...` takes precedence over launch.env).
+            # Why: lets ad-hoc overrides survive without editing committed config (and avoids
+            # the silent "wrapper restart drops my env" trap when sibling re-runs start.bat).
+            $existing = [Environment]::GetEnvironmentVariable($key, 'Process')
+            if ($existing) {
+                $skipped += "$key (preset=$existing)"
+            } else {
+                [Environment]::SetEnvironmentVariable($key, $val, 'Process')
+                $loaded += "$key=$val"
+            }
         }
     }
     if ($loaded.Count -gt 0) {
-        Write-Host ("   [OK] {0} var(s): {1}" -f $loaded.Count, ($loaded -join ', ')) -ForegroundColor DarkGray
+        Write-Host ("   [OK] {0} var(s) loaded: {1}" -f $loaded.Count, ($loaded -join ', ')) -ForegroundColor DarkGray
+    }
+    if ($skipped.Count -gt 0) {
+        Write-Host ("   [SKIP] {0} var(s) preset by env, launch.env not applied: {1}" -f $skipped.Count, ($skipped -join ', ')) -ForegroundColor DarkGray
     }
 } else {
     Write-Host "[INFO] config/launch.env not found (defaults: port=18080, host=0.0.0.0)" -ForegroundColor DarkGray
