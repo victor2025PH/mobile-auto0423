@@ -483,7 +483,24 @@ def _get_async_executor() -> ThreadPoolExecutor:
 
 
 def _push_with_retry_queue(path: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """sync push + 失败时 enqueue 本地. 返回 server response 或 None."""
+    """sync push + 失败时 enqueue 本地. 返回 server response 或 None.
+
+    2026-05-04 Stage F.1: _async_executor 被 reset (test 间 fixture cleanup
+    通过 reset_async_executor_for_tests 设 None) 时, daemon 残留 task
+    no-op return. 防 E.5 wait=False 后 daemon 在 fixture cleanup +
+    monkeypatch undo 后还在跑, 调真 _http_post_json → fail → enqueue
+    SQLite, 让下一 test fixture setup 时 SQLite 被持有 conn.execute 卡死.
+
+    用 _async_executor is None 而非 PYTEST_CURRENT_TEST: 不需要 hardcoded
+    test 文件名 exception list (test_metrics_async_enqueue_counter 这种
+    显式测 fire_and_forget 的 test 在 fixture 内, _async_executor 仍 set,
+    走 normal path; daemon 残留 task 永远在 fixture cleanup 之后, 看到的
+    _async_executor 已是 None, no-op). production 0 影响 (function name
+    带 _for_tests 不被 prod 调).
+    """
+    if _async_executor is None:
+        # daemon worker 残留 task: executor 已 reset, no-op 静默退出
+        return None
     try:
         return _http_post_json(path, body)
     except Exception as exc:  # noqa: BLE001

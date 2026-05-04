@@ -76,6 +76,10 @@ def _p29_reset_global_state():
         ("src.host.central_push_drain", "reset_for_tests"),
         ("src.host.fb_concurrency", "reset_metrics_for_tests"),
         ("src.host.cluster_lock_client", "reset_caches_for_tests"),
+        # 2026-05-04 F.2: _apply_tuning_adjustments mutate RISK_MULTIPLIERS
+        # 让 phase5 TestAdaptiveCompliance 3 个 test (assume 默认值) 在全 suite
+        # 跑序下 fail. reset 还原默认 dict + 清 singleton.
+        ("src.behavior.adaptive_compliance", "reset_for_tests"),
     ]
     for mod_name, fn_name in reset_targets:
         try:
@@ -99,6 +103,20 @@ def _p29_reset_global_state():
         ("src.host.fb_store", "_PEER_NAME_REJECT_RECENT", "list", "clear"),
         ("src.host.preflight", "_cache", "dict", "clear"),
         ("src.host.routers.cluster", "_WEBHOOK_COOLDOWN", "dict", "clear"),
+        # 2026-05-04 Stage F.4 audit cache 类入册 (剥洋葱第 N 层 — 可能 cover
+        # phase12_3 test_recycle_no_dead_at_meta_still_revives 的 setup error,
+        # 该 test 调 _line_pool_recycle_dead_peers 用 _REFERRAL_*_CACHE):
+        ("src.host.executor", "_REFERRAL_KEYWORDS_CACHE", "dict", "clear"),
+        ("src.host.executor", "_PEER_REGION_CACHE", "dict", "clear"),
+        # VLM cache: 测试 mock VLM 后, cache leak 让下个 test 误判 healthy
+        ("src.host.fb_profile_classifier", "_VLM_HEALTH", "dict", "clear"),
+        ("src.host.ollama_vlm", "_VLM_CONCURRENCY_STATS", "dict", "clear"),
+        ("src.host.ollama_vlm", "_WARMUP_STATE", "dict", "clear"),
+        # worker proxy cache: 跨 test fixture 可能 spam probe 不同 IP
+        ("src.host.worker_device_proxy", "_worker_base_cache", "dict", "clear"),
+        ("src.host.worker_device_proxy", "_negative_cache", "dict", "clear"),
+        # central_customer_store 熔断 state + customer_sync_bridge AB cache
+        ("src.host.customer_sync_bridge", "_ab_winner_cache", "dict", "clear"),
     ]
     for mod_name, attr, _typ, action in inline_clears:
         try:
