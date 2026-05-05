@@ -829,6 +829,39 @@ def test_trigger_async_falls_back_to_sync_when_no_prober(
     assert "w03" in out["probed"]
 
 
+# ── Stage W: /metrics 接入 reverse_probe 字段 ────────────────────────
+
+
+def test_metrics_snapshot_includes_reverse_probe_when_running(
+    fresh_coord, monkeypatch,
+):
+    """health_monitor.snapshot() 暴露 reverse_probe 字段, prober 跑时返完整 status."""
+    from src.host.health_monitor import metrics as _metrics
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    start_reverse_prober(interval=10.0, startup_delay=0)
+    try:
+        snap = _metrics.snapshot()
+        assert "reverse_probe" in snap
+        rp = snap["reverse_probe"]
+        assert rp["running"] is True
+        assert "iterations" in rp
+        assert "total_probed" in rp
+        assert rp["interval_sec"] == 10.0
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_metrics_snapshot_reverse_probe_running_false_when_not_started(
+    fresh_coord, monkeypatch,
+):
+    """prober 没启动时 snapshot reverse_probe = {running: False}."""
+    from src.host.health_monitor import metrics as _metrics
+    reset_reverse_prober_for_tests()  # clean
+    snap = _metrics.snapshot()
+    assert snap["reverse_probe"] == {"running": False}
+
+
 # ── Stage V.1: trigger 批量 host_ids ─────────────────────────────────
 
 
