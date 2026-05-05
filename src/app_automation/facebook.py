@@ -6680,7 +6680,15 @@ class FacebookAutomation(BaseAutomation):
                 if key_fb in seen_fb:
                     continue
                 seen_fb.add(key_fb)
-                item_fb = {"name": name_fb}
+                # 2026-05-05 P7-D: 带 row 名字 bounds → executor:4178 用它
+                # tap 进 profile, 设 from_current_profile=True 绕开 search_people.
+                # 真机 task a50d9f9f: 22 contributors row 名字抽出后, search 全
+                # not_found 因为 FB 全局搜不到生人 displayName.
+                item_fb = {
+                    "name": name_fb,
+                    "profile_pic_bounds": [int(left), int(top),
+                                            int(right), int(bottom)],
+                }
                 if raw_fb and raw_fb != name_fb:
                     item_fb["profile_snippet"] = raw_fb[:180]
                 out_fb.append(item_fb)
@@ -6716,7 +6724,13 @@ class FacebookAutomation(BaseAutomation):
             if key in seen:
                 continue
             seen.add(key)
-            item = {"name": name}
+            # 2026-05-05 P7-D: 带 row 名字 bounds (同 P7-C-1 fallback) →
+            # executor:4178 触发 tap row 进 profile, 绕开 search_people.
+            item = {
+                "name": name,
+                "profile_pic_bounds": [int(left), int(top),
+                                        int(right), int(bottom)],
+            }
             if raw and raw != name:
                 item["profile_snippet"] = raw[:180]
             out.append(item)
