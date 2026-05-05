@@ -440,3 +440,133 @@ def test_start_explicit_args_override_cfg(fresh_coord, monkeypatch):
     t = start_reverse_prober(interval=0.05)  # 显式覆盖
     assert t._interval == 0.05
     stop_reverse_prober(timeout_sec=2.0)
+
+
+# ── Stage L.1: /cluster/reverse-probe/status endpoint ─────────────────
+
+
+def test_status_endpoint_when_prober_not_running(fresh_coord, monkeypatch):
+    """prober 没启动时 endpoint 返 running=False + reason."""
+    from src.host.routers.cluster import cluster_reverse_probe_status
+    reset_reverse_prober_for_tests()  # 确保 _reverse_prober is None
+    out = cluster_reverse_probe_status()
+    assert out["running"] is False
+    assert "reason" in out
+
+
+def test_status_endpoint_when_prober_running(fresh_coord, monkeypatch):
+    """prober 跑着时 endpoint 返完整 status dict."""
+    from src.host.routers.cluster import cluster_reverse_probe_status
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+
+    t = start_reverse_prober(interval=10.0, startup_delay=0)
+    try:
+        out = cluster_reverse_probe_status()
+        assert out["running"] is True
+        assert "iterations" in out
+        assert "total_probed" in out
+        assert "total_recovered" in out
+        assert out["interval_sec"] == 10.0
+        assert "per_host_backoff" in out
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+# ── Stage M.1: /cluster/reverse-probe/trigger endpoint ────────────────
+
+
+def test_trigger_specific_host_clears_backoff_and_probes(
+    fresh_coord, monkeypatch,
+):
+    """trigger 指定 host_id: 清退避窗口 + 立即 probe."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    # _verify_cluster_secret 用 load_cluster_config 读 secret, mock 返空
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": "",
+                 "reverse_probe_startup_delay": 0},
+    )
+
+    fresh_coord._hosts["w_target"] = HostInfo(
+        host_id="w_target", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    pr = start_reverse_prober(interval=10.0, startup_delay=0)
+    # 模拟该 host 已退避到未来
+    pr._next_probe_at["w_target"] = time.time() + 1000
+
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: True,
+    )
+
+    try:
+        out = cluster_reverse_probe_trigger({"host_id": "w_target"})
+        assert "w_target" in out["probed"]
+        assert "w_target" in out["recovered"]
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_trigger_no_host_probes_all_stale(fresh_coord, monkeypatch):
+    """trigger 不传 host_id: probe 所有 stale host."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": "",
+                 "reverse_probe_startup_delay": 0},
+    )
+
+    fresh_coord._hosts["w_dead"] = HostInfo(
+        host_id="w_dead", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+    fresh_coord._hosts["w_alive"] = HostInfo(
+        host_id="w_alive", host_ip="192.168.0.50", port=8000,
+        last_heartbeat=time.time(), online=True)
+
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    start_reverse_prober(interval=10.0, startup_delay=0)
+
+    probed_args = []
+
+    def _probe(hid, timeout=5.0):
+        probed_args.append(hid)
+        return hid == "w_dead"
+    monkeypatch.setattr(fresh_coord, "reverse_probe_worker", _probe)
+
+    try:
+        out = cluster_reverse_probe_trigger({})
+        # 只有 stale host (w_dead) 被 probe, w_alive 跳过
+        assert probed_args == ["w_dead"]
+        assert out["probed"] == ["w_dead"]
+        assert out["recovered"] == ["w_dead"]
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_trigger_secret_verification_rejects_wrong_signature(
+    fresh_coord, monkeypatch,
+):
+    """secret 配置时, body 缺签名 → 抛 HTTPException."""
+    from fastapi import HTTPException
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    fresh_coord._secret = "REAL_SECRET"
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    # cluster_state 路径 verify 用 load_cluster_config 读 shared_secret
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": "REAL_SECRET",
+                 "reverse_probe_startup_delay": 0},
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        cluster_reverse_probe_trigger({"host_id": "x"})
+    # 缺 _sig / _ts 应被拒
+    assert exc_info.value.status_code in (401, 403)

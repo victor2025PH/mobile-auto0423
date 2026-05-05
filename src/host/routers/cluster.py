@@ -271,6 +271,74 @@ def cluster_all_devices():
     return {"devices": get_cluster_coordinator().get_all_devices()}
 
 
+@router.get("/cluster/reverse-probe/status")
+def cluster_reverse_probe_status():
+    """主控 reverse heartbeat prober 状态 (Stage I/K/L 暴露).
+
+    返回字段:
+      - running: prober 是否在跑
+      - iterations: 累计 tick 次数
+      - total_probed / total_recovered: 累计 probe 数 / 成功数
+      - interval_sec / max_interval_sec / backoff_multiplier: 退避配置
+      - per_host_backoff: {host_id: 当前退避间隔} — 失败 host 看退避节奏
+    """
+    from .. import multi_host as _mh
+    pr = _mh._reverse_prober
+    if pr is None:
+        return {
+            "running": False,
+            "reason": "not started (非 coordinator role 或 OPENCLAW_DISABLE_REVERSE_PROBE)",
+        }
+    return pr.status()
+
+
+@router.post("/cluster/reverse-probe/trigger")
+def cluster_reverse_probe_trigger(body: dict = None):  # type: ignore[assignment]
+    """Stage M.1 容灾响应加速: 让主控立即 probe 一个 host (跳过退避窗口).
+
+    body: {"host_id": "w03"} or empty 触发 全 stale host probe
+    返回: {"probed": [...], "recovered": [...]}
+
+    用途:
+      - worker push 心跳挂掉时, worker 调本 endpoint 让主控立即接管探测
+        (容灾响应从 30s probe 间隔降到 ~1s)
+      - ops 手动 trigger 调试
+
+    安全: shared_secret 验证 (与 /cluster/heartbeat 同).
+    """
+    body = body or {}
+    _verify_cluster_secret(body)
+    import time as _t
+    from .. import multi_host as _mh
+    coord = _mh.get_cluster_coordinator()
+    target = (body.get("host_id") or "").strip()
+    probed: list[str] = []
+    recovered: list[str] = []
+    now = _t.time()
+    if target:
+        # 单 host 立即 probe (清退避窗口)
+        if _mh._reverse_prober is not None:
+            _mh._reverse_prober._next_probe_at.pop(target, None)
+        probed.append(target)
+        if coord.reverse_probe_worker(target):
+            recovered.append(target)
+    else:
+        # 全 stale host 立即 probe (清所有退避)
+        with coord._lock:
+            stale = [
+                hid for hid, h in coord._hosts.items()
+                if hid != "coordinator" and h.host_ip
+                and (now - h.last_heartbeat) > _mh._HOST_TIMEOUT
+            ]
+        for hid in stale:
+            if _mh._reverse_prober is not None:
+                _mh._reverse_prober._next_probe_at.pop(hid, None)
+            probed.append(hid)
+            if coord.reverse_probe_worker(hid):
+                recovered.append(hid)
+    return {"probed": probed, "recovered": recovered}
+
+
 @router.get("/cluster/execution-policies")
 def cluster_execution_policies():
     """聚合本机与各 Worker 的 /tasks/meta/execution-policy（经主控中转，避免浏览器直连 Worker CORS）。"""
