@@ -1217,6 +1217,16 @@ class _ReverseHeartbeatProber(threading.Thread):
         )
 
     def status(self) -> dict:
+        # 2026-05-05 Stage H.1: 暴露 per_host_next_probe_at_iso 让 ops 看
+        # "下次 何时 probe" (vs 只看间隔不知道几秒后).
+        from datetime import datetime as _dt, timezone as _tz
+        next_probe_iso: Dict[str, str] = {}
+        for hid, ts in self._next_probe_at.items():
+            try:
+                next_probe_iso[hid] = _dt.fromtimestamp(
+                    ts, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                next_probe_iso[hid] = ""
         return {
             "running": self.is_alive() and not self._stop_event.is_set(),
             "iterations": self._iterations,
@@ -1226,6 +1236,7 @@ class _ReverseHeartbeatProber(threading.Thread):
             "max_interval_sec": self._max_interval,
             "backoff_multiplier": self._backoff_mult,
             "per_host_backoff": dict(self._current_interval),
+            "per_host_next_probe_at_iso": next_probe_iso,
         }
 
 

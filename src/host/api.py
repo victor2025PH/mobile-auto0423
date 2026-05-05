@@ -428,6 +428,32 @@ async def lifespan(application: FastAPI):
     except Exception:
         pass
 
+    # 2026-05-05 Stage H.2: 让 lifespan SIGTERM 路径干净退出.
+    # 补 4 个 startup 启动的 daemon 但 shutdown 没停的 (Stage E.2 全 suite 验
+    # 时 starlette TestClient teardown 卡死的根因之一).
+    # 剩余 3 个未补 (job_scheduler / w03_event_bridge / w03_cache) — 这些
+    # module 没 stop_* 函数, 改它们是 prod 行为大改, 留 H.2-followup PR.
+    try:
+        from .central_push_drain import stop_drain_thread
+        stop_drain_thread(timeout_sec=5.0)
+    except Exception:
+        pass
+    try:
+        from .agent_mesh_worker_listener import stop_worker_listener
+        stop_worker_listener(timeout_sec=5.0)
+    except Exception:
+        pass
+    try:
+        from .strategy_optimizer import stop_strategy_optimizer
+        stop_strategy_optimizer()
+    except Exception:
+        pass
+    try:
+        from .device_stats_aggregator import stop as _stop_aggregator
+        _stop_aggregator()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # App & Middleware
