@@ -8163,6 +8163,21 @@ class FacebookAutomation(BaseAutomation):
                     "(BACK → re-open search → retype → retry). group=%r",
                     group_name,
                 )
+                # P6-A v2 (2026-05-05): self-heal 之前先 wake screen + healthcheck.
+                # 真机 task 67b98ecc (2026-05-05 09:42-09:45) 暴露 5 路 IME 全
+                # 失败的真根因: atx-agent 挂导致 dump 全 0 (uiautomator dump
+                # SIGKILL / atx-agent stub 异常), 后续 BACK + 'hierarchy 离开
+                # 搜索页' 检查必失败 → 放弃自愈. wake + healthcheck 让 atx-agent
+                # stub 重启后 dump 能拿到真实 hierarchy, self-heal 才有意义.
+                # P6-A v1 的群循环外 wake (_gidx > 0) 永远没触发因为 task 卡
+                # 第 1 群; v2 改在真根因点 (5 路 IME 全失败 = atx-agent 大概率挂).
+                try:
+                    if hasattr(self, "_ensure_screen_awake"):
+                        self._ensure_screen_awake(did)
+                except Exception as _sh_wake_e:
+                    log.debug(
+                        "[enter_group] self-heal pre-wake failed: %s", _sh_wake_e,
+                    )
                 _selfheal_ok = False
                 try:
                     # 1. BACK 收起 IME / typeahead overlay
