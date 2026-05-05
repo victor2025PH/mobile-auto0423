@@ -80,6 +80,10 @@ def _p29_reset_global_state():
         # 让 phase5 TestAdaptiveCompliance 3 个 test (assume 默认值) 在全 suite
         # 跑序下 fail. reset 还原默认 dict + 清 singleton.
         ("src.behavior.adaptive_compliance", "reset_for_tests"),
+        # 2026-05-05 Stage I: reverse heartbeat prober daemon stop+join,
+        # 防孤儿 thread 跨 test 反向 probe 真 worker IP 引发网络副作用 +
+        # 跨 test 写 cluster_state.json 污染.
+        ("src.host.multi_host", "reset_reverse_prober_for_tests"),
     ]
     for mod_name, fn_name in reset_targets:
         try:

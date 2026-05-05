@@ -302,6 +302,21 @@ async def lifespan(application: FastAPI):
     except Exception as e:
         logger.debug("集群自动启动跳过: %s", e)
 
+    # 2026-05-05 Stage I: coordinator 启动 reverse heartbeat prober.
+    # worker HeartbeatSender 失效时, 主控反向 GET worker /devices 把它注册
+    # 成 online (Stage B 真机验证发现 W03/W175 server 活但 push 心跳停 →
+    # /cluster/devices 返 0). 30s 间隔 + 10s 启动延时.
+    try:
+        from .multi_host import load_cluster_config, start_reverse_prober
+        _cluster_cfg = load_cluster_config()
+        if (_cluster_cfg.get("role") or "").lower() == "coordinator":
+            start_reverse_prober()
+            logger.info("Reverse heartbeat prober 已启动 (主控反向探测 stale worker)")
+        else:
+            logger.debug("Reverse prober 跳过 (非 coordinator role)")
+    except Exception as e:
+        logger.debug("Reverse heartbeat prober 启动跳过: %s", e)
+
     # P9-A: 启动 Worker-03 CRM 数据的 SWR 缓存（异步预热，不阻塞启动）
     try:
         from .leads_cache import get_w03_cache
@@ -403,6 +418,13 @@ async def lifespan(application: FastAPI):
     try:
         from .openclaw_agent import stop_openclaw_agent
         stop_openclaw_agent()
+    except Exception:
+        pass
+
+    # 2026-05-05 Stage I: 停止 reverse heartbeat prober
+    try:
+        from .multi_host import stop_reverse_prober
+        stop_reverse_prober(timeout_sec=5.0)
     except Exception:
         pass
 

@@ -281,6 +281,83 @@ class ClusterCoordinator:
 
         return total
 
+    def reverse_probe_worker(self, host_id: str,
+                              timeout: float = 5.0) -> bool:
+        """主动 GET worker /devices, 成功则注册成 online via heartbeat.
+
+        2026-05-05 Stage I.1: 解决 worker HeartbeatSender 没在 push 心跳但
+        worker server 实际活着的场景 (Stage B 真机验证发现 W03/W175 直接
+        HTTP 200 但 last_heartbeat 944 分钟前 → /cluster/devices 返 0).
+
+        本函数主动 probe **已知**历史 worker (cluster_state.json 持久化的
+        host_id), 不主动扫局域网 (安全 + 不浪费网络).
+
+        失败的 host 保持 offline 状态.
+
+        Args:
+            host_id: 要 probe 的 worker host_id (必须在 self._hosts 里)
+            timeout: HTTP timeout 秒数
+
+        Returns:
+            True 如果 probe 成功 + 注册 online; False 否则
+        """
+        import urllib.request
+        with self._lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            host_ip = h.host_ip
+            port = h.port or DEFAULT_OPENCLAW_PORT
+            host_name = h.host_name
+        # coordinator 自己不 probe; 没 IP 的 host 不 probe (没法连)
+        if not host_ip or host_id == "coordinator":
+            return False
+
+        url = f"http://{host_ip}:{port}/devices"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            if self._secret:
+                req.add_header("X-Cluster-Secret", self._secret)
+            req.add_header("Connection", "close")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            devices = data if isinstance(data, list) else data.get("devices", [])
+            if not isinstance(devices, list):
+                devices = []
+        except Exception as e:
+            log.debug("[Cluster] reverse probe %s @ %s 失败: %s",
+                      host_id, host_ip, e)
+            return False
+
+        # 标准化设备数据 (与 refresh_all_devices 同处理)
+        normalized = []
+        for d in devices:
+            if isinstance(d, dict):
+                normalized.append(d)
+            elif isinstance(d, str):
+                normalized.append({"device_id": d, "status": "unknown"})
+
+        # 注册成 online via 内部 heartbeat 路径 (复用 receive_heartbeat 的
+        # online state machine + persist + event_stream worker.online).
+        self.receive_heartbeat({
+            "host_id": host_id,
+            "host_name": host_name,
+            "host_ip": host_ip,
+            "port": port,
+            "devices": normalized,
+            "tasks_active": 0,
+            "tasks_completed": 0,
+            "cpu_usage": 0.0,
+            "memory_usage": 0.0,
+            "version": "",
+            "secret": self._secret,
+            "_via": "reverse_probe",
+        })
+        log.info("[Cluster] reverse probe 成功: %s @ %s — %d devices",
+                 host_id, host_ip, len(normalized))
+        return True
+
     def get_all_devices(self) -> List[dict]:
         """Return unified device list across all hosts."""
         self._refresh_online_status()
@@ -874,3 +951,155 @@ def is_worker_standalone() -> bool:
     if sender is None:
         return False
     return getattr(sender, '_standalone_mode', False)
+
+
+# ── Reverse Heartbeat Prober (Stage I, 2026-05-05) ───────────────────
+#
+# 动机:
+#   worker HeartbeatSender 失效 (worker 进程跑但 sender 没启动 / 网络
+#   单向通) 时, 主控反向 GET worker /devices 把它注册成 online. 配合
+#   既有 push heartbeat 的双轨容灾.
+#
+# 设计:
+#   - 仅 probe **已知**历史 worker (cluster_state.json 持久化的 host_id
+#     即 _hosts 里有的 host); 不主动扫局域网 (安全)
+#   - 仅 probe last_heartbeat 超过 _HOST_TIMEOUT 的 stale host (即
+#     被判 offline 的) — 已 online 的 host 让 push 心跳处理
+#   - probe 间隔默认 30s (push 心跳 _HEARTBEAT_INTERVAL=15s 的 2 倍,
+#     防双轨重复噪音)
+#   - 失败的 host 保持 offline (probe 不引入 false positive)
+#   - 单例 thread, idempotent start/stop
+#
+# 关闭开关:
+#   OPENCLAW_DISABLE_REVERSE_PROBE=1 完全禁用 (worker only 模式或测试)
+
+_REVERSE_PROBE_INTERVAL = 30.0
+_REVERSE_PROBE_STARTUP_DELAY = 10.0
+
+
+class _ReverseHeartbeatProber(threading.Thread):
+    """主控后台线程, 周期性 reverse probe stale worker."""
+
+    def __init__(self, interval: float = _REVERSE_PROBE_INTERVAL,
+                 startup_delay: float = _REVERSE_PROBE_STARTUP_DELAY):
+        super().__init__(daemon=True, name="reverse-hb-prober")
+        # interval 不在这里 clamp; caller 默认 30s, 测试可传更小
+        self._interval = max(0.1, interval)
+        self._startup_delay = max(0.0, startup_delay)
+        self._stop_event = threading.Event()
+        self._iterations = 0
+        self._last_probed = 0
+        self._last_recovered = 0
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        if self._startup_delay > 0:
+            self._stop_event.wait(self._startup_delay)
+            if self._stop_event.is_set():
+                return
+        log.info("[Cluster] reverse heartbeat prober 启动 (interval=%.0fs)",
+                 self._interval)
+        while not self._stop_event.is_set():
+            self._tick()
+            self._stop_event.wait(self._interval)
+        log.info(
+            "[Cluster] reverse heartbeat prober 停止, "
+            "iterations=%d total_probed=%d total_recovered=%d",
+            self._iterations, self._last_probed, self._last_recovered,
+        )
+
+    def _tick(self) -> None:
+        """单 tick: 找 stale host + 逐个 probe.
+
+        异常被 catch 不让线程死 — 单 host probe 失败不影响其他 host.
+        """
+        self._iterations += 1
+        try:
+            coord = get_cluster_coordinator()
+            now = time.time()
+            with coord._lock:
+                stale_hosts = [
+                    hid for hid, h in coord._hosts.items()
+                    if hid != "coordinator"
+                    and h.host_ip
+                    and (now - h.last_heartbeat) > _HOST_TIMEOUT
+                ]
+            if not stale_hosts:
+                return
+            log.debug("[Cluster] reverse prober tick #%d: %d stale hosts",
+                      self._iterations, len(stale_hosts))
+            for hid in stale_hosts:
+                if self._stop_event.is_set():
+                    return
+                self._last_probed += 1
+                if coord.reverse_probe_worker(hid):
+                    self._last_recovered += 1
+        except Exception:  # noqa: BLE001
+            log.exception("[Cluster] reverse prober tick 失败 (continue)")
+
+    def status(self) -> dict:
+        return {
+            "running": self.is_alive() and not self._stop_event.is_set(),
+            "iterations": self._iterations,
+            "total_probed": self._last_probed,
+            "total_recovered": self._last_recovered,
+            "interval_sec": self._interval,
+        }
+
+
+_reverse_prober: Optional[_ReverseHeartbeatProber] = None
+_prober_lock = threading.Lock()
+
+
+def start_reverse_prober(
+    interval: float = _REVERSE_PROBE_INTERVAL,
+    startup_delay: float = _REVERSE_PROBE_STARTUP_DELAY,
+) -> Optional[_ReverseHeartbeatProber]:
+    """启动主控的 reverse heartbeat prober. idempotent.
+
+    OPENCLAW_DISABLE_REVERSE_PROBE=1 完全禁用 (返 None).
+    """
+    if os.environ.get("OPENCLAW_DISABLE_REVERSE_PROBE", "").strip() in (
+        "1", "true", "yes",
+    ):
+        log.info("[Cluster] reverse prober 已通过 env 关闭")
+        return None
+    global _reverse_prober
+    with _prober_lock:
+        if _reverse_prober is not None and _reverse_prober.is_alive():
+            return _reverse_prober
+        t = _ReverseHeartbeatProber(
+            interval=interval, startup_delay=startup_delay)
+        t.start()
+        _reverse_prober = t
+        return t
+
+
+def stop_reverse_prober(timeout_sec: float = 5.0) -> bool:
+    """优雅停止 reverse prober. 返 True 如果在 timeout 内退出."""
+    global _reverse_prober
+    with _prober_lock:
+        t = _reverse_prober
+        _reverse_prober = None
+    if t is None:
+        return True
+    t.stop()
+    t.join(timeout=timeout_sec)
+    return not t.is_alive()
+
+
+def reset_reverse_prober_for_tests() -> None:
+    """仅测试用. 强制 stop+join 防孤儿 + 清单例.
+
+    与 central_push_drain.reset_for_tests 同 pattern (Stage C.2 教训:
+    旧 '只清单例不停 thread' 让孤儿 daemon 跨 test 污染).
+    """
+    global _reverse_prober
+    with _prober_lock:
+        t = _reverse_prober
+        _reverse_prober = None
+    if t is not None:
+        t.stop()
+        t.join(timeout=2.0)
