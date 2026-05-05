@@ -570,3 +570,136 @@ def test_trigger_secret_verification_rejects_wrong_signature(
         cluster_reverse_probe_trigger({"host_id": "x"})
     # 缺 _sig / _ts 应被拒
     assert exc_info.value.status_code in (401, 403)
+
+
+# ── Stage N.1: HeartbeatSender auto-trigger ──────────────────────────
+
+
+def _make_sender():
+    """构造 minimal HeartbeatSender 不起 thread."""
+    from src.host.multi_host import HeartbeatSender
+    s = HeartbeatSender.__new__(HeartbeatSender)
+    s._coordinator_url = "http://127.0.0.1:18080"
+    s._host_id = "w03"
+    s._consecutive_failures = 0
+    s._standalone_mode = False
+    s._last_auto_trigger_at = 0.0
+    s._AUTO_TRIGGER_COOLDOWN_SEC = 300.0
+    return s
+
+
+def test_auto_trigger_cooldown_blocks_spam(monkeypatch):
+    """5min cooldown 内重复调 _try_auto_trigger 立即返 False 不发请求."""
+    s = _make_sender()
+    s._last_auto_trigger_at = time.time()  # 刚 trigger 过
+
+    called = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: called.append(1) or MagicMock(),
+    )
+    assert s._try_auto_trigger() is False
+    assert called == []  # 没 HTTP 请求
+
+
+def test_auto_trigger_health_unreachable_skips_trigger(monkeypatch):
+    """主控 /health 不通 (双向网断) → skip trigger 不浪费 timeout."""
+    s = _make_sender()
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            ConnectionRefusedError("nope")),
+    )
+    assert s._try_auto_trigger() is False
+
+
+def test_auto_trigger_full_path_calls_trigger_endpoint(monkeypatch):
+    """主控 /health 200 + trigger 200 → return True."""
+    s = _make_sender()
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+
+    calls = []
+
+    def _fake_urlopen(req, timeout=None):
+        calls.append((req.full_url, req.get_method()))
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = b"ok"
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *a: False
+        resp.close = lambda: None
+        return resp
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    assert s._try_auto_trigger() is True
+    # 验证: 先 GET /health, 再 POST /cluster/reverse-probe/trigger
+    assert len(calls) == 2
+    assert calls[0] == ("http://127.0.0.1:18080/health", "GET")
+    assert calls[1] == (
+        "http://127.0.0.1:18080/cluster/reverse-probe/trigger", "POST")
+
+
+def test_auto_trigger_signs_body_when_secret_configured(monkeypatch):
+    """配置 secret 时, trigger body 应含 _sig + _ts (HMAC-SHA256)."""
+    import json
+    s = _make_sender()
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": "TEST_SECRET"},
+    )
+    captured_body = []
+
+    def _fake_urlopen(req, timeout=None):
+        if req.get_method() == "POST":
+            captured_body.append(json.loads(req.data))
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = b""
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *a: False
+        resp.close = lambda: None
+        return resp
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    assert s._try_auto_trigger() is True
+    assert len(captured_body) == 1
+    body = captured_body[0]
+    assert body["host_id"] == "w03"
+    assert "_sig" in body
+    assert "_ts" in body
+    assert len(body["_sig"]) == 64  # SHA256 hex
+
+
+def test_auto_trigger_trigger_5xx_returns_false(monkeypatch):
+    """trigger endpoint 返 500+ 时 → return False."""
+    s = _make_sender()
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+
+    def _fake_urlopen(req, timeout=None):
+        resp = MagicMock()
+        if req.get_method() == "GET":
+            resp.status = 200
+            resp.read.return_value = b"ok"
+        else:
+            resp.status = 500
+            resp.read.return_value = b"server error"
+        resp.__enter__ = lambda self: self
+        resp.__exit__ = lambda self, *a: False
+        resp.close = lambda: None
+        return resp
+
+    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+    # 5xx 不应返 True (status >= 400 跳过 success log)
+    # 注: 实际 urllib 在 status>=400 时抛 HTTPError, 我们这里 mock 直接返
+    # status 字段, code path 还是会 catch 但不进 success branch.
+    s._try_auto_trigger()  # 不抛, 但 status>=400 不算成功

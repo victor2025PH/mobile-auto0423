@@ -531,6 +531,9 @@ class HeartbeatSender:
     _standalone_mode: bool = False
     _last_collected_data: Optional[dict] = None
     _collect_timeout: float = 5.0
+    # 2026-05-05 Stage N.1: auto-trigger reverse probe cooldown 防 spam
+    _last_auto_trigger_at: float = 0.0
+    _AUTO_TRIGGER_COOLDOWN_SEC: float = 300.0  # 5 min
 
     def __init__(self, coordinator_url: str, local_port: int = DEFAULT_OPENCLAW_PORT,
                  interval: int = _HEARTBEAT_INTERVAL):
@@ -578,7 +581,87 @@ class HeartbeatSender:
                     log.warning("[Cluster] 连续 %d 次心跳失败，进入降级独立模式",
                                 self._consecutive_failures)
                     self._standalone_mode = True
+                    # Stage N.1: 进入降级时立即尝试 trigger reverse probe
+                    # (容灾响应从 worker push 30s 间隔 → 主控 1 tick 内接管)
+                    self._try_auto_trigger()
+            # Stage N.1: 持续 standalone 期间周期性 retry trigger
+            # (单次 trigger 失败后, 5min cooldown 后再试; 直到 push 心跳恢复
+            # 退出 standalone_mode)
+            if self._standalone_mode:
+                self._try_auto_trigger()
             self._stop.wait(self._interval)
+
+    def _try_auto_trigger(self) -> bool:
+        """Stage N.1 — push 心跳挂掉时通知主控反向 probe.
+
+        步骤:
+          1. cooldown 检查 (5min 一次, 防 spam)
+          2. GET 主控 /health 预检 (双向网断时 skip 不浪费)
+          3. POST /cluster/reverse-probe/trigger 让主控 immediate probe
+
+        签名复用 _send_heartbeat 模式 (HMAC-SHA256 over host_id:ts).
+        全部失败被 catch — 不影响心跳主循环.
+
+        Returns:
+            True 如果 trigger 成功推到主控 (主控收到 200);
+            False 如果 cooldown / 网断 / 主控 5xx / 签名拒.
+        """
+        import urllib.request
+        import json
+        import time as _time
+        now = _time.time()
+        if (now - self._last_auto_trigger_at) < self._AUTO_TRIGGER_COOLDOWN_SEC:
+            return False  # cooldown 内不重复 trigger
+        self._last_auto_trigger_at = now
+
+        # Step 1: 主控可达性预检 (避免双向网断时浪费 5s timeout)
+        health_url = f"{self._coordinator_url}/health"
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            req.add_header("Connection", "close")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status >= 400:
+                    log.debug("[Cluster] auto-trigger 主控 /health %d, skip",
+                              resp.status)
+                    return False
+        except Exception as e:
+            log.debug("[Cluster] auto-trigger 主控 /health 不可达 (双向网断): %s", e)
+            return False
+
+        # Step 2: 主控可达, 调 trigger endpoint
+        cfg = load_cluster_config()
+        secret = cfg.get("shared_secret", "")
+        body = {"host_id": self._host_id}
+        if secret:
+            import hmac as _hmac
+            import hashlib as _hashlib
+            ts = str(now)
+            sig = _hmac.new(
+                secret.encode(), f"{self._host_id}:{ts}".encode(),
+                _hashlib.sha256,
+            ).hexdigest()
+            body["_sig"] = sig
+            body["_ts"] = ts
+
+        trigger_url = (
+            f"{self._coordinator_url}/cluster/reverse-probe/trigger")
+        try:
+            payload = json.dumps(body).encode()
+            req = urllib.request.Request(
+                trigger_url, data=payload,
+                headers={"Content-Type": "application/json",
+                         "Connection": "close"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status < 400:
+                    log.info(
+                        "[Cluster] auto-trigger 成功 (push 心跳挂掉, "
+                        "主控反向 probe 已接管)")
+                    return True
+        except Exception as e:
+            log.debug("[Cluster] auto-trigger POST 失败: %s", e)
+        return False
 
     def _send_heartbeat(self):
         import urllib.request
@@ -621,12 +704,15 @@ class HeartbeatSender:
             headers={"Content-Type": "application/json", "Connection": "close"},
             method="POST",
         )
+        # 2026-05-05 Stage N.1: 修 swallow bug — HTTP exception 必须 raise
+        # 给 _loop 让 _consecutive_failures 累加进入 standalone_mode (Stage B
+        # 真机发现根因: 旧版 try: urlopen except: log.warning 让 fail 沉默,
+        # _consecutive_failures 永远 0, standalone 永不进, auto-trigger 永不触).
+        resp = urllib.request.urlopen(req, timeout=10)
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
             resp.read()
+        finally:
             resp.close()
-        except Exception as e:
-            log.warning("[Cluster] Heartbeat HTTP failed: %s", e)
 
     def _collect_status(self) -> dict:
         """Collect local status for heartbeat."""
