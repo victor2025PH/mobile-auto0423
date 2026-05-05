@@ -8943,7 +8943,11 @@ class FacebookAutomation(BaseAutomation):
             seen_names = set()
             scrolls = 0
             max_scrolls = max(5, max_members // 6)
-            extract_deadline = time.time() + max(45.0, min(120.0, max_scrolls * 18.0))
+            # 2026-05-05 P7-C-2: 真机 task f2aebe47 揭示 contributors 列表
+            # dump_hierarchy 每轮 ~60s (SDUI lazy + 386 members 大列表慢),
+            # 原公式 max(45, min(120, 6*18=108))=108s 只让 ~2 次循环跑完就熔断
+            # (scrolls=2 < max=6, members=0). 改成按 60s/轮 估算给 6 次留时间.
+            extract_deadline = time.time() + max(120.0, min(360.0, max_scrolls * 60.0))
 
             while len(members) < max_members and scrolls < max_scrolls:
                 if time.time() > extract_deadline:
