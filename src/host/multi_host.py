@@ -832,6 +832,14 @@ def load_cluster_config() -> Dict[str, Any]:
         "host_name": "",
         "host_id": "",
         "advertise_ip": "",
+        # 2026-05-05 Stage K.2: reverse heartbeat prober 配置
+        # interval=默认 30s probe stale host
+        # max_interval=300s 退避上限 (probe 持续失败时, 5min 一次足够)
+        # backoff_multiplier=2.0 失败一次间隔翻倍 (30→60→120→240→300 cap)
+        "reverse_probe_interval": 30,
+        "reverse_probe_max_interval": 300,
+        "reverse_probe_backoff_multiplier": 2.0,
+        "reverse_probe_startup_delay": 10,
     }
     if cfg_path.exists():
         try:
@@ -975,21 +983,39 @@ def is_worker_standalone() -> bool:
 
 _REVERSE_PROBE_INTERVAL = 30.0
 _REVERSE_PROBE_STARTUP_DELAY = 10.0
+_REVERSE_PROBE_MAX_INTERVAL = 300.0      # 退避上限 5 min
+_REVERSE_PROBE_BACKOFF_MULT = 2.0        # 失败一次间隔翻倍
 
 
 class _ReverseHeartbeatProber(threading.Thread):
-    """主控后台线程, 周期性 reverse probe stale worker."""
+    """主控后台线程, 周期性 reverse probe stale worker.
+
+    2026-05-05 Stage K.1 加 per-host 指数退避:
+      - 默认 _interval (30s) 间隔 probe
+      - probe 失败 → 该 host 下次 probe 时间退避 (2x, 60s/120s/240s/300s 上限)
+      - probe 成功 → reset 退避到默认间隔
+      - 减真宕机 worker 的网络噪音 (避免每 30s 浪费 5s timeout)
+    """
 
     def __init__(self, interval: float = _REVERSE_PROBE_INTERVAL,
-                 startup_delay: float = _REVERSE_PROBE_STARTUP_DELAY):
+                 startup_delay: float = _REVERSE_PROBE_STARTUP_DELAY,
+                 max_interval: float = _REVERSE_PROBE_MAX_INTERVAL,
+                 backoff_multiplier: float = _REVERSE_PROBE_BACKOFF_MULT):
         super().__init__(daemon=True, name="reverse-hb-prober")
-        # interval 不在这里 clamp; caller 默认 30s, 测试可传更小
-        self._interval = max(0.1, interval)
+        # interval 下限 1ms 防 0 引发死循环; 实际 caller 默认 30s
+        self._interval = max(0.001, interval)
         self._startup_delay = max(0.0, startup_delay)
+        self._max_interval = max(self._interval, max_interval)
+        self._backoff_mult = max(1.0, backoff_multiplier)
         self._stop_event = threading.Event()
         self._iterations = 0
         self._last_probed = 0
         self._last_recovered = 0
+        # K.1: per-host 退避 state. host_id → next 允许 probe 的 monotonic 时间
+        # (time.time() 基). 初次 probe 永远允许 (字典里没的 host = 立即可 probe).
+        self._next_probe_at: Dict[str, float] = {}
+        # 当前每 host 的退避间隔 (上次失败后将间隔翻倍, 写到这里供下次用).
+        self._current_interval: Dict[str, float] = {}
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1011,7 +1037,7 @@ class _ReverseHeartbeatProber(threading.Thread):
         )
 
     def _tick(self) -> None:
-        """单 tick: 找 stale host + 逐个 probe.
+        """单 tick: 找 stale host + 逐个 probe (尊重 per-host 退避).
 
         异常被 catch 不让线程死 — 单 host probe 失败不影响其他 host.
         """
@@ -1026,18 +1052,46 @@ class _ReverseHeartbeatProber(threading.Thread):
                     and h.host_ip
                     and (now - h.last_heartbeat) > _HOST_TIMEOUT
                 ]
-            if not stale_hosts:
+            # K.1: 退避过滤 — 跳过 next_probe_at 在未来的 host
+            due_hosts = [
+                hid for hid in stale_hosts
+                if self._next_probe_at.get(hid, 0.0) <= now
+            ]
+            if not due_hosts:
                 return
-            log.debug("[Cluster] reverse prober tick #%d: %d stale hosts",
-                      self._iterations, len(stale_hosts))
-            for hid in stale_hosts:
+            log.debug(
+                "[Cluster] reverse prober tick #%d: %d stale, %d due",
+                self._iterations, len(stale_hosts), len(due_hosts),
+            )
+            for hid in due_hosts:
                 if self._stop_event.is_set():
                     return
                 self._last_probed += 1
-                if coord.reverse_probe_worker(hid):
+                ok = coord.reverse_probe_worker(hid)
+                self._update_backoff(hid, ok, now)
+                if ok:
                     self._last_recovered += 1
         except Exception:  # noqa: BLE001
             log.exception("[Cluster] reverse prober tick 失败 (continue)")
+
+    def _update_backoff(self, host_id: str, ok: bool, now: float) -> None:
+        """K.1: probe 成功 reset 间隔到默认; 失败 翻倍间隔到 max_interval 上限.
+
+        间隔记 _current_interval[host_id], 下次允许 probe 的时间记
+        _next_probe_at[host_id]. 字典里没的 host = 立即可 probe (init 状态).
+        """
+        if ok:
+            self._current_interval[host_id] = self._interval
+            self._next_probe_at[host_id] = now + self._interval
+            return
+        prev = self._current_interval.get(host_id, self._interval)
+        new_interval = min(self._max_interval, prev * self._backoff_mult)
+        self._current_interval[host_id] = new_interval
+        self._next_probe_at[host_id] = now + new_interval
+        log.debug(
+            "[Cluster] reverse probe %s 退避 → %.0fs (next at +%.0fs)",
+            host_id, new_interval, new_interval,
+        )
 
     def status(self) -> dict:
         return {
@@ -1046,6 +1100,9 @@ class _ReverseHeartbeatProber(threading.Thread):
             "total_probed": self._last_probed,
             "total_recovered": self._last_recovered,
             "interval_sec": self._interval,
+            "max_interval_sec": self._max_interval,
+            "backoff_multiplier": self._backoff_mult,
+            "per_host_backoff": dict(self._current_interval),
         }
 
 
@@ -1054,11 +1111,14 @@ _prober_lock = threading.Lock()
 
 
 def start_reverse_prober(
-    interval: float = _REVERSE_PROBE_INTERVAL,
-    startup_delay: float = _REVERSE_PROBE_STARTUP_DELAY,
+    interval: Optional[float] = None,
+    startup_delay: Optional[float] = None,
+    max_interval: Optional[float] = None,
+    backoff_multiplier: Optional[float] = None,
 ) -> Optional[_ReverseHeartbeatProber]:
     """启动主控的 reverse heartbeat prober. idempotent.
 
+    参数 None 时从 cluster.yaml 读取 (default values 来自 load_cluster_config).
     OPENCLAW_DISABLE_REVERSE_PROBE=1 完全禁用 (返 None).
     """
     if os.environ.get("OPENCLAW_DISABLE_REVERSE_PROBE", "").strip() in (
@@ -1066,12 +1126,34 @@ def start_reverse_prober(
     ):
         log.info("[Cluster] reverse prober 已通过 env 关闭")
         return None
+    # K.2: 默认值从 cluster.yaml 读
+    cfg = load_cluster_config()
+    interval = float(
+        interval if interval is not None
+        else cfg.get("reverse_probe_interval", _REVERSE_PROBE_INTERVAL)
+    )
+    startup_delay = float(
+        startup_delay if startup_delay is not None
+        else cfg.get("reverse_probe_startup_delay", _REVERSE_PROBE_STARTUP_DELAY)
+    )
+    max_interval = float(
+        max_interval if max_interval is not None
+        else cfg.get("reverse_probe_max_interval", _REVERSE_PROBE_MAX_INTERVAL)
+    )
+    backoff_multiplier = float(
+        backoff_multiplier if backoff_multiplier is not None
+        else cfg.get("reverse_probe_backoff_multiplier",
+                     _REVERSE_PROBE_BACKOFF_MULT)
+    )
     global _reverse_prober
     with _prober_lock:
         if _reverse_prober is not None and _reverse_prober.is_alive():
             return _reverse_prober
         t = _ReverseHeartbeatProber(
-            interval=interval, startup_delay=startup_delay)
+            interval=interval, startup_delay=startup_delay,
+            max_interval=max_interval,
+            backoff_multiplier=backoff_multiplier,
+        )
         t.start()
         _reverse_prober = t
         return t

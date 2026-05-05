@@ -284,3 +284,159 @@ def test_reset_for_tests_stops_thread(fresh_coord, monkeypatch):
     reset_reverse_prober_for_tests()
     time.sleep(0.1)
     assert not t.is_alive(), "reset_for_tests 应真 stop+join thread"
+
+
+# ── Stage K.1: per-host 指数退避 ─────────────────────────────────────
+
+
+def test_backoff_fail_doubles_interval(fresh_coord, monkeypatch):
+    """单 host probe 连续失败, 间隔翻倍直到 max_interval cap."""
+    fresh_coord._hosts["w_dead"] = HostInfo(
+        host_id="w_dead", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: False,
+    )
+
+    pr = _ReverseHeartbeatProber(
+        interval=10.0, startup_delay=0,
+        max_interval=80.0, backoff_multiplier=2.0,
+    )
+    # Tick 1: 第一次 probe → fail → 间隔翻倍到 20s
+    pr._tick()
+    assert pr._current_interval["w_dead"] == 20.0
+    # Tick 2 立即跑: 还在退避内 (next_probe_at 在未来), 不 probe
+    probed_count_before = pr._last_probed
+    pr._tick()
+    assert pr._last_probed == probed_count_before  # 没 probe
+
+    # 模拟时间过去 (绕过退避): 直接 fast-forward _next_probe_at
+    pr._next_probe_at["w_dead"] = 0
+    pr._tick()  # → fail again → 40s
+    assert pr._current_interval["w_dead"] == 40.0
+    pr._next_probe_at["w_dead"] = 0
+    pr._tick()  # → 80s (cap)
+    assert pr._current_interval["w_dead"] == 80.0
+    pr._next_probe_at["w_dead"] = 0
+    pr._tick()  # → 仍 80s (cap)
+    assert pr._current_interval["w_dead"] == 80.0
+
+
+def test_backoff_success_resets_to_default(fresh_coord, monkeypatch):
+    """probe 失败 N 次后成功 → 间隔 reset 到默认."""
+    fresh_coord._hosts["w_flaky"] = HostInfo(
+        host_id="w_flaky", host_ip="192.168.0.50", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    results = iter([False, False, True])
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: next(results),
+    )
+
+    pr = _ReverseHeartbeatProber(
+        interval=10.0, startup_delay=0,
+        max_interval=80.0, backoff_multiplier=2.0,
+    )
+    pr._tick()  # fail → 20s
+    assert pr._current_interval["w_flaky"] == 20.0
+    pr._next_probe_at["w_flaky"] = 0
+    pr._tick()  # fail → 40s
+    assert pr._current_interval["w_flaky"] == 40.0
+    pr._next_probe_at["w_flaky"] = 0
+    pr._tick()  # success → reset 10s
+    assert pr._current_interval["w_flaky"] == 10.0
+
+
+def test_backoff_per_host_independent(fresh_coord, monkeypatch):
+    """两 host 退避独立 — w_dead 退避不影响 w_alive."""
+    fresh_coord._hosts["w_dead"] = HostInfo(
+        host_id="w_dead", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+    fresh_coord._hosts["w_alive"] = HostInfo(
+        host_id="w_alive", host_ip="192.168.0.50", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    def _probe(hid, timeout=5.0):
+        return hid == "w_alive"
+    monkeypatch.setattr(fresh_coord, "reverse_probe_worker", _probe)
+
+    pr = _ReverseHeartbeatProber(
+        interval=10.0, startup_delay=0,
+        max_interval=80.0, backoff_multiplier=2.0,
+    )
+    pr._tick()
+    # w_dead fail → 20s 退避; w_alive success → 10s default
+    assert pr._current_interval["w_dead"] == 20.0
+    assert pr._current_interval["w_alive"] == 10.0
+
+
+def test_backoff_init_state_allows_immediate_probe(fresh_coord, monkeypatch):
+    """新 host 字典里没 entry → 立即 probe (不等任何退避窗口)."""
+    fresh_coord._hosts["w_new"] = HostInfo(
+        host_id="w_new", host_ip="192.168.0.50", port=8000,
+        last_heartbeat=0.0, online=False)
+    probed = []
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: probed.append(hid) or True,
+    )
+    pr = _ReverseHeartbeatProber(interval=100.0, startup_delay=0)
+    pr._tick()  # 第一次 tick 立即 probe (字典里没 next_probe_at[w_new])
+    assert probed == ["w_new"]
+
+
+def test_status_includes_backoff_info(fresh_coord, monkeypatch):
+    """status() 暴露 max_interval / backoff_multiplier / per_host_backoff."""
+    pr = _ReverseHeartbeatProber(
+        interval=30.0, startup_delay=0,
+        max_interval=300.0, backoff_multiplier=2.0,
+    )
+    s = pr.status()
+    assert s["interval_sec"] == 30.0
+    assert s["max_interval_sec"] == 300.0
+    assert s["backoff_multiplier"] == 2.0
+    assert s["per_host_backoff"] == {}
+
+
+# ── Stage K.2: cluster.yaml 配置 ───────────────────────────────────
+
+
+def test_start_reads_cluster_yaml_defaults(fresh_coord, monkeypatch):
+    """start_reverse_prober 不传参数时, 从 cluster.yaml 读默认."""
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+
+    fake_cfg = {
+        "reverse_probe_interval": 0.05,
+        "reverse_probe_startup_delay": 0,
+        "reverse_probe_max_interval": 200.0,
+        "reverse_probe_backoff_multiplier": 3.0,
+    }
+    monkeypatch.setattr(multi_host, "load_cluster_config",
+                        lambda: fake_cfg)
+
+    t = start_reverse_prober()
+    assert t is not None
+    assert t._interval == 0.05
+    assert t._max_interval == 200.0
+    assert t._backoff_mult == 3.0
+
+    stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_start_explicit_args_override_cfg(fresh_coord, monkeypatch):
+    """显式参数覆盖 cluster.yaml."""
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"reverse_probe_interval": 100.0,
+                 "reverse_probe_startup_delay": 0},
+    )
+    t = start_reverse_prober(interval=0.05)  # 显式覆盖
+    assert t._interval == 0.05
+    stop_reverse_prober(timeout_sec=2.0)
