@@ -7021,22 +7021,42 @@ class FacebookAutomation(BaseAutomation):
                 pass
             return _hits
 
-        # 第 1 层: atx-agent dump retry 5 次 (每次 sleep 0.7s 让 SDUI 渲染)
+        # 2026-05-05 P7-B: 用户反馈 task 1a78fad7 — preview 页第一个 See all
+        # 是 "Admins and Moderators" (一般 1-3 人, 不是引流目标), 真正的
+        # contributors See all 在屏幕下方, 默认 dump 拿不到 (lazy render).
+        # 改成: 优先 dump 找到 ≥ 2 个 See all 才停; 找不到就 scroll_down 再
+        # dump retry, 让 contributors section 进入屏幕.
+        # 第 1 层: atx-agent dump + scroll retry 8 次 (前 2 次不滚等 SDUI 渲染,
+        # 之后每次 scroll_down 一屏触发 contributors 区域 lazy render).
         seeall2 = []
-        for _retry in range(5):
+        for _retry in range(8):
             time.sleep(0.7)
             try:
                 _xml_try = d.dump_hierarchy() or ""
             except Exception:
                 _xml_try = ""
             _hits = _find_seeall_in_xml(_xml_try)
-            if _hits:
+            if len(_hits) >= 2:
+                # 找到 ≥ 2 个 → 第一个是 admins, 第二个是 contributors, 停
                 seeall2 = _hits
-                log.info("[about-path] retry %d: atx-agent dump 命中 %d 个 See all",
+                log.info("[about-path] retry %d: dump 命中 %d 个 See all (≥2 ✓)",
                          _retry, len(_hits))
                 break
+            if _hits and _retry == 7:
+                # 已是最后一次仍只 1 个 → 用现有的当 fallback
+                seeall2 = _hits
+                log.info("[about-path] retry 7: dump 仅 %d 个 See all, fallback 用 idx=0",
+                         len(_hits))
+                break
+            log.info("[about-path] retry %d: dump 命中 %d 个 See all, scroll_down 后重试",
+                     _retry, len(_hits))
+            if _retry >= 1:
+                try:
+                    self.hb.scroll_down(d)
+                except Exception:
+                    pass
         else:
-            log.info("[about-path] atx-agent dump 5 retry 仍 0, fallback raw adb")
+            log.info("[about-path] atx-agent dump 8 retry 仍 0, fallback raw adb")
 
         # 第 2 层: raw adb uiautomator dump (绕开 atx-agent cache)
         if not seeall2:
@@ -7075,12 +7095,14 @@ class FacebookAutomation(BaseAutomation):
                 log.debug("[about-path] 坐标 tap failed: %s", e)
             return True
 
-        # 取第二个 (跳过 Things in Common, 进更通用的 contributors 完整列表)
+        # 取第二个 (用户反馈 2026-05-05: 第一个 See all 是 admins/moderators
+        # 一般 1-3 人不是引流目标, 第二个才是 group contributors 完整列表)
         seeall2.sort(key=lambda x: x[1])
         idx = 1 if len(seeall2) >= 2 else 0
         sl2, st2, sr2, sb2 = seeall2[idx]
         scx2, scy2 = (sl2 + sr2) // 2, (st2 + sb2) // 2
-        log.info("[about-path] tap See all (idx=%d/n=%d) bounds=(%d,%d,%d,%d) center=(%d,%d)",
+        log.info("[about-path] tap See all (idx=%d/n=%d, 2nd=contributors) "
+                 "bounds=(%d,%d,%d,%d) center=(%d,%d)",
                  idx, len(seeall2), sl2, st2, sr2, sb2, scx2, scy2)
         try:
             self.hb.tap(d, scx2, scy2)
