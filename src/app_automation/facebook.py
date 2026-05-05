@@ -6633,7 +6633,43 @@ class FacebookAutomation(BaseAutomation):
                 left, top, right, bottom = el.bounds
                 add_centers.append(((top + bottom) // 2, left, right))
         if not add_centers:
-            return []
+            # 2026-05-05 P7-C-1: contributors 完整列表页 (已是群成员视角)
+            # 不显示 "加好友" 按钮 → 原 return [] 导致 task f2aebe47/aa3a5783
+            # 跑满 6 次 scroll 仍 yielded=0/40. 降级 row-pattern 识别:
+            # 用 _clean_group_member_candidate_name 严过滤 (blocklist + role
+            # markers + length 2-60), 配 y/x/高度 几何约束.
+            out_fb: List[Dict[str, Any]] = []
+            seen_fb = set()
+            for el in elements:
+                bounds = getattr(el, "bounds", None)
+                if not bounds:
+                    continue
+                left, top, right, bottom = bounds
+                if top < 240 or bottom > 1500:
+                    continue
+                # 名字行高度 25-80 (排除大容器 / 整 row / 图片节点)
+                if (bottom - top) < 25 or (bottom - top) > 80:
+                    continue
+                # 头像在 x<100 区, 名字必在头像右侧
+                if left < 80:
+                    continue
+                raw_fb = (getattr(el, "content_desc", "") or
+                          getattr(el, "text", "") or "").strip()
+                name_fb = self._clean_group_member_candidate_name(raw_fb)
+                if not name_fb:
+                    continue
+                key_fb = name_fb.casefold()
+                if key_fb in seen_fb:
+                    continue
+                seen_fb.add(key_fb)
+                item_fb = {"name": name_fb}
+                if raw_fb and raw_fb != name_fb:
+                    item_fb["profile_snippet"] = raw_fb[:180]
+                out_fb.append(item_fb)
+            if out_fb:
+                log.info("[extract_candidates] P7-C-1 fallback (no add_centers) "
+                         "row-pattern 抽到 %d 候选", len(out_fb))
+            return out_fb
 
         def _has_add_action_near(bounds) -> bool:
             _left, top, _right, bottom = bounds
