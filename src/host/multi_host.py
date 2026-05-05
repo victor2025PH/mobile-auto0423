@@ -631,7 +631,9 @@ class HeartbeatSender:
         # Step 2: 主控可达, 调 trigger endpoint
         cfg = load_cluster_config()
         secret = cfg.get("shared_secret", "")
-        body = {"host_id": self._host_id}
+        # P.2: worker auto-trigger 用 async 模式 — endpoint 立即返
+        # {"queued":[...]} 不阻塞 worker 心跳循环 (默认 sync 等 5s probe).
+        body = {"host_id": self._host_id, "wait": False}
         if secret:
             import hmac as _hmac
             import hashlib as _hashlib
@@ -1094,6 +1096,10 @@ class _ReverseHeartbeatProber(threading.Thread):
         self._max_interval = max(self._interval, max_interval)
         self._backoff_mult = max(1.0, backoff_multiplier)
         self._stop_event = threading.Event()
+        # 2026-05-05 Stage P.1: 外部唤醒事件 (trigger endpoint async 路径用).
+        # request_immediate_probe set 此 event → run loop 的 wait 立即返 →
+        # 下次 _tick 优先 probe 已 pop 退避的 host.
+        self._wake_event = threading.Event()
         self._iterations = 0
         self._last_probed = 0
         self._last_recovered = 0
@@ -1105,6 +1111,20 @@ class _ReverseHeartbeatProber(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
+        # P.1: 设 wake_event 让 _wait_for_next_tick polling 立即退出
+        self._wake_event.set()
+
+    def request_immediate_probe(self, host_id: str = "") -> None:
+        """Stage P.1: 外部 trigger — pop 指定 host 的退避窗口 + 唤醒 prober.
+
+        host_id 为空时 pop 所有 host 的退避 (全 stale 立即 probe). 调用方
+        可立即返 {"queued": [...]}, prober 在 ≤_wake_check_step 秒内被唤醒.
+        """
+        if host_id:
+            self._next_probe_at.pop(host_id, None)
+        else:
+            self._next_probe_at.clear()
+        self._wake_event.set()
 
     def run(self) -> None:
         if self._startup_delay > 0:
@@ -1115,12 +1135,29 @@ class _ReverseHeartbeatProber(threading.Thread):
                  self._interval)
         while not self._stop_event.is_set():
             self._tick()
-            self._stop_event.wait(self._interval)
+            self._wait_for_next_tick()
         log.info(
             "[Cluster] reverse heartbeat prober 停止, "
             "iterations=%d total_probed=%d total_recovered=%d",
             self._iterations, self._last_probed, self._last_recovered,
         )
+
+    def _wait_for_next_tick(self) -> None:
+        """P.1: polling-based wait, stop/wake event 任一 set 立即返.
+
+        threading 没原生 wait_any. polling 0.05s step 在 30s interval 下
+        是 600 次循环, 性能可忽略. 让外部 trigger 唤醒延迟 ≤ 50ms.
+        """
+        step = 0.05
+        elapsed = 0.0
+        while elapsed < self._interval:
+            if self._stop_event.is_set():
+                return
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return
+            time.sleep(step)
+            elapsed += step
 
     def _tick(self) -> None:
         """单 tick: 找 stale host + 逐个 probe (尊重 per-host 退避).

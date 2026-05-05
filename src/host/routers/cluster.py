@@ -312,6 +312,40 @@ def cluster_reverse_probe_trigger(body: dict = None):  # type: ignore[assignment
     from .. import multi_host as _mh
     coord = _mh.get_cluster_coordinator()
     target = (body.get("host_id") or "").strip()
+    # 2026-05-05 Stage P.2: wait field 控制 sync vs async.
+    #   wait=True (default): sync 等 probe 完成, 返 {probed, recovered}
+    #   wait=False: async 入队 (set wake_event), 立即返 {queued, mode:async}
+    # Worker auto-trigger (N.1) 用 wait=False 不阻塞自身心跳循环;
+    # dashboard 单击用 wait=True 拿即时反馈.
+    wait = bool(body.get("wait", True))
+
+    # ── Async 路径: 委托 prober wake event 处理 ──
+    if not wait:
+        prober = _mh._reverse_prober
+        if prober is None:
+            # prober 没启动 → 必须 sync 兜底 (worker mode 或 env disabled)
+            wait = True
+        else:
+            queued: list[str] = []
+            now = _t.time()
+            if target:
+                queued.append(target)
+                prober.request_immediate_probe(target)
+            else:
+                with coord._lock:
+                    stale = [
+                        hid for hid, h in coord._hosts.items()
+                        if hid != "coordinator" and h.host_ip
+                        and (now - h.last_heartbeat) > _mh._HOST_TIMEOUT
+                    ]
+                for hid in stale:
+                    queued.append(hid)
+                # 全 stale 一次性 wake (传空 host_id 清所有退避)
+                if stale:
+                    prober.request_immediate_probe("")
+            return {"queued": queued, "mode": "async"}
+
+    # ── Sync 路径 (现行行为, dashboard 默认) ──
     probed: list[str] = []
     recovered: list[str] = []
     now = _t.time()
@@ -336,7 +370,7 @@ def cluster_reverse_probe_trigger(body: dict = None):  # type: ignore[assignment
             probed.append(hid)
             if coord.reverse_probe_worker(hid):
                 recovered.append(hid)
-    return {"probed": probed, "recovered": recovered}
+    return {"probed": probed, "recovered": recovered, "mode": "sync"}
 
 
 @router.get("/cluster/execution-policies")

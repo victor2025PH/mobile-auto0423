@@ -677,6 +677,158 @@ def test_auto_trigger_signs_body_when_secret_configured(monkeypatch):
     assert len(body["_sig"]) == 64  # SHA256 hex
 
 
+# ── Stage P: prober wake_event + trigger async ──────────────────────
+
+
+def test_request_immediate_probe_pops_backoff_and_wakes(fresh_coord):
+    """request_immediate_probe(host_id): pop 退避窗口 + set wake_event."""
+    pr = _ReverseHeartbeatProber(interval=10.0, startup_delay=0)
+    # 模拟该 host 已退避到未来
+    pr._next_probe_at["w03"] = time.time() + 1000
+    pr._current_interval["w03"] = 240.0
+
+    pr.request_immediate_probe("w03")
+
+    # 退避被 pop
+    assert "w03" not in pr._next_probe_at
+    # wake_event set
+    assert pr._wake_event.is_set()
+
+
+def test_request_immediate_probe_empty_clears_all(fresh_coord):
+    """host_id='' 清所有退避."""
+    pr = _ReverseHeartbeatProber(interval=10.0, startup_delay=0)
+    pr._next_probe_at["w03"] = time.time() + 1000
+    pr._next_probe_at["w175"] = time.time() + 500
+
+    pr.request_immediate_probe("")
+
+    assert pr._next_probe_at == {}
+    assert pr._wake_event.is_set()
+
+
+def test_wake_event_makes_prober_tick_immediately(fresh_coord, monkeypatch):
+    """prober run loop wait_for_next_tick 在 wake_event set 时立即返."""
+    fresh_coord._hosts["w03"] = HostInfo(
+        host_id="w03", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: True,
+    )
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+
+    # interval=5s 但我们用 wake event 让它 ≤200ms 完成第二 tick
+    pr = start_reverse_prober(interval=5.0, startup_delay=0)
+    try:
+        time.sleep(0.1)  # 让第一 tick 跑完
+        first_iter = pr._iterations
+
+        pr.request_immediate_probe("w03")  # wake!
+        time.sleep(0.2)  # ≤50ms polling step + 一些余量
+
+        assert pr._iterations > first_iter, \
+            "wake_event 应让 prober 立即跑下一 tick (而非等满 5s)"
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_trigger_endpoint_wait_false_returns_queued(fresh_coord, monkeypatch):
+    """wait=false: endpoint 立即返 {queued: [...], mode: async}, 不阻塞."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    fresh_coord._hosts["w03"] = HostInfo(
+        host_id="w03", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    start_reverse_prober(interval=10.0, startup_delay=0)
+
+    # 让 reverse_probe_worker 慢 1s, 验证 async 不等
+    probe_calls = []
+
+    def _slow_probe(hid, timeout=5.0):
+        probe_calls.append(hid)
+        time.sleep(1.0)
+        return True
+    monkeypatch.setattr(fresh_coord, "reverse_probe_worker", _slow_probe)
+
+    try:
+        t0 = time.time()
+        out = cluster_reverse_probe_trigger(
+            {"host_id": "w03", "wait": False})
+        elapsed = time.time() - t0
+
+        assert out["mode"] == "async"
+        assert "w03" in out["queued"]
+        # 立即返, 没等 1s probe
+        assert elapsed < 0.5, f"async should be fast, took {elapsed:.2f}s"
+    finally:
+        stop_reverse_prober(timeout_sec=3.0)
+
+
+def test_trigger_endpoint_wait_true_default_sync(fresh_coord, monkeypatch):
+    """wait=true (default): sync 等 probe 完成, mode=sync."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    fresh_coord._hosts["w03"] = HostInfo(
+        host_id="w03", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    start_reverse_prober(interval=10.0, startup_delay=0)
+
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: True,
+    )
+
+    try:
+        out = cluster_reverse_probe_trigger({"host_id": "w03"})  # wait 不传 → True
+        assert out.get("mode") == "sync"
+        assert "w03" in out["probed"]
+        assert "w03" in out["recovered"]
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_trigger_async_falls_back_to_sync_when_no_prober(
+    fresh_coord, monkeypatch,
+):
+    """prober 没启动时 wait=false 自动 fallback 到 sync (兜底安全)."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    fresh_coord._hosts["w03"] = HostInfo(
+        host_id="w03", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    reset_reverse_prober_for_tests()  # prober is None
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: True,
+    )
+
+    out = cluster_reverse_probe_trigger({"host_id": "w03", "wait": False})
+    # prober None 时, async 路径 fallback 到 sync, mode=sync
+    assert out["mode"] == "sync"
+    assert "w03" in out["probed"]
+
+
 def test_auto_trigger_trigger_5xx_returns_false(monkeypatch):
     """trigger endpoint 返 500+ 时 → return False."""
     s = _make_sender()
