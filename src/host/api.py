@@ -454,6 +454,24 @@ async def lifespan(application: FastAPI):
     except Exception:
         pass
 
+    # 2026-05-05 H.2-followup: 补 3 个新加 stop 的 daemon
+    # (job_scheduler / w03_event_bridge / w03_cache 之前没 stop_*, 现已加)
+    try:
+        from .job_scheduler import stop_job_scheduler
+        stop_job_scheduler(timeout_sec=5.0)
+    except Exception:
+        pass
+    try:
+        from .w03_event_bridge import stop_w03_bridge
+        stop_w03_bridge(timeout_sec=5.0)
+    except Exception:
+        pass
+    try:
+        from .leads_cache import stop_w03_cache
+        stop_w03_cache(timeout_sec=5.0)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # App & Middleware
