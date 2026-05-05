@@ -6987,13 +6987,11 @@ class FacebookAutomation(BaseAutomation):
         except Exception:
             return True
 
-        # 2026-05-04 P0 优化: 优先用 Search Members 输入路径绕开 SDUI 限制.
-        # FB 服务端按账号活跃度 lazy 渲染 contributors 列表 (低活跃账号 dump
-        # 抓不到真名). 但 search 输入触发 FB 主动 push 搜索结果, 真名必须
-        # 出现在 dump 里 (用户能看到).
-        if self._tap_via_search_members_input(d, did):
-            log.info("[about-path] ✓ 用 Search Members 输入路径")
-            return True
+        # 2026-05-05 P7-A: search-input 路径从主路径降为 fallback (用户反馈
+        # task a1c2f336: Members preview 后被 search-input 短路, 1 字符抽 1-7
+        # 候选 << max=40, 实际目标是滚动抽全员). 先走完整 contributors 列表
+        # (下方 6998+ 三层 dump 找第二个 See all), 进 extract_group_members
+        # 8923 滚动循环抽全员; search-input 留作低活跃账号 0 抽时的 fallback.
 
         # 2026-05-04 重构 dump 策略: SDUI lazy load + atx-agent cache 不一致
         # 导致 task 内 dump 抓不到 "See all members" 文字. 用 retry + raw adb
@@ -8962,6 +8960,36 @@ class FacebookAutomation(BaseAutomation):
                 self.hb.scroll_down(d)
                 self.hb.wait_read(random.randint(800, 2000))
                 scrolls += 1
+
+        # 2026-05-05 P7-A fallback: 滚动循环 0 抽 → 用 Search Members 输入兜底
+        # (低活跃账号 SDUI lazy 不渲染真名时仍能抽到 1-7 候选).
+        if not members:
+            try:
+                if self._tap_via_search_members_input(d, did):
+                    _sic_fb = getattr(self, "_search_input_candidates", None)
+                    if _sic_fb and isinstance(_sic_fb, list):
+                        log.info(
+                            "[extract_group_members] P7-A fallback search-input "
+                            "抽到 %d 候选 (滚动 0 抽后)", len(_sic_fb))
+                        for _c in _sic_fb[:max_members]:
+                            _name = _c.get("name", "").strip()
+                            if not _name:
+                                continue
+                            members.append({
+                                "name": _name,
+                                "raw_name": _name,
+                                "source_section": "search_members_input_fallback",
+                                "source_group": group_name,
+                                "discover_method": "search_members_input_fallback",
+                                "profile_snippet": "",
+                                "profile_pic_bounds": _c.get("bounds"),
+                            })
+                        try:
+                            self._search_input_candidates = None
+                        except Exception:
+                            pass
+            except Exception as _fb_e:
+                log.debug("[extract_group_members] P7-A fallback 异常: %s", _fb_e)
 
         # P2.0 (2026-04-30): 进群且 Members tab 没硬失败, 但循环后仍 0 成员
         # —— 最容易遗漏的现场。同步取证, 让运营看到当时屏幕到底是什么。
