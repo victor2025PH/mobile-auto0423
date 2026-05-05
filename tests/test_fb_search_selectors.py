@@ -109,3 +109,74 @@ def test_query_editor_only_className_editText():
     t = sel.FB_SEARCH_QUERY_EDITOR_SELECTORS
     assert len(t) == 1
     assert t[0] == {"className": "android.widget.EditText"}
+
+
+def test_home_search_tap_skips_search_facebook_outside_top_slot(monkeypatch):
+    """Search Facebook 也必须做坐标保护，避免点到右上 Messenger/聊天入口。"""
+    from unittest.mock import MagicMock
+
+    from src.app_automation import facebook as fb_mod
+    from src.app_automation.facebook import FacebookAutomation
+
+    class FakeEl:
+        def __init__(self, exists, center=(0, 0), desc=""):
+            self._exists = exists
+            self.center = center
+            self.info = {"contentDescription": desc, "text": ""}
+
+        def exists(self, timeout=0):
+            return self._exists
+
+    class FakeDevice:
+        def __init__(self):
+            self.search_opened = False
+            self.pkg = fb_mod.PACKAGE
+
+        def __call__(self, **sel):
+            desc = sel.get("description") or ""
+            if desc == "Search Facebook":
+                # Right edge, where Messenger/chat shortcuts commonly live.
+                return FakeEl(True, center=(690, 112), desc=desc)
+            if desc == "Search":
+                return FakeEl(True, center=(584, 112), desc=desc)
+            return FakeEl(False)
+
+        def dump_hierarchy(self):
+            return "<search/>" if self.search_opened else "<home/>"
+
+        def app_current(self):
+            return {"package": self.pkg}
+
+        def app_stop(self, pkg):
+            pass
+
+        def window_size(self):
+            return (720, 1600)
+
+    d = FakeDevice()
+    fb = FacebookAutomation.__new__(FacebookAutomation)
+    fb._did = MagicMock(return_value="dev1")
+    fb._u2 = MagicMock(return_value=d)
+    fb._adb_start_main_user = MagicMock()
+    fb._el_center = lambda el: el.center
+
+    def tap(_d, x, y):
+        assert (x, y) != (690, 112)
+        if (x, y) == (584, 112):
+            d.search_opened = True
+
+    fb.hb = MagicMock()
+    fb.hb.tap.side_effect = tap
+
+    monkeypatch.setattr(fb_mod.time, "sleep", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        fb_mod, "hierarchy_looks_like_fb_home",
+        lambda _xml: not d.search_opened,
+    )
+    monkeypatch.setattr(
+        fb_mod, "hierarchy_looks_like_fb_search_surface",
+        lambda _xml: d.search_opened,
+    )
+
+    assert fb._tap_search_bar_preferred(d, "dev1") is True
+    fb.hb.tap.assert_called_once()

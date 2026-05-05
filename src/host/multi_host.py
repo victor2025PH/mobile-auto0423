@@ -281,6 +281,83 @@ class ClusterCoordinator:
 
         return total
 
+    def reverse_probe_worker(self, host_id: str,
+                              timeout: float = 5.0) -> bool:
+        """主动 GET worker /devices, 成功则注册成 online via heartbeat.
+
+        2026-05-05 Stage I.1: 解决 worker HeartbeatSender 没在 push 心跳但
+        worker server 实际活着的场景 (Stage B 真机验证发现 W03/W175 直接
+        HTTP 200 但 last_heartbeat 944 分钟前 → /cluster/devices 返 0).
+
+        本函数主动 probe **已知**历史 worker (cluster_state.json 持久化的
+        host_id), 不主动扫局域网 (安全 + 不浪费网络).
+
+        失败的 host 保持 offline 状态.
+
+        Args:
+            host_id: 要 probe 的 worker host_id (必须在 self._hosts 里)
+            timeout: HTTP timeout 秒数
+
+        Returns:
+            True 如果 probe 成功 + 注册 online; False 否则
+        """
+        import urllib.request
+        with self._lock:
+            h = self._hosts.get(host_id)
+            if h is None:
+                return False
+            host_ip = h.host_ip
+            port = h.port or DEFAULT_OPENCLAW_PORT
+            host_name = h.host_name
+        # coordinator 自己不 probe; 没 IP 的 host 不 probe (没法连)
+        if not host_ip or host_id == "coordinator":
+            return False
+
+        url = f"http://{host_ip}:{port}/devices"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            if self._secret:
+                req.add_header("X-Cluster-Secret", self._secret)
+            req.add_header("Connection", "close")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(raw)
+            devices = data if isinstance(data, list) else data.get("devices", [])
+            if not isinstance(devices, list):
+                devices = []
+        except Exception as e:
+            log.debug("[Cluster] reverse probe %s @ %s 失败: %s",
+                      host_id, host_ip, e)
+            return False
+
+        # 标准化设备数据 (与 refresh_all_devices 同处理)
+        normalized = []
+        for d in devices:
+            if isinstance(d, dict):
+                normalized.append(d)
+            elif isinstance(d, str):
+                normalized.append({"device_id": d, "status": "unknown"})
+
+        # 注册成 online via 内部 heartbeat 路径 (复用 receive_heartbeat 的
+        # online state machine + persist + event_stream worker.online).
+        self.receive_heartbeat({
+            "host_id": host_id,
+            "host_name": host_name,
+            "host_ip": host_ip,
+            "port": port,
+            "devices": normalized,
+            "tasks_active": 0,
+            "tasks_completed": 0,
+            "cpu_usage": 0.0,
+            "memory_usage": 0.0,
+            "version": "",
+            "secret": self._secret,
+            "_via": "reverse_probe",
+        })
+        log.info("[Cluster] reverse probe 成功: %s @ %s — %d devices",
+                 host_id, host_ip, len(normalized))
+        return True
+
     def get_all_devices(self) -> List[dict]:
         """Return unified device list across all hosts."""
         self._refresh_online_status()
@@ -454,6 +531,9 @@ class HeartbeatSender:
     _standalone_mode: bool = False
     _last_collected_data: Optional[dict] = None
     _collect_timeout: float = 5.0
+    # 2026-05-05 Stage N.1: auto-trigger reverse probe cooldown 防 spam
+    _last_auto_trigger_at: float = 0.0
+    _AUTO_TRIGGER_COOLDOWN_SEC: float = 300.0  # 5 min
 
     def __init__(self, coordinator_url: str, local_port: int = DEFAULT_OPENCLAW_PORT,
                  interval: int = _HEARTBEAT_INTERVAL):
@@ -501,7 +581,89 @@ class HeartbeatSender:
                     log.warning("[Cluster] 连续 %d 次心跳失败，进入降级独立模式",
                                 self._consecutive_failures)
                     self._standalone_mode = True
+                    # Stage N.1: 进入降级时立即尝试 trigger reverse probe
+                    # (容灾响应从 worker push 30s 间隔 → 主控 1 tick 内接管)
+                    self._try_auto_trigger()
+            # Stage N.1: 持续 standalone 期间周期性 retry trigger
+            # (单次 trigger 失败后, 5min cooldown 后再试; 直到 push 心跳恢复
+            # 退出 standalone_mode)
+            if self._standalone_mode:
+                self._try_auto_trigger()
             self._stop.wait(self._interval)
+
+    def _try_auto_trigger(self) -> bool:
+        """Stage N.1 — push 心跳挂掉时通知主控反向 probe.
+
+        步骤:
+          1. cooldown 检查 (5min 一次, 防 spam)
+          2. GET 主控 /health 预检 (双向网断时 skip 不浪费)
+          3. POST /cluster/reverse-probe/trigger 让主控 immediate probe
+
+        签名复用 _send_heartbeat 模式 (HMAC-SHA256 over host_id:ts).
+        全部失败被 catch — 不影响心跳主循环.
+
+        Returns:
+            True 如果 trigger 成功推到主控 (主控收到 200);
+            False 如果 cooldown / 网断 / 主控 5xx / 签名拒.
+        """
+        import urllib.request
+        import json
+        import time as _time
+        now = _time.time()
+        if (now - self._last_auto_trigger_at) < self._AUTO_TRIGGER_COOLDOWN_SEC:
+            return False  # cooldown 内不重复 trigger
+        self._last_auto_trigger_at = now
+
+        # Step 1: 主控可达性预检 (避免双向网断时浪费 5s timeout)
+        health_url = f"{self._coordinator_url}/health"
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            req.add_header("Connection", "close")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status >= 400:
+                    log.debug("[Cluster] auto-trigger 主控 /health %d, skip",
+                              resp.status)
+                    return False
+        except Exception as e:
+            log.debug("[Cluster] auto-trigger 主控 /health 不可达 (双向网断): %s", e)
+            return False
+
+        # Step 2: 主控可达, 调 trigger endpoint
+        cfg = load_cluster_config()
+        secret = cfg.get("shared_secret", "")
+        # P.2: worker auto-trigger 用 async 模式 — endpoint 立即返
+        # {"queued":[...]} 不阻塞 worker 心跳循环 (默认 sync 等 5s probe).
+        body = {"host_id": self._host_id, "wait": False}
+        if secret:
+            import hmac as _hmac
+            import hashlib as _hashlib
+            ts = str(now)
+            sig = _hmac.new(
+                secret.encode(), f"{self._host_id}:{ts}".encode(),
+                _hashlib.sha256,
+            ).hexdigest()
+            body["_sig"] = sig
+            body["_ts"] = ts
+
+        trigger_url = (
+            f"{self._coordinator_url}/cluster/reverse-probe/trigger")
+        try:
+            payload = json.dumps(body).encode()
+            req = urllib.request.Request(
+                trigger_url, data=payload,
+                headers={"Content-Type": "application/json",
+                         "Connection": "close"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status < 400:
+                    log.info(
+                        "[Cluster] auto-trigger 成功 (push 心跳挂掉, "
+                        "主控反向 probe 已接管)")
+                    return True
+        except Exception as e:
+            log.debug("[Cluster] auto-trigger POST 失败: %s", e)
+        return False
 
     def _send_heartbeat(self):
         import urllib.request
@@ -544,12 +706,15 @@ class HeartbeatSender:
             headers={"Content-Type": "application/json", "Connection": "close"},
             method="POST",
         )
+        # 2026-05-05 Stage N.1: 修 swallow bug — HTTP exception 必须 raise
+        # 给 _loop 让 _consecutive_failures 累加进入 standalone_mode (Stage B
+        # 真机发现根因: 旧版 try: urlopen except: log.warning 让 fail 沉默,
+        # _consecutive_failures 永远 0, standalone 永不进, auto-trigger 永不触).
+        resp = urllib.request.urlopen(req, timeout=10)
         try:
-            resp = urllib.request.urlopen(req, timeout=10)
             resp.read()
+        finally:
             resp.close()
-        except Exception as e:
-            log.warning("[Cluster] Heartbeat HTTP failed: %s", e)
 
     def _collect_status(self) -> dict:
         """Collect local status for heartbeat."""
@@ -755,6 +920,14 @@ def load_cluster_config() -> Dict[str, Any]:
         "host_name": "",
         "host_id": "",
         "advertise_ip": "",
+        # 2026-05-05 Stage K.2: reverse heartbeat prober 配置
+        # interval=默认 30s probe stale host
+        # max_interval=300s 退避上限 (probe 持续失败时, 5min 一次足够)
+        # backoff_multiplier=2.0 失败一次间隔翻倍 (30→60→120→240→300 cap)
+        "reverse_probe_interval": 30,
+        "reverse_probe_max_interval": 300,
+        "reverse_probe_backoff_multiplier": 2.0,
+        "reverse_probe_startup_delay": 10,
     }
     if cfg_path.exists():
         try:
@@ -874,3 +1047,285 @@ def is_worker_standalone() -> bool:
     if sender is None:
         return False
     return getattr(sender, '_standalone_mode', False)
+
+
+# ── Reverse Heartbeat Prober (Stage I, 2026-05-05) ───────────────────
+#
+# 动机:
+#   worker HeartbeatSender 失效 (worker 进程跑但 sender 没启动 / 网络
+#   单向通) 时, 主控反向 GET worker /devices 把它注册成 online. 配合
+#   既有 push heartbeat 的双轨容灾.
+#
+# 设计:
+#   - 仅 probe **已知**历史 worker (cluster_state.json 持久化的 host_id
+#     即 _hosts 里有的 host); 不主动扫局域网 (安全)
+#   - 仅 probe last_heartbeat 超过 _HOST_TIMEOUT 的 stale host (即
+#     被判 offline 的) — 已 online 的 host 让 push 心跳处理
+#   - probe 间隔默认 30s (push 心跳 _HEARTBEAT_INTERVAL=15s 的 2 倍,
+#     防双轨重复噪音)
+#   - 失败的 host 保持 offline (probe 不引入 false positive)
+#   - 单例 thread, idempotent start/stop
+#
+# 关闭开关:
+#   OPENCLAW_DISABLE_REVERSE_PROBE=1 完全禁用 (worker only 模式或测试)
+
+_REVERSE_PROBE_INTERVAL = 30.0
+_REVERSE_PROBE_STARTUP_DELAY = 10.0
+_REVERSE_PROBE_MAX_INTERVAL = 300.0      # 退避上限 5 min
+_REVERSE_PROBE_BACKOFF_MULT = 2.0        # 失败一次间隔翻倍
+
+
+class _ReverseHeartbeatProber(threading.Thread):
+    """主控后台线程, 周期性 reverse probe stale worker.
+
+    2026-05-05 Stage K.1 加 per-host 指数退避:
+      - 默认 _interval (30s) 间隔 probe
+      - probe 失败 → 该 host 下次 probe 时间退避 (2x, 60s/120s/240s/300s 上限)
+      - probe 成功 → reset 退避到默认间隔
+      - 减真宕机 worker 的网络噪音 (避免每 30s 浪费 5s timeout)
+    """
+
+    def __init__(self, interval: float = _REVERSE_PROBE_INTERVAL,
+                 startup_delay: float = _REVERSE_PROBE_STARTUP_DELAY,
+                 max_interval: float = _REVERSE_PROBE_MAX_INTERVAL,
+                 backoff_multiplier: float = _REVERSE_PROBE_BACKOFF_MULT):
+        super().__init__(daemon=True, name="reverse-hb-prober")
+        # interval 下限 1ms 防 0 引发死循环; 实际 caller 默认 30s
+        self._interval = max(0.001, interval)
+        self._startup_delay = max(0.0, startup_delay)
+        self._max_interval = max(self._interval, max_interval)
+        self._backoff_mult = max(1.0, backoff_multiplier)
+        self._stop_event = threading.Event()
+        # 2026-05-05 Stage P.1: 外部唤醒事件 (trigger endpoint async 路径用).
+        # request_immediate_probe set 此 event → run loop 的 wait 立即返 →
+        # 下次 _tick 优先 probe 已 pop 退避的 host.
+        self._wake_event = threading.Event()
+        self._iterations = 0
+        self._last_probed = 0
+        self._last_recovered = 0
+        # K.1: per-host 退避 state. host_id → next 允许 probe 的 monotonic 时间
+        # (time.time() 基). 初次 probe 永远允许 (字典里没的 host = 立即可 probe).
+        self._next_probe_at: Dict[str, float] = {}
+        # 当前每 host 的退避间隔 (上次失败后将间隔翻倍, 写到这里供下次用).
+        self._current_interval: Dict[str, float] = {}
+        # V.2: per-host 连续失败计数 (UX). probe 成功 reset 0; 失败累加.
+        # status() 暴露给 ops 看 "死透节奏" — 比退避间隔更直观.
+        self._consecutive_failures: Dict[str, int] = {}
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        # P.1: 设 wake_event 让 _wait_for_next_tick polling 立即退出
+        self._wake_event.set()
+
+    def request_immediate_probe(self, host_id: str = "") -> None:
+        """Stage P.1: 外部 trigger — pop 指定 host 的退避窗口 + 唤醒 prober.
+
+        host_id 为空时 pop 所有 host 的退避 (全 stale 立即 probe). 调用方
+        可立即返 {"queued": [...]}, prober 在 ≤_wake_check_step 秒内被唤醒.
+        """
+        if host_id:
+            self._next_probe_at.pop(host_id, None)
+        else:
+            self._next_probe_at.clear()
+        self._wake_event.set()
+
+    def run(self) -> None:
+        if self._startup_delay > 0:
+            self._stop_event.wait(self._startup_delay)
+            if self._stop_event.is_set():
+                return
+        log.info("[Cluster] reverse heartbeat prober 启动 (interval=%.0fs)",
+                 self._interval)
+        while not self._stop_event.is_set():
+            self._tick()
+            self._wait_for_next_tick()
+        log.info(
+            "[Cluster] reverse heartbeat prober 停止, "
+            "iterations=%d total_probed=%d total_recovered=%d",
+            self._iterations, self._last_probed, self._last_recovered,
+        )
+
+    def _wait_for_next_tick(self) -> None:
+        """P.1: polling-based wait, stop/wake event 任一 set 立即返.
+
+        threading 没原生 wait_any. polling 0.05s step 在 30s interval 下
+        是 600 次循环, 性能可忽略. 让外部 trigger 唤醒延迟 ≤ 50ms.
+        """
+        step = 0.05
+        elapsed = 0.0
+        while elapsed < self._interval:
+            if self._stop_event.is_set():
+                return
+            if self._wake_event.is_set():
+                self._wake_event.clear()
+                return
+            time.sleep(step)
+            elapsed += step
+
+    def _tick(self) -> None:
+        """单 tick: 找 stale host + 逐个 probe (尊重 per-host 退避).
+
+        异常被 catch 不让线程死 — 单 host probe 失败不影响其他 host.
+        """
+        self._iterations += 1
+        try:
+            coord = get_cluster_coordinator()
+            now = time.time()
+            with coord._lock:
+                stale_hosts = [
+                    hid for hid, h in coord._hosts.items()
+                    if hid != "coordinator"
+                    and h.host_ip
+                    and (now - h.last_heartbeat) > _HOST_TIMEOUT
+                ]
+            # K.1: 退避过滤 — 跳过 next_probe_at 在未来的 host
+            due_hosts = [
+                hid for hid in stale_hosts
+                if self._next_probe_at.get(hid, 0.0) <= now
+            ]
+            if not due_hosts:
+                return
+            log.debug(
+                "[Cluster] reverse prober tick #%d: %d stale, %d due",
+                self._iterations, len(stale_hosts), len(due_hosts),
+            )
+            for hid in due_hosts:
+                if self._stop_event.is_set():
+                    return
+                self._last_probed += 1
+                ok = coord.reverse_probe_worker(hid)
+                self._update_backoff(hid, ok, now)
+                if ok:
+                    self._last_recovered += 1
+        except Exception:  # noqa: BLE001
+            log.exception("[Cluster] reverse prober tick 失败 (continue)")
+
+    def _update_backoff(self, host_id: str, ok: bool, now: float) -> None:
+        """K.1: probe 成功 reset 间隔到默认; 失败 翻倍间隔到 max_interval 上限.
+
+        间隔记 _current_interval[host_id], 下次允许 probe 的时间记
+        _next_probe_at[host_id]. 字典里没的 host = 立即可 probe (init 状态).
+        """
+        if ok:
+            self._current_interval[host_id] = self._interval
+            self._next_probe_at[host_id] = now + self._interval
+            # V.2: 成功 reset 失败计数
+            self._consecutive_failures[host_id] = 0
+            return
+        prev = self._current_interval.get(host_id, self._interval)
+        new_interval = min(self._max_interval, prev * self._backoff_mult)
+        self._current_interval[host_id] = new_interval
+        self._next_probe_at[host_id] = now + new_interval
+        # V.2: 累加失败计数
+        self._consecutive_failures[host_id] = (
+            self._consecutive_failures.get(host_id, 0) + 1
+        )
+        log.debug(
+            "[Cluster] reverse probe %s 退避 → %.0fs (next at +%.0fs)",
+            host_id, new_interval, new_interval,
+        )
+
+    def status(self) -> dict:
+        # 2026-05-05 Stage H.1: 暴露 per_host_next_probe_at_iso 让 ops 看
+        # "下次 何时 probe" (vs 只看间隔不知道几秒后).
+        from datetime import datetime as _dt, timezone as _tz
+        next_probe_iso: Dict[str, str] = {}
+        for hid, ts in self._next_probe_at.items():
+            try:
+                next_probe_iso[hid] = _dt.fromtimestamp(
+                    ts, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception:
+                next_probe_iso[hid] = ""
+        return {
+            "running": self.is_alive() and not self._stop_event.is_set(),
+            "iterations": self._iterations,
+            "total_probed": self._last_probed,
+            "total_recovered": self._last_recovered,
+            "interval_sec": self._interval,
+            "max_interval_sec": self._max_interval,
+            "backoff_multiplier": self._backoff_mult,
+            "per_host_backoff": dict(self._current_interval),
+            "per_host_next_probe_at_iso": next_probe_iso,
+            "per_host_consecutive_failures": dict(self._consecutive_failures),
+        }
+
+
+_reverse_prober: Optional[_ReverseHeartbeatProber] = None
+_prober_lock = threading.Lock()
+
+
+def start_reverse_prober(
+    interval: Optional[float] = None,
+    startup_delay: Optional[float] = None,
+    max_interval: Optional[float] = None,
+    backoff_multiplier: Optional[float] = None,
+) -> Optional[_ReverseHeartbeatProber]:
+    """启动主控的 reverse heartbeat prober. idempotent.
+
+    参数 None 时从 cluster.yaml 读取 (default values 来自 load_cluster_config).
+    OPENCLAW_DISABLE_REVERSE_PROBE=1 完全禁用 (返 None).
+    """
+    if os.environ.get("OPENCLAW_DISABLE_REVERSE_PROBE", "").strip() in (
+        "1", "true", "yes",
+    ):
+        log.info("[Cluster] reverse prober 已通过 env 关闭")
+        return None
+    # K.2: 默认值从 cluster.yaml 读
+    cfg = load_cluster_config()
+    interval = float(
+        interval if interval is not None
+        else cfg.get("reverse_probe_interval", _REVERSE_PROBE_INTERVAL)
+    )
+    startup_delay = float(
+        startup_delay if startup_delay is not None
+        else cfg.get("reverse_probe_startup_delay", _REVERSE_PROBE_STARTUP_DELAY)
+    )
+    max_interval = float(
+        max_interval if max_interval is not None
+        else cfg.get("reverse_probe_max_interval", _REVERSE_PROBE_MAX_INTERVAL)
+    )
+    backoff_multiplier = float(
+        backoff_multiplier if backoff_multiplier is not None
+        else cfg.get("reverse_probe_backoff_multiplier",
+                     _REVERSE_PROBE_BACKOFF_MULT)
+    )
+    global _reverse_prober
+    with _prober_lock:
+        if _reverse_prober is not None and _reverse_prober.is_alive():
+            return _reverse_prober
+        t = _ReverseHeartbeatProber(
+            interval=interval, startup_delay=startup_delay,
+            max_interval=max_interval,
+            backoff_multiplier=backoff_multiplier,
+        )
+        t.start()
+        _reverse_prober = t
+        return t
+
+
+def stop_reverse_prober(timeout_sec: float = 5.0) -> bool:
+    """优雅停止 reverse prober. 返 True 如果在 timeout 内退出."""
+    global _reverse_prober
+    with _prober_lock:
+        t = _reverse_prober
+        _reverse_prober = None
+    if t is None:
+        return True
+    t.stop()
+    t.join(timeout=timeout_sec)
+    return not t.is_alive()
+
+
+def reset_reverse_prober_for_tests() -> None:
+    """仅测试用. 强制 stop+join 防孤儿 + 清单例.
+
+    与 central_push_drain.reset_for_tests 同 pattern (Stage C.2 教训:
+    旧 '只清单例不停 thread' 让孤儿 daemon 跨 test 污染).
+    """
+    global _reverse_prober
+    with _prober_lock:
+        t = _reverse_prober
+        _reverse_prober = None
+    if t is not None:
+        t.stop()
+        t.join(timeout=2.0)

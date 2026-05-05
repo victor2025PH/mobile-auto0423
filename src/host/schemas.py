@@ -57,6 +57,7 @@ class TaskType(str, Enum):
     FACEBOOK_BROWSE_GROUPS = "facebook_browse_groups"
     FACEBOOK_GROUP_ENGAGE = "facebook_group_engage"
     FACEBOOK_EXTRACT_MEMBERS = "facebook_extract_members"
+    FACEBOOK_GROUP_MEMBER_GREET = "facebook_group_member_greet"
     FACEBOOK_CHECK_INBOX = "facebook_check_inbox"
     FACEBOOK_CHECK_MESSAGE_REQUESTS = "facebook_check_message_requests"
     FACEBOOK_CHECK_FRIEND_REQUESTS = "facebook_check_friend_requests"

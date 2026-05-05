@@ -20,12 +20,21 @@ Selector = Dict[str, Any]
 FB_HOME_SEARCH_BUTTON_SELECTORS: Tuple[Selector, ...] = (
     {"className": "android.widget.Button", "description": "搜索"},
     {"description": "搜索", "clickable": True},
+    {"className": "android.widget.Button", "description": "搜索 Facebook"},
+    {"description": "搜索 Facebook", "clickable": True},
+    {"className": "android.widget.Button", "description": "搜索Facebook"},
+    {"description": "搜索Facebook", "clickable": True},
     {"className": "android.widget.Button", "description": "Search"},
     {"description": "Search", "clickable": True},
+    {"className": "android.widget.Button", "description": "Search Facebook"},
+    {"description": "Search Facebook", "clickable": True},
 )
 
 # ── ``_fallback_search_tap``：主循环全失败后的兜底 ─────────────────────
 FB_FALLBACK_SEARCH_TAP_SELECTORS: Tuple[Selector, ...] = (
+    {"description": "Search Facebook"},
+    {"description": "搜索 Facebook"},
+    {"description": "搜索Facebook"},
     {"description": "搜索"},
     {"description": "Search"},
     {"resourceId": "com.facebook.katana:id/search_bar_text_view"},

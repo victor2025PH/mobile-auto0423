@@ -609,6 +609,38 @@ _instance: Optional[AdaptiveCompliance] = None
 _ac_lock = threading.Lock()
 
 
+# ── 测试支持 (Stage F.2) ──
+
+# 默认值快照 — _apply_tuning_adjustments 会就地 mutate RISK_MULTIPLIERS,
+# 跨 test 污染下游 (test_many_failures_trigger_high_risk 期望 multiplier
+# 等等). reset_for_tests 用此默认值 deep copy 还原.
+_DEFAULT_RISK_MULTIPLIERS = {
+    "low": 1.0,
+    "medium": 0.7,
+    "high": 0.4,
+    "critical": 0.2,
+}
+
+
+def reset_for_tests() -> None:
+    """仅测试用. 还原 RISK_MULTIPLIERS 到默认值 + 清 singleton.
+
+    根因 (2026-05-04 Stage F.2):
+      _apply_tuning_adjustments (line 560) global RISK_MULTIPLIERS 修改
+      module-level dict (e.g. high: 0.4 → 0.25 自适应反检测降级). 某测试
+      触发后, 下个 TestAdaptiveCompliance test 的 _fresh_ac() 创新 instance,
+      但 instance.multiplier property 读 RISK_MULTIPLIERS module-level →
+      拿到 mutate 后的值, 假设默认 0.4 的断言 fail.
+
+      conftest P2-⑨ autouse 调本函数, 让 RISK_MULTIPLIERS 永远从默认开始.
+    """
+    global _instance
+    RISK_MULTIPLIERS.clear()
+    RISK_MULTIPLIERS.update(_DEFAULT_RISK_MULTIPLIERS)
+    with _ac_lock:
+        _instance = None
+
+
 def get_adaptive_compliance() -> AdaptiveCompliance:
     global _instance
     if _instance is None:

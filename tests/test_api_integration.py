@@ -22,12 +22,29 @@ os.environ.setdefault("OPENCLAW_API_KEY", "")
 
 @pytest.fixture(scope="module")
 def client():
+    """API integration TestClient — 不进 lifespan context (跳过 startup/shutdown).
+
+    根因 (2026-05-04): 旧版 ``with TestClient(app) as c`` 触发 lifespan startup
+    起 ~15 个 daemon thread (drain / scheduler / W03 cache / proxy_health /
+    router_manager / openclaw_agent ...), 但 lifespan shutdown 段只停 7 个,
+    剩余 daemon 让 starlette ``TestClient.__exit__`` 的 ``wait_shutdown`` 卡
+    portal.call() 永挂 -> 全 suite pytest --timeout=60 触发 stack trace, fail-fast
+    被破坏.
+
+    fix: 不进 ``with``, TestClient(app) 直接构造跳过 lifespan. endpoint route
+    已在 import 时注册, /health 等用 ``_get_metrics().snapshot()`` lazy 读 +
+    ``snap.get(..., {})`` 兜底, 无 lifespan 注入也能正常返回. 测试只用
+    lightweight read endpoint, 不依赖 lifespan 副产物 (e.g. WorkflowEngine
+    action register / auto_start_cluster).
+
+    Trade-off: 若未来加测试用例触到 lifespan 依赖 endpoint, 需单独 spin up
+    一个进 with 的 client fixture (并接受 teardown 慢).
+    """
     from src.host.database import init_db
     init_db()
     from src.host.api import app
     from fastapi.testclient import TestClient
-    with TestClient(app) as c:
-        yield c
+    yield TestClient(app)
 
 
 # ═══════════════════════════════════════════════════════════════════

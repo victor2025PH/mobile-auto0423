@@ -550,6 +550,17 @@ class Metrics:
                 "skipped_no_local_device": self.tt_campaign_skipped_no_local_row,
                 "skipped_local_offline": self.tt_campaign_skipped_local_offline,
             }
+        # 2026-05-05 Stage W: reverse heartbeat prober 指标接入 /metrics
+        # 让 dashboard / Prometheus exporter / ops 看 JSON snapshot 一目了然.
+        # prober 没启动 (worker mode 或 env disabled) 时返 running=False
+        # — 不引入新 prometheus_client 依赖.
+        rev_probe = {"running": False}
+        try:
+            from src.host.multi_host import _reverse_prober as _rp
+            if _rp is not None:
+                rev_probe = _rp.status()
+        except Exception:
+            pass
         return {
             "uptime_seconds": uptime,
             "tasks": {
@@ -565,6 +576,7 @@ class Metrics:
             "last_heartbeat": self.last_heartbeat,
             "devices": dict(self.device_status),
             "recent_alerts": self.alerts[-20:],
+            "reverse_probe": rev_probe,
         }
 
 
@@ -756,6 +768,12 @@ _STUCK_THRESHOLDS = {
     "whatsapp_": 900,
     "linkedin_": 900,
     "batch_": 1800,
+    # 2026-05-03 v27: facebook 全链路任务 (group_member_greet / campaign_run)
+    # 候选池放大到 40 + 加好友间隔 60-180s + 视觉判别 + greeting 间隔, 单
+    # 任务正常需要 60-90 分钟. 旧 1200s 默认值在第 30 轮把 sent>0 的任务杀
+    # 在 1247s. 给 facebook_ 前缀整体 7200s (与 executor _TASK_TYPE_TIMEOUTS
+    # 对齐).
+    "facebook_": 7200,
 }
 _DEFAULT_STUCK_THRESHOLD = 1200
 

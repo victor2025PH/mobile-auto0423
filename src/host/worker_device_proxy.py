@@ -38,13 +38,17 @@ _CACHE_POS_TTL = 90.0
 _CACHE_NEG_TTL = 12.0
 
 # 环境变量可覆盖：OPENCLAW_WORKER_BASES=http://192.168.0.103:8000,http://...
+# 2026-05-04: 删除硬编码 192.168.0.103 fallback (W03 实际 IP 已变 .101).
+# IP 自适应路径: HeartbeatSender._collect_status 每次心跳用 _get_local_ip()
+# 实时取出口 IP, 主控写 cluster_state.json. _list_worker_bases() 从
+# cluster_state.json 读最新 host_ip (line 88-104). worker IP 变后下次心跳
+# (10s 间隔) 自动同步. 这里 fallback 只在心跳未开始 (主控刚启动 < 10s)
+# 或 OPENCLAW_WORKER_BASES env 显式指定时用.
 _EXTRA_BASES = [
     b.strip().rstrip("/")
     for b in (os.environ.get("OPENCLAW_WORKER_BASES", "") or "").split(",")
     if b.strip()
 ]
-if not _EXTRA_BASES:
-    _EXTRA_BASES = ["http://192.168.0.103:8000"]
 
 
 def _is_coordinator_host() -> bool:

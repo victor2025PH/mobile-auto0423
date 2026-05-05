@@ -129,7 +129,8 @@ def create_task_endpoint(body: TaskCreate):
             )
     # campaign 含 gated step(add_friends / send_greeting / 未来 B 加的 reply_flood 等)时,
     # 前置闸统一走 check_gates_for_campaign_steps, 任何 step gate 失败整单拒绝入队。
-    if task_type == "facebook_campaign_run" and body.device_id:
+    if task_type in ("facebook_campaign_run", "facebook_group_member_greet") \
+            and body.device_id:
         from src.host.fb_add_friend_gate import campaign_step_names
         from src.host.gate_registry import check_gates_for_campaign_steps
 

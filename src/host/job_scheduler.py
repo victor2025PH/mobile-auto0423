@@ -315,15 +315,21 @@ def execute_scheduled_action(job: dict) -> dict:
 
 
 _scheduler_thread_started = False
+_scheduler_stop_event = None  # threading.Event 延迟初始化 (避免 import time 占用)
+_scheduler_thread = None
 
 
 def start_job_scheduler():
     """Background thread checking cron jobs every 30 seconds."""
-    global _scheduler_thread_started
+    global _scheduler_thread_started, _scheduler_stop_event, _scheduler_thread
     if _scheduler_thread_started:
         return
     _scheduler_thread_started = True
     import threading
+    if _scheduler_stop_event is None:
+        _scheduler_stop_event = threading.Event()
+    else:
+        _scheduler_stop_event.clear()
 
     def _cron_matches(cron_expr: str) -> bool:
         parts = cron_expr.strip().split()
@@ -356,7 +362,8 @@ def start_job_scheduler():
         # Lazy import to avoid circular dependency
         from .analytics_store import load_analytics_history, record_analytics_snapshot
         load_analytics_history()
-        while True:
+        # 2026-05-05 H.2-followup: while True → stop_event 可控
+        while not _scheduler_stop_event.is_set():
             try:
                 jobs = load_scheduled_jobs()
                 try:
@@ -436,10 +443,31 @@ def start_job_scheduler():
                 except Exception as e:
                     logger.debug("[lead_mesh/mesh] cleanup 失败: %s", e)
 
-            time.sleep(30)
+            # 2026-05-05 H.2-followup: time.sleep(30) → stop_event.wait(30)
+            # 让 stop_job_scheduler 立即唤醒 thread 退出
+            _scheduler_stop_event.wait(30)
 
     t = threading.Thread(target=_loop, daemon=True, name="job-scheduler")
     t.start()
+    _scheduler_thread = t
+
+
+def stop_job_scheduler(timeout_sec: float = 5.0) -> bool:
+    """优雅停止 job_scheduler thread (Stage H.2-followup).
+
+    设 _stop_event 让 _loop 下次 wait 立即唤醒退出. join thread.
+    Returns True 如果在 timeout 内退出.
+    """
+    global _scheduler_thread_started, _scheduler_thread
+    if _scheduler_stop_event is not None:
+        _scheduler_stop_event.set()
+    t = _scheduler_thread
+    _scheduler_thread = None
+    _scheduler_thread_started = False
+    if t is None:
+        return True
+    t.join(timeout=timeout_sec)
+    return not t.is_alive()
 
 
 # ---------------------------------------------------------------------------

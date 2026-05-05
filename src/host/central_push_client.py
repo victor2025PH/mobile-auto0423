@@ -114,6 +114,40 @@ def reset_push_metrics_for_tests() -> None:
         for k in _metrics:
             _metrics[k] = 0
 
+
+def reset_async_executor_for_tests() -> None:
+    """仅测试用. shutdown 现有 _async_executor 强制 cancel pending tasks.
+
+    2026-05-04 修: 旧 reset_state fixture 仅 monkeypatch.setattr 设
+    _async_executor=None, monkeypatch undo 后旧 executor (E1) 还 alive 持
+    4 worker thread + 残留 fire_and_forget task. E1 worker 在下一 test setup
+    之后跑 → 调真 _http_post_json (mock 已 undo) → enqueue 本地 → inc
+    push_async_enqueue counter → 污染下一 test (test_metrics_async_enqueue_counter
+    在 alphabetical 全 suite 跑序下 actual=N+1 vs expected=1).
+
+    fix 同 central_push_drain.reset_for_tests: 进 reset 就 shutdown +
+    cancel_futures, 防孤儿 executor leak.
+    """
+    global _async_executor
+    with _async_lock:
+        ex = _async_executor
+        _async_executor = None
+    if ex is not None:
+        # 2026-05-04 Stage E.5 修 D.4 副作用: 旧版 wait=True 让 t.join()
+        # 在 worker thread 跑真 _http_post_json 卡 30s+ urlopen 时永挂
+        # (E.2 全 suite trace: conftest.py:85 → reset_async_executor_for_tests
+        # → ex.shutdown wait=True → t.join → 永挂 timeout).
+        #
+        # 改 wait=False: cancel_futures=True 丢 pending submission, 已 started
+        # worker 在 daemon thread (ThreadPoolExecutor worker default daemon=True
+        # since Python 3.9) 自然跑完后 process exit 清理.
+        #
+        # trade-off: 已 started task 跑到结束前可能 inc 1-2 次 metric, 但
+        # 因为 fixture 的 _http_post_json monkeypatch 还在 (P2-⑨ teardown
+        # LIFO 顺序: 此处 stop 在 monkeypatch undo 之前), worker 跑的还是
+        # mock 状态, inc 也在 reset_push_metrics_for_tests 的 scope 里清掉.
+        ex.shutdown(wait=False, cancel_futures=True)
+
 # UUIDv5 namespace: worker 离线时也能算出确定性 customer_id, 主控收到 push
 # 时若已存在 (canonical_source, canonical_id) 则 ON CONFLICT 走 update 路径,
 # customer_id 保持为首次写入时的值 (PK 不变).
@@ -449,7 +483,24 @@ def _get_async_executor() -> ThreadPoolExecutor:
 
 
 def _push_with_retry_queue(path: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """sync push + 失败时 enqueue 本地. 返回 server response 或 None."""
+    """sync push + 失败时 enqueue 本地. 返回 server response 或 None.
+
+    2026-05-04 Stage F.1: _async_executor 被 reset (test 间 fixture cleanup
+    通过 reset_async_executor_for_tests 设 None) 时, daemon 残留 task
+    no-op return. 防 E.5 wait=False 后 daemon 在 fixture cleanup +
+    monkeypatch undo 后还在跑, 调真 _http_post_json → fail → enqueue
+    SQLite, 让下一 test fixture setup 时 SQLite 被持有 conn.execute 卡死.
+
+    用 _async_executor is None 而非 PYTEST_CURRENT_TEST: 不需要 hardcoded
+    test 文件名 exception list (test_metrics_async_enqueue_counter 这种
+    显式测 fire_and_forget 的 test 在 fixture 内, _async_executor 仍 set,
+    走 normal path; daemon 残留 task 永远在 fixture cleanup 之后, 看到的
+    _async_executor 已是 None, no-op). production 0 影响 (function name
+    带 _for_tests 不被 prod 调).
+    """
+    if _async_executor is None:
+        # daemon worker 残留 task: executor 已 reset, no-op 静默退出
+        return None
     try:
         return _http_post_json(path, body)
     except Exception as exc:  # noqa: BLE001

@@ -55,6 +55,9 @@ class W03Cache:
         self._lock = threading.Lock()
         self._refreshing: set[str] = set()
         self._started = False
+        # 2026-05-05 H.2-followup: 停 _refresh_loop 用 stop_event + thread ref
+        self._stop_event = threading.Event()
+        self._refresh_thread: Optional[threading.Thread] = None
 
     # ── 内部工具 ─────────────────────────────────────────────────────
 
@@ -104,8 +107,11 @@ class W03Cache:
 
     def _refresh_loop(self):
         """后台线程：每隔 _REFRESH_INTERVAL 秒全量刷新所有端点。"""
-        while True:
-            time.sleep(_REFRESH_INTERVAL)
+        # 2026-05-05 H.2-followup: while True + time.sleep → stop_event 可控
+        while not self._stop_event.is_set():
+            self._stop_event.wait(_REFRESH_INTERVAL)
+            if self._stop_event.is_set():
+                break
             for key, path, timeout in _ENDPOINTS:
                 try:
                     data = self._fetch(path, timeout)
@@ -135,9 +141,28 @@ class W03Cache:
                 log.info("[W03Cache] 预热完成: %s", list(self._cache.keys()))
             threading.Thread(target=_warm, daemon=True, name="w03-cache-warm").start()
 
-        threading.Thread(target=self._refresh_loop, daemon=True,
-                         name="w03-cache-bg").start()
+        # 2026-05-05 H.2-followup: 保 thread ref 以便 stop join
+        self._stop_event.clear()
+        t = threading.Thread(target=self._refresh_loop, daemon=True,
+                             name="w03-cache-bg")
+        t.start()
+        self._refresh_thread = t
         log.info("[W03Cache] 后台刷新线程已启动（间隔 %ds）", _REFRESH_INTERVAL)
+
+    def stop(self, timeout_sec: float = 5.0) -> bool:
+        """优雅停止后台刷新线程 (Stage H.2-followup).
+
+        设 _stop_event 让 _refresh_loop 下次 wait 立即唤醒退出. join thread.
+        Returns True 如果在 timeout 内退出.
+        """
+        self._stop_event.set()
+        t = self._refresh_thread
+        self._refresh_thread = None
+        self._started = False
+        if t is None:
+            return True
+        t.join(timeout=timeout_sec)
+        return not t.is_alive()
 
     def get_leads(self) -> Optional[list]:
         """返回 Worker-03 全量线索列表（缓存）。None = 尚未预热。"""
@@ -214,3 +239,13 @@ def get_w03_cache() -> W03Cache:
     if _INSTANCE is None:
         _INSTANCE = W03Cache()
     return _INSTANCE
+
+
+def stop_w03_cache(timeout_sec: float = 5.0) -> bool:
+    """模块级 wrapper for api.py lifespan shutdown (Stage H.2-followup).
+
+    没启动 instance 时返 True (no-op). 与 start 对称.
+    """
+    if _INSTANCE is None:
+        return True
+    return _INSTANCE.stop(timeout_sec=timeout_sec)

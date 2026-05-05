@@ -165,7 +165,18 @@ def get_drain_status() -> dict:
 
 
 def reset_for_tests() -> None:
-    """仅测试用. 强制清掉 singleton (不停 thread, 留给上层测试 stop)."""
+    """仅测试用. 强制 stop thread + 清单例.
+
+    2026-05-04 修: 旧行为 "不停 thread 留给上层 stop" 在 conftest.py P2-⑨
+    autouse fixture 场景下导致上一 test 的 daemon 变孤儿继续 _tick →
+    drain → _http_post_json → push_total 计数污染下一 test (Stage 0
+    baseline 复现: alphabetical 全 suite 跑 test_metrics_increments_on_5xx_after_retries
+    actual=5 vs expected=1). 进 reset 就 stop+join, 让 "reset" 名实相符.
+    """
     global _drain_thread
     with _thread_lock:
+        t = _drain_thread
         _drain_thread = None
+    if t is not None:
+        t.stop()
+        t.join(timeout=2.0)

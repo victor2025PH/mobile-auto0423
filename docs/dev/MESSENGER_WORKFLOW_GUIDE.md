@@ -131,7 +131,7 @@ curl -X POST http://localhost:8000/facebook/account-phase \
 通过 Dashboard 创建任务, 或直接 API:
 
 ```bash
-# 提取群成员 → 打分 → 加好友 → 打招呼, 一步到位
+# 群成员打招呼 → 打分 → 加好友 → 打招呼, 一步到位
 curl -X POST http://localhost:8000/tasks -d '{
   "device_id": "<did>",
   "task_type": "facebook_extract_members",

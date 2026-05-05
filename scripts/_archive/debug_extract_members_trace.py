@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""FB 群成员提取链路 trace (2026-04-24, Phase 9-extract).
+"""FB 群成员打招呼链路 trace (2026-04-24, Phase 9-extract).
 
 与 Phase 7 的 debug_fb_search_trace 同思路 — 真机 dump + 每步截图, 定位
 `_tap_group_members_tab` 失败原因.
@@ -59,7 +59,7 @@ def _parse_bounds(s: str):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="FB 群成员提取 UI 诊断")
+    ap = argparse.ArgumentParser(description="FB 群成员打招呼 UI 诊断")
     ap.add_argument("--device", required=True)
     args = ap.parse_args()
 

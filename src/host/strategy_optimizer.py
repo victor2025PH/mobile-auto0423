@@ -387,6 +387,17 @@ def start_strategy_optimizer():
     get_strategy_optimizer().start()
 
 
+def stop_strategy_optimizer():
+    """停止策略优化器（供 api.py lifespan shutdown 调用）。
+
+    2026-05-05 Stage H.2: 让 lifespan SIGTERM 路径干净退出. instance.stop()
+    设 _running=False, 6h 循环 thread 在下次 wait 醒来时退出.
+    """
+    global _optimizer
+    if _optimizer is not None:
+        _optimizer.stop()
+
+
 def get_optimized_params() -> Dict[str, int]:
     """
     获取当前优化后的任务参数。

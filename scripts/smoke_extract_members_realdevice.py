@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""FB 群成员提取 单独 smoke (2026-04-24 Phase 9).
+"""FB 群成员打招呼 单独 smoke (2026-04-24 Phase 9).
 
 与 smoke_fb_name_hunter_realdevice 区别: 只测"进群 + 提取 Members",
 不发好友请求 / 不打招呼. 10 分钟内能定位 UI 断点.
@@ -32,7 +32,7 @@ if str(_ROOT) not in sys.path:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="FB 群成员提取 smoke")
+    ap = argparse.ArgumentParser(description="FB 群成员打招呼 smoke")
     ap.add_argument("--device", required=True)
     ap.add_argument("--group", default="",
                      help="群名(精确匹配); 空=假设已在群页面不 enter_group")

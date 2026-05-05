@@ -105,3 +105,11 @@ scripts/vlm_eval_dataset/screenshots/*
 # Debug screenshots from interactive sessions (root-level and subdirs)
 **/real_*.png
 **/screen_*.png
+
+# 真机 hierarchy dump 残留 (顶级目录), 由调试脚本临时产生, 子目录 .xml (如
+# AndroidManifest.xml in tools/*/apk_src/) 不受影响
+/*.xml
+
+# 任务状态 / 列表临时 dump (gh / curl 抓的 API 返回, 调试用)
+/task_detail.json
+/tasks_recent.json

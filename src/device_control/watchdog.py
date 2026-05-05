@@ -269,16 +269,13 @@ class DeviceWatchdog:
         return ""
 
     def _check_network(self, device_id: str) -> bool:
-        try:
-            result = _sp_run_text(
-                [self._adb, "-s", device_id, "shell",
-                 "ping", "-c", "1", "-W", "3", "8.8.8.8"],
-                capture_output=True, timeout=8,
-            )
-            return "1 received" in result.stdout or "1 packets received" in result.stdout
-        except Exception as e:
-            log.debug("watchdog 网络检查失败 %s: %s", device_id, e)
-            return False
+        # 2026-05-04: ping 8.8.8.8 在 911proxy 等 Per-App SOCKS 代理设备上
+        # adb shell (uid=2000) 走默认路由不通,但 FB App 走代理通—— watchdog
+        # 误报触发 _recover_network(切飞行模式 8s),严重干扰 task 跑期间的
+        # dump_hierarchy 与 FB 网络. PR #157 commit 3 已为 preflight 加 VPN
+        # HttpProxy + Android IS_VALIDATED 双源兜底,这里直接 short-circuit
+        # 跳过 ping 误判,避免 watchdog 把 task 设备搞炸.
+        return True
 
     def _detect_captcha(self, device_id: str) -> bool:
         """Check if a CAPTCHA/verification screen is visible."""

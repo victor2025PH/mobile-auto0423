@@ -330,7 +330,26 @@ def _check_network_ex(device_id: str) -> Tuple[bool, str, str]:
                 tag = "fb_icmp" if host.startswith("31.13.") else f"ping {host}"
                 return True, f"connected({tag})", NET_OK
 
-        # ── 关键兜底：geo 路径独立验证 ──
+        # ── 兜底 ①：通过 VPN 系统 HttpProxy 探测 ──
+        # V2RayNG/Clash 等会注入系统级 HttpProxy 到 VPN 网络配置，业务 App 自动应用，
+        # 但 adb shell 不应用 → 直接探测系统 proxy 即可验证业务路径。
+        sys_proxy = _get_device_http_proxy(device_id)
+        if sys_proxy:
+            for label, px_cmd in (
+                ("curl_via_proxy",
+                 f"curl -x http://{sys_proxy} -s --connect-timeout 6 -o /dev/null -w '%{{http_code}}' {url}"),
+                ("curl_via_proxy_fb",
+                 f"curl -x http://{sys_proxy} -s --connect-timeout 8 -o /dev/null -w '%{{http_code}}' -L {fb_url}"),
+            ):
+                r_px = _sp_run_text(
+                    ["adb", "-s", device_id, "shell", px_cmd],
+                    capture_output=True, timeout=14,
+                )
+                px_code = (r_px.stdout or "").strip().strip("'").strip()
+                if px_code in ("204", "200", "301", "302"):
+                    return True, f"connected(via_http_proxy={sys_proxy},{label}={px_code})", NET_OK
+
+        # ── 兜底 ②：geo 路径独立验证 ──
         # 911proxy 等 Per-App SOCKS 代理只对申请代理的 App 生效，adb shell（uid=2000）
         # 走默认路由 → 探测失败但业务 App 实际通。能拿到 public_ip 说明手机能上网。
         public_ip = _try_get_public_ip(device_id)
@@ -340,6 +359,18 @@ def _check_network_ex(device_id: str) -> Tuple[bool, str, str]:
                 f"代理可能为 Per-App 模式，业务 App 流量预计可走代理。已放行。"
             )
             logger.warning("[preflight] %s 探测路径误报兜底: %s", device_id[:8], warn)
+            return True, warn, NET_PROXY_PATH_MISMATCH
+
+        # ── 兜底 ③：Android 系统自身已验证 ──
+        # NetworkAgent 自带 captive portal 检测，IS_VALIDATED 是系统级真相。
+        # 比 shell 探测可靠：走完整网络栈（含 VPN HttpProxy），不受 uid 路由策略影响。
+        sys_ok, sys_msg = _check_android_validated(device_id)
+        if sys_ok:
+            warn = (
+                f"shell 探测路径未通（HTTP={code!r}），但 Android 系统判定 {sys_msg} — "
+                f"VPN/HttpProxy 场景下 shell 不走代理为已知误报，业务 App 流量可达。已放行。"
+            )
+            logger.warning("[preflight] %s 系统级兜底: %s", device_id[:8], warn)
             return True, warn, NET_PROXY_PATH_MISMATCH
 
         # 区分 hijack vs zero：拿到状态码（如 302）= 运营商劫持；空 = 完全断网
@@ -361,6 +392,55 @@ def _check_network_ex(device_id: str) -> Tuple[bool, str, str]:
         return False, "网络检查超时，请检查 USB 稳定性或重新插拔设备。", NET_TIMEOUT
     except Exception as e:
         return False, f"网络检查异常: {e}", NET_ERROR
+
+
+def _check_android_validated(device_id: str) -> Tuple[bool, str]:
+    """读 dumpsys connectivity 看 Android 系统自身判定的网络可达性。
+
+    Android NetworkAgent 在网络上线后会自动跑 captive portal 检测（generate_204
+    走系统网络栈，包括 VPN 的 HttpProxy），通过则标 IS_VALIDATED。
+    这是比 adb shell curl 更可靠的判据 —— shell uid=2000 走默认路由，
+    不会应用 VPN 的 system HttpProxy（V2RayNG / Clash 等场景）。
+    """
+    try:
+        # IS_VALIDATED 出现在 Score(Policies:...) 字段；CONNECTED + VALIDATED 双重判据
+        r = _sp_run_text(
+            ["adb", "-s", device_id, "shell",
+             "dumpsys connectivity | grep -E 'IS_VALIDATED|Transports:' | head -20"],
+            capture_output=True, timeout=8,
+        )
+        out = (r.stdout or "")
+        if "IS_VALIDATED" not in out:
+            return False, "no_validated_network"
+        import re as _re
+        transports = _re.findall(r"Transports:\s*([A-Z|_]+)", out)
+        tag = ",".join(set(transports)) or "unknown"
+        return True, f"android_validated({tag})"
+    except Exception as e:
+        return False, f"err:{e}"
+
+
+def _get_device_http_proxy(device_id: str) -> str:
+    """读 dumpsys connectivity 上 VPN/网络配置的系统 HttpProxy。
+
+    格式形如 'HttpProxy: [127.0.0.1] 10808'（V2RayNG/Clash/Surfboard 等会注入）。
+    业务 App 自动应用此代理，shell 不会 —— 显式带 -x 探测能验证业务路径。
+    """
+    try:
+        r = _sp_run_text(
+            ["adb", "-s", device_id, "shell",
+             "dumpsys connectivity | grep -E 'HttpProxy:' | head -3"],
+            capture_output=True, timeout=6,
+        )
+        import re as _re
+        m = _re.search(r"HttpProxy:\s*\[([0-9a-fA-F:.]+)\]\s*(\d+)", r.stdout or "")
+        if m:
+            host, port = m.group(1), m.group(2)
+            if host and host != "0.0.0.0" and port and port != "0":
+                return f"{host}:{port}"
+    except Exception:
+        pass
+    return ""
 
 
 def _try_get_public_ip(device_id: str) -> str:

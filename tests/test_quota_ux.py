@@ -111,9 +111,9 @@ class TestQuotaStatusEndpoint:
     def test_action_schema_complete(self, guard):
         from src.host.routers.facebook import fb_quota_status
 
-        # 用满 join_group quota
+        # join_group 执行链路按 device_id 作为 quota account 记录
         for _ in range(3):
-            guard.check_and_record("facebook", "join_group", "")
+            guard.check_and_record("facebook", "join_group", "DEVICE1")
 
         with patch("src.behavior.compliance_guard.get_compliance_guard",
                    return_value=guard):
@@ -121,13 +121,15 @@ class TestQuotaStatusEndpoint:
 
         action = result["actions"]["join_group"]
         # 完整字段
-        for k in ("hourly_used", "hourly_limit", "hourly_remaining",
+        for k in ("quota_account",
+                  "hourly_used", "hourly_limit", "hourly_remaining",
                   "daily_used", "daily_limit", "daily_remaining",
                   "next_slot_eta_seconds", "next_slot_eta_minutes",
                   "available_now"):
             assert k in action, f"missing field: {k}"
 
         # 满了应该 not available_now
+        assert action["quota_account"] == "DEVICE1"
         assert action["hourly_used"] == 3
         assert action["hourly_remaining"] == 0
         assert action["available_now"] is False
@@ -138,7 +140,7 @@ class TestQuotaStatusEndpoint:
         """没满时 available_now=True, eta=0."""
         from src.host.routers.facebook import fb_quota_status
 
-        guard.check_and_record("facebook", "join_group", "")  # 1/3
+        guard.check_and_record("facebook", "join_group", "DEVICE1")  # 1/3
 
         with patch("src.behavior.compliance_guard.get_compliance_guard",
                    return_value=guard):
@@ -148,6 +150,23 @@ class TestQuotaStatusEndpoint:
         assert action["available_now"] is True
         assert action["next_slot_eta_seconds"] == 0
         assert action["hourly_remaining"] == 2
+
+    def test_join_group_status_uses_device_account_not_global_blank(self, guard):
+        """旧空账号 join_group 记录不应误判当前设备入群 quota 已满。"""
+        from src.host.routers.facebook import fb_quota_status
+
+        for _ in range(3):
+            guard.check_and_record("facebook", "join_group", "")
+
+        with patch("src.behavior.compliance_guard.get_compliance_guard",
+                   return_value=guard):
+            result = fb_quota_status("DEVICE1")
+
+        action = result["actions"]["join_group"]
+        assert action["quota_account"] == "DEVICE1"
+        assert action["hourly_used"] == 0
+        assert action["hourly_remaining"] == 3
+        assert action["available_now"] is True
 
 
 # ── _execute_facebook catch QuotaExceeded ────────────────────────────
@@ -218,3 +237,47 @@ class TestExecutorQuotaCatch:
 
         assert "分钟后可派" not in msg
         assert meta["quota"]["eta_minutes"] == 0
+
+    def test_extract_members_keyword_flow_preserves_groups_on_join_quota(self):
+        """宽关键词已发现群组后，入群 quota 满应返回群组状态而不是丢失现场。"""
+        from src.host.executor import _execute_facebook
+
+        manager = MagicMock()
+
+        def raise_quota(*args, **kwargs):
+            raise QuotaExceeded(
+                "facebook", "join_group", "DEVICE1", "hourly", 3, 3
+            )
+
+        with patch("src.host.executor._fresh_facebook") as mock_fresh:
+            fb_mock = MagicMock()
+            fb_mock.discover_groups_by_keyword.return_value = [
+                {
+                    "group_name": "猫好き集合",
+                    "keyword": "ペット",
+                    "member_count": 1200,
+                    "requires_join": True,
+                }
+            ]
+            fb_mock.join_group.side_effect = raise_quota
+            mock_fresh.return_value = fb_mock
+
+            with patch("src.behavior.compliance_guard.get_compliance_guard") as mock_guard:
+                mock_guard.return_value.get_next_slot_eta.return_value = 2220
+                ok, msg, meta = _execute_facebook(
+                    manager, "DEVICE1", "facebook_extract_members",
+                    {
+                        "group_name": "ペット",
+                        "broad_keyword": True,
+                        "max_groups": 1,
+                        "join_if_needed": True,
+                    },
+                )
+
+        assert ok is False
+        assert "[quota]" in msg
+        assert meta["outcome"] == "join_quota_blocked_after_discovery"
+        assert meta["quota"]["eta_minutes"] >= 37
+        assert meta["groups"][0]["status"] == "join_quota_blocked"
+        assert meta["groups"][0]["next_action"] == "retry_after_join_group_quota"
+        assert meta["discovered_groups"][0]["group_name"] == "猫好き集合"

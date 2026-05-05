@@ -191,6 +191,19 @@ def evaluate_task_gate_detailed(
     policy = load_task_execution_policy()
     empty_conn: Dict[str, Any] = {}
 
+    try:
+        from src.host.fb_playbook import local_rules_disabled
+        if task_type.startswith("facebook_") and local_rules_disabled():
+            logger.info("[gate] facebook local_rules_disabled=true，跳过统一门禁")
+            return GateEvaluation(
+                True,
+                "",
+                task_type=task_type,
+                connectivity={"skipped": "local_rules_disabled", **empty_conn},
+            )
+    except Exception:
+        pass
+
     if params.get("bypass_manual_gate") and _policy_allows_param_bypass(policy):
         logger.info("[gate] bypass via params (policy allows_param_bypass)")
         return GateEvaluation(

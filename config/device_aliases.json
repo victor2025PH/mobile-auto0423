@@ -250,5 +250,49 @@
     "alias": "主控-01",
     "number": 1,
     "miui_hardened_at": "2026-04-25T14:57:18"
+  },
+  "Q4N7AM7HMZGU4LZD": {
+    "display_name": "Q4N7AM7H",
+    "slot": 7,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-07",
+    "alias": "主控-07",
+    "number": 7,
+    "miui_hardened_at": "2026-05-04T14:31:22"
+  },
+  "VWNJFUNRV4LF4XTS": {
+    "display_name": "VWNJFUNR",
+    "slot": 8,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-08",
+    "alias": "主控-08",
+    "number": 8,
+    "miui_hardened_at": "2026-05-04T14:31:28"
+  },
+  "XW8TQKEQIVJRQO69": {
+    "display_name": "XW8TQKEQ",
+    "slot": 9,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-09",
+    "alias": "主控-09",
+    "number": 9,
+    "miui_hardened_at": "2026-05-04T14:31:32"
+  },
+  "IJ8HZLORS485PJWW": {
+    "display_name": "IJ8HZLOR",
+    "slot": 5,
+    "host_scope": "coordinator",
+    "host_name": "主控",
+    "host_label_short": "主控",
+    "display_label": "主控-05",
+    "alias": "主控-05",
+    "number": 5,
+    "miui_hardened_at": "2026-05-04T14:31:16"
   }
 }

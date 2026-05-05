@@ -76,7 +76,7 @@ gate_matrix:
 #             不需改代码。若要只恢复 VPN 预检、不强制国家匹配，把 enforce_preflight 改回 true 即可。
 #
 # 2026-04-27 复原 enforce_preflight=true:
-#   原因：圈层拓客 5h 死循环事故复盘 — VPN preflight 关闭叠加 VPN 中途掉线
+#   原因：社群客服拓展 5h 死循环事故复盘 — VPN preflight 关闭叠加 VPN 中途掉线
 #         (任务跑期间所有截图都是 "No Internet Connection"), 任务在断网状态下
 #         继续操作 → AutoSelector 学错入口 → 误进 Messenger → 5h 反复无进展。
 #   保持 enforce_geo_for_risky=false (不强制出口国匹配, 仍允许测试出口).

@@ -78,7 +78,7 @@ manual_gate:
 
 | 日期 | 改动 | 是否有 TTL | 后果 |
 |------|------|-----------|------|
-| 2026-04-21 | `enforce_preflight: false` | ❌ 无 | 潜伏 6 天 → 4-26 圈层拓客 5h 死循环 |
+| 2026-04-21 | `enforce_preflight: false` | ❌ 无 | 潜伏 6 天 → 4-26 社群客服拓展 5h 死循环 |
 | 2026-04-26 | `enabled_probability: 1.0` (b2b self test) | ❌ 无 | 仍是隐患 (用户记忆里) |
 | 2026-04-20 | `gate_mode: dev` | ✅ 当天复原 | 无事故 |
 

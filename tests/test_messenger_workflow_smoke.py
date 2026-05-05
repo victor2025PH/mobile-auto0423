@@ -7,7 +7,12 @@
 """
 from __future__ import annotations
 
+import os
+
 import pytest
+
+# P2-⑫: spawn 子 Python 进程时强制 UTF-8 防 Windows cp936 emoji 解码挂.
+_UTF8_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
 
 def test_smoke_runs_without_fail(tmp_db):
@@ -104,7 +109,7 @@ def test_smoke_no_color_flag():
     r = subprocess.run(
         [sys.executable, str(repo / "scripts" / "messenger_workflow_smoke.py"),
          "--no-color"],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=_UTF8_ENV, timeout=60,
     )
     # 只验证能跑起来, 结果细节由其他 test 覆盖
     assert r.returncode in (0, 1), f"unexpected exit: {r.returncode}"

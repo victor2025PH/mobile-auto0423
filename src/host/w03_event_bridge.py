@@ -25,18 +25,41 @@ _last_event_id = 0
 _bridge_started = False
 _bridge_lock = threading.Lock()
 _consecutive_failures = 0
+# 2026-05-05 H.2-followup: 停 thread 用 stop_event + thread ref
+_bridge_stop_event = threading.Event()
+_bridge_thread = None
 
 
 def start_w03_bridge():
     """启动 W03 事件桥接后台线程（幂等）。"""
-    global _bridge_started
+    global _bridge_started, _bridge_thread
     with _bridge_lock:
         if _bridge_started:
             return
         _bridge_started = True
+    _bridge_stop_event.clear()
     t = threading.Thread(target=_bridge_loop, daemon=True, name="w03-event-bridge")
     t.start()
+    _bridge_thread = t
     logger.info("[W03Bridge] 事件桥接线程已启动，轮询间隔 %ds", _POLL_INTERVAL)
+
+
+def stop_w03_bridge(timeout_sec: float = 5.0) -> bool:
+    """优雅停止 W03 事件桥接 (Stage H.2-followup).
+
+    设 _stop_event 让 _bridge_loop 下次 wait 立即唤醒退出. join thread.
+    Returns True 如果在 timeout 内退出.
+    """
+    global _bridge_started, _bridge_thread
+    _bridge_stop_event.set()
+    t = _bridge_thread
+    _bridge_thread = None
+    with _bridge_lock:
+        _bridge_started = False
+    if t is None:
+        return True
+    t.join(timeout=timeout_sec)
+    return not t.is_alive()
 
 
 def _bridge_loop():
@@ -45,7 +68,8 @@ def _bridge_loop():
     # 首次启动：先获取当前 max_id，避免转发大量历史事件
     _init_since_id()
 
-    while True:
+    # 2026-05-05 H.2-followup: while True → stop_event 可控
+    while not _bridge_stop_event.is_set():
         sleep_time = _POLL_INTERVAL
         try:
             from .event_stream import EventStreamHub
@@ -99,7 +123,8 @@ def _bridge_loop():
             # 离线时拉长间隔，减少无用请求
             sleep_time = _RETRY_INTERVAL if _consecutive_failures >= 3 else _POLL_INTERVAL
 
-        time.sleep(sleep_time)
+        # 2026-05-05 H.2-followup: time.sleep → stop_event.wait 让 stop 立即唤醒
+        _bridge_stop_event.wait(sleep_time)
 
 
 def _init_since_id():

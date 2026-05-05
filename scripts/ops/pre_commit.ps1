@@ -26,13 +26,15 @@ if ($branch -eq 'main') {
 }
 
 # ---- 2. Refuse staged runtime config files ----
+# 区分: 真 runtime (heartbeat / 通知 history / queue DB / local override)
+#   vs source-of-truth (设备注册 — 首次接入写入后稳定, 历史有 commit 记录).
+# 2026-05-04 修: device_aliases/device_registry 从黑名单移到豁免, 让 ops
+# 能正常持久化新设备注册 (4 台主控-05/07/08/09 扩容场景).
 $staged = & git diff --cached --name-only 2>$null
 $runtimeConfigs = @(
-    'config/cluster_state.json',
-    'config/device_aliases.json',
-    'config/device_registry.json',
-    'config/notify_config.json',
-    'config/launch.env',         # local override, not in git
+    'config/cluster_state.json',           # 心跳 + IP, 服务启动 rewrite
+    'config/notify_config.json',           # 通知 history 自动追加 + 滚动
+    'config/launch.env',                   # local override, not in git
     'config/central_push_queue.db',
     'config/central_push_queue.db-shm',
     'config/central_push_queue.db-wal'

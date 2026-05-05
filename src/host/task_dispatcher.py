@@ -52,6 +52,7 @@ _RESCUE_BATCH_LIMIT = 100
 # fb_risk_events. 否则会被 SLA 误杀.
 _TASK_PROGRESS_TIMEOUT_SEC: dict[str, int] = {
     "facebook_extract_members":          1800,  # 30 min — writes mark_group_visit
+    "facebook_group_member_greet":       3600,  # 60 min — writes group visit / friend request
     "facebook_add_friend":               1200,  # 20 min — writes add_friend_sent/risk
     "facebook_send_greeting":             900,  # 15 min — writes greeting_sent
     "facebook_send_message":              600,  # 10 min — writes contact_event

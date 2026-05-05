@@ -513,5 +513,49 @@
     "number": 3,
     "alias": "主控-03",
     "created_at": "2026-04-21T15:13:00.794730"
+  },
+  "IJ8HZLORS485PJWW": {
+    "current_serial": "IJ8HZLORS485PJWW",
+    "previous_serials": [],
+    "imei": "",
+    "hw_serial": "IJ8HZLORS485PJWW",
+    "android_id": "4301811f8ba60fa",
+    "model": "23106RN0DA",
+    "number": 5,
+    "alias": "主控-05",
+    "created_at": "2026-05-04T03:56:21.563018"
+  },
+  "Q4N7AM7HMZGU4LZD": {
+    "current_serial": "Q4N7AM7HMZGU4LZD",
+    "previous_serials": [],
+    "imei": "",
+    "hw_serial": "Q4N7AM7HMZGU4LZD",
+    "android_id": "eec5b233c377cfaa",
+    "model": "23106RN0DA",
+    "number": 7,
+    "alias": "主控-07",
+    "created_at": "2026-05-04T03:56:27.840422"
+  },
+  "VWNJFUNRV4LF4XTS": {
+    "current_serial": "VWNJFUNRV4LF4XTS",
+    "previous_serials": [],
+    "imei": "",
+    "hw_serial": "VWNJFUNRV4LF4XTS",
+    "android_id": "f1203685de9f5cfe",
+    "model": "23106RN0DA",
+    "number": 8,
+    "alias": "主控-08",
+    "created_at": "2026-05-04T03:56:38.082937"
+  },
+  "XW8TQKEQIVJRQO69": {
+    "current_serial": "XW8TQKEQIVJRQO69",
+    "previous_serials": [],
+    "imei": "",
+    "hw_serial": "XW8TQKEQIVJRQO69",
+    "android_id": "ac881c11941b9c83",
+    "model": "23106RN0DA",
+    "number": 9,
+    "alias": "主控-09",
+    "created_at": "2026-05-04T03:56:43.719276"
   }
 }

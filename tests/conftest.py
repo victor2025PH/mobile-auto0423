@@ -69,9 +69,21 @@ def _p29_reset_global_state():
     # 这种"清后不重建"型 reset 必须 test 自己显式调用, 不适合 autouse.
     reset_targets = [
         ("src.host.central_push_client", "reset_push_metrics_for_tests"),
+        # 2026-05-04 D.4: shutdown 旧 ThreadPoolExecutor + cancel_futures, 防
+        # fire_and_forget task leak 到下一 test 调真 _http_post_json 后 inc
+        # push_async_enqueue counter (test_metrics_async_enqueue_counter flaky).
+        ("src.host.central_push_client", "reset_async_executor_for_tests"),
         ("src.host.central_push_drain", "reset_for_tests"),
         ("src.host.fb_concurrency", "reset_metrics_for_tests"),
         ("src.host.cluster_lock_client", "reset_caches_for_tests"),
+        # 2026-05-04 F.2: _apply_tuning_adjustments mutate RISK_MULTIPLIERS
+        # 让 phase5 TestAdaptiveCompliance 3 个 test (assume 默认值) 在全 suite
+        # 跑序下 fail. reset 还原默认 dict + 清 singleton.
+        ("src.behavior.adaptive_compliance", "reset_for_tests"),
+        # 2026-05-05 Stage I: reverse heartbeat prober daemon stop+join,
+        # 防孤儿 thread 跨 test 反向 probe 真 worker IP 引发网络副作用 +
+        # 跨 test 写 cluster_state.json 污染.
+        ("src.host.multi_host", "reset_reverse_prober_for_tests"),
     ]
     for mod_name, fn_name in reset_targets:
         try:
@@ -88,8 +100,27 @@ def _p29_reset_global_state():
         ("src.host.routers.tasks", "_RETRY_THROTTLE", "dict", "clear"),
         ("src.host.task_store", "_device_fail_streak", "dict", "clear"),
         ("src.host.fb_store", "_PEER_NAME_REJECT_COUNTER", "dict", "reset_count"),
+        # 2026-05-04 Stage E.3 audit 发现: fb_store 已有 _COUNTER 兜底, 但 by-event
+        # dict + recent samples list 漏盖, 跨 test 累积. scripts/audit_module_globals.py
+        # 22 SUSPICIOUS 中前 5 个 high-priority 优先入册.
+        ("src.host.fb_store", "_PEER_NAME_REJECT_BY_EVENT", "dict", "clear"),
+        ("src.host.fb_store", "_PEER_NAME_REJECT_RECENT", "list", "clear"),
         ("src.host.preflight", "_cache", "dict", "clear"),
         ("src.host.routers.cluster", "_WEBHOOK_COOLDOWN", "dict", "clear"),
+        # 2026-05-04 Stage F.4 audit cache 类入册 (剥洋葱第 N 层 — 可能 cover
+        # phase12_3 test_recycle_no_dead_at_meta_still_revives 的 setup error,
+        # 该 test 调 _line_pool_recycle_dead_peers 用 _REFERRAL_*_CACHE):
+        ("src.host.executor", "_REFERRAL_KEYWORDS_CACHE", "dict", "clear"),
+        ("src.host.executor", "_PEER_REGION_CACHE", "dict", "clear"),
+        # VLM cache: 测试 mock VLM 后, cache leak 让下个 test 误判 healthy
+        ("src.host.fb_profile_classifier", "_VLM_HEALTH", "dict", "clear"),
+        ("src.host.ollama_vlm", "_VLM_CONCURRENCY_STATS", "dict", "clear"),
+        ("src.host.ollama_vlm", "_WARMUP_STATE", "dict", "clear"),
+        # worker proxy cache: 跨 test fixture 可能 spam probe 不同 IP
+        ("src.host.worker_device_proxy", "_worker_base_cache", "dict", "clear"),
+        ("src.host.worker_device_proxy", "_negative_cache", "dict", "clear"),
+        # central_customer_store 熔断 state + customer_sync_bridge AB cache
+        ("src.host.customer_sync_bridge", "_ab_winner_cache", "dict", "clear"),
     ]
     for mod_name, attr, _typ, action in inline_clears:
         try:
