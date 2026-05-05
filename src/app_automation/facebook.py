@@ -2748,6 +2748,13 @@ class FacebookAutomation(BaseAutomation):
 
         ok, sz = _try_dump()
         if ok:
+            # P6-C (2026-05-05) 可观测性: probe ok 时也 log, 让真机 task 数据
+            # 能区分 "wake 没调用" vs "wake 静默成功" — 之前 task 67b98ecc /
+            # ef180eeb 0/40 时找不到 [ensure_awake] log 导致误判 wake 没生效.
+            log.info(
+                "[ensure_awake] %s probe ok size=%d (no healing needed)",
+                device_id, sz,
+            )
             return True
         log.warning(
             "[ensure_awake] %s 首次 dump probe 失败 size=%d", device_id, sz,
@@ -8180,9 +8187,16 @@ class FacebookAutomation(BaseAutomation):
                     )
                 _selfheal_ok = False
                 try:
-                    # 1. BACK 收起 IME / typeahead overlay
+                    # 1. BACK 收起 IME / typeahead overlay.
+                    # P6-A v3 (2026-05-05): 真机 task ef180eeb 揭示 P6-A v1/v2
+                    # 假设错: dump 不是空 (76 elements), 而是 IME 占满屏 hierarchy.
+                    # 单次 BACK + sleep 0.6s 不足以等 IME 真正收起 → dump 看到的
+                    # 仍是 IME 元素, hierarchy_looks_like_fb_search_surface 必失败
+                    # → "BACK 后已离开搜索页" 误判 → 放弃自愈.
+                    # 修法: BACK 之后 sleep 1.5s (从 0.6s 加长) 等 IME 动画完成.
+                    # 不加第 2 次 BACK 因为可能误退出搜索页.
                     self._adb("shell input keyevent 4", device_id=did)
-                    time.sleep(0.6)
+                    time.sleep(1.5)
                     # 2. 确认仍在搜索页面 (BACK 有时会直接回到 Feed)
                     _sh_xml = d.dump_hierarchy() or ""
                     if not hierarchy_looks_like_fb_search_surface(_sh_xml):
