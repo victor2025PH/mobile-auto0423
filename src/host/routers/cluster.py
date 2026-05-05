@@ -311,7 +311,16 @@ def cluster_reverse_probe_trigger(body: dict = None):  # type: ignore[assignment
     import time as _t
     from .. import multi_host as _mh
     coord = _mh.get_cluster_coordinator()
+    # 2026-05-05 Stage V.1: 优先级 host_id (单) > host_ids (批) > {} 全 stale.
+    # 让 ops 一次性 trigger 多个特定 worker (e.g. 网络分区恢复时).
     target = (body.get("host_id") or "").strip()
+    targets_batch: list[str] = []
+    if not target:
+        raw_batch = body.get("host_ids")
+        if isinstance(raw_batch, list):
+            targets_batch = [
+                str(h).strip() for h in raw_batch if str(h).strip()
+            ]
     # 2026-05-05 Stage P.2: wait field 控制 sync vs async.
     #   wait=True (default): sync 等 probe 完成, 返 {probed, recovered}
     #   wait=False: async 入队 (set wake_event), 立即返 {queued, mode:async}
@@ -331,6 +340,12 @@ def cluster_reverse_probe_trigger(body: dict = None):  # type: ignore[assignment
             if target:
                 queued.append(target)
                 prober.request_immediate_probe(target)
+            elif targets_batch:
+                # V.1: 批量 host_ids — 逐个 pop 退避 + 一次 wake
+                for hid in targets_batch:
+                    queued.append(hid)
+                    prober._next_probe_at.pop(hid, None)
+                prober.request_immediate_probe("")  # wake 一次
             else:
                 with coord._lock:
                     stale = [
@@ -356,6 +371,14 @@ def cluster_reverse_probe_trigger(body: dict = None):  # type: ignore[assignment
         probed.append(target)
         if coord.reverse_probe_worker(target):
             recovered.append(target)
+    elif targets_batch:
+        # V.1: 批量精确 trigger
+        for hid in targets_batch:
+            if _mh._reverse_prober is not None:
+                _mh._reverse_prober._next_probe_at.pop(hid, None)
+            probed.append(hid)
+            if coord.reverse_probe_worker(hid):
+                recovered.append(hid)
     else:
         # 全 stale host 立即 probe (清所有退避)
         with coord._lock:

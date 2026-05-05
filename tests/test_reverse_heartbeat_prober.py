@@ -829,6 +829,165 @@ def test_trigger_async_falls_back_to_sync_when_no_prober(
     assert "w03" in out["probed"]
 
 
+# ── Stage V.1: trigger 批量 host_ids ─────────────────────────────────
+
+
+def test_trigger_batch_host_ids_sync(fresh_coord, monkeypatch):
+    """body host_ids:[a,b] 批量 sync probe."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    fresh_coord._hosts["w03"] = HostInfo(
+        host_id="w03", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+    fresh_coord._hosts["w175"] = HostInfo(
+        host_id="w175", host_ip="192.168.0.50", port=8000,
+        last_heartbeat=0.0, online=False)
+    fresh_coord._hosts["w_ignored"] = HostInfo(
+        host_id="w_ignored", host_ip="192.168.0.10", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    start_reverse_prober(interval=10.0, startup_delay=0)
+
+    probed_args = []
+
+    def _probe(hid, timeout=5.0):
+        probed_args.append(hid)
+        return True
+    monkeypatch.setattr(fresh_coord, "reverse_probe_worker", _probe)
+
+    try:
+        out = cluster_reverse_probe_trigger(
+            {"host_ids": ["w03", "w175"]})
+        # 只 probe 指定批, w_ignored 跳过
+        assert sorted(probed_args) == ["w03", "w175"]
+        assert sorted(out["probed"]) == ["w03", "w175"]
+        assert out.get("mode") == "sync"
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_trigger_batch_host_ids_async(fresh_coord, monkeypatch):
+    """async 路径批量入队."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    pr = start_reverse_prober(interval=10.0, startup_delay=0)
+    # 模拟两 host 都退避到未来
+    pr._next_probe_at["w03"] = time.time() + 1000
+    pr._next_probe_at["w175"] = time.time() + 1000
+
+    try:
+        out = cluster_reverse_probe_trigger(
+            {"host_ids": ["w03", "w175"], "wait": False})
+        assert sorted(out["queued"]) == ["w03", "w175"]
+        assert out["mode"] == "async"
+        # 退避被 pop
+        assert "w03" not in pr._next_probe_at
+        assert "w175" not in pr._next_probe_at
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+def test_trigger_host_id_takes_priority_over_batch(fresh_coord, monkeypatch):
+    """同时传 host_id + host_ids: host_id 优先 (单值精确)."""
+    from src.host.routers.cluster import cluster_reverse_probe_trigger
+
+    monkeypatch.setattr(
+        multi_host, "load_cluster_config",
+        lambda: {"shared_secret": ""},
+    )
+    fresh_coord._hosts["w03"] = HostInfo(
+        host_id="w03", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    monkeypatch.delenv("OPENCLAW_DISABLE_REVERSE_PROBE", raising=False)
+    reset_reverse_prober_for_tests()
+    start_reverse_prober(interval=10.0, startup_delay=0)
+
+    probed_args = []
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: probed_args.append(hid) or True,
+    )
+
+    try:
+        out = cluster_reverse_probe_trigger(
+            {"host_id": "w03", "host_ids": ["should_be_ignored"]})
+        assert probed_args == ["w03"]
+        assert out["probed"] == ["w03"]
+    finally:
+        stop_reverse_prober(timeout_sec=2.0)
+
+
+# ── Stage V.2: per_host_consecutive_failures ────────────────────────
+
+
+def test_consecutive_failures_increments_on_fail(fresh_coord, monkeypatch):
+    """probe 失败 → consecutive_failures 累加."""
+    fresh_coord._hosts["w_dead"] = HostInfo(
+        host_id="w_dead", host_ip="192.168.0.99", port=8000,
+        last_heartbeat=0.0, online=False)
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: False,
+    )
+    pr = _ReverseHeartbeatProber(
+        interval=10.0, startup_delay=0,
+        max_interval=80.0, backoff_multiplier=2.0,
+    )
+    pr._tick()
+    assert pr._consecutive_failures["w_dead"] == 1
+    pr._next_probe_at["w_dead"] = 0
+    pr._tick()
+    assert pr._consecutive_failures["w_dead"] == 2
+    pr._next_probe_at["w_dead"] = 0
+    pr._tick()
+    assert pr._consecutive_failures["w_dead"] == 3
+
+
+def test_consecutive_failures_resets_on_success(fresh_coord, monkeypatch):
+    """probe 成功 → consecutive_failures 清零."""
+    fresh_coord._hosts["w_flaky"] = HostInfo(
+        host_id="w_flaky", host_ip="192.168.0.50", port=8000,
+        last_heartbeat=0.0, online=False)
+
+    results = iter([False, False, True])
+    monkeypatch.setattr(
+        fresh_coord, "reverse_probe_worker",
+        lambda hid, timeout=5.0: next(results),
+    )
+    pr = _ReverseHeartbeatProber(
+        interval=10.0, startup_delay=0,
+        max_interval=80.0, backoff_multiplier=2.0,
+    )
+    pr._tick()  # fail → 1
+    assert pr._consecutive_failures["w_flaky"] == 1
+    pr._next_probe_at["w_flaky"] = 0
+    pr._tick()  # fail → 2
+    assert pr._consecutive_failures["w_flaky"] == 2
+    pr._next_probe_at["w_flaky"] = 0
+    pr._tick()  # success → 0
+    assert pr._consecutive_failures["w_flaky"] == 0
+
+
+def test_status_includes_per_host_consecutive_failures(fresh_coord):
+    pr = _ReverseHeartbeatProber(interval=10.0, startup_delay=0)
+    pr._consecutive_failures = {"w03": 5, "w175": 0}
+    s = pr.status()
+    assert s["per_host_consecutive_failures"] == {"w03": 5, "w175": 0}
+
+
 def test_auto_trigger_trigger_5xx_returns_false(monkeypatch):
     """trigger endpoint 返 500+ 时 → return False."""
     s = _make_sender()

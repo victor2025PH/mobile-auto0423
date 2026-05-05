@@ -1108,6 +1108,9 @@ class _ReverseHeartbeatProber(threading.Thread):
         self._next_probe_at: Dict[str, float] = {}
         # 当前每 host 的退避间隔 (上次失败后将间隔翻倍, 写到这里供下次用).
         self._current_interval: Dict[str, float] = {}
+        # V.2: per-host 连续失败计数 (UX). probe 成功 reset 0; 失败累加.
+        # status() 暴露给 ops 看 "死透节奏" — 比退避间隔更直观.
+        self._consecutive_failures: Dict[str, int] = {}
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -1206,11 +1209,17 @@ class _ReverseHeartbeatProber(threading.Thread):
         if ok:
             self._current_interval[host_id] = self._interval
             self._next_probe_at[host_id] = now + self._interval
+            # V.2: 成功 reset 失败计数
+            self._consecutive_failures[host_id] = 0
             return
         prev = self._current_interval.get(host_id, self._interval)
         new_interval = min(self._max_interval, prev * self._backoff_mult)
         self._current_interval[host_id] = new_interval
         self._next_probe_at[host_id] = now + new_interval
+        # V.2: 累加失败计数
+        self._consecutive_failures[host_id] = (
+            self._consecutive_failures.get(host_id, 0) + 1
+        )
         log.debug(
             "[Cluster] reverse probe %s 退避 → %.0fs (next at +%.0fs)",
             host_id, new_interval, new_interval,
@@ -1237,6 +1246,7 @@ class _ReverseHeartbeatProber(threading.Thread):
             "backoff_multiplier": self._backoff_mult,
             "per_host_backoff": dict(self._current_interval),
             "per_host_next_probe_at_iso": next_probe_iso,
+            "per_host_consecutive_failures": dict(self._consecutive_failures),
         }
 
 
