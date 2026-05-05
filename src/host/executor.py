@@ -3766,10 +3766,24 @@ def _campaign_extract_members(fb, resolved: str, params: Dict[str, Any],
         for s in source_order
     }
 
-    for g in discovered[:max_groups]:
+    for _gidx, g in enumerate(discovered[:max_groups]):
         exact_group = (g.get("group_name") or "").strip()
         if not exact_group:
             continue
+        # P6-A (2026-05-04): 每群循环入口 wake screen + dump probe.
+        # 真机 task ef707204 (2026-05-04 20:21+) 暴露第 4-5 群重新 enter_group
+        # 时 5 路 IME silent no-op + atx-agent dump 偶发 0 (running_total
+        # 17/40 而非 40/40 因此卡住). task 入口 P3-A wake 已生效但 task 跑 40+
+        # 分钟后 atx-agent 偶发挂, 每群循环重新 wake + healthcheck 解决.
+        # 第一群跳过 (task 入口刚 wake 过 < 1 min, 不重复触发).
+        if _gidx > 0 and hasattr(fb, "_ensure_screen_awake"):
+            try:
+                fb._ensure_screen_awake(resolved)
+            except Exception as _wake_e:
+                logger.debug(
+                    "[FB Campaign] per-group wake (gidx=%d) failed: %s",
+                    _gidx, _wake_e,
+                )
         group_members: List[Dict[str, Any]] = []
         source_results: List[Dict[str, Any]] = []
         for source in source_order:
