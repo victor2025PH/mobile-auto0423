@@ -6621,8 +6621,21 @@ class FacebookAutomation(BaseAutomation):
             return ""
         return text
 
-    def _extract_group_member_candidates(self, elements) -> List[Dict[str, Any]]:
-        """从成员列表 XML 元素中抽取带“加为好友”动作的用户。"""
+    def _extract_group_member_candidates(
+        self, elements,
+        enable_no_add_fallback: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """从成员列表 XML 元素中抽取带“加为好友”动作的用户.
+
+        Args:
+            elements: XMLParser 解析后的元素列表.
+            enable_no_add_fallback: 当没有任何 "加为好友" 按钮时是否启用
+                P7-C-1 row-pattern 降级识别. 默认 False 保留 'must require
+                add_friend action' 契约 (test_member_candidates_require_add_friend_action),
+                避免把帖子控件/图片/按钮误识别为客户线索. 真业务调用方
+                (extract_group_members 在 contributors 完整列表页) 显式传
+                True 启用 P7-C-1 降级.
+        """
         add_centers = []
         for el in elements:
             raw = ((getattr(el, "text", "") or "") + " " +
@@ -6633,6 +6646,11 @@ class FacebookAutomation(BaseAutomation):
                 left, top, right, bottom = el.bounds
                 add_centers.append(((top + bottom) // 2, left, right))
         if not add_centers:
+            # 2026-05-05 Stage T: P7-C-1 fallback 改 opt-in 而非默认
+            # (违反 test_member_candidates_require_add_friend_action 契约).
+            # 调用方 (extract_group_members:9002) 决定是否启用降级识别.
+            if not enable_no_add_fallback:
+                return []
             # 2026-05-05 P7-C-1: contributors 完整列表页 (已是群成员视角)
             # 不显示 "加好友" 按钮 → 原 return [] 导致 task f2aebe47/aa3a5783
             # 跑满 6 次 scroll 仍 yielded=0/40. 降级 row-pattern 识别:
@@ -8999,7 +9017,11 @@ class FacebookAutomation(BaseAutomation):
                     xml = d.dump_hierarchy()
                     from ..vision.screen_parser import XMLParser
                     elements = XMLParser.parse(xml)
-                    for member in self._extract_group_member_candidates(elements):
+                    # Stage T: extract_group_members 跑在 contributors 完整列表页,
+                    # 启用 P7-C-1 row-pattern 降级 (没"加好友"按钮时 fallback).
+                    for member in self._extract_group_member_candidates(
+                        elements, enable_no_add_fallback=True,
+                    ):
                         name = (member.get("name") or "").strip()
                         if not name or name in seen_names:
                             continue
